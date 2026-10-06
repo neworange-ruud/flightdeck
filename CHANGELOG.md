@@ -8,7 +8,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Open Worktree in VS Code** on the remote-control wire: each session now publishes the folder it runs in, and a snapshot names the account and OS the host runs as. FlightDeck Desktop uses these to open a remote host's folders in VS Code over SSH. Both fields are additive, so older clients ignore them.
 
 ### Improvements
 

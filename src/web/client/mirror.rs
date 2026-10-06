@@ -14,9 +14,9 @@ use std::collections::HashMap;
 
 use crate::contracts::{AgentTabPosition, TabId};
 use crate::web::protocol::{
-    AboutDoc, ActivityEvent, CommandView, Delta, DialogView, Geometry, HelpDoc, ProjectId,
-    ProjectView, Seat, SeatInfo, Selection, SessionView, Snapshot, TerminalId, TerminalRole,
-    TerminalView, UpdateNotice, ViewerId,
+    AboutDoc, ActivityEvent, CommandView, Delta, DialogView, Geometry, HelpDoc, HostMachine,
+    ProjectId, ProjectView, Seat, SeatInfo, Selection, SessionView, Snapshot, TerminalId,
+    TerminalRole, TerminalView, UpdateNotice, ViewerId,
 };
 
 /// The most activity entries kept. The host retains its own bounded feed and
@@ -63,6 +63,7 @@ pub struct RemoteWorkspace {
     pub about: Option<AboutDoc>,
     pub update: Option<UpdateNotice>,
     pub sidebar_position: AgentTabPosition,
+    pub host_machine: Option<HostMachine>,
     selection: LocalSelection,
 }
 
@@ -109,6 +110,7 @@ impl RemoteWorkspace {
         self.about = snapshot.about;
         self.update = snapshot.update;
         self.sidebar_position = snapshot.sidebar_position;
+        self.host_machine = snapshot.host_machine;
         if first {
             let host = self.host_selection.clone();
             self.selection.project = host.project_id;

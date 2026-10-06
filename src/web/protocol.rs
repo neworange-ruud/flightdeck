@@ -960,6 +960,11 @@ pub struct SessionView {
     /// The cyan `[existing]` chip: attached to a branch that already existed.
     #[serde(default)]
     pub attached_existing_branch: bool,
+    /// The absolute folder the session runs in on the host: its worktree, or
+    /// the project root for a session on the base branch. In the host's own
+    /// path syntax. Empty from a host that predates the field.
+    #[serde(default)]
+    pub worktree_path: String,
 }
 
 /// One open project (a tab in the project row).
@@ -1660,6 +1665,36 @@ pub struct Snapshot {
     /// not a wrong one.
     #[serde(default)]
     pub sidebar_position: AgentTabPosition,
+    /// Who and what the host is: the account FlightDeck runs as and its OS.
+    /// A native client uses it to open the host's folders over SSH in a
+    /// local editor. Additive and defaulted like [`Snapshot::sidebar_position`];
+    /// `None` from a host that predates it.
+    #[serde(default)]
+    pub host_machine: Option<HostMachine>,
+}
+
+/// The host's account and operating system ([`Snapshot::host_machine`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMachine {
+    /// The login name FlightDeck runs as, when the environment names one.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// `std::env::consts::OS`: `macos`, `linux`, `windows`, …
+    pub os: String,
+}
+
+impl HostMachine {
+    /// This machine.
+    pub fn current() -> HostMachine {
+        let user = ["USER", "USERNAME", "LOGNAME"]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|name| !name.trim().is_empty());
+        HostMachine {
+            user,
+            os: std::env::consts::OS.to_string(),
+        }
+    }
 }
 
 /// A newer FlightDeck release than the one running, as the host learnt it

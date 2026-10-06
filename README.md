@@ -614,6 +614,31 @@ terminals.
   address outside loopback or Tailscale warns you once. Use it on a network you
   trust, or over Tailscale or WireGuard.
 
+#### Edit the other machine's files in VS Code
+
+**Open Worktree in VS Code** (command palette, or right-click an agent) opens
+the folder the agent works in in VS Code on the machine you are at. A remote
+window opens it over SSH with VS Code's
+[Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
+extension, so the files stay on the other machine and VS Code's terminal, git
+and language servers run there. A local window just opens the folder.
+
+For a remote window you need:
+
+- VS Code with the Remote - SSH extension on the machine you are at.
+- SSH access to the other machine as the account FlightDeck runs as there. On
+  Linux, `tailscale up --ssh` lets your tailnet log in with no keys. On macOS,
+  turn on **Remote Login** under System Settings → General → Sharing. On
+  Windows, add the **OpenSSH Server** optional feature.
+
+By default FlightDeck connects as the other machine's FlightDeck user, at the
+address you connected to (`user@100.73.111.96`). To use a `Host` entry from
+`~/.ssh/config` instead, add `"ssh_target": "my-alias"` to that remote's record
+in `~/.flightdeck/remotes.json`. It is read each time you open a folder. Set
+one when SSH needs something the address does not say: a port other than 22, a
+different user, or a remote you reach through a tunnel such as
+`localhost:7420`.
+
 Mission control, split view, the configuration manager and Pull Base are not
 offered in a remote window yet. The remote's terminals keep the other machine's
 size: the window shows that grid and does not resize it.

@@ -970,6 +970,8 @@ impl Shared {
             // 1h position 4: the browser mirrors the body row on the same
             // setting the desktop mirrors it on, read from the same config.
             sidebar_position: state.sidebar_position,
+            // Fixed for the life of the process, like `commands`.
+            host_machine: Some(crate::web::protocol::HostMachine::current()),
         }
     }
 

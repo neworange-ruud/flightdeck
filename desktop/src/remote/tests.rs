@@ -12,8 +12,8 @@ use flightdeck::host::{HostEvent, OverlayInput, OverlayView};
 use flightdeck::web::client::{LinkEnd, LinkEvent, LinkOut, LinkState, RemoteClient, Script};
 use flightdeck::web::protocol::{
     ClientMsg, Delta, DialogBody, DialogKey, DialogOrigin, DialogView, Geometry, GitBar,
-    ProjectView, Seat, Selection, SessionPhase, SessionStatus, SessionView, Snapshot, StatusBucket,
-    TermBytes, TerminalRole, TerminalView, PROTOCOL_VERSION,
+    HostMachine, ProjectView, Seat, Selection, SessionPhase, SessionStatus, SessionView, Snapshot,
+    StatusBucket, TermBytes, TerminalRole, TerminalView, PROTOCOL_VERSION,
 };
 use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext};
 use gpui_component::Root;
@@ -70,6 +70,7 @@ fn session(id: &str, name: &str, shells: &[&str]) -> SessionView {
         lifecycle_reporting: true,
         recovered: false,
         attached_existing_branch: false,
+        worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
     }
 }
 
@@ -110,6 +111,10 @@ fn snapshot() -> Snapshot {
         about: None,
         update: None,
         sidebar_position: AgentTabPosition::default(),
+        host_machine: Some(HostMachine {
+            user: Some("dev".to_string()),
+            os: "linux".to_string(),
+        }),
     }
 }
 
@@ -183,6 +188,63 @@ fn commands(script: &mut Script) -> Vec<(String, Option<serde_json::Value>)> {
             _ => None,
         })
         .collect()
+}
+
+fn open_in_vscode() -> HostEvent {
+    HostEvent::RunPaletteAction(flightdeck::tui::palette::PaletteAction::FrontEnd(
+        flightdeck::tui::palette::FrontEndAction::OpenInVsCode,
+    ))
+}
+
+/// The window opens the session it shows on the host, over SSH as the host's
+/// own account, in this machine's VS Code — and the host is never asked.
+#[gpui::test]
+fn open_in_vscode_opens_the_shown_session_over_ssh(app: &mut TestAppContext) {
+    let (model, mut script, cx) = open(app);
+    commands(&mut script);
+    let urls = model.update(cx, |m, _| {
+        m.apply(open_in_vscode());
+        m.take_open_urls()
+    });
+    assert_eq!(
+        urls,
+        ["vscode://vscode-remote/ssh-remote+dev@192.168.2.20/repo/.flightdeck/worktrees/search"]
+    );
+    assert!(commands(&mut script).is_empty(), "nothing goes to the host");
+}
+
+/// An SSH target saved for the remote by hand (an `~/.ssh/config` alias)
+/// replaces the derived one, read when the action runs.
+#[gpui::test]
+fn open_in_vscode_uses_the_ssh_target_saved_for_the_remote(app: &mut TestAppContext) {
+    use flightdeck::web::client::store::{save_remotes, RemotesFile, SavedRemote};
+    let (model, _script, cx) = open(app);
+    let fs = std::rc::Rc::new(flightdeck::testing::FakeFs::new());
+    let path = std::path::PathBuf::from("/home/u/.flightdeck/remotes.json");
+    let mut file = RemotesFile::default();
+    file.upsert(SavedRemote {
+        label: "studio".to_string(),
+        address: "192.168.2.20:7420".to_string(),
+        token: "t".to_string(),
+        last_seen: None,
+        viewer_id: None,
+        host_version: None,
+        warned_unencrypted: true,
+        ssh_target: Some("studio-box".to_string()),
+    });
+    save_remotes(fs.as_ref(), &path, &file).unwrap();
+    let urls = model.update(cx, |m, _| {
+        m.set_remotes(super::connect::Store {
+            fs,
+            path: Some(path),
+        });
+        m.apply(open_in_vscode());
+        m.take_open_urls()
+    });
+    assert_eq!(
+        urls,
+        ["vscode://vscode-remote/ssh-remote+studio-box/repo/.flightdeck/worktrees/search"]
+    );
 }
 
 #[gpui::test]
@@ -531,6 +593,7 @@ mod connect {
             viewer_id: None,
             host_version: None,
             warned_unencrypted: warned,
+            ssh_target: None,
         }
     }
 

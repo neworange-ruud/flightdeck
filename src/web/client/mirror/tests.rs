@@ -54,6 +54,7 @@ fn session(project: &str, id: &str, name: &str, shells: &[&str]) -> SessionView 
         lifecycle_reporting: true,
         recovered: false,
         attached_existing_branch: false,
+        worktree_path: String::new(),
     }
 }
 
@@ -105,6 +106,7 @@ fn snapshot() -> Snapshot {
         about: None,
         update: None,
         sidebar_position: AgentTabPosition::default(),
+        host_machine: None,
     }
 }
 

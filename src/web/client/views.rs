@@ -422,6 +422,58 @@ pub fn palette_view(ws: &RemoteWorkspace, filter: &str, selected: usize) -> Pale
 }
 
 // ---------------------------------------------------------------------------
+// Open Worktree in VS Code, over SSH to the host
+// ---------------------------------------------------------------------------
+
+/// A host folder to open in this machine's VS Code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VsCodeFolder {
+    /// The `vscode://` link for the platform to open.
+    pub url: String,
+    /// The folder, in the host's path syntax.
+    pub path: String,
+    /// The SSH destination the link names.
+    pub ssh_target: String,
+    /// A session is selected, but the host predates
+    /// [`crate::web::protocol::SessionView::worktree_path`], so this is the
+    /// project root instead of the session's folder.
+    pub root_fallback: bool,
+}
+
+/// The folder this client is looking at — the selected session's, else the
+/// selected project's root — as a Remote - SSH link to the host at `address`.
+/// `configured` is the SSH target saved for this remote by hand, if any.
+///
+/// `None` when nothing is selected. A host that predates
+/// [`crate::web::protocol::SessionView::worktree_path`] still has a project
+/// root to open; one that predates [`crate::web::protocol::HostMachine`]
+/// leaves the user to SSH, and its OS is read off the path.
+pub fn vscode_folder(
+    ws: &RemoteWorkspace,
+    address: &str,
+    configured: Option<&str>,
+) -> Option<VsCodeFolder> {
+    let session_path = ws.selected_session().map(|s| s.worktree_path.clone());
+    let root_fallback = session_path.as_ref().is_some_and(String::is_empty);
+    let path = session_path
+        .filter(|p| !p.is_empty())
+        .or_else(|| ws.selected_project().map(|p| p.root.clone()))?;
+    let machine = ws.host_machine.as_ref();
+    let os = match machine {
+        Some(m) => m.os.clone(),
+        None if path.starts_with('/') => "linux".to_string(),
+        None => "windows".to_string(),
+    };
+    let ssh_target = crate::host::vscode::ssh_target(configured, address, machine);
+    Some(VsCodeFolder {
+        url: crate::host::vscode::remote_folder_url(&ssh_target, &os, &path),
+        path,
+        ssh_target,
+        root_fallback,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The shared dialog (D13), answered from a remote window
 // ---------------------------------------------------------------------------
 

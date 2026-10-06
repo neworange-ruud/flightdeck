@@ -2437,6 +2437,17 @@ fn build_web_host_state(
                     },
                     recovered: tab.meta.recovered,
                     attached_existing_branch: tab.meta.attached_existing_branch,
+                    // A base-branch session's relative path is `.`, which
+                    // must not reach a remote editor as `<root>/.`.
+                    worktree_path: to_absolute(
+                        &project.state.repo_root,
+                        Path::new(&tab.meta.worktree_path_relative),
+                    )
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .collect::<std::path::PathBuf>()
+                    .display()
+                    .to_string(),
                     terminals,
                 },
                 streams,
@@ -14807,6 +14818,60 @@ mod tests {
                     "whichever project is active when the answer lands shows it"
                 );
             }
+        }
+
+        /// Each session publishes the folder it runs in, which a remote
+        /// desktop opens in VS Code over SSH: the worktree, or for a session
+        /// on the base branch (relative path `.`) the project root itself.
+        #[test]
+        fn each_session_publishes_the_folder_it_runs_in() {
+            let mut workspace = one_project_workspace(false);
+            let tab = |id: &str, rel: &str| TabState {
+                id: id.to_string(),
+                name: id.to_string(),
+                slug: id.to_string(),
+                agent: "codex".to_string(),
+                branch: format!("flightdeck/{id}"),
+                worktree_path_relative: rel.to_string(),
+                base_branch: "main".to_string(),
+                base_commit_sha: "abc123".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                attached_existing_branch: false,
+                recovered: false,
+                last_known_status: "unknown".to_string(),
+                manual_status: None,
+                containerized: false,
+                container_image: None,
+                runs_on_base: rel == ".",
+                resume_args: Vec::new(),
+                activity: Default::default(),
+            };
+            let mut saved = default_state("main");
+            saved.tabs = vec![
+                tab("login", ".flightdeck/worktrees/login"),
+                tab("base", "."),
+            ];
+            let config = workspace.projects[0].state.config.clone();
+            workspace.projects[0].state = AppState::new(config, saved, "/repo", "/repo/state.json");
+
+            let state = host_state(&workspace);
+            // Compared as paths: the host spells them with its own separator.
+            let paths: Vec<PathBuf> = state.projects[0]
+                .sessions
+                .iter()
+                .map(|s| PathBuf::from(&s.worktree_path))
+                .collect();
+            assert_eq!(
+                paths,
+                [
+                    PathBuf::from("/repo/.flightdeck/worktrees/login"),
+                    PathBuf::from("/repo"),
+                ]
+            );
+            assert!(
+                !state.projects[0].sessions[1].worktree_path.ends_with('.'),
+                "no trailing `.` component"
+            );
         }
 
         /// A host that has learnt nothing sends nothing. `None` is not the same

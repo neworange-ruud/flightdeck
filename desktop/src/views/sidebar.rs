@@ -13,6 +13,7 @@
 
 use flightdeck::app::commands::{Command, Selector};
 use flightdeck::host::HostEvent;
+use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
 use flightdeck::view::{
     format_elapsed, AgentBadge, AgentRowView, TerminalRef, TerminalView, UpstreamState,
 };
@@ -497,6 +498,18 @@ fn agent_menu(
             "Open in file manager",
             Some("OpenWorktreeInFileManager"),
         ))
+        .item({
+            let host = host.clone();
+            PopupMenuItem::new("Open in VS Code").on_click(move |_, _, cx| {
+                host.select_agent(index, cx);
+                host.dispatch(
+                    HostEvent::RunPaletteAction(PaletteAction::FrontEnd(
+                        FrontEndAction::OpenInVsCode,
+                    )),
+                    cx,
+                );
+            })
+        })
         .separator()
         .item(item("Close agent…", Some("CloseAgentTab")))
 }

@@ -343,6 +343,7 @@ impl ConnectView {
                     host_version: None,
                     // Either the link needs no warning, or it was just read.
                     warned_unencrypted: true,
+                    ssh_target: None,
                 };
                 self.saved.upsert(remote.clone());
                 self.store.save(&self.saved);
