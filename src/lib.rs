@@ -14855,20 +14855,22 @@ mod tests {
             workspace.projects[0].state = AppState::new(config, saved, "/repo", "/repo/state.json");
 
             let state = host_state(&workspace);
-            let paths: Vec<&str> = state.projects[0]
+            // Compared as paths: the host spells them with its own separator.
+            let paths: Vec<PathBuf> = state.projects[0]
                 .sessions
                 .iter()
-                .map(|s| s.worktree_path.as_str())
+                .map(|s| PathBuf::from(&s.worktree_path))
                 .collect();
-            let root = std::path::Path::new("/repo");
             assert_eq!(
                 paths,
                 [
-                    root.join(".flightdeck/worktrees/login")
-                        .display()
-                        .to_string(),
-                    root.display().to_string(),
+                    PathBuf::from("/repo/.flightdeck/worktrees/login"),
+                    PathBuf::from("/repo"),
                 ]
+            );
+            assert!(
+                !state.projects[0].sessions[1].worktree_path.ends_with('.'),
+                "no trailing `.` component"
             );
         }
 
