@@ -16,6 +16,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- None yet.
+
+## [1.25.1] - 2026-10-07
+
+### New features
+
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
 - The sidebar, git status panel and remote clients now show the branch an Agent Session's worktree has checked out, not the one it was created on. Ahead/behind are counted for that branch too. Before, switching branches in the worktree's shell left the old name on screen.
 - While a remote client is attached, the host also refreshes git status for the projects that are not active, every 10 seconds. A remote window can show any project, and before this the ones not active on the host never updated.
 
