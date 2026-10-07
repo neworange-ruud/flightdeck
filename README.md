@@ -578,6 +578,10 @@ terminal tabs, `F1` help, and so on. Some differences:
   `Ctrl-Shift-V`.
 - Leaving terminal focus honours the same `[ui] use_f2_to_leave_terminal_focus`
   setting, read when the app starts.
+- **Links in terminal output open in your browser.** Hold `Cmd` (macOS) or
+  `Ctrl` (Windows, Linux) over an `http(s)` URL to underline it, and click it
+  to open it. A URL wrapped onto the next rows opens whole. In a remote window
+  it opens on the machine you are at.
 
 ### Control another machine from FlightDeck Desktop
 

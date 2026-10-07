@@ -22,10 +22,11 @@
 //! their column, so a glyph with a foreign advance cannot shift its neighbours.
 
 use gpui::{
-    fill, point, px, relative, size, App, Bounds, ContentMask, DispatchPhase, Element, ElementId,
-    ElementInputHandler, Entity, Font, GlobalElementId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window,
+    fill, point, px, relative, size, App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element,
+    ElementId, ElementInputHandler, Entity, Font, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point, ShapedLine, SharedString, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
+    Window,
 };
 
 use super::boxdraw::{BoxGlyph, Corner, Weight};
@@ -35,6 +36,7 @@ use super::rowcache::RowCache;
 use super::view::TerminalView;
 use crate::theme::Hex;
 use flightdeck::contracts::PtySize;
+use flightdeck::terminal::grid::links::LinkSegment;
 use flightdeck::terminal::grid::CursorShape;
 
 /// The monospace family terminals draw with: the bundled Geist Mono
@@ -216,6 +218,11 @@ pub struct Prepared {
     /// The scrollbar thumbs (see [`scrollbars`]) and their colour.
     scrollbars: Vec<Bounds<Pixels>>,
     scrollbar_colour: Hex,
+    /// The link under the pointer while Cmd / Ctrl is held, underlined in
+    /// `link_colour`, and the hitbox its hand cursor is set on.
+    link: Vec<LinkSegment>,
+    link_colour: Hex,
+    hitbox: Hitbox,
 }
 
 impl Element for TerminalElement {
@@ -289,6 +296,8 @@ impl Element for TerminalElement {
                 view.set_metrics(metrics);
                 view.set_window_active(window_active);
                 let (mut cache, selection) = view.prepare_rows(focused, cx);
+                // Output may have moved the text under a still pointer.
+                view.refresh_hover_link(cx);
                 if reshape {
                     cache.invalidate_derived();
                 }
@@ -309,6 +318,13 @@ impl Element for TerminalElement {
                 height * f32::from(viewport.rows),
             ),
         );
+        let link = self
+            .view
+            .read(cx)
+            .hover_link()
+            .map(|l| l.segments.clone())
+            .unwrap_or_default();
+        let hitbox = window.insert_hitbox(grid, HitboxBehavior::Normal);
         let (offset, history) = scroll.unwrap_or((0, 0));
         let (vertical, horizontal) = scrollbars(grid, &viewport, offset, history);
         let scrollbars = vertical.into_iter().chain(horizontal).collect();
@@ -336,6 +352,9 @@ impl Element for TerminalElement {
             cursor_colour: palette.cursor,
             scrollbars,
             scrollbar_colour: palette.scrollbar,
+            link,
+            link_colour: palette.fg,
+            hitbox,
         }
     }
 
@@ -397,6 +416,17 @@ impl Element for TerminalElement {
                 }
             }
 
+            // The hovered link: a one-pixel underline along each of its rows.
+            let link_colour = prepared.link_colour.hsla();
+            for seg in &prepared.link {
+                let cell = m.cell_bounds(seg.row, seg.col, seg.cols);
+                let y = cell.origin.y + cell.size.height - px(1.5);
+                window.paint_quad(fill(
+                    Bounds::new(point(cell.origin.x, y), size(cell.size.width, px(1.))),
+                    link_colour,
+                ));
+            }
+
             for cell in rows.iter().flat_map(|r| &r.layout.boxes) {
                 paint_box(
                     &cell.glyph,
@@ -445,6 +475,9 @@ impl Element for TerminalElement {
                 view.update(cx, |view, cx| view.window_mouse_move(event, grid, cx));
             }
         });
+        if !prepared.link.is_empty() {
+            window.set_cursor_style(CursorStyle::PointingHand, &prepared.hitbox);
+        }
         let view = self.view.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
             if phase == DispatchPhase::Bubble {
