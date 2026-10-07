@@ -1514,6 +1514,9 @@ mod overlays {
     fn the_git_status_panel_reads_out_what_collect_status_found() {
         let fakes = Fakes::new();
         let (state, _pty) = fakes.state_with_a_tab();
+        fakes
+            .git
+            .set_current_branch(state.tabs[0].meta.branch.clone());
         let mut host = fakes.host(state);
         command(&mut host, Command::ShowGitStatus);
         let OverlayView::GitStatus(view) = overlay(&host) else {

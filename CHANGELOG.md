@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- The sidebar, git status panel and remote clients now show the branch an Agent Session's worktree has checked out, not the one it was created on. Ahead/behind are counted for that branch too. Before, switching branches in the worktree's shell left the old name on screen.
 
 ## [1.25.0] - 2026-10-06
 

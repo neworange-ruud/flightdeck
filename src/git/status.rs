@@ -116,6 +116,11 @@ pub struct WorktreeStatus {
 }
 
 /// Collect the status panel data for an Agent Tab (SPECS §21).
+///
+/// `branch` is the branch the tab was created on. The status reports the one
+/// the worktree has checked out *now* — the user may have switched it in a
+/// shell — and falls back to `branch` only when git names none (a detached
+/// HEAD). Upstream and ahead/behind follow the reported branch.
 pub fn collect_status(
     git: &dyn GitExecutor,
     branch: &str,
@@ -123,6 +128,11 @@ pub fn collect_status(
     base_commit_sha: &str,
     worktree_path: &Path,
 ) -> Result<WorktreeStatus> {
+    let checked_out = git
+        .current_branch(worktree_path)
+        .ok()
+        .filter(|b| !b.is_empty() && b != "HEAD");
+    let branch = checked_out.as_deref().unwrap_or(branch);
     // One porcelain call yields both the dirty flag and the per-category counts.
     let porcelain = git.status_porcelain(worktree_path)?;
     let changes = parse_porcelain_changes(&porcelain);
@@ -420,6 +430,29 @@ mod tests {
         );
     }
 
+    /// A branch switched inside the worktree is what the sidebar and git
+    /// strip show, and ahead/behind are counted for it, not for the branch the
+    /// tab was created on.
+    #[test]
+    fn collect_status_reports_the_branch_checked_out_now() {
+        let git = FakeGit::new().with_current_branch("feature/NVM-10-diagrams");
+        let wt = Path::new("/repo/wt");
+        let status = collect_status(&git, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert_eq!(status.branch, "feature/NVM-10-diagrams");
+    }
+
+    /// A detached HEAD names no branch, so the tab's own branch stays shown.
+    #[test]
+    fn collect_status_keeps_the_tab_branch_on_a_detached_head() {
+        let wt = Path::new("/repo/wt");
+        let detached = FakeGit::new().with_current_branch_error("HEAD is detached");
+        let status = collect_status(&detached, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert_eq!(status.branch, "flightdeck/feat");
+        let abbrev = FakeGit::new().with_current_branch("HEAD");
+        let status = collect_status(&abbrev, "flightdeck/feat", "main", "sha-base", wt).unwrap();
+        assert_eq!(status.branch, "flightdeck/feat");
+    }
+
     #[test]
     fn collect_status_survives_an_unreadable_diff() {
         let git = FakeGit::new();
@@ -511,7 +544,9 @@ mod tests {
 
     #[test]
     fn collect_status_reports_dirty_ahead_behind_drift() {
-        let git = FakeGit::new().with_branches(["main", "flightdeck/feat"]);
+        let git = FakeGit::new()
+            .with_branches(["main", "flightdeck/feat"])
+            .with_current_branch("flightdeck/feat");
         let wt = Path::new("/repo/.flightdeck/worktrees/feat");
         git.set_dirty_at(wt, true);
         git.set_upstream(
