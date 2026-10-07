@@ -22,6 +22,12 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- None yet.
+
+## [0.4.1] - 2026-10-07
+
+### Bug fixes
+
 - The Linux (`.deb`, `.rpm`, AppImage) and Windows (MSI, portable zip) builds are published with the release again. Their packaging steps failed, so 0.3.0 and 0.4.0 shipped macOS builds only.
 
 ## [0.4.0] - 2026-10-06
