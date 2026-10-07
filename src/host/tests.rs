@@ -1514,6 +1514,9 @@ mod overlays {
     fn the_git_status_panel_reads_out_what_collect_status_found() {
         let fakes = Fakes::new();
         let (state, _pty) = fakes.state_with_a_tab();
+        fakes
+            .git
+            .set_current_branch(state.tabs[0].meta.branch.clone());
         let mut host = fakes.host(state);
         command(&mut host, Command::ShowGitStatus);
         let OverlayView::GitStatus(view) = overlay(&host) else {
@@ -2076,4 +2079,96 @@ mod native_remote_client {
         client.stop();
         host.stop_services();
     }
+}
+
+/// The bug as it was reported: FlightDeck open, the agent running, and the
+/// branch switched in the worktree's shell. Only the timed refresh runs — no
+/// explicit request — and the sidebar row and the state remote clients are
+/// sent must both move to the new branch.
+#[test]
+fn a_branch_switched_while_the_agent_runs_reaches_the_sidebar_and_remote_clients() {
+    let fakes = Fakes::new();
+    let (state, _pty) = fakes.state_with_a_tab();
+    let created = state.tabs[0].meta.branch.clone();
+    fakes.git.set_current_branch(created.clone());
+    let mut host = fakes.host(state);
+
+    // Turn the loop on the fake clock until the sidebar shows `want`.
+    let turn_until = |host: &mut AppHost, want: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            fakes.clock.advance_millis(100);
+            host.tick();
+            if host.agent_rows()[0].branch == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sidebar still shows {:?}, never {want:?}",
+                host.agent_rows()[0].branch
+            );
+            if host.workspace.projects[0].status_in_flight {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    };
+    let web_branch = |host: &AppHost| {
+        host.web_host_state().projects[0].sessions[0]
+            .git
+            .branch
+            .clone()
+    };
+
+    turn_until(&mut host, &created);
+    assert_eq!(web_branch(&host).as_deref(), Some(created.as_str()));
+
+    fakes
+        .git
+        .set_current_branch("feature/NVM-10-dev-workflow-diagrams");
+    turn_until(&mut host, "feature/NVM-10-dev-workflow-diagrams");
+    assert_eq!(
+        web_branch(&host).as_deref(),
+        Some("feature/NVM-10-dev-workflow-diagrams"),
+        "remote clients are sent the same branch"
+    );
+    assert_eq!(
+        host.active_state().tabs[0].meta.branch,
+        created,
+        "the tab's own branch, which push and finish act on, is unchanged"
+    );
+}
+
+/// A remote window may show any project, so while one is attached the host
+/// refreshes the projects that are not active too — slower, and never with
+/// nobody watching.
+#[test]
+fn background_projects_refresh_only_while_a_remote_viewer_is_attached() {
+    use super::{background_refresh_due, BACKGROUND_GIT_REFRESH_MIN_MS, GIT_REFRESH_EVERY};
+    let tick = GIT_REFRESH_EVERY * 3;
+    assert!(
+        !background_refresh_due(tick, 50_000, None, || 0),
+        "nobody watching"
+    );
+    assert!(background_refresh_due(tick, 50_000, None, || 1));
+    assert!(
+        !background_refresh_due(tick + 1, 50_000, None, || 1),
+        "only on the active refresh's tick"
+    );
+    let last = Some(50_000);
+    assert!(!background_refresh_due(
+        tick,
+        50_000 + BACKGROUND_GIT_REFRESH_MIN_MS - 1,
+        last,
+        || 1
+    ));
+    assert!(background_refresh_due(
+        tick,
+        50_000 + BACKGROUND_GIT_REFRESH_MIN_MS,
+        last,
+        || 1
+    ));
+    assert!(
+        !background_refresh_due(tick + 1, 50_000, None, || panic!("not asked when not due")),
+        "the viewer count is read only when otherwise due"
+    );
 }

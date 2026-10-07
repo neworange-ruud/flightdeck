@@ -22,7 +22,8 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- The sidebar and git strip now show the branch an agent's worktree has checked out, in local and remote windows. Before, switching branches in the worktree's shell left the name it was created with.
+- A remote window now sees git status update for every project, not only the one active on the host.
 
 ## [0.4.1] - 2026-10-07
 

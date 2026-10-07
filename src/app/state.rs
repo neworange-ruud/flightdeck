@@ -5693,6 +5693,7 @@ mod tests {
         )
         .unwrap();
         let branch = app.tabs[0].meta.branch.clone();
+        git.set_current_branch(&branch);
         // The branch has been pushed (has an upstream) and origin is GitHub.
         git.set_upstream(&branch, Some(format!("origin/{branch}")));
         git.set_remote("origin", "git@github.com:owner/repo.git");

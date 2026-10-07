@@ -95,6 +95,12 @@ const ANSWERED_PROMPTS_KEPT: usize = 64;
 /// (S4)") must not also run `git status` faster.
 pub const GIT_REFRESH_MIN_MS: u64 = 2_000;
 
+/// How often the projects that are *not* active are refreshed while a remote
+/// client is attached. A remote window browses every project on its own (R2),
+/// so the host cannot know which one it shows; slower than the active
+/// project's refresh, because a remote may be looking at none of them.
+pub const BACKGROUND_GIT_REFRESH_MIN_MS: u64 = 10_000;
+
 /// One front-end-neutral input for [`AppHost::handle`].
 ///
 /// These are the actions a key map or a click resolves *to*, not raw keys: a
@@ -198,6 +204,9 @@ pub struct AppHost<'a> {
     /// The clock reading at the last git-status refresh, for
     /// [`GIT_REFRESH_MIN_MS`].
     last_git_refresh_ms: Option<u64>,
+    /// The clock reading at the last refresh of the projects that are not
+    /// active, for [`BACKGROUND_GIT_REFRESH_MIN_MS`].
+    last_background_git_refresh_ms: Option<u64>,
     /// The clock reading taken at the top of the current [`AppHost::pump`], so
     /// every phase of one turn — and the front-end's render — agree on "now".
     now_ms: u64,
@@ -347,6 +356,7 @@ impl<'a> AppHost<'a> {
             workspace_ui: WorkspaceUi::default(),
             tick: 0,
             last_git_refresh_ms: None,
+            last_background_git_refresh_ms: None,
             now_ms: 0,
             store_home: None,
             update_rx,
@@ -918,6 +928,25 @@ impl<'a> AppHost<'a> {
             let p = &mut workspace.projects[active];
             if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
                 p.status_in_flight = true;
+            }
+        }
+        // --- And, while a remote client is attached, the others too: it may
+        //     be showing any of them, and only the host can refresh them. ---
+        let remote_viewers = || web_surface.handle.as_ref().map_or(0, |h| h.viewer_count());
+        if background_refresh_due(
+            self.tick,
+            now_ms,
+            self.last_background_git_refresh_ms,
+            remote_viewers,
+        ) {
+            self.last_background_git_refresh_ms = Some(now_ms);
+            for (idx, p) in workspace.projects.iter_mut().enumerate() {
+                if idx != active
+                    && !p.status_in_flight
+                    && spawn_status_refresh(&p.state, &p.git, &p.status_tx)
+                {
+                    p.status_in_flight = true;
+                }
             }
         }
         self.tick = self.tick.wrapping_add(1);
@@ -1753,6 +1782,21 @@ impl<'a> AppHost<'a> {
 /// enough to take twice a turn: a status file or a finalized worktree moves
 /// it without any byte of PTY output, and [`AppHost::pump`] must still say
 /// "redraw" for those.
+/// Whether this turn also refreshes the projects that are not active: on the
+/// active refresh's tick, no more often than [`BACKGROUND_GIT_REFRESH_MIN_MS`],
+/// and only while a remote client is attached. `remote_viewers` is asked last,
+/// so a turn that is not due never takes the viewer registry's lock.
+fn background_refresh_due(
+    tick: u64,
+    now_ms: u64,
+    last_ms: Option<u64>,
+    remote_viewers: impl FnOnce() -> usize,
+) -> bool {
+    tick.is_multiple_of(GIT_REFRESH_EVERY)
+        && last_ms.is_none_or(|last| now_ms.saturating_sub(last) >= BACKGROUND_GIT_REFRESH_MIN_MS)
+        && remote_viewers() > 0
+}
+
 fn status_fingerprint(
     workspace: &Workspace,
     now_ms: u64,
