@@ -797,3 +797,80 @@ fn a_resize_sets_the_pty_and_what_the_web_is_told(app: &mut TestAppContext) {
         "{before:?} -> {after:?}"
     );
 }
+
+// --- links -------------------------------------------------------------------
+
+/// The platform's link modifier: Cmd on macOS, Ctrl elsewhere.
+fn link_modifier() -> Modifiers {
+    Modifiers::secondary_key()
+}
+
+#[gpui::test]
+fn a_cmd_or_ctrl_click_on_a_link_opens_it_and_a_plain_click_does_not(app: &mut TestAppContext) {
+    let (view, pty, cx) = owned(app, Emulator::Alacritty);
+    output(&view, &pty, cx, b"PR: https://github.com/o/r/pull/96. Done");
+
+    let at = cell(&view, cx, 0, 12);
+    cx.simulate_click(at, Modifiers::none());
+    assert_eq!(cx.opened_url(), None, "a plain click selects, as before");
+
+    cx.simulate_click(at, link_modifier());
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/o/r/pull/96")
+    );
+    assert!(
+        !read_terminal(&view, cx, |t| t.has_selection()),
+        "opening a link selects nothing"
+    );
+}
+
+#[gpui::test]
+fn the_link_goes_to_the_browser_not_to_a_mouse_aware_program(app: &mut TestAppContext) {
+    let (view, pty, cx) = owned(app, Emulator::Alacritty);
+    // The program asks for button reporting, then prints a link.
+    output(&view, &pty, cx, b"\x1b[?1000hsee https://x.io/docs");
+    let mut seen = pty.input().len();
+    let link = cell(&view, cx, 0, 6);
+    cx.simulate_click(link, link_modifier());
+    assert_eq!(cx.opened_url().as_deref(), Some("https://x.io/docs"));
+    assert!(written(&pty, &mut seen).is_empty(), "no mouse report sent");
+
+    // Off a link the modifier changes nothing: the click is reported.
+    let plain = cell(&view, cx, 0, 1);
+    cx.simulate_click(plain, Modifiers::none());
+    assert!(!written(&pty, &mut seen).is_empty());
+}
+
+#[gpui::test]
+fn holding_the_modifier_over_a_link_underlines_all_of_it(app: &mut TestAppContext) {
+    let (view, pty, cx) = owned(app, Emulator::Alacritty);
+    output(&view, &pty, cx, b"go https://example.com/a now");
+    let over = cell(&view, cx, 0, 8);
+    let hovered = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |v, _| v.hover_link().map(|l| l.url.clone()))
+    };
+
+    cx.simulate_mouse_move(over, None, Modifiers::none());
+    assert_eq!(hovered(cx), None, "no underline without the modifier");
+
+    cx.simulate_modifiers_change(link_modifier());
+    assert_eq!(hovered(cx).as_deref(), Some("https://example.com/a"));
+    let segments = view.read_with(cx, |v, _| v.hover_link().unwrap().segments.clone());
+    assert_eq!(
+        segments,
+        [flightdeck::terminal::grid::links::LinkSegment {
+            row: 0,
+            col: 3,
+            cols: 21
+        }]
+    );
+
+    let off = cell(&view, cx, 0, 1);
+    cx.simulate_mouse_move(off, None, link_modifier());
+    assert_eq!(hovered(cx), None, "off the link");
+    cx.simulate_mouse_move(over, None, link_modifier());
+    assert!(hovered(cx).is_some());
+    cx.simulate_modifiers_change(Modifiers::none());
+    assert_eq!(hovered(cx), None, "the modifier let go");
+}

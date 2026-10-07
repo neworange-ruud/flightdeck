@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Clickable links in terminals.** Hold `Cmd` (macOS) or `Ctrl` (Windows, Linux) over a URL in an agent's or shell's output to underline it, and click to open it in the browser. A URL wrapped onto the next rows opens whole. Only `http` and `https` links open, and in a remote window they open on the machine you are at.
 
 ### Improvements
 

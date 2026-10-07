@@ -27,6 +27,7 @@
 //! want to pin exact cells without going through a parser.
 
 pub mod alacritty_grid;
+pub mod links;
 pub mod mouse;
 pub mod vt100_grid;
 

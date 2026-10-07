@@ -52,6 +52,12 @@
 //!   panned first: the wheel reaches its hidden rows before the history, a
 //!   sideways swipe its hidden columns, and a typed key brings the cursor
 //!   back into view (see [`super::pan`]).
+//! - **Links.** Holding the platform's secondary modifier (Cmd on macOS, Ctrl
+//!   elsewhere) underlines the web link under the pointer and shows a hand
+//!   cursor; a click with it held opens the link in the browser instead of
+//!   selecting or reaching the program. Links are read off the text
+//!   ([`flightdeck::terminal::grid::links`]), wrapped rows included, and only
+//!   `http(s)` ever opens.
 //! - Cmd-C on macOS copies the selection too (release already has). Input —
 //!   a key, a paste — drops the selection and returns to the live screen (the
 //!   host does that for the app; the owned path does it here).
@@ -73,12 +79,13 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use flightdeck::terminal::grid::links::{link_at, Link};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    Styled, Task, UTF16Selection, Window,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, Styled, Task, UTF16Selection, Window,
 };
 
 use flightdeck::app::keymap::encode_paste;
@@ -157,6 +164,13 @@ pub struct TerminalView {
     motion_cell: Option<(u16, u16)>,
     /// A local selection drag in progress.
     drag: Option<Drag>,
+    /// Where the pointer is over the grid (window coordinates), when it is.
+    pointer: Option<Point<Pixels>>,
+    /// Whether the secondary modifier (Cmd / Ctrl) is held.
+    link_modifier: bool,
+    /// The link under the pointer while the modifier is held: underlined, and
+    /// what a click opens.
+    hover_link: Option<Link>,
     /// The auto-scroll loop while a drag is held past an edge, and whether it
     /// is still running (it ends itself once the drag ends or comes back).
     autoscroll: Option<Task<()>>,
@@ -297,6 +311,9 @@ impl TerminalView {
             forwarded_button: None,
             motion_cell: None,
             drag: None,
+            pointer: None,
+            link_modifier: false,
+            hover_link: None,
             autoscroll: None,
             autoscrolling: false,
             scroll_remainder: 0.0,
@@ -809,6 +826,12 @@ impl TerminalView {
         let Some((row, col)) = self.cell_at(event.position, cx) else {
             return;
         };
+        if event.button == MouseButton::Left && event.modifiers.secondary() {
+            if let Some(link) = self.link_at_cell(row, col, cx) {
+                cx.open_url(&link.url);
+                return;
+            }
+        }
         if self.forwards_mouse(event.modifiers.shift, cx) {
             let Some((mode, encoding)) =
                 self.with_terminal(cx, |t| (t.screen().modes().mouse_mode, t.mouse_encoding()))
@@ -851,6 +874,11 @@ impl TerminalView {
         grid: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if self.forwarded_button.is_none() && self.drag.is_none() {
+            self.pointer = grid.contains(&event.position).then_some(event.position);
+            self.link_modifier = event.modifiers.secondary();
+            self.refresh_hover_link(cx);
+        }
         if let Some(code) = self.forwarded_button {
             let Some((row, col)) = self.cell_at(event.position, cx) else {
                 return;
@@ -900,6 +928,39 @@ impl TerminalView {
                 self.write(&input::mouse_motion_bytes(encoding, 3, col, row), cx);
             }
         }
+    }
+
+    /// The modifier keys changed (Cmd / Ctrl pressed or let go over a link).
+    pub fn modifiers_changed(&mut self, modifiers: &Modifiers, cx: &mut Context<Self>) {
+        self.link_modifier = modifiers.secondary();
+        self.refresh_hover_link(cx);
+    }
+
+    /// The link under the pointer, while the modifier is held. Recomputed on
+    /// every pointer move, modifier change and frame, so the underline stays on
+    /// the text even when output scrolls under a still pointer.
+    pub fn refresh_hover_link(&mut self, cx: &mut Context<Self>) {
+        let link = match (self.link_modifier, self.pointer) {
+            (true, Some(position)) => self
+                .cell_at(position, cx)
+                .and_then(|(row, col)| self.link_at_cell(row, col, cx)),
+            _ => None,
+        };
+        if link != self.hover_link {
+            self.hover_link = link;
+            cx.notify();
+        }
+    }
+
+    /// The link underlined now, if any.
+    pub fn hover_link(&self) -> Option<&Link> {
+        self.hover_link.as_ref()
+    }
+
+    /// The web link covering visible cell `(row, col)`.
+    fn link_at_cell(&self, row: u16, col: u16, cx: &gpui::App) -> Option<Link> {
+        self.with_terminal(cx, |t| link_at(t.screen(), row, col))
+            .flatten()
     }
 
     /// Whether a motion report for `cell` is due: xterm reports motion per
@@ -1290,6 +1351,10 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
+            // Cmd / Ctrl pressed or let go with the pointer still over a link.
+            .on_modifiers_changed(cx.listener(|view, event: &ModifiersChangedEvent, _, cx| {
+                view.modifiers_changed(&event.modifiers, cx)
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
