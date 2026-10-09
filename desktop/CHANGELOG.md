@@ -22,6 +22,12 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- None yet.
+
+## [0.5.1] - 2026-10-09
+
+### Bug fixes
+
 - Remote window: switching projects no longer drops you on the project's first
   agent. Each project remembers the agent you last looked at, and switching
   back lands on it (and on the terminal it was showing), as a local project
