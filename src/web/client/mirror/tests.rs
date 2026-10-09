@@ -215,6 +215,39 @@ fn each_session_remembers_its_own_terminal() {
 }
 
 #[test]
+fn each_project_remembers_its_own_session() {
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(snapshot());
+    ws.select_session(&TabId("s2".to_string()));
+    ws.select_project(&"/repo/site".into());
+    assert_eq!(
+        ws.selected_session().map(|s| s.session_id.0.as_str()),
+        Some("s3")
+    );
+    ws.select_project(&"/repo/app".into());
+    assert_eq!(
+        ws.selected_session().map(|s| s.session_id.0.as_str()),
+        Some("s2")
+    );
+}
+
+#[test]
+fn a_project_whose_remembered_session_closed_lands_on_its_first() {
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(snapshot());
+    ws.select_session(&TabId("s2".to_string()));
+    ws.select_project(&"/repo/site".into());
+    ws.apply_delta(Delta::SessionRemoved {
+        session_id: TabId("s2".to_string()),
+    });
+    ws.select_project(&"/repo/app".into());
+    assert_eq!(
+        ws.selected_session().map(|s| s.session_id.0.as_str()),
+        Some("s1")
+    );
+}
+
+#[test]
 fn deltas_update_status_git_terminals_and_sessions() {
     let mut ws = RemoteWorkspace::new();
     ws.apply_snapshot(snapshot());
