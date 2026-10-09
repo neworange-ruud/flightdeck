@@ -72,6 +72,10 @@ pub struct RemoteWorkspace {
 struct LocalSelection {
     project: Option<ProjectId>,
     session: Option<TabId>,
+    /// Per project, the session last looked at — so switching back to a
+    /// project lands on the agent that was showing, like a local project's
+    /// own selected tab.
+    sessions: HashMap<ProjectId, TabId>,
     /// Per session, the terminal last looked at — so switching back to a
     /// session lands on the terminal that was showing, like a local tab's own
     /// selected child.
@@ -161,6 +165,7 @@ impl RemoteWorkspace {
                 for project in &mut self.projects {
                     project.sessions.retain(|s| s.session_id != session_id);
                 }
+                self.selection.sessions.retain(|_, s| s != &session_id);
                 self.selection.terminals.remove(&session_id);
                 changed
             }
@@ -283,7 +288,7 @@ impl RemoteWorkspace {
         }
         if self.selection.project.as_ref() != Some(project) {
             self.selection.project = Some(project.clone());
-            self.selection.session = None;
+            self.selection.session = self.selection.sessions.get(project).cloned();
         }
         self.repair_selection();
         true
@@ -430,6 +435,16 @@ impl RemoteWorkspace {
             .is_some_and(|id| project.sessions.iter().any(|s| &s.session_id == id));
         if !session_ok {
             self.selection.session = project.sessions.first().map(|s| s.session_id.clone());
+        }
+        match &self.selection.session {
+            Some(id) => {
+                self.selection
+                    .sessions
+                    .insert(project.project_id.clone(), id.clone());
+            }
+            None => {
+                self.selection.sessions.remove(&project.project_id);
+            }
         }
         let Some(session) = self
             .selection
