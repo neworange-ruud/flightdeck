@@ -936,3 +936,188 @@ fn a_pasted_image_goes_to_the_host_with_the_input(app: &mut TestAppContext) {
     });
     assert!(message.contains("up to 10 MB"), "{message:?}");
 }
+
+// --- the SSH shell tab ------------------------------------------------------------
+
+/// A window with its SSH shell on a fake PTY: the backend, to read what was
+/// spawned, and the handle of the first session it hands out.
+fn open_with_shell(
+    app: &mut TestAppContext,
+) -> (
+    Entity<RemoteModel>,
+    Script,
+    Entity<RemoteWindow>,
+    std::rc::Rc<flightdeck::testing::FakePty>,
+    flightdeck::testing::FakePtyHandle,
+    &mut VisualTestContext,
+) {
+    let (model, script, window, cx) = open_on(app, snapshot());
+    let pty = std::rc::Rc::new(flightdeck::testing::FakePty::new());
+    let session = pty.queue_session();
+    let backend: std::rc::Rc<dyn flightdeck::contracts::PtyBackend> = pty.clone();
+    window.update(cx, |w, _| w.set_shell_pty(backend));
+    (model, script, window, pty, session, cx)
+}
+
+/// What the window sent the host as terminal input, as `(terminal, bytes)`.
+fn inputs(script: &mut Script) -> Vec<(String, Vec<u8>)> {
+    script
+        .sent()
+        .into_iter()
+        .filter_map(LinkOut::into_frame)
+        .filter_map(|frame| match frame {
+            ClientMsg::Input(i) => Some((i.terminal_id.as_str().to_string(), i.data)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The shell tab runs `ssh` to the same target "Open in VS Code" uses, on
+/// this machine, and draws it in place of the project's sidebar, git strip
+/// and terminal. The host is never asked.
+#[gpui::test]
+fn the_shell_tab_runs_ssh_to_the_host_in_place_of_the_project(app: &mut TestAppContext) {
+    let (model, mut script, window, pty, session, cx) = open_with_shell(app);
+    script.sent();
+    assert!(
+        pty.spawns().is_empty(),
+        "nothing starts until the tab is shown"
+    );
+
+    click(cx, "remote-shell-tab");
+    let spawns = pty.spawns();
+    assert_eq!(spawns.len(), 1);
+    assert_eq!(
+        (spawns[0].0.as_str(), spawns[0].1.as_slice()),
+        ("ssh", ["dev@192.168.2.20".to_string()].as_slice())
+    );
+    assert!(model.read_with(cx, |m, _| m.shell_active()));
+    assert!(cx.debug_bounds("agent-row-0").is_none(), "no sidebar");
+    assert!(cx.debug_bounds("git-push").is_none(), "no git strip");
+    assert!(
+        cx.debug_bounds("remote-project-tab-0").is_some(),
+        "the project tabs stay, to go back"
+    );
+
+    // Its output is drawn; nothing went to the host.
+    session.push_output(b"dev@studio:~$ ".to_vec());
+    let shell = window
+        .read_with(cx, |w, _| w.shell_view())
+        .expect("started");
+    let screen = shell.update(cx, |view, cx| {
+        view.poll_once(cx);
+        view.owned_terminal()
+            .map(|t| t.screen().contents())
+            .unwrap_or_default()
+    });
+    assert!(screen.contains("dev@studio:~$"), "{screen:?}");
+    assert!(script.sent().is_empty(), "the shell is not the host's");
+
+    // A project tab goes back, and the shell keeps running for next time.
+    click(cx, "remote-project-tab-0");
+    assert!(!model.read_with(cx, |m, _| m.shell_active()));
+    assert!(cx.debug_bounds("agent-row-0").is_some());
+    click(cx, "remote-shell-tab");
+    assert_eq!(pty.spawns().len(), 1, "the same session, not a new one");
+}
+
+/// Keys and pastes on the shell tab go to the shell; none reach the agent
+/// the host's terminal (now hidden) belongs to.
+#[gpui::test]
+fn typing_and_pasting_in_the_shell_never_reach_the_hosts_terminal(app: &mut TestAppContext) {
+    let (model, mut script, _window, _pty, session, cx) = open_with_shell(app);
+    model.update(cx, |m, _| {
+        m.focus_terminal(flightdeck::view::TerminalRef::Primary)
+    });
+    click(cx, "remote-shell-tab");
+    script.sent();
+
+    cx.simulate_keystrokes("l s enter");
+    assert_eq!(session.input(), b"ls\r");
+
+    // The table's Paste chord is a window action; on the shell tab it pastes
+    // into the shell.
+    cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("pwd".into())));
+    let paste = flightdeck_desktop::keys::KeymapAction::for_entry(
+        crate::commands::keymap()
+            .entry("Paste")
+            .expect("Paste is in the table"),
+    );
+    cx.dispatch_action(paste);
+    cx.run_until_parked();
+    assert!(
+        String::from_utf8_lossy(&session.input()).ends_with("pwd"),
+        "{:?}",
+        session.input()
+    );
+
+    // Input routed through the model is dropped, not sent to the hidden one.
+    model.update(cx, |m, cx| {
+        m.dispatch(HostEvent::TerminalInput(b"rm -rf\r".to_vec()), cx);
+        m.dispatch(HostEvent::Paste("text".to_string()), cx);
+    });
+    assert!(inputs(&mut script).is_empty());
+}
+
+/// A host command from the shell tab would act on a session nobody is
+/// looking at: it is refused with a word, and nothing is sent.
+#[gpui::test]
+fn a_host_command_from_the_shell_tab_is_refused(app: &mut TestAppContext) {
+    let (model, mut script, _window, _pty, _session, cx) = open_with_shell(app);
+    click(cx, "remote-shell-tab");
+    script.sent();
+    model.update(cx, |m, cx| {
+        m.dispatch(
+            HostEvent::Command(flightdeck::app::commands::Command::RestartAgent),
+            cx,
+        )
+    });
+    assert!(commands(&mut script).is_empty(), "nothing went to the host");
+    let message = model.read_with(cx, |m, _| match m.overlay() {
+        Some(OverlayView::Message(view)) => view.text,
+        _ => String::new(),
+    });
+    assert!(message.contains("project tab"), "{message:?}");
+
+    // Switching projects from the shell goes back to the project it left.
+    model.update(cx, |m, cx| {
+        m.dispatch(
+            HostEvent::SwitchProject(flightdeck::app::commands::Selector::Next),
+            cx,
+        )
+    });
+    assert!(!model.read_with(cx, |m, _| m.shell_active()));
+}
+
+/// An SSH session that ended (logged out, network gone) stays readable and
+/// offers Reconnect, which starts a new one.
+#[gpui::test]
+fn an_ended_shell_offers_to_reconnect(app: &mut TestAppContext) {
+    let (_model, _script, window, pty, session, cx) = open_with_shell(app);
+    click(cx, "remote-shell-tab");
+    assert!(cx.debug_bounds("remote-shell-reconnect").is_none());
+
+    session.set_state(flightdeck::contracts::ProcessState::Exited(255));
+    let shell = window
+        .read_with(cx, |w, _| w.shell_view())
+        .expect("started");
+    shell.update(cx, |view, cx| view.poll_once(cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("remote-shell-ended").is_some());
+
+    click(cx, "remote-shell-reconnect");
+    assert_eq!(pty.spawns().len(), 2, "a new ssh");
+    assert!(cx.debug_bounds("remote-shell-ended").is_none());
+}
+
+/// No `ssh` to run: the tab says so and can try again.
+#[gpui::test]
+fn a_shell_that_cannot_start_says_why(app: &mut TestAppContext) {
+    let (_model, _script, _window, pty, _session, cx) = open_with_shell(app);
+    pty.fail_next_spawn();
+    click(cx, "remote-shell-tab");
+    assert!(cx.debug_bounds("remote-shell-reconnect").is_some());
+    click(cx, "remote-shell-reconnect");
+    assert_eq!(pty.spawns().len(), 1, "the second try started it");
+    assert!(cx.debug_bounds("remote-shell-reconnect").is_none());
+}

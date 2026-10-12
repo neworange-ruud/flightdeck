@@ -21,10 +21,16 @@
 //! through [`crate::commands::perform_remote_entry`] — the sidebar `"App"`,
 //! the terminal `"Terminal"`, and focus follows this window's own input mode.
 //! Mission control and split view have no remote counterpart in v1.
+//!
+//! After the project tabs sits the SSH shell tab ([`super::shell`]): a
+//! terminal this window runs itself, drawn full width in place of the
+//! sidebar, git strip and mirrored terminal while it is on screen.
 
 use std::rc::Rc;
 
 use flightdeck::app::modes::InputMode;
+use flightdeck::contracts::PtyBackend;
+use flightdeck::terminal::pty::PortablePtyBackend;
 use flightdeck::web::client::views;
 use flightdeck::web::client::LinkEnd;
 use flightdeck::web::protocol::{Seat, SeatRequest};
@@ -38,7 +44,9 @@ use gpui::{
 use gpui_component::{h_flex, v_flex};
 
 use super::RemoteModel;
-use crate::commands::{keycap, keymap, perform_remote_entry, perform_remote_id};
+use crate::commands::{
+    intent_for, keycap, keymap, perform_remote_entry, perform_remote_id, Intent,
+};
 use crate::fonts::MONO_FAMILY;
 use crate::surface::Surface;
 use crate::terminal::view::TerminalView;
@@ -60,6 +68,14 @@ pub struct RemoteWindow {
     terminal: Entity<TerminalView>,
     app_focus: FocusHandle,
     layer: Entity<OverlayLayer>,
+    /// The SSH shell, once its tab was first shown.
+    shell: Option<Entity<TerminalView>>,
+    /// The SSH target the shell was last started on.
+    shell_target: String,
+    /// Why the SSH shell could not start (no `ssh` on `PATH`).
+    shell_error: Option<String>,
+    /// What the SSH shell runs on: the real PTY, a fake one in tests.
+    shell_pty: Rc<dyn PtyBackend>,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -80,9 +96,57 @@ impl RemoteWindow {
             terminal,
             app_focus: cx.focus_handle(),
             layer,
+            shell: None,
+            shell_target: String::new(),
+            shell_error: None,
+            shell_pty: Rc::new(PortablePtyBackend),
             #[cfg(target_os = "macos")]
             drag_pending: false,
         }
+    }
+
+    /// Run the SSH shell on `pty` instead of a real one.
+    #[cfg(test)]
+    pub(crate) fn set_shell_pty(&mut self, pty: Rc<dyn PtyBackend>) {
+        self.shell_pty = pty;
+    }
+
+    /// The SSH shell's view, once started.
+    #[cfg(test)]
+    pub(crate) fn shell_view(&self) -> Option<Entity<TerminalView>> {
+        self.shell.clone()
+    }
+
+    /// Start the SSH shell if its tab is on screen and it has not started.
+    /// An ended one stays, its last words readable, until Reconnect.
+    fn ensure_shell(&mut self, cx: &mut Context<Self>) {
+        if !self.remote.read(cx).shell_active()
+            || self.shell.is_some()
+            || self.shell_error.is_some()
+        {
+            return;
+        }
+        let target = self.remote.read(cx).ssh_target();
+        self.shell_target = target.clone();
+        match super::shell::spawn(self.shell_pty.as_ref(), &target) {
+            Ok(terminal) => {
+                self.shell = Some(cx.new(|cx| TerminalView::new(terminal, cx).app_framed()));
+            }
+            Err(e) => {
+                self.shell_error = Some(format!(
+                    "Could not run `{} {target}`: {e}",
+                    super::shell::SSH
+                ));
+            }
+        }
+    }
+
+    /// Start the SSH shell again (its Reconnect).
+    fn reconnect_shell(&mut self, cx: &mut Context<Self>) {
+        self.shell = None;
+        self.shell_error = None;
+        self.ensure_shell(cx);
+        cx.notify();
     }
 
     /// The terminal view, for tests that drive it.
@@ -103,6 +167,15 @@ impl RemoteWindow {
                 cx.quit();
                 return;
             }
+            // The shell takes a paste itself; the model keeps the rest of
+            // the terminal's input from the host's hidden one.
+            if let (Intent::PasteClipboard, Some(shell)) = (intent_for(&entry.action), &self.shell)
+            {
+                if self.remote.read(cx).shell_active() {
+                    shell.update(cx, |view, cx| view.paste_clipboard(cx));
+                    return;
+                }
+            }
             perform_remote_entry(entry, &self.remote, cx);
         }
     }
@@ -111,6 +184,7 @@ impl RemoteWindow {
         let model = self.remote.read(cx);
         let ws = model.workspace();
         let tabs = views::project_tabs(ws);
+        let shell_active = model.shell_active();
         let live = model.client().state().is_live();
         let link = model.link_label();
         let name = model.label().to_string();
@@ -141,7 +215,7 @@ impl RemoteWindow {
                     ))
                     .child(div().max_w(px(160.)).truncate().child(tab.name.clone()))
                     .when_else(
-                        tab.active,
+                        tab.active && !shell_active,
                         |t| {
                             t.border_1()
                                 .border_color(p.border.hsla())
@@ -160,7 +234,8 @@ impl RemoteWindow {
                             cx.notify();
                         })
                     })
-            }));
+            }))
+            .child(shell_tab(shell_active, p, &self.remote));
 
         let identity = h_flex()
             .id("remote-identity")
@@ -266,6 +341,13 @@ impl RemoteWindow {
         let ws = model.workspace();
         let mode = model.mode();
         let (pill_bg, pill_ink, word, pill_entry) = match mode {
+            // The shell has no APP mode: its keys are all the shell's.
+            _ if model.shell_active() => (
+                p.pill_terminal_bg,
+                p.pill_terminal_ink,
+                "SSH",
+                "FocusTerminal",
+            ),
             InputMode::Terminal => (
                 p.pill_terminal_bg,
                 p.pill_terminal_ink,
@@ -357,6 +439,10 @@ impl RemoteWindow {
     fn main_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
         let model = self.remote.read(cx);
         let ws = model.workspace();
+        // The shell does not need the link: SSH reaches the host on its own.
+        if model.shell_active() {
+            return self.shell_area(p, cx);
+        }
         if let Some(end) = model.ended() {
             return ended(p, end, &self.remote).into_any_element();
         }
@@ -384,9 +470,73 @@ impl RemoteWindow {
     }
 }
 
+impl RemoteWindow {
+    /// The SSH shell, full width; with Reconnect once it ended, or why it
+    /// could not start.
+    fn shell_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
+        let target = &self.shell_target;
+        let reconnect = |label: &'static str| {
+            div()
+                .id("remote-shell-reconnect")
+                .debug_selector(|| "remote-shell-reconnect".into())
+                .flex_none()
+                .px_3()
+                .py_1()
+                .rounded(px(6.))
+                .bg(p.button_primary_bg.hsla())
+                .text_color(p.button_primary_ink.hsla())
+                .cursor_pointer()
+                .text_size(px(12.))
+                .child(label)
+                .on_click(cx.listener(|this, _, _, cx| this.reconnect_shell(cx)))
+        };
+        let Some(shell) = &self.shell else {
+            let error = self.shell_error.clone().unwrap_or_default();
+            return v_flex()
+                .flex_1()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(notice_card(p, "The SSH shell did not start.", &error))
+                .child(reconnect("Try again"))
+                .into_any_element();
+        };
+        let ended = shell.read(cx).has_exited().then(|| {
+            h_flex()
+                .debug_selector(|| "remote-shell-ended".into())
+                .flex_none()
+                .px(px(14.))
+                .py(px(8.))
+                .gap_3()
+                .border_t_1()
+                .border_color(p.hairline.hsla())
+                .bg(p.surface_window.hsla())
+                .text_size(px(12.))
+                .text_color(p.muted.hsla())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("The SSH session to {target} ended.")),
+                )
+                .child(reconnect("Reconnect"))
+        });
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .child(div().flex_1().min_h_0().child(shell.clone()))
+            .children(ended)
+            .into_any_element()
+    }
+}
+
 impl Render for RemoteWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *Palette::global(cx);
+        self.ensure_shell(cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
             window.remove_window();
@@ -395,6 +545,7 @@ impl Render for RemoteWindow {
         let overlay = model.overlay();
         let mode = model.mode();
         let has_terminal = model.active_terminal().is_some();
+        let shell_active = model.shell_active();
         let data = SidebarData {
             rows: views::agent_rows(ws),
             focused_child: views::focused_child(ws),
@@ -412,7 +563,14 @@ impl Render for RemoteWindow {
             layer.set_view(overlay, window, cx);
         });
         if !overlay_open {
-            let want = if mode == InputMode::Terminal && has_terminal {
+            let shell_focus = self
+                .shell
+                .as_ref()
+                .filter(|_| shell_active)
+                .map(|shell| shell.read(cx).focus_handle().clone());
+            let want = if let Some(handle) = shell_focus {
+                handle
+            } else if mode == InputMode::Terminal && has_terminal {
                 self.terminal.read(cx).focus_handle().clone()
             } else {
                 self.app_focus.clone()
@@ -438,7 +596,9 @@ impl Render for RemoteWindow {
             .min_w_0()
             .h_full()
             .bg(p.surface_terminal.hsla())
-            .child(git_strip(&strip, &surface, &p))
+            .when(!shell_active, |main| {
+                main.child(git_strip(&strip, &surface, &p))
+            })
             .child(self.main_area(&p, cx));
         let titlebar = self.titlebar(&p, cx).into_any_element();
         let status = self.status_bar(&p, cx).into_any_element();
@@ -457,12 +617,52 @@ impl Render for RemoteWindow {
                     .flex_1()
                     .min_h_0()
                     .items_start()
-                    .child(side)
+                    .when(!shell_active, |row| row.child(side))
                     .child(main),
             )
             .child(status)
             .child(self.layer.clone())
     }
+}
+
+/// The SSH shell's tab, after the project tabs.
+fn shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+    let remote = remote.clone();
+    h_flex()
+        .id("remote-shell-tab")
+        .debug_selector(|| "remote-shell-tab".into())
+        .flex_none()
+        .h(px(30.))
+        .px(px(10.))
+        .gap(px(8.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .child(icons::icon(
+            crate::assets::icon::TERMINAL,
+            px(13.),
+            if active { p.ink } else { p.muted },
+        ))
+        .child("SSH shell")
+        .when_else(
+            active,
+            |t| {
+                t.border_1()
+                    .border_color(p.border.hsla())
+                    .bg(p.surface_raised.hsla())
+                    .text_color(p.ink.hsla())
+                    .font_weight(FontWeight::MEDIUM)
+            },
+            |t| {
+                t.text_color(p.muted.hsla())
+                    .hover(|s| s.bg(p.surface_raised.hsla()))
+            },
+        )
+        .on_click(move |_, _, cx| {
+            remote.update(cx, |model, cx| {
+                model.show_shell();
+                cx.notify();
+            })
+        })
 }
 
 /// One clickable hint: its keycap and word.
