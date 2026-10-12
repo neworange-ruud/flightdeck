@@ -1129,3 +1129,29 @@ fn a_shell_that_cannot_start_says_why(app: &mut TestAppContext) {
     assert_eq!(pty.spawns().len(), 1, "the second try started it");
     assert!(cx.debug_bounds("remote-shell-reconnect").is_none());
 }
+
+/// Tab and Shift-Tab reach the program in the terminal — a shell completes
+/// with them — rather than moving focus, which the widget layer binds them to
+/// in every window.
+#[gpui::test]
+fn tab_reaches_the_terminal_for_completion(app: &mut TestAppContext) {
+    let (model, mut script, _window, _pty, session, cx) = open_with_shell(app);
+    model.update(cx, |m, _| {
+        m.focus_terminal(flightdeck::view::TerminalRef::Primary)
+    });
+    cx.run_until_parked();
+    script.sent();
+    cx.simulate_keystrokes("g i t space c h tab shift-tab");
+    let typed: Vec<u8> = inputs(&mut script)
+        .into_iter()
+        .flat_map(|(terminal, bytes)| {
+            assert_eq!(terminal, "s2:primary");
+            bytes
+        })
+        .collect();
+    assert_eq!(typed, b"git ch\t\x1b[Z", "the host's terminal");
+
+    click(cx, "remote-shell-tab");
+    cx.simulate_keystrokes("c d space tab");
+    assert_eq!(session.input(), b"cd \t", "the SSH shell");
+}

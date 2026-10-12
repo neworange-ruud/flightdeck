@@ -28,7 +28,10 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- Tab and Shift-Tab reach the terminal again: a shell's Tab completion works
+  in every terminal (an agent's shell tabs, a remote window's terminals and its
+  SSH shell). The widget layer used to take them for moving focus between
+  controls, so the shell never saw them.
 
 ## [0.5.1] - 2026-10-09
 
