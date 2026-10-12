@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- A remote window has an **SSH shell** tab after its project tabs: a plain
+- A remote window has an **SSH shell** tab, always the first tab: a plain
   shell on the host, outside any project. It runs `ssh` from this machine to
   the same target "Open in VS Code" uses (the one saved for the remote, else
   the host's account at its address, so a tailnet address goes over

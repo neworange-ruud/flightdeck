@@ -983,6 +983,14 @@ fn the_shell_tab_runs_ssh_to_the_host_in_place_of_the_project(app: &mut TestAppC
         pty.spawns().is_empty(),
         "nothing starts until the tab is shown"
     );
+    let shell_tab = cx.debug_bounds("remote-shell-tab").expect("the shell tab");
+    let first_project = cx
+        .debug_bounds("remote-project-tab-0")
+        .expect("a project tab");
+    assert!(
+        shell_tab.right() <= first_project.left(),
+        "the shell is the first tab: {shell_tab:?} vs {first_project:?}"
+    );
 
     click(cx, "remote-shell-tab");
     let spawns = pty.spawns();

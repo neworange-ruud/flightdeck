@@ -22,9 +22,10 @@
 //! the terminal `"Terminal"`, and focus follows this window's own input mode.
 //! Mission control and split view have no remote counterpart in v1.
 //!
-//! After the project tabs sits the SSH shell tab ([`super::shell`]): a
-//! terminal this window runs itself, drawn full width in place of the
-//! sidebar, git strip and mirrored terminal while it is on screen.
+//! The first tab, before the project tabs, is the SSH shell
+//! ([`super::shell`]): a terminal this window runs itself, drawn full width
+//! in place of the sidebar, git strip and mirrored terminal while it is on
+//! screen.
 
 use std::rc::Rc;
 
@@ -197,6 +198,7 @@ impl RemoteWindow {
             .min_w_0()
             .overflow_x_scroll()
             .text_size(px(12.5))
+            .child(shell_tab(shell_active, p, &self.remote))
             .children(tabs.iter().enumerate().map(|(i, tab)| {
                 let remote = remote.clone();
                 h_flex()
@@ -234,8 +236,7 @@ impl RemoteWindow {
                             cx.notify();
                         })
                     })
-            }))
-            .child(shell_tab(shell_active, p, &self.remote));
+            }));
 
         let identity = h_flex()
             .id("remote-identity")
@@ -625,7 +626,7 @@ impl Render for RemoteWindow {
     }
 }
 
-/// The SSH shell's tab, after the project tabs.
+/// The SSH shell's tab, first in the row, before the project tabs.
 fn shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
     let remote = remote.clone();
     h_flex()
