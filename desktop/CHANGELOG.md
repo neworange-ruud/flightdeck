@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.6.0] - 2026-10-12
+
+### New features
+
 - A remote window has an **SSH shell** tab, always the first tab: a plain
   shell on the host, outside any project. It runs `ssh` from this machine to
   the same target "Open in VS Code" uses (the one saved for the remote, else
@@ -22,9 +36,6 @@ uses that version's section as the GitHub Release notes.
   accept SSH. When the session ends, Reconnect starts a new one. Host commands
   are refused on that tab, so they cannot hit an agent you can't see.
 
-### Improvements
-
-- None yet.
 
 ### Bug fixes
 
