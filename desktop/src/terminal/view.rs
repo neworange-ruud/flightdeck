@@ -119,7 +119,7 @@ pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Where the terminal a [`TerminalView`] draws lives.
 pub enum TerminalSource {
-    /// The view owns it (the spike window).
+    /// The view owns it (the spike window, a remote window's SSH shell).
     Owned(Terminal),
     /// The host owns it: whichever terminal is on screen in the active
     /// project (the app).
@@ -218,10 +218,14 @@ pub struct TerminalView {
     busy: bool,
     /// Owned source: the poll loop.
     poll: Option<Task<()>>,
+    /// Owned source: frame the screen as the app's terminals are, rather
+    /// than the spike's tighter frame ([`Self::app_framed`]).
+    app_frame: bool,
 }
 
 impl TerminalView {
-    /// A view owning `terminal` and polling it (the spike window).
+    /// A view owning `terminal` and polling it (the spike window, a remote
+    /// window's SSH shell).
     pub fn new(mut terminal: Terminal, cx: &mut Context<Self>) -> Self {
         let palette = TermPalette::from_palette(Palette::global(cx));
         terminal
@@ -230,6 +234,13 @@ impl TerminalView {
         let mut view = Self::with_source(TerminalSource::Owned(terminal), palette, cx);
         view.poll = Some(Self::start_polling(cx));
         view
+    }
+
+    /// Frame an owned terminal as the app's own are (a remote window's SSH
+    /// shell sits where a project's terminal does).
+    pub fn app_framed(mut self) -> Self {
+        self.app_frame = true;
+        self
     }
 
     /// The owned source's poll loop. Each turn sleeps for what
@@ -254,7 +265,7 @@ impl TerminalView {
 
     /// Drain the owned PTY once and repaint if the screen changed. Returns
     /// whether to keep polling.
-    fn poll_once(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn poll_once(&mut self, cx: &mut Context<Self>) -> bool {
         let TerminalSource::Owned(terminal) = &mut self.source else {
             return false;
         };
@@ -337,6 +348,7 @@ impl TerminalView {
             backlog: Vec::new(),
             busy: false,
             poll: None,
+            app_frame: false,
         }
     }
 
@@ -347,6 +359,12 @@ impl TerminalView {
 
     pub fn probe(&self) -> Option<&Rc<RefCell<Probe>>> {
         self.probe.as_ref()
+    }
+
+    /// Whether an owned terminal's process has ended (the view then says so
+    /// under the screen).
+    pub fn has_exited(&self) -> bool {
+        self.exited.is_some()
     }
 
     /// The owned terminal (the spike and the bench); `None` for the host's.
@@ -733,6 +751,26 @@ impl TerminalView {
         }
     }
 
+    /// Paste the clipboard's text into an owned terminal, as its Cmd-V (Ctrl-
+    /// Shift-V) does. Returns whether there was text to paste.
+    pub fn paste_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+        let TerminalSource::Owned(terminal) = &mut self.source else {
+            return false;
+        };
+        // The core's paste encoder, the one the TUI and the app use.
+        let bytes = encode_paste(&text, terminal.bracketed_paste());
+        terminal.clear_selection();
+        terminal.scroll_to_bottom();
+        self.write(&bytes, cx);
+        self.input_happened(cx);
+        // The jump back to the live screen shows before any echo does.
+        cx.notify();
+        true
+    }
+
     fn owned_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let TerminalSource::Owned(terminal) = &mut self.source else {
             return;
@@ -747,16 +785,8 @@ impl TerminalView {
             m.control && m.shift && !m.alt
         };
         if clipboard_chord && ks.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                // The core's paste encoder, the one the TUI and the app use.
-                let bytes = encode_paste(&text, terminal.bracketed_paste());
-                terminal.clear_selection();
-                terminal.scroll_to_bottom();
-                self.write(&bytes, cx);
-                self.input_happened(cx);
+            if self.paste_clipboard(cx) {
                 cx.stop_propagation();
-                // The jump back to the live screen shows before any echo does.
-                cx.notify();
             }
             return;
         }
@@ -1366,7 +1396,7 @@ impl Render for TerminalView {
                     // The mockup's terminal padding (18px / 22px) in the app;
                     // the spike keeps its tighter frame.
                     .when_else(
-                        is_host,
+                        is_host || self.app_frame,
                         |d| d.py(gpui::px(18.)).px(gpui::px(22.)),
                         |d| d.p_2(),
                     )

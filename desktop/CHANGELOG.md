@@ -14,7 +14,13 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- A remote window has an **SSH shell** tab, always the first tab: a plain
+  shell on the host, outside any project. It runs `ssh` from this machine to
+  the same target "Open in VS Code" uses (the one saved for the remote, else
+  the host's account at its address, so a tailnet address goes over
+  Tailscale), and takes the whole window while it is on screen. The host must
+  accept SSH. When the session ends, Reconnect starts a new one. Host commands
+  are refused on that tab, so they cannot hit an agent you can't see.
 
 ### Improvements
 
@@ -22,7 +28,10 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- Tab and Shift-Tab reach the terminal again: a shell's Tab completion works
+  in every terminal (an agent's shell tabs, a remote window's terminals and its
+  SSH shell). The widget layer used to take them for moving focus between
+  controls, so the shell never saw them.
 
 ## [0.5.1] - 2026-10-09
 

@@ -58,6 +58,7 @@ use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
 
 pub mod connect;
+pub mod shell;
 pub mod window;
 
 #[cfg(test)]
@@ -113,6 +114,10 @@ pub struct RemoteModel {
     /// target), so a hand edit applies without reconnecting. None in a window
     /// that was not opened from the real file.
     remotes: connect::Store,
+    /// The SSH shell tab is on screen ([`shell`]) instead of a project. The
+    /// host's terminals are hidden then, so nothing typed or run here goes
+    /// to them.
+    shell: bool,
     /// Every event dispatched, in order, for the tests.
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
@@ -142,6 +147,7 @@ impl RemoteModel {
                 fs: std::rc::Rc::new(flightdeck::contracts::real::RealFs),
                 path: None,
             },
+            shell: false,
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
@@ -200,6 +206,38 @@ impl RemoteModel {
 
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// Whether the SSH shell tab is on screen.
+    pub fn shell_active(&self) -> bool {
+        self.shell
+    }
+
+    /// Show the SSH shell tab (its tab's click). The window starts the shell
+    /// the first time.
+    pub fn show_shell(&mut self) {
+        self.shell = true;
+        self.local = Local::None;
+    }
+
+    /// Where the SSH shell connects: the target saved for this remote by
+    /// hand, else the host's own account at the address this window reached
+    /// it on — the one "Open in VS Code" uses.
+    pub fn ssh_target(&self) -> String {
+        flightdeck::host::vscode::ssh_target(
+            self.configured_ssh_target().as_deref(),
+            &self.address,
+            self.workspace().host_machine.as_ref(),
+        )
+    }
+
+    /// The SSH target saved for this remote by hand, read each time so a hand
+    /// edit applies without reconnecting.
+    fn configured_ssh_target(&self) -> Option<String> {
+        self.remotes
+            .load()
+            .get(&self.address)
+            .and_then(|saved| saved.ssh_target.clone())
     }
 
     /// Whether the window should close (the table's Quit, or the user's
@@ -420,6 +458,9 @@ impl RemoteModel {
 
     /// [`RemoteModel::dispatch`] without a GPUI context.
     pub fn apply(&mut self, event: HostEvent) {
+        if self.shell && Self::hidden_from_shell(&event) {
+            return;
+        }
         match event {
             HostEvent::TerminalInput(bytes) => self.type_bytes(bytes),
             HostEvent::Paste(text) => {
@@ -461,6 +502,20 @@ impl RemoteModel {
             // Mission control's inline prompt answers are a local window's.
             HostEvent::AnswerPrompt(_) => {}
         }
+    }
+
+    /// Input meant for the host's terminal on screen, which the SSH shell
+    /// hides: dropped rather than sent to an agent nobody is looking at. The
+    /// shell takes its own keys and pastes ([`window`]).
+    fn hidden_from_shell(event: &HostEvent) -> bool {
+        matches!(
+            event,
+            HostEvent::TerminalInput(_)
+                | HostEvent::Paste(_)
+                | HostEvent::PasteImage(_)
+                | HostEvent::FocusApp
+                | HostEvent::FocusTerminal
+        )
     }
 
     /// Keystrokes for the terminal on screen. Typing returns to the live
@@ -544,6 +599,7 @@ impl RemoteModel {
             .get(index)
             .map(|p| p.project_id.clone());
         if let Some(id) = id {
+            self.shell = false;
             self.client.workspace_mut().select_project(&id);
         }
     }
@@ -559,6 +615,16 @@ impl RemoteModel {
     }
 
     fn run(&mut self, action: RemoteAction) {
+        // Stepping through sessions, terminals or projects from the shell tab
+        // first goes back to the project.
+        if let RemoteAction::Local(
+            LocalAction::Session(_) | LocalAction::Terminal(_) | LocalAction::Project(_),
+        ) = action
+        {
+            if std::mem::take(&mut self.shell) {
+                return;
+            }
+        }
         match action {
             RemoteAction::Local(LocalAction::Session(selector)) => self.step_session(selector),
             RemoteAction::Local(LocalAction::Terminal(selector)) => self.step_terminal(selector),
@@ -570,6 +636,13 @@ impl RemoteModel {
             }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
             RemoteAction::Unavailable(why) => self.local = Local::Message(why.to_string()),
+            RemoteAction::Send { .. } if self.shell => {
+                self.local = Local::Message(
+                    "Switch to a project tab to run host commands: the SSH shell is not one of \
+                     the host's sessions."
+                        .to_string(),
+                )
+            }
             RemoteAction::Send { name, scope } => {
                 let args = views::target(self.workspace(), scope).map(|t| t.args());
                 if self.client.command(name, args).is_none() {
@@ -585,11 +658,7 @@ impl RemoteModel {
     /// target is the one saved for this remote by hand, else the host's own
     /// account at the address this window reached it on.
     fn open_in_vscode(&mut self) {
-        let configured = self
-            .remotes
-            .load()
-            .get(&self.address)
-            .and_then(|saved| saved.ssh_target.clone());
+        let configured = self.configured_ssh_target();
         match views::vscode_folder(self.workspace(), &self.address, configured.as_deref()) {
             Some(open) => {
                 let fallback = if open.root_fallback {
@@ -653,6 +722,10 @@ impl RemoteModel {
     }
 
     fn step_project(&mut self, selector: Selector) {
+        // From the shell tab, back to the project it left.
+        if std::mem::take(&mut self.shell) {
+            return;
+        }
         let ids: Vec<ProjectId> = self
             .workspace()
             .projects

@@ -55,13 +55,31 @@ pub use terminal::{
     app_key_down, paste_bytes, terminal_key_down, ImeState, OptionKey, TerminalKey,
 };
 
-use flightdeck::app::keymap::Keymap;
-use gpui::App;
+use flightdeck::app::keymap::{Context, Keymap};
+use gpui::{App, KeyBinding, NoAction};
 
-/// Bind every chord in `keymap` as a GPUI key binding.
+/// Bind every chord in `keymap` as a GPUI key binding, and hand the
+/// terminal the keys the widget layer would take ([`TERMINAL_KEEPS`]).
 ///
 /// Call once at start-up, after `gpui_component::init` (so on equal context
 /// depth our bindings, added later, win ties the way GPUI orders them).
 pub fn register(cx: &mut App, keymap: &Keymap) {
     cx.bind_keys(key_bindings(keymap));
+    cx.bind_keys(terminal_keeps_bindings());
+}
+
+/// Keys a focused terminal must receive although gpui-component binds them:
+/// its `Root` (every window's) takes Tab and Shift-Tab for focus traversal,
+/// and GPUI performs a binding before the focused view's key handler — so a
+/// shell never saw Tab, and completion did nothing.
+pub const TERMINAL_KEEPS: [&str; 2] = ["tab", "shift-tab"];
+
+/// [`TERMINAL_KEEPS`] disabled under the `"Terminal"` context, which is
+/// deeper than `"Root"` and so wins: the key reaches the terminal's own
+/// handler, which encodes it for the PTY (`\t`, `ESC [ Z`).
+pub fn terminal_keeps_bindings() -> Vec<KeyBinding> {
+    TERMINAL_KEEPS
+        .iter()
+        .map(|key| KeyBinding::new(key, NoAction {}, Some(Context::Terminal.name())))
+        .collect()
 }
