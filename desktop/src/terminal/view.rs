@@ -280,6 +280,10 @@ impl TerminalView {
             self.cadence.output(Instant::now());
         }
         self.busy = pumped.backlog || terminal.screen().holds_output();
+        // A program drawing its own selection copies with OSC 52.
+        if let Some(text) = terminal.take_clipboard() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         let state = terminal.process_state();
         let ended = !matches!(state, ProcessState::Running | ProcessState::Starting);
         let newly_ended = ended && self.exited.is_none();

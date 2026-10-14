@@ -199,11 +199,16 @@ fn hosted(
     let model = app.new(|_| HostModel::new(host));
     let pty = f.pty.queue_session();
     model.update(app, |m, _| {
-        m.host_mut()
+        let session = &mut m
+            .host_mut()
             .active_state_mut()
             .selected_mut()
             .expect("a tab")
-            .session
+            .session;
+        // The fixture's tabs predate the host, so they have the TUI's profile;
+        // the app's own tabs get the desktop's (alacritty) when they are made.
+        session.set_profile(crate::terminal::desktop_profile());
+        session
             .spawn_primary(
                 &f.pty,
                 "sh",
@@ -361,6 +366,34 @@ fn cmd_c_copies_the_selection_on_macos(app: &mut TestAppContext) {
     assert_eq!(
         cx.read_from_clipboard().and_then(|c| c.text()),
         Some("copy".to_string())
+    );
+}
+
+#[gpui::test]
+fn a_programs_osc_52_copy_lands_on_the_clipboard(app: &mut TestAppContext) {
+    // A program that draws its own selection (Claude Code's fullscreen
+    // renderer reports the mouse and selects itself) copies with OSC 52.
+    let (view, pty, cx) = owned(app, Emulator::Alacritty);
+    cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+    output(&view, &pty, cx, b"\x1b]52;c;Y29waWVkIHRleHQ=\x07");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("copied text".to_string())
+    );
+}
+
+#[gpui::test]
+fn an_osc_52_copy_from_the_hosts_terminal_lands_on_the_clipboard(app: &mut TestAppContext) {
+    let (pty, model, _view, cx) = hosted(app, |_| {});
+    cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+    pty.push_output(b"\x1b]52;c;Y29waWVkIHRleHQ=\x07".to_vec());
+    model.update(cx, |m, cx| {
+        m.turn(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()),
+        Some("copied text".to_string())
     );
 }
 

@@ -118,6 +118,10 @@ pub struct RemoteModel {
     /// host's terminals are hidden then, so nothing typed or run here goes
     /// to them.
     shell: bool,
+    /// What the program on screen copied with OSC 52 (Claude Code's own
+    /// mouse selection does), for the turn to put on this machine's
+    /// clipboard: the host's emulator cannot, its clipboard is not ours.
+    copied: Option<String>,
     /// Every event dispatched, in order, for the tests.
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
@@ -148,6 +152,7 @@ impl RemoteModel {
                 path: None,
             },
             shell: false,
+            copied: None,
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
@@ -312,6 +317,9 @@ impl RemoteModel {
     /// when anything changed. Returns whether it redrew.
     pub fn turn(&mut self, cx: &mut Context<Self>) -> bool {
         let changed = self.pump();
+        if let Some(text) = self.copied.take() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
         if changed {
             self.cadence.output(Instant::now());
             cx.notify();
@@ -384,6 +392,15 @@ impl RemoteModel {
             .map(|t| (t.terminal_id.clone(), t.role, t.title.clone(), t.geometry))
             .collect();
         let mut changed = false;
+        // Only the terminal on screen may copy: the user selected in it. The
+        // SSH shell tab hides them all.
+        let on_screen = match self.shell {
+            true => None,
+            false => self
+                .workspace()
+                .selected_terminal()
+                .map(|t| t.terminal_id.clone()),
+        };
         self.terminals
             .retain(|id, _| wanted.iter().any(|(w, ..)| w == id));
         for (id, role, title, geometry) in wanted {
@@ -424,6 +441,11 @@ impl RemoteModel {
                 changed = true;
             }
             changed |= crate::terminal::pump(&mut mirror.terminal, &mut mirror.backlog).changed();
+            if let Some(text) = mirror.terminal.take_clipboard() {
+                if on_screen.as_ref() == Some(&id) {
+                    self.copied = Some(text);
+                }
+            }
         }
         changed
     }

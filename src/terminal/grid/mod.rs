@@ -292,6 +292,16 @@ pub trait TerminalGrid: GridView + Send {
     /// position / device attribute / colour queries), drained on read.
     fn take_replies(&mut self) -> Vec<u8>;
 
+    /// The text the program last put on the clipboard with OSC 52 (`ESC ] 52 ;
+    /// c ; <base64> BEL`), drained on read; only the newest is kept. Programs
+    /// that draw their own mouse selection copy this way — Claude Code's
+    /// fullscreen renderer does — so a front-end that drops it loses every
+    /// copy made inside such a program. Reads (`?` instead of data) are never
+    /// answered. `None` for an emulator that does not parse OSC 52 (vt100).
+    fn take_clipboard(&mut self) -> Option<String> {
+        None
+    }
+
     /// Resize the grid. The caller resizes the PTY to match. Drops any
     /// selection, since content may reflow under a new width.
     fn resize(&mut self, rows: u16, cols: u16);

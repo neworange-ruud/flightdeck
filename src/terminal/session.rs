@@ -377,6 +377,13 @@ impl Terminal {
         self.grid.selected_text()
     }
 
+    /// The text the program last copied with OSC 52, drained on read (see
+    /// [`TerminalGrid::take_clipboard`]). A front-end puts it on the system
+    /// clipboard when this terminal is the one on screen.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.grid.take_clipboard()
+    }
+
     /// Resize both the emulator grid and the underlying PTY (SPECS §23). The
     /// active selection is dropped, as content reflows under a new width.
     pub fn resize(&mut self, size: PtySize) -> Result<()> {
