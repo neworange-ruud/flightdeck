@@ -45,5 +45,15 @@
 	<array>
 		<string>group.agency.neworange.flightdeck.remote</string>
 	</array>
+	<!--
+	  Time Sensitive Notifications (remote-control-bza0): lets a *needs input*
+	  notification (interruption level time-sensitive — set by the relay's APNs
+	  payload and by the Notification Service Extension) break through Focus and
+	  the scheduled summary. Without it iOS silently presents those as `active`.
+	  The capability must be enabled on the App ID and present in the signing
+	  profile (regenerate the manual App Store profile) — see ios/README.md.
+	-->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
 </dict>
 </plist>
