@@ -378,6 +378,7 @@ impl Connection {
             protocol_version: version,
             server_time_ms: now_ms(),
             connection_id: self.connection_id.clone(),
+            relay_mode: None,
         })
         .await;
 
@@ -405,6 +406,7 @@ impl Connection {
                 key_agreement_public_key,
                 role,
                 claim_token_hint,
+                direct_endpoint: _,
             } => {
                 self.on_pairing_offer(
                     device_id,
@@ -664,6 +666,8 @@ impl Connection {
             pairing_id: claim.pairing_id.clone(),
             peer_device_id: Some(desktop_device),
             peer_key_agreement_public_key: desktop_ka_key,
+            direct_endpoint: None,
+            peer_device_public_key: None,
         })
         .await;
 
@@ -675,6 +679,8 @@ impl Connection {
                     pairing_id: claim.pairing_id,
                     peer_device_id: Some(device_id),
                     peer_key_agreement_public_key: phone_ka_key,
+                    direct_endpoint: None,
+                    peer_device_public_key: None,
                 })
                 .await;
         }
@@ -872,6 +878,7 @@ impl Connection {
                 key_agreement_public_key,
                 role,
                 claim_token_hint,
+                direct_endpoint: _,
             } => {
                 self.on_pairing_offer(
                     device_id,

@@ -267,6 +267,7 @@ fn mock_authenticate(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str]) -> bool {
             protocol_version: 1,
             server_time_ms: 0,
             connection_id: "conn-1".to_string(),
+            relay_mode: None,
         },
     );
     let nonce_raw = [7u8; 32];
@@ -424,6 +425,7 @@ fn auth_failure_reports_disconnected_and_never_connected() {
                 protocol_version: 1,
                 server_time_ms: 0,
                 connection_id: "conn".to_string(),
+                relay_mode: None,
             },
         );
         ws_send(
@@ -583,6 +585,7 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
                     protocol_version: 1,
                     server_time_ms: 0,
                     connection_id: "conn".to_string(),
+                    relay_mode: None,
                 },
             );
             ws_send(
@@ -1134,6 +1137,7 @@ fn desktop_announces_machine_name_on_auth() {
                 protocol_version: 1,
                 server_time_ms: 0,
                 connection_id: "conn".to_string(),
+                relay_mode: None,
             },
         );
         let nonce_raw = [7u8; 32];
@@ -2132,6 +2136,7 @@ fn a_fresh_desktop_offers_a_pairing_before_it_authenticates() {
                 protocol_version: 1,
                 server_time_ms: 0,
                 connection_id: "conn".to_string(),
+                relay_mode: None,
             },
         );
         let nonce_raw = [9u8; 32];

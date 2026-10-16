@@ -738,6 +738,7 @@ mod tests {
             key_agreement_public_key: public_key_b64(&desktop_key),
             role: Role::Desktop,
             claim_token_hint: Some(CLAIM_TOKEN.to_string()),
+            direct_endpoint: None,
         });
         let (pairing_id, issued_token) = match desktop.recv_expect(d_deadline, "pairing_offer_ok") {
             RelayFrame::PairingOfferOk {

@@ -1369,6 +1369,7 @@ fn build_pairing_offer(identity: &DeviceIdentity, claim_token_hint: Option<Strin
         key_agreement_public_key: public_key,
         role: Role::Desktop,
         claim_token_hint,
+        direct_endpoint: None,
     }
 }
 
@@ -1948,6 +1949,7 @@ async fn handle_frame(
             pairing_id,
             peer_device_id,
             peer_key_agreement_public_key,
+            ..
         } => {
             // The phone joined: record the peer id + its key-agreement key and
             // mark the pairing established so the E2E channel can be derived now
