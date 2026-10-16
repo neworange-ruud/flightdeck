@@ -8,7 +8,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Reliable, private phone notifications.** Your Mac now decides when your phone gets a push and sends it as a visible alert whose text only the iPhone can read: the payload is end-to-end encrypted and the iOS app decrypts it. Notifications arrive even when the app was force-quit. There are three kinds: an agent needs input or permission, hit an error, or is done. A done alert waits until the agent has stayed idle for `[remote] push_done_debounce_secs` (default 5), so a pause mid-turn does not notify. The silent wake-up pushes and the push per queued message are gone.
+- **Direct link over Tailscale (opt-in).** Set `[remote] direct_enabled = true` and the iPhone can talk to your Mac directly over Tailscale instead of through the relay. `direct_port` (default 47800) and `direct_host` control where it listens and what address the phone is given. The Mac keeps an outbox, so nothing is lost while the phone is away. A pairing made with the direct link on uses it automatically; it needs the updated iPhone app, so re-pair phones you paired before. The remote-access status shows each phone as "paired · direct" or "paired · relay" and the address the Mac listens on.
+- **Push-only relay mode.** Relay operators can run with `RELAY_MODE=push_only` for a relay that only delivers notifications, for use with the direct link. The relay also accepts pushes from the Mac on `POST /v1/push` and logs the outcome of each one.
 
 ### Improvements
 
@@ -16,7 +18,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- A phone or desktop that resumes a relay session from 0 after the relay's queue overflowed no longer loops on `seq_violation`. It now gets the retained tail replayed and carries on.
 
 ## [1.25.1] - 2026-10-07
 
