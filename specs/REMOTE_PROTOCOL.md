@@ -107,9 +107,13 @@ Every connection begins with version negotiation on the relay plane.
     `hello_ok.relay_mode` (§5.9), `pairing_offer.direct_endpoint`,
     `pairing_claimed.direct_endpoint` and `pairing_claimed.peer_device_public_key`
     (§5.2, §5.10). `push_notify` is a frame a v3 relay cannot parse, which is
-    why v4 is a real bump: a desktop sends `push_notify` only on a connection
-    negotiated at **`PUSH_NOTIFY_MIN_VERSION` (4)** or above. Against an older
-    relay it sends none (that relay still drives its own legacy wake pushes).
+    why v4 is a real bump: a desktop writes the `push_notify` frame only on a
+    connection negotiated at **`PUSH_NOTIFY_MIN_VERSION` (4)** or above. Against
+    an older relay it still tries the HTTPS endpoint (§5.5.3); that relay has
+    none and answers 404, which the desktop logs and drops — it never retries,
+    spins, or falls back to the frame. So a v3 relay gets **no** v4 pushes, and
+    a v4 relay no longer sends the legacy wake pushes either: deploy the relay
+    first, then desktops, then the phone app (§5.5 *Rollout order*).
     Likewise the relay puts a pairing in direct mode only for a phone that
     negotiated **`DIRECT_LINK_MIN_VERSION` (4)** or above (§5.2).
 - The client opens with `hello { protocol_version, role, device_id, client }`
@@ -167,7 +171,23 @@ relay  → client: envelope { … }                                     // repla
     Rust `p256::ecdsa::Signature::from_slice`.
   - Message signed: the exact decoded `nonce` bytes (hashed with SHA-256 as
     part of standard ECDSA signing).
-- On failure the relay sends `error { code: auth_failed, … }` and closes.
+- On failure the relay sends `error { code: auth_failed, … }` and closes. It
+  rejects an `auth_response` only for an **unknown device** or a **bad
+  signature**; pairing ids the device is not (or no longer) a member of are
+  simply left out of `auth_ok`.
+- **A relay that forgot the desktop (desktop behaviour).** A desktop whose
+  auth-first reconnect is rejected `auth_failed` several times in a row
+  (3 in this build) concludes the relay lost its record of the device (a wiped
+  store). It drops its relay-mode pairings (they cannot work any more) and
+  reports them for re-pairing. Its direct-mode pairings are kept — their data
+  plane is the Mac's own link (§5.10) — but the relay can no longer push for
+  them, and authenticating again would only be rejected again (the relay
+  rejects the *device*), so the desktop: tells the user pushes are unavailable
+  until the phone is re-paired; leaves those relay-unknown ids out of every
+  later `auth_response`; **stops reconnecting**; and, when the user asks to
+  pair, reconnects and runs the offer-first bootstrap (§5.2) — the pre-auth
+  `pairing_offer` is the only frame that re-registers a device — before it
+  authenticates with the new pairing id. It never loops on a rejection.
 - A device may activate several `pairing_ids` on one connection (multi-Mac, §10).
 - **`machine_name` (desktop only, optional, v1 amendment).** The desktop's
   `auth_response` MAY carry a `machine_name` — the human-readable name of the Mac
@@ -275,6 +295,21 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
     direct offer claimed by a pre-v4 phone — is in **relay mode** and behaves
     exactly as before. Switching an existing pairing to direct mode means
     re-pairing; so does changing the endpoint.
+  - **Push-only relays refuse claims that would be relay mode** (§5.9). On a
+    `push_only` relay a claim whose pairing would end up in relay mode — the
+    offer carried no `direct_endpoint`, or the claiming phone negotiated below
+    `DIRECT_LINK_MIN_VERSION` so the endpoint would be withheld — is refused
+    with `error { code: pairing_claim_rejected }` and a message saying what to
+    do (`"this relay is push-only; update the iPhone app to pair over
+    Tailscale"`, or `"…turn on the Mac's direct link (Tailscale) and pair
+    again"`). The waiting desktop, if connected, receives the same error
+    **carrying the `pairing_id`** of its offer and fails its pairing attempt
+    with that message; the half-made pairing is revoked in the store. The token
+    is spent (redemption is single-use). Defensively, a desktop that receives a
+    `pairing_claimed` without the endpoint echo from a relay that announced
+    `push_only` does not establish it: it drops the pairing, sends `revoke`, and
+    reports the refusal. Offers themselves are not policed: a push-only relay
+    still accepts an offer without an endpoint (an older desktop's).
 - **Phone identity key to the desktop (v4).** The **desktop-bound**
   `pairing_claimed` additionally carries `peer_device_public_key`: the phone's
   identity public key, exactly the `device_public_key` from its
@@ -367,6 +402,11 @@ silent pushes, and one wake per envelope was noisy. From v4:
   The relay stays zero-knowledge: it sees only the pairing, the event id and the
   `class`.
 - The same path serves both relay modes (§5.9) and both pairing modes (§5.10).
+- **Rollout order: relay, then desktops, then the phone app.** A v4 relay no
+  longer sends wake pushes, so a v3 desktop paired through it gets no pushes at
+  all until it is updated; a v3 relay has no `push_notify` (a v4 desktop's
+  HTTPS push gets 404 and is dropped, §4); and a v4 phone app no longer acts on
+  silent wake pushes, so it should arrive last, once pushes come as v4 alerts.
 
 #### 5.5.1 `push_notify` (desktop → relay, v4)
 
@@ -392,11 +432,27 @@ silent pushes, and one wake per envelope was noisy. From v4:
 - **Fire-and-forget.** There is no success reply on the WebSocket; failures
   surface as `error` frames. If the pairing has **no registered push token**, the
   relay silently does nothing (debug log, no content).
-- The relay MAY rate-limit `push_notify` per pairing, answering
-  `error { code: rate_limited, pairing_id }`.
+- **Rate limit.** The relay limits accepted pushes **per desktop device**
+  (not per pairing), counting the WebSocket frame and `POST /v1/push` against
+  one budget: 60 per fixed one-minute window in this build
+  (`DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE`). Over budget it answers
+  `error { code: rate_limited, pairing_id }` on the WebSocket (advisory: the
+  desktop logs it and does not treat it as a queue overflow, §6.1) or `429
+  rate_limited` over HTTPS. The limit applies after membership and size
+  validation, so refused pushes do not spend it.
 - **Desktop transport rule.** Send `push_notify` over the relay WebSocket when it
-  is connected **and authenticated** at a negotiated version ≥ 4; otherwise POST
-  the same fields over HTTPS (§5.5.3). It is never sent on the direct link
+  is connected **and authenticated** at a negotiated version ≥ 4 **and has
+  delivered a relay frame within the last 25 s** (`PUSH_WS_MAX_SILENCE`, just
+  over the 20 s ping interval — a quieter socket may be half-open, accepting
+  writes that never arrive until the 60 s liveness teardown); otherwise POST the
+  same fields over HTTPS (§5.5.3). The rule is applied again when the frame is
+  about to be written: a push that waited more than 30 s
+  (`PUSH_WS_MAX_QUEUE_AGE`), meets a session negotiated below v4, finds the
+  socket silent, or whose write fails, is POSTed over HTTPS instead; and a push
+  is **never held for a later session** — one queued while no session is
+  authenticated is POSTed at once. The `event_id` is the same on every route,
+  so the rare WS + HTTPS double delivery collapses into one alert on the phone
+  (it is the APNs collapse id, §5.5.2). It is never sent on the direct link
   (§5.10) — the Mac is the server there and pushes always go via the relay.
 - Fixture: `relay/push_notify.json` (the same push as case 0 of
   `e2e_crypto/push_vectors.json`).
@@ -512,7 +568,20 @@ holds no WebSocket). The desktop derives the URL from its configured relay URL:
   `rate_limited`, `bad_frame`, `seq_violation` (§6.1), `relay_mode_push_only`
   (v4, §5.9), `internal`). Whether it is fatal is implied by the code
   (auth/version errors close the socket; `peer_unavailable`/`rate_limited`/
-  `seq_violation`/`relay_mode_push_only` are advisory).
+  `seq_violation`/`relay_mode_push_only`/`pairing_claim_rejected`/
+  `unknown_pairing` are advisory).
+- **`bad_frame` carrying a `pairing_id` is advisory.** The relay closes the
+  socket after every connection-level `bad_frame` (a malformed frame, a wrong
+  first frame, an invalid offer or claim), and those never name a pairing. A
+  `bad_frame` that names a `pairing_id` refuses one frame for that pairing (an
+  oversized or malformed `push_notify`, §5.5.1; an envelope whose sender does
+  not match) and the connection stays open, so a client MUST NOT reconnect on
+  it — reconnecting would only meet the same refusal. Fatal codes for a client:
+  `auth_failed`, `unsupported_version`, `not_authenticated`, `internal`, and
+  `bad_frame` without a `pairing_id`; everything else is advisory.
+- **`pairing_claim_rejected` to a desktop** carries the `pairing_id` of the
+  desktop's pending offer when a phone's claim of it was refused (§5.2,
+  push-only relays); the desktop forgets that offer and shows the message.
 - `bye { reason? }` — graceful shutdown notice before either side closes.
 
 ### 5.7 Machine name (desktop → relay → phone, v1 amendment)
@@ -631,7 +700,10 @@ absent as `full`.
   direct mode (§5.10), so the relay only needs to authenticate devices and send
   pushes. A desktop that sees `relay_mode: push_only` SHOULD only offer
   direct-mode pairings (a relay-mode pairing would have no data plane); the relay
-  does not police this.
+  does not police offers, but it **refuses a claim** whose pairing would be relay
+  mode (§5.2), so such a pairing is never minted. A desktop that cannot offer a
+  direct endpoint tells the user why: the direct link is switched off, or it is
+  on but not listening yet (Tailscale not running or not connected).
 - **Decision: pairing bootstrap stays on the relay in both modes.** It would be
   possible to pair directly over Tailscale, but the relay keeps
   `pairing_offer`/`pairing_claim` because:
@@ -656,7 +728,11 @@ unchanged.
   path `DIRECT_LINK_PATH`) from the pairing's `direct_endpoint`. The desktop
   serves it only when the user opts in, and binds **only** to its Tailscale
   interface address(es) (or loopback, for tests) — never `0.0.0.0` — mirroring
-  web network mode.
+  web network mode. "Tailscale address" means one `tailscale status --json`
+  reports for this node (`Self.TailscaleIPs`) whenever the CLI answers (none
+  reported → nothing bound); only when the CLI cannot be asked does the desktop
+  fall back to the address ranges `100.64.0.0/10` / `fd7a:115c:a1e0::/48` —
+  the IPv4 range is shared with carrier-grade NAT, so it is never preferred.
 - **Framing.** The **same `RelayFrame` JSON** as the relay, with the Mac in the
   relay's role:
 

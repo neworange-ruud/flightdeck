@@ -400,30 +400,57 @@ Supported initial agents:
 
 Agent definitions must be config-driven.
 
-### `[remote]` direct link — phone ⇄ desktop over Tailscale (`specs/REMOTE_PROTOCOL.md` §5.10)
+### `[remote]` section — FlightDeck Remote (`specs/REMOTE_PROTOCOL.md`)
 
-FlightDeck Remote's `[remote]` table (`enabled`, `relay_url`,
-`relay_password`) also carries the opt-in **direct link**, which serves the
-phone protocol from this machine over Tailscale instead of through the relay's
-data plane:
+The phone link is configured by an optional `[remote]` table, layered like
+every other section:
 
 ```toml
 [remote]
-direct_enabled = false   # serve the phone directly over Tailscale
-direct_port = 47800      # stable: each direct pairing stores host:port on the phone
-direct_host = ""         # empty = Tailscale MagicDNS name, else the 100.x address
+enabled = false
+relay_url = "wss://relay.flightdeckai.app/ws"
+relay_password = ""            # FLIGHTDECK_RELAY_PASSWORD overrides it
+push_done_debounce_secs = 5
+direct_enabled = false         # serve the phone directly over Tailscale
+direct_port = 47800            # stable: each direct pairing stores host:port on the phone
+direct_host = ""               # empty = Tailscale MagicDNS name, else the 100.x address
 ```
+
+- **`enabled`**, **`relay_url`**, **`relay_password`**: the master switch, the
+  relay to connect to, and the shared relay password, documented in the
+  generated global config.
+- **`push_done_debounce_secs`** (integer, default `5`): how long an agent must
+  stay settled idle after a turn before the desktop decides to push a **done**
+  notification to the paired phone. The desktop decides every push itself and
+  only ever pushes three things: *needs input* (a question or permission
+  prompt) and *error*, both immediately and once per active→settled edge, and
+  *done*, after this window. Going back to work inside the window cancels the
+  done, and the next settle restarts the window, so mid-turn pauses never
+  notify; moving from idle to needs input or error inside the window pushes
+  that instead. `0` pushes done the moment the agent settles. A value above
+  `3600` is rejected at load (SPECS §26) as a likely milliseconds-for-seconds
+  typo. A project may override it. Editable in the configuration manager as
+  "Phone done-push delay (seconds)".
+
+**Direct link (phone ⇄ desktop over Tailscale, `specs/REMOTE_PROTOCOL.md`
+§5.10).** The `direct_*` keys opt in to serving the phone protocol from this
+machine over Tailscale instead of through the relay's data plane:
 
 - **`direct_enabled`** (bool, default `false`) — when on (and `enabled` is on),
   FlightDeck listens for the phone on this machine's **Tailscale addresses
-  only** (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), never `0.0.0.0` or another
-  network; Tailscale coming up after launch is picked up within 30 s. Pairings
-  made while it is on are **direct mode**: their envelopes are kept in a bounded
-  per-pairing outbox on this machine (`~/.flightdeck/remote-direct/`; newest
-  1000 envelopes / 8 MiB) and replayed to the phone when it reconnects, and
-  never sent through the relay. The relay still carries pairing, push
-  notifications and unpairing. Existing pairings keep using the relay until
-  re-paired. Also a toggle in the configuration manager.
+  only**, never `0.0.0.0` or another network: the addresses
+  `tailscale status --json` reports for this machine, or — only when the
+  `tailscale` CLI cannot be run — interface addresses in Tailscale's ranges
+  (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`; the IPv4 range is shared with
+  carrier-grade NAT, hence the CLI's word first). Tailscale coming up after
+  launch is picked up within 30 s. Pairings made while it is on are **direct
+  mode**: their envelopes are kept in a bounded per-pairing outbox on this
+  machine (`~/.flightdeck/remote-direct/`; newest 1000 envelopes / 8 MiB) and
+  replayed to the phone when it reconnects, and never sent through the relay.
+  The relay still carries pairing, push notifications and unpairing. Existing
+  pairings keep using the relay until re-paired. Against a push-only relay
+  pairing needs the direct link; with it off (or on but not listening yet),
+  Pair Phone says which. Also a toggle in the configuration manager.
 - **`direct_port`** (integer, default `47800`) — the listener's TCP port. A
   configured `0` is rejected at load (SPECS §26): a port that changes every
   launch would break every direct pairing.
@@ -473,35 +500,6 @@ replay_bytes = 262144   # 256 KiB per-terminal replay buffer (Q2)
 Like `[remote]`, this section is off by default and behaves bit-for-bit as
 before (no listener opened) until `enabled` is set or the palette starts it
 explicitly.
-
-### `[remote]` section — FlightDeck Remote (`specs/REMOTE_PROTOCOL.md`)
-
-The phone link is configured by an optional `[remote]` table, layered like
-every other section:
-
-```toml
-[remote]
-enabled = false
-relay_url = "wss://relay.flightdeckai.app/ws"
-relay_password = ""            # FLIGHTDECK_RELAY_PASSWORD overrides it
-push_done_debounce_secs = 5
-```
-
-- **`enabled`**, **`relay_url`**, **`relay_password`**: the master switch, the
-  relay to connect to, and the shared relay password, documented in the
-  generated global config.
-- **`push_done_debounce_secs`** (integer, default `5`): how long an agent must
-  stay settled idle after a turn before the desktop decides to push a **done**
-  notification to the paired phone. The desktop decides every push itself and
-  only ever pushes three things: *needs input* (a question or permission
-  prompt) and *error*, both immediately and once per active→settled edge, and
-  *done*, after this window. Going back to work inside the window cancels the
-  done, and the next settle restarts the window, so mid-turn pauses never
-  notify; moving from idle to needs input or error inside the window pushes
-  that instead. `0` pushes done the moment the agent settles. A value above
-  `3600` is rejected at load (SPECS §26) as a likely milliseconds-for-seconds
-  typo. A project may override it. Editable in the configuration manager as
-  "Phone done-push delay (seconds)".
 
 ---
 
