@@ -126,20 +126,8 @@ final class TransportCoordinator {
     /// client starts immediately (`reconcile`) or waits for the next foreground.
     ///
     /// Owned **solely** by `setForeground` / `startAll` / `stopAll` — the
-    /// scenePhase lifecycle. The background-wake path deliberately does not
-    /// touch it (see `beginBackgroundWake`).
+    /// scenePhase lifecycle.
     private var isForeground = false
-
-    /// Whether a silent-push background wake is currently running
-    /// (remote-control-0ef.4): `beginBackgroundWake` returned `true` and
-    /// `endBackgroundWake` hasn't run yet.
-    private var wakeInFlight = false
-
-    /// Set when the app foregrounds *while* a wake is in flight. The wake's
-    /// trailing `endBackgroundWake` then leaves the transport up — the live link
-    /// now belongs to the foreground, and tearing it down would drop the socket
-    /// the user is looking at (remote-control-aew).
-    private var wakeSuperseded = false
 
     /// The most recent APNs device token handed over by `PushCoordinator`
     /// (remote-control-b8d.10), remembered so a machine added at runtime
@@ -199,7 +187,8 @@ final class TransportCoordinator {
         }
         // Force an immediate reconnect when the network path is restored /
         // switches (remote-control-0ef.22) — only while foregrounded (the
-        // clients are torn down in the background; APNs push wakes them there).
+        // clients are torn down in the background; pushes arrive as visible
+        // alerts the Notification Service Extension decrypts).
         self.networkMonitor.onPathChange = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isForeground else { return }
@@ -430,71 +419,9 @@ final class TransportCoordinator {
         guard active != isForeground else { return }
         isForeground = active
         if active {
-            // A wake still in flight no longer owns the transport: from here the
-            // link is the foreground's, so the wake must not tear it back down
-            // when it finishes (remote-control-aew).
-            if wakeInFlight { wakeSuperseded = true }
             await startAll()
         } else {
             await stopAll()
-        }
-    }
-
-    /// Whether the transport is currently under foreground (scenePhase)
-    /// ownership. Read by the background-wake path so it never fights the
-    /// foreground lifecycle.
-    var isForegroundActive: Bool { isForeground }
-
-    // MARK: - Background wake (remote-control-0ef.4 / -aew)
-
-    /// Bring every client up for a silent APNs wake while backgrounded, WITHOUT
-    /// claiming foreground ownership. Returns whether the wake may proceed; the
-    /// caller must pair a `true` with exactly one `endBackgroundWake()`.
-    ///
-    /// Returns `false` — having done nothing at all — when the app is
-    /// foregrounded. iOS delivers `content-available` pushes to a foregrounded
-    /// app too, and the transport there is already live and owned by the
-    /// scenePhase lifecycle. Running a wake over it used to be actively
-    /// destructive (remote-control-aew): the wake's trailing teardown killed the
-    /// socket the user was looking at, which detached the phone's leg at the
-    /// relay, which made the relay push a wake for the *next* desktop envelope
-    /// (`deliver_or_push` pushes whenever no peer is attached) — a self-
-    /// sustaining connect-for-a-second-then-"Reconnecting…" flap that only ended
-    /// when the desktop went quiet.
-    ///
-    /// Also `false` when a wake is ALREADY in flight. A chatty desktop can land
-    /// several wakes in one background window (the relay pushes per undelivered
-    /// envelope), and overlapping wakes tear down each other's transport: the
-    /// first one's teardown lands mid-wait for the second, which then sits on a
-    /// dead link and tears it down again. One wake already drains the whole
-    /// queue, so the later pushes have nothing left to do.
-    ///
-    /// Deliberately does NOT go through `startAll()`: that would set
-    /// `isForeground`, which then swallows the next real `setForeground(true)`
-    /// (its `active != isForeground` guard) and leaves the app permanently
-    /// disconnected after the wake's teardown. The network-path monitor stays
-    /// off too — proactive reconnects are a foreground behavior.
-    func beginBackgroundWake() async -> Bool {
-        guard !isForeground, !wakeInFlight else { return false }
-        wakeInFlight = true
-        wakeSuperseded = false
-        for handle in handles {
-            await handle.store.start()
-        }
-        return true
-    }
-
-    /// Finish a wake started by `beginBackgroundWake()`: tear the clients back
-    /// down so the next foreground reconnects from a clean state — *unless* the
-    /// app foregrounded while the wake was running, in which case the live link
-    /// belongs to the foreground now and is left alone.
-    func endBackgroundWake() async {
-        let superseded = wakeSuperseded || isForeground
-        wakeInFlight = false
-        wakeSuperseded = false
-        guard !superseded else { return }
-        for handle in handles {
-            await handle.store.stop()
         }
     }
 
@@ -513,7 +440,7 @@ final class TransportCoordinator {
     /// Stop every client: cancel supervisors, close every `URLSessionWebSocketTask`,
     /// and tear down each store's event bridge. On return, no socket lingers.
     /// Also stops the network-path monitor (no proactive reconnects while
-    /// backgrounded — APNs push owns the wake there).
+    /// backgrounded — push notifications cover that time, spec §7.2).
     func stopAll() async {
         isForeground = false
         networkMonitor.cancel()

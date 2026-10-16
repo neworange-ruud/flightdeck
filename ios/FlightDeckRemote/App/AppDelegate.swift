@@ -6,9 +6,16 @@
 //  `@UIApplicationDelegateAdaptor` purely for the push-notification callbacks
 //  SwiftUI doesn't surface natively (PRD §5.2/§9.1):
 //   - remote-notification registration success/failure,
-//   - silent *wake* pushes (the relay's zero-knowledge push, `apns.rs`),
 //   - foreground presentation + tap handling as the
 //     `UNUserNotificationCenterDelegate`.
+//
+//  There is no `didReceiveRemoteNotification` handler: pushes are visible
+//  alerts whose sealed payload the Notification Service Extension decrypts
+//  before iOS shows them (spec §7.2, remote-control-bza0). The old silent
+//  *wake* push — reconnect, resume, post a local notification inside the
+//  background window — was throttled by iOS and dropped entirely after a
+//  force-quit, so it is gone, together with the `remote-notification`
+//  background mode.
 //
 //  It holds no state and makes no decisions — everything is delegated to the
 //  shared `PushCoordinator`, which the SwiftUI `App` wires to the live router.
@@ -44,28 +51,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
         // Expected on the Simulator (no APNs) and offline; never fatal — the
-        // app works without push, it just can't be woken while backgrounded.
+        // app works without push, it just gets no notifications while away.
         NSLog("FlightDeckRemote: remote notification registration failed: \(error)")
-    }
-
-    func application(
-        _ application: UIApplication,
-        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
-    ) {
-        // A silent *wake* push (spec §11 step 1). While backgrounded the
-        // transport was torn down (`stopAll`), so nothing reconnects on its own
-        // — the wake performer must actively bring the link back, `resume` the
-        // queued envelopes, schedule the local notifications, and only THEN
-        // report completion (remote-control-0ef.4). Returning synchronously
-        // here (as before) let iOS re-suspend the app before any of that ran,
-        // making the whole background-notification model inert. Nothing
-        // content-bearing crosses the zero-knowledge relay, so there is nothing
-        // to decode from `userInfo`.
-        Task { @MainActor in
-            let result = await PushCoordinator.shared.handleWakePush()
-            completionHandler(result)
-        }
     }
 
     // MARK: - UNUserNotificationCenterDelegate

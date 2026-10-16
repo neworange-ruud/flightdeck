@@ -77,6 +77,8 @@ ios/
     PrivacyInfo.xcprivacy         Apple privacy manifest (required for uploads)
     FlightDeckRemote.entitlements          aps-environment: development (Debug)
     FlightDeckRemote-Release.entitlements  aps-environment: production (Release)
+  FlightDeckNotificationService/  Notification Service Extension (decrypts pushes)
+  Shared/                         Code compiled into BOTH the app and the extension
   FlightDeckRemoteTests/           Unit tests (Swift Testing)
   FlightDeckRemoteUITests/         UI tests (XCTest / XCUIApplication)
   scripts/test.sh                 xcodegen + xcodebuild test, one command
@@ -144,9 +146,13 @@ numbered 1, with no warning, which meant every CI upload carried the same build
 number. `DistributionMetadataTests.buildNumberIsAPositiveInteger` guards it: an
 unsubstituted `$(...)` or a missing default fails there rather than at upload.
 
-The default (`1`) lives in the app target's `CURRENT_PROJECT_VERSION`;
+The default (`1`) lives in the project-level `CURRENT_PROJECT_VERSION`, shared
+by the app and its Notification Service Extension (App Store Connect rejects an
+embedded extension whose version or build number differs from the app's;
+`DistributionMetadataTests.extensionVersionMatchesTheApp` guards it).
 `scripts/release` resets it on a version bump — note it rewrites *that* setting,
-not `CFBundleVersion`, for the same reason.
+not `CFBundleVersion`, for the same reason — and rewrites every
+`CFBundleShortVersionString` in `project.yml` (one per bundle).
 
 CI overrides it with `github.run_number`, which increments on every run of this
 workflow (per-workflow, not repository-wide) and so strictly increases. To pick a
@@ -219,6 +225,7 @@ CI gets all of it as repository secrets:
 | `APPLE_DISTRIBUTION_CERT` | base64 of a `.p12` (certificate + private key) |
 | `APPLE_DISTRIBUTION_CERT_PASSWORD` | the `.p12` export password |
 | `APPLE_APP_STORE_PROFILE` | base64 of the App Store `.mobileprovision` |
+| `APPLE_APP_STORE_PROFILE_NSE` | base64 of the Notification Service Extension's App Store `.mobileprovision` |
 
 These are distinct from the existing `CODESIGN_*` secrets, which hold the
 *Developer ID* certificate used to notarize the macOS desktop binary — a
@@ -268,6 +275,11 @@ is root-owned on some machines and unwritable).
 If the profile is regenerated, it must keep the same name — `project.yml`'s
 `PROVISIONING_PROFILE_SPECIFIER` refers to it by name.
 
+The embedded Notification Service Extension is a second bundle id and signs
+the same way against its own profile, **"FlightDeck Remote Notifications App
+Store"** (`agency.neworange.flightdeck.remote.notification-service`), supplied
+as `FD_NSE_PROFILE_PATH` locally and `APPLE_APP_STORE_PROFILE_NSE` in CI.
+
 Internal TestFlight testing (up to 100 App Store Connect team members) needs
 **no App Review** — a build is available to testers minutes after processing.
 External testing (public links, up to 10,000 testers) needs Beta App Review,
@@ -298,3 +310,58 @@ The parts that break uploads silently, all now covered by
 First archive on a new machine: automatic signing creates the Apple
 Distribution certificate and App Store profile on demand, which requires the
 Account Holder or Admin role on the team.
+
+## Push: Notification Service Extension
+
+Pushes are **visible alerts** (`mutable-content: 1`) with generic text from the
+relay; the real content rides alongside in `fd_push`, sealed end to end by the
+desktop (spec §7.2). `FlightDeckNotificationService` decrypts it before iOS
+shows the notification and rewrites title, body, sound, interruption level and
+the deep-link `userInfo` (so a tap opens the agent exactly as a local
+notification does). The logic is the shared, unit-tested
+`Shared/PushNotificationRewriter.swift`; the extension class is a thin shell.
+
+- **Per-project mute and the three toggles** are applied in the extension from
+  the App Group settings. iOS cannot drop a visible push without the
+  notification-filtering entitlement (which we do not request), so a suppressed
+  event is delivered as quietly as allowed: `.passive` interruption level (no
+  banner, sound or screen wake — it lands silently in Notification Center), no
+  sound, the relay's generic text, relevance 0.
+- **Any failure** — unknown pairing, Keychain unreadable (before first unlock),
+  decryption or JSON error, `serviceExtensionTimeWillExpire` — delivers the
+  relay's generic notification unchanged. Nothing is ever dropped.
+- There is **no silent wake path** any more (`didReceiveRemoteNotification`,
+  `UIBackgroundModes: remote-notification` are gone).
+
+What the extension reads, and from where:
+
+| Data | Store | Group |
+| --- | --- | --- |
+| Pairing records (`pairing-record-v1.<id>`) and the KA private key (`device-key-agreement-key`) | Keychain, service `agency.neworange.flightdeck.remote` | `$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared` |
+| Notification toggles + muted projects | `UserDefaults` suite | App Group `group.agency.neworange.flightdeck.remote` |
+
+`KeychainStore` writes just those two kinds of item into the shared group
+(`SharedContainer.accessGroup`); everything else stays in the app's default
+group, which the extension cannot read. On launch the app moves existing items
+into the shared group (crash-safe copy → verify → delete) and copies the
+settings into the App Group (`SharedStorageMigration`), so existing users keep
+their pairings without re-pairing.
+
+**Developer-portal requirements (team 7NKCS4AZS9)** — none of this is needed for
+the unsigned simulator build, all of it for a device or TestFlight build:
+
+1. Register the App Group `group.agency.neworange.flightdeck.remote`.
+2. Enable *App Groups* (with that group) on the App ID
+   `agency.neworange.flightdeck.remote`, and register the App ID
+   `agency.neworange.flightdeck.remote.notification-service` with *App Groups*
+   (same group). Debug's automatic signing can do both when run from Xcode
+   with an Admin account.
+3. **Regenerate** the "FlightDeck Remote App Store" profile (it must now carry
+   the App Group) and create "FlightDeck Remote Notifications App Store" for
+   the extension; update `APPLE_APP_STORE_PROFILE` and add
+   `APPLE_APP_STORE_PROFILE_NSE`. Without this the Release archive fails to sign.
+
+The Keychain access group needs no registration: profiles carry the
+`7NKCS4AZS9.*` wildcard. Time-sensitive delivery for *needs input* additionally
+needs the Time Sensitive Notifications capability on the app; without it iOS
+presents those as `active`.
