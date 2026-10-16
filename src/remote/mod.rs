@@ -306,9 +306,17 @@ pub enum RemoteOutbound {
     },
     /// Ask the relay to push the phone (spec §5.5.1): send a `push_notify`
     /// frame on the live session. Queued by [`push::PushSender`] only while
-    /// [`push::PushLink`] reports an authenticated session at a version that
-    /// carries the frame; the client re-checks the negotiated version before
-    /// writing, holds a push whose write failed for the next session, and drops
-    /// (with a log line) one a reconnect landed on an older relay.
-    PushNotify(PushNotifyBody),
+    /// [`push::PushLink`] reports an authenticated, recently-heard session at a
+    /// version that carries the frame. Pushes travel on their own channel
+    /// inside the client, so one is never held across sessions: whenever the
+    /// socket cannot be trusted with it at write time — no session, a version
+    /// below v4, older than [`push::PUSH_WS_MAX_QUEUE_AGE`], a socket silent for
+    /// [`push::PUSH_WS_MAX_SILENCE`], or a failed write — the client posts it
+    /// over HTTPS instead, under the same `event_id`.
+    PushNotify {
+        /// The sealed push.
+        push: PushNotifyBody,
+        /// When it was queued (monotonic), for the age bound.
+        queued_at: std::time::Instant,
+    },
 }

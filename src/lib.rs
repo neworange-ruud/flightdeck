@@ -3024,6 +3024,7 @@ fn start_remote_at(
             crate::remote::client::ClientOptions {
                 direct_advert: Some(d.advert()),
                 router: Some(d.router()),
+                push_poster: None,
             },
         ),
         None => RemoteHandle::start_with_store(cfg, identity, store, inbound_tx, outbound_rx),

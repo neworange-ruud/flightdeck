@@ -104,6 +104,56 @@ fn the_push_link_tracks_the_session() {
     assert_eq!(reader.live_version(), None);
 }
 
+#[test]
+fn the_push_link_is_fresh_only_while_relay_frames_keep_arriving() {
+    let link = PushLink::new();
+    assert_eq!(link.fresh_version(Duration::from_secs(60)), None, "down");
+    link.set_live(4);
+    assert_eq!(
+        link.fresh_version(Duration::from_secs(60)),
+        Some(4),
+        "auth_ok is itself an inbound frame"
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        link.fresh_version(Duration::from_millis(10)),
+        None,
+        "silent past the window: maybe half-open"
+    );
+    assert_eq!(link.live_version(), Some(4), "still live, just not trusted");
+    link.mark_inbound();
+    assert_eq!(link.fresh_version(Duration::from_millis(10)), Some(4));
+}
+
+/// A live v4 socket that has gone quiet is not handed the push: it goes over
+/// HTTPS instead of into a possibly half-open socket.
+#[test]
+fn a_live_but_silent_socket_sends_the_push_over_https() {
+    let link = PushLink::new();
+    link.set_live(4);
+    let poster = RecordingPoster::default();
+    let (sender, _) = sender(&link, &poster, "wss://relay.example/ws");
+    let sender = sender.with_max_silence(Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(30));
+    let mut sent = Vec::new();
+    let route = sender.dispatch(body("pair_1"), 1_000, &mut |o| sent.push(o));
+    assert_eq!(route, PushRoute::Https);
+    assert!(sent.is_empty());
+    assert_eq!(poster.0.lock().unwrap().len(), 1);
+}
+
+/// The silence bound sits just above the client's ping interval, so a
+/// healthy link (a pong per ping) is never mistaken for a silent one.
+#[test]
+fn the_silence_bound_clears_the_ping_interval() {
+    use crate::remote::client::{LIVENESS_TIMEOUT, PING_INTERVAL};
+    assert!(PUSH_WS_MAX_SILENCE > PING_INTERVAL);
+    assert!(
+        PUSH_WS_MAX_SILENCE < LIVENESS_TIMEOUT,
+        "under the liveness teardown"
+    );
+}
+
 // --- sealing ------------------------------------------------------------------
 
 #[test]
@@ -199,7 +249,7 @@ fn a_live_v4_socket_carries_the_push_as_a_frame() {
     let route = sender.dispatch(push.clone(), 1_000, &mut |o| sent.push(o));
     assert_eq!(route, PushRoute::RelaySocket);
     assert!(
-        matches!(sent.as_slice(), [RemoteOutbound::PushNotify(b)] if *b == push),
+        matches!(sent.as_slice(), [RemoteOutbound::PushNotify { push: b, .. }] if *b == push),
         "{sent:?}"
     );
     assert!(poster.0.lock().unwrap().is_empty(), "no HTTPS");

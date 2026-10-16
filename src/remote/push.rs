@@ -31,9 +31,9 @@
 //! A direct-mode pairing (spec §5.10) is pushed exactly the same way: pushes
 //! always go via the relay, whatever carries the pairing's data plane.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -55,6 +55,22 @@ pub const PUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pause before the single retry of a transient HTTPS failure.
 const PUSH_HTTP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// How long the relay WebSocket may go without delivering a relay frame before
+/// it stops being trusted with a push. The relay client pings every 20 s and
+/// any relay frame (a pong at the latest) proves the socket alive, so a healthy
+/// link is never silent for much longer than one ping interval; the 5 s on top
+/// absorbs a slow pong. A socket silent beyond this may be half-open — still
+/// "live" until the 60 s liveness teardown, with writes vanishing into the
+/// kernel buffer — so the push goes over HTTPS instead (spec §5.5.1).
+pub const PUSH_WS_MAX_SILENCE: Duration = Duration::from_secs(25);
+
+/// The oldest a push may be when the relay client gets to write it on the
+/// WebSocket. An older one (a busy pump, a slow write) is posted over HTTPS
+/// instead, so a push is never delivered late just because it sat in a queue
+/// (spec §5.5.1). The same `event_id` makes a WS + HTTPS double delivery
+/// collapse into one alert on the phone (it is the APNs collapse id).
+pub const PUSH_WS_MAX_QUEUE_AGE: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Link state shared with the relay client task
 // ---------------------------------------------------------------------------
@@ -63,10 +79,31 @@ const PUSH_HTTP_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// negotiated protocol version of the live, authenticated session, or nothing.
 ///
 /// Cloned between the relay client task (the only writer: it sets the version
-/// on `auth_ok` and clears it when the session ends) and the push sender (the
-/// reader). A plain atomic, so reading it on the UI tick never blocks.
-#[derive(Debug, Clone, Default)]
-pub struct PushLink(Arc<AtomicU16>);
+/// on `auth_ok`, stamps every relay frame it receives, and clears the version
+/// when the session ends) and the push sender (the reader). Plain atomics, so
+/// reading it on the UI tick never blocks.
+#[derive(Debug, Clone)]
+pub struct PushLink(Arc<LinkInner>);
+
+#[derive(Debug)]
+struct LinkInner {
+    /// The negotiated version, 0 while down.
+    version: AtomicU16,
+    /// When the last relay frame arrived, in ms since `epoch` (monotonic).
+    last_inbound_ms: AtomicU64,
+    /// The monotonic origin for `last_inbound_ms`.
+    epoch: Instant,
+}
+
+impl Default for PushLink {
+    fn default() -> Self {
+        PushLink(Arc::new(LinkInner {
+            version: AtomicU16::new(0),
+            last_inbound_ms: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }))
+    }
+}
 
 impl PushLink {
     /// A link that starts down.
@@ -77,20 +114,49 @@ impl PushLink {
     /// The negotiated version of the live authenticated session, or `None`
     /// when the relay WebSocket is not connected and authenticated.
     pub fn live_version(&self) -> Option<u16> {
-        match self.0.load(Ordering::SeqCst) {
+        match self.0.version.load(Ordering::SeqCst) {
             0 => None,
             v => Some(v),
         }
     }
 
-    /// The session authenticated at `version`.
+    /// [`Self::live_version`], but only while the socket has delivered a relay
+    /// frame within `max_silence` — the version a push may be routed over the
+    /// socket at. A live but silent socket may be half-open (see
+    /// [`PUSH_WS_MAX_SILENCE`]).
+    pub fn fresh_version(&self, max_silence: Duration) -> Option<u16> {
+        self.live_version()
+            .filter(|_| self.heard_within(max_silence))
+    }
+
+    /// Whether a relay frame arrived within the last `window`.
+    pub fn heard_within(&self, window: Duration) -> bool {
+        let now = self.elapsed_ms();
+        let last = self.0.last_inbound_ms.load(Ordering::SeqCst);
+        now.saturating_sub(last) <= window.as_millis() as u64
+    }
+
+    /// A relay frame just arrived: the socket is demonstrably alive.
+    pub fn mark_inbound(&self) {
+        self.0
+            .last_inbound_ms
+            .store(self.elapsed_ms(), Ordering::SeqCst);
+    }
+
+    /// The session authenticated at `version` (its `auth_ok` is itself an
+    /// inbound frame).
     pub fn set_live(&self, version: u16) {
-        self.0.store(version, Ordering::SeqCst);
+        self.mark_inbound();
+        self.0.version.store(version, Ordering::SeqCst);
     }
 
     /// The session ended (or never authenticated).
     pub fn set_down(&self) {
-        self.0.store(0, Ordering::SeqCst);
+        self.0.version.store(0, Ordering::SeqCst);
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.0.epoch.elapsed().as_millis() as u64
     }
 }
 
@@ -180,9 +246,10 @@ pub struct HttpsPush {
 }
 
 /// Delivers HTTPS pushes. Fire-and-forget: [`Self::post`] must return at once
-/// (the caller is the UI tick); the production [`RuntimePoster`] runs the
-/// request on the shared runtime. Tests substitute a recorder.
-pub trait PushPoster: Send {
+/// (the caller is the UI tick, or the relay client rerouting a push it will not
+/// trust to its socket); the production [`RuntimePoster`] runs the request on
+/// the shared runtime. Tests substitute a recorder.
+pub trait PushPoster: Send + Sync {
     /// Start delivering `push`; never blocks.
     fn post(&self, push: HttpsPush);
 }
@@ -388,6 +455,7 @@ pub struct PushSender {
     endpoint: Option<String>,
     relay_password: Option<String>,
     poster: Box<dyn PushPoster>,
+    max_silence: Duration,
 }
 
 impl PushSender {
@@ -423,11 +491,19 @@ impl PushSender {
             endpoint: push_endpoint_url(relay_url),
             relay_password,
             poster,
+            max_silence: PUSH_WS_MAX_SILENCE,
         }
     }
 
+    /// Override [`PUSH_WS_MAX_SILENCE`] (a test seam).
+    pub fn with_max_silence(mut self, max_silence: Duration) -> Self {
+        self.max_silence = max_silence;
+        self
+    }
+
     /// Send one sealed push: onto the relay client's outbound channel when the
-    /// WebSocket can carry it, otherwise as a signed HTTPS request stamped
+    /// WebSocket can carry it — authenticated at v4+ and heard from within
+    /// [`PUSH_WS_MAX_SILENCE`] — otherwise as a signed HTTPS request stamped
     /// `now_unix_ms` (the desktop's wall clock). Never blocks. Returns the
     /// route taken.
     pub fn dispatch(
@@ -436,25 +512,61 @@ impl PushSender {
         now_unix_ms: i64,
         outbound: &mut dyn FnMut(RemoteOutbound),
     ) -> PushRoute {
-        let route = choose_route(self.link.live_version());
+        let route = choose_route(self.link.fresh_version(self.max_silence));
         match route {
             PushRoute::RelaySocket => {
                 log_outcome(&push, route, "queued");
-                outbound(RemoteOutbound::PushNotify(push));
+                outbound(RemoteOutbound::PushNotify {
+                    push,
+                    queued_at: Instant::now(),
+                });
             }
-            PushRoute::Https => match &self.endpoint {
-                Some(url) => {
-                    let request = sign_push_request(&self.identity, now_unix_ms, push);
-                    self.poster.post(HttpsPush {
-                        url: url.clone(),
-                        relay_password: self.relay_password.clone(),
-                        request,
-                    });
-                }
-                None => log_outcome(&push, route, "dropped: relay url has no https endpoint"),
-            },
+            PushRoute::Https => post_https(
+                self.poster.as_ref(),
+                &self.identity,
+                self.endpoint.as_deref(),
+                self.relay_password.clone(),
+                push,
+                now_unix_ms,
+                if self.link.live_version().is_some() {
+                    "socket silent"
+                } else {
+                    "no socket"
+                },
+            ),
         }
         route
+    }
+}
+
+/// Sign `push` as `identity` (stamped `now_unix_ms`) and hand it to `poster`
+/// for `endpoint`, or log the drop when the relay URL has no HTTPS endpoint.
+/// Shared by [`PushSender::dispatch`] and the relay client's reroute of a push
+/// it will not trust to its socket. `why` is the routing reason, logged.
+pub fn post_https(
+    poster: &dyn PushPoster,
+    identity: &DeviceIdentity,
+    endpoint: Option<&str>,
+    relay_password: Option<String>,
+    push: PushNotifyBody,
+    now_unix_ms: i64,
+    why: &str,
+) {
+    match endpoint {
+        Some(url) => {
+            log_outcome(&push, PushRoute::Https, &format!("posting ({why})"));
+            let request = sign_push_request(identity, now_unix_ms, push);
+            poster.post(HttpsPush {
+                url: url.to_string(),
+                relay_password,
+                request,
+            });
+        }
+        None => log_outcome(
+            &push,
+            PushRoute::Https,
+            &format!("dropped ({why}): relay url has no https endpoint"),
+        ),
     }
 }
 

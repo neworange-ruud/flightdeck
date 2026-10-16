@@ -2697,9 +2697,43 @@ struct PushSession {
     mock: std::thread::JoinHandle<()>,
 }
 
+/// Records every push the client reroutes over HTTPS instead of posting it.
+#[derive(Clone, Default)]
+struct RecordingPoster(std::sync::Arc<Mutex<Vec<crate::remote::push::HttpsPush>>>);
+
+impl crate::remote::push::PushPoster for RecordingPoster {
+    fn post(&self, push: crate::remote::push::HttpsPush) {
+        self.0.lock().unwrap().push(push);
+    }
+}
+
+impl RecordingPoster {
+    /// Wait (bounded) until `n` pushes were posted, and return them.
+    fn wait_for(&self, n: usize) -> Vec<crate::remote::push::HttpsPush> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let posted = self.0.lock().unwrap().clone();
+            if posted.len() >= n {
+                return posted;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// Start a client for `pair_test` against a mock that authenticates at
 /// `version`, then hands the socket to `relay`.
 fn push_session(version: u16, relay: impl FnOnce(&mut Ws) + Send + 'static) -> PushSession {
+    push_session_tuned(version, ClientTuning::default(), relay)
+}
+
+/// [`push_session`] with explicit tuning (its `options.push_poster` included).
+fn push_session_tuned(
+    version: u16,
+    tuning: ClientTuning,
+    relay: impl FnOnce(&mut Ws) + Send + 'static,
+) -> PushSession {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let identity = DeviceIdentity::generate();
@@ -2726,7 +2760,7 @@ fn push_session(version: u16, relay: impl FnOnce(&mut Ws) + Send + 'static) -> P
     let store = Box::new(MemStore(Mutex::new(seed)));
     let (in_tx, in_rx) = channel();
     let (out_tx, out_rx) = channel();
-    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    let handle = RemoteHandle::start_tuned(cfg, identity, store, in_tx, out_rx, tuning);
     PushSession {
         handle,
         in_rx,
@@ -2748,7 +2782,10 @@ fn a_v4_session_publishes_its_version_and_writes_push_notify_frames() {
     wait_for_connected(&s.in_rx);
     assert_eq!(link.live_version(), Some(4), "authenticated at v4");
     s.out_tx
-        .send(RemoteOutbound::PushNotify(sample_push()))
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now(),
+        })
         .unwrap();
     s.mock.join().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2759,10 +2796,23 @@ fn a_v4_session_publishes_its_version_and_writes_push_notify_frames() {
     s.handle.stop();
 }
 
+/// Tuning whose pushes reroute to `poster` instead of the network.
+fn tuning_with_poster(poster: &RecordingPoster) -> ClientTuning {
+    ClientTuning {
+        options: ClientOptions {
+            push_poster: Some(std::sync::Arc::new(poster.clone())),
+            ..ClientOptions::default()
+        },
+        ..ClientTuning::default()
+    }
+}
+
 #[test]
-fn a_push_queued_for_an_older_relay_is_dropped_not_written() {
-    let s = push_session(3, |ws| {
-        // The push is dropped; the ack sent after it is the next frame.
+fn a_push_queued_for_an_older_relay_goes_over_https_not_the_socket() {
+    let poster = RecordingPoster::default();
+    let s = push_session_tuned(3, tuning_with_poster(&poster), |ws| {
+        // The push never reaches the socket; the ack sent after it is the
+        // next frame.
         match ws_recv(ws) {
             Some(RelayFrame::Ack { cursor, .. }) => assert_eq!(cursor, 7),
             other => panic!("expected the ack, not a push: {other:?}"),
@@ -2771,7 +2821,10 @@ fn a_push_queued_for_an_older_relay_is_dropped_not_written() {
     wait_for_connected(&s.in_rx);
     assert_eq!(s.handle.push_link().live_version(), Some(3));
     s.out_tx
-        .send(RemoteOutbound::PushNotify(sample_push()))
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now(),
+        })
         .unwrap();
     s.out_tx
         .send(RemoteOutbound::Ack {
@@ -2780,7 +2833,112 @@ fn a_push_queued_for_an_older_relay_is_dropped_not_written() {
         })
         .unwrap();
     s.mock.join().unwrap();
+    let posted = poster.wait_for(1);
     s.handle.stop();
+    assert_eq!(posted.len(), 1, "rerouted over HTTPS");
+    assert_eq!(posted[0].request.push, sample_push(), "same event id");
+    assert!(posted[0].url.ends_with("/v1/push"), "{}", posted[0].url);
+}
+
+/// A push that sat in the queue past the age bound is not written late on the
+/// socket: it goes over HTTPS, under the same event id.
+#[test]
+fn a_stale_push_is_rerouted_over_https() {
+    let poster = RecordingPoster::default();
+    let s = push_session_tuned(4, tuning_with_poster(&poster), |ws| match ws_recv(ws) {
+        Some(RelayFrame::Ack { cursor, .. }) => assert_eq!(cursor, 9),
+        other => panic!("a stale push must not be written: {other:?}"),
+    });
+    wait_for_connected(&s.in_rx);
+    s.out_tx
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now() - (PUSH_WS_MAX_QUEUE_AGE + Duration::from_secs(1)),
+        })
+        .unwrap();
+    s.out_tx
+        .send(RemoteOutbound::Ack {
+            pairing_id: PairingId::new("pair_test"),
+            cursor: 9,
+        })
+        .unwrap();
+    s.mock.join().unwrap();
+    let posted = poster.wait_for(1);
+    s.handle.stop();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].request.push.event_id, sample_push().event_id);
+}
+
+/// The socket has delivered no relay frame within the silence bound, so it
+/// may be half-open (writes vanish until the liveness teardown): the push goes
+/// over HTTPS rather than into it.
+#[test]
+fn a_push_on_a_silent_socket_is_rerouted_over_https() {
+    let poster = RecordingPoster::default();
+    let tuning = ClientTuning {
+        push_max_silence: Duration::from_millis(50),
+        ..tuning_with_poster(&poster)
+    };
+    let s = push_session_tuned(4, tuning, |ws| match ws_recv(ws) {
+        Some(RelayFrame::Ack { cursor, .. }) => assert_eq!(cursor, 11),
+        other => panic!("a push on a silent socket must not be written: {other:?}"),
+    });
+    wait_for_connected(&s.in_rx);
+    std::thread::sleep(Duration::from_millis(200));
+    s.out_tx
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now(),
+        })
+        .unwrap();
+    s.out_tx
+        .send(RemoteOutbound::Ack {
+            pairing_id: PairingId::new("pair_test"),
+            cursor: 11,
+        })
+        .unwrap();
+    s.mock.join().unwrap();
+    let posted = poster.wait_for(1);
+    s.handle.stop();
+    assert_eq!(posted.len(), 1, "rerouted over HTTPS");
+}
+
+/// With no session at all (the relay is unreachable, the client is backing
+/// off), a push that reaches the client is posted over HTTPS at once — never
+/// held for whenever the next session comes up.
+#[test]
+fn a_push_with_no_session_goes_over_https_at_once() {
+    let addr = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let poster = RecordingPoster::default();
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let (in_tx, _in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_tuned(
+        cfg,
+        DeviceIdentity::generate(),
+        Box::new(MemStore(Mutex::new(RemoteState::default()))),
+        in_tx,
+        out_rx,
+        tuning_with_poster(&poster),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    out_tx
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now(),
+        })
+        .unwrap();
+    let posted = poster.wait_for(1);
+    handle.stop();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].url, format!("http://{addr}/v1/push"));
 }
 
 #[test]
@@ -2937,6 +3095,7 @@ fn direct_offer_drill(echo: bool) -> (RemoteState, Vec<RemoteInbound>, Vec<Relay
     let options = ClientOptions {
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
         router: None,
+        push_poster: None,
     };
     let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
 
@@ -3240,6 +3399,7 @@ fn push_only_refusal_drill(direct_enabled: bool, expected: &str) {
     let options = ClientOptions {
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(None))),
         router: None,
+        push_poster: None,
     };
     let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
     let mut refusal = None;
@@ -3328,7 +3488,10 @@ fn a_refused_push_is_advisory_and_not_a_peer_backlog() {
     let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
     wait_for_connected(&in_rx);
     out_tx
-        .send(RemoteOutbound::PushNotify(sample_push()))
+        .send(RemoteOutbound::PushNotify {
+            push: sample_push(),
+            queued_at: Instant::now(),
+        })
         .unwrap();
     let mut inbound = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3441,6 +3604,7 @@ fn push_only_claim_drill(then: RelayFrame) -> (RemoteState, Vec<RemoteInbound>, 
     let options = ClientOptions {
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
         router: None,
+        push_poster: None,
     };
     let handle = RemoteHandle::start_with_options(
         cfg,

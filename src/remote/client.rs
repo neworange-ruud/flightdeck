@@ -100,7 +100,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::contracts::real::RealFs;
 use crate::contracts::RemoteConfig;
 use crate::remote::direct::{advertised, DirectAdvert, OutboundRouter};
-use crate::remote::push::PushLink;
+use crate::remote::push::{
+    post_https, PushLink, PushPoster, RuntimePoster, PUSH_WS_MAX_QUEUE_AGE, PUSH_WS_MAX_SILENCE,
+};
 use crate::remote::state::{load_remote_state, remote_state_path, save_remote_state, RemoteState};
 use crate::remote::{DeviceIdentity, RemoteInbound, RemoteOutbound};
 
@@ -108,7 +110,8 @@ use flightdeck_remote_protocol::relay::{
     ClientInfo, EncryptedEnvelope, RelayErrorCode, RelayFrame, RelayMode,
 };
 use flightdeck_remote_protocol::{
-    DeviceId, DirectEndpoint, PairingId, Role, PROTOCOL_VERSION, PUSH_NOTIFY_MIN_VERSION,
+    push_endpoint_url, DeviceId, DirectEndpoint, PairingId, PushNotifyBody, Role, PROTOCOL_VERSION,
+    PUSH_NOTIFY_MIN_VERSION,
 };
 
 // --- Tuning constants ------------------------------------------------------
@@ -124,7 +127,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// so every send is wrapped in this timeout instead.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Latency-probe interval.
-const PING_INTERVAL: Duration = Duration::from_secs(20);
+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Liveness deadline: tear the session down and reconnect if no inbound frame
 /// (Pong, Envelope, Ack — anything) arrives for this long. A half-open socket
 /// (laptop sleep/wake, wifi↔cell handoff, relay redeploy, NAT idle-reap) stays
@@ -133,7 +136,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// this the dead link is never noticed (remote-control-0ef.1). Coordinated with
 /// the relay's own server-side idle sweep (both 60s) and a multiple of
 /// [`PING_INTERVAL`] so a couple of lost pongs don't cause a spurious teardown.
-const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Minimum time a session must stay authenticated before a clean drop is allowed
 /// to reset the reconnect backoff. A session that reaches `auth_ok` then
 /// immediately drops (relay crash/redeploy loop, authed-idle eviction) must NOT
@@ -217,6 +220,11 @@ struct ClientTuning {
     /// reached the store set this to [`Duration::ZERO`] so every pump event
     /// flushes a dirty gate immediately; production uses the real interval.
     cursor_flush_interval: Duration,
+    /// See [`PUSH_WS_MAX_SILENCE`]: a push is written on the socket only if a
+    /// relay frame arrived within this window (tests shrink it).
+    push_max_silence: Duration,
+    /// See [`PUSH_WS_MAX_QUEUE_AGE`]: an older push goes over HTTPS instead.
+    push_max_queue_age: Duration,
     /// Optional wiring from [`ClientOptions`] (not timing, but threaded the same
     /// way so the session signatures stay put). See there.
     options: ClientOptions,
@@ -229,6 +237,8 @@ impl Default for ClientTuning {
             min_stable_session: MIN_STABLE_SESSION,
             fail_next_envelope_writes: Arc::new(AtomicU32::new(0)),
             cursor_flush_interval: CURSOR_FLUSH_INTERVAL,
+            push_max_silence: PUSH_WS_MAX_SILENCE,
+            push_max_queue_age: PUSH_WS_MAX_QUEUE_AGE,
             options: ClientOptions::default(),
         }
     }
@@ -245,6 +255,10 @@ pub struct ClientOptions {
     /// Splits the app's outbound traffic before it reaches the relay session:
     /// a direct-mode pairing's envelopes go to its outbox, never the relay.
     pub router: Option<Arc<dyn OutboundRouter>>,
+    /// Where a push the client will not trust to its socket is posted over
+    /// HTTPS (spec §5.5.1). `None` = the shared-runtime [`RuntimePoster`];
+    /// tests substitute a recorder.
+    pub push_poster: Option<Arc<dyn PushPoster>>,
 }
 
 impl ClientOptions {
@@ -498,6 +512,11 @@ impl RemoteHandle {
         // drops its sender (shutdown) or when the session task has gone away and
         // the forward fails, so it holds nothing open past the app's lifetime.
         let (async_out_tx, async_out_rx) = unbounded_channel::<RemoteOutbound>();
+        // Pushes get a channel of their own: they are independent of the
+        // envelope stream's order, and a separate inbox is what lets the task
+        // reroute one over HTTPS the moment no session can carry it, instead of
+        // leaving it queued behind a dead session (spec §5.5.1).
+        let (push_tx, push_rx) = unbounded_channel::<QueuedPush>();
         // The direct link's router (if any) takes a direct-mode pairing's
         // traffic here, before the relay session ever sees it — so it flows even
         // while the relay is unreachable, and can never leak to the relay.
@@ -513,7 +532,13 @@ impl RemoteHandle {
                         },
                         None => msg,
                     };
-                    if async_out_tx.send(msg).is_err() {
+                    let sent = match msg {
+                        RemoteOutbound::PushNotify { push, queued_at } => {
+                            push_tx.send(QueuedPush { push, queued_at }).is_ok()
+                        }
+                        other => async_out_tx.send(other).is_ok(),
+                    };
+                    if !sent {
                         break;
                     }
                 }
@@ -540,7 +565,10 @@ impl RemoteHandle {
                 identity,
                 store,
                 InboundTx::new(inbound_tx),
-                async_out_rx,
+                AppRx {
+                    outbound: async_out_rx,
+                    pushes: PushInbox::new(push_rx),
+                },
                 TaskSignals {
                     stop: stop_rx,
                     push_link: task_link,
@@ -875,7 +903,7 @@ async fn run(
     identity: DeviceIdentity,
     store: Box<dyn RemoteStore>,
     inbound_tx: InboundTx,
-    mut outbound_rx: UnboundedReceiver<RemoteOutbound>,
+    mut rx: AppRx,
     signals: TaskSignals,
     tuning: ClientTuning,
 ) {
@@ -883,6 +911,16 @@ async fn run(
         mut stop,
         push_link,
     } = signals;
+    let poster: Arc<dyn PushPoster> = tuning
+        .options
+        .push_poster
+        .clone()
+        .unwrap_or_else(|| Arc::new(RuntimePoster));
+    let fallback = PushFallback {
+        identity: &identity,
+        cfg: &cfg,
+        poster: poster.as_ref(),
+    };
     let mut attempt: u32 = 0;
     // Consecutive auth rejections of our persisted pairing (see
     // [`AUTH_REJECT_REOFFER_THRESHOLD`]). Any non-rejection outcome resets it.
@@ -914,11 +952,12 @@ async fn run(
             &mut state,
             store.as_ref(),
             &inbound_tx,
-            &mut outbound_rx,
+            &mut rx,
             &mut stop,
             &tuning,
             pending.take(),
             &push_link,
+            &fallback,
             Bootstrap {
                 relay_unknown,
                 exclude: &relay_unknown_ids,
@@ -1052,7 +1091,8 @@ async fn run(
             );
             match park_until_pairing_requested(
                 &mut stop,
-                &mut outbound_rx,
+                &mut rx,
+                &fallback,
                 &mut state,
                 store.as_ref(),
                 &mut relay_unknown_ids,
@@ -1068,10 +1108,19 @@ async fn run(
             }
         }
         // Backoff, woken early by `stop()` instead of the blocking client's
-        // 100 ms poll loop.
-        tokio::select! {
-            _ = stopped(&mut stop) => break,
-            _ = sleep(backoff_delay(attempt, jitter_unit())) => {}
+        // 100 ms poll loop. No session can carry a push meanwhile, so one that
+        // arrives goes over HTTPS at once.
+        let backoff = sleep(backoff_delay(attempt, jitter_unit()));
+        tokio::pin!(backoff);
+        let stopping = loop {
+            tokio::select! {
+                _ = stopped(&mut stop) => break true,
+                _ = &mut backoff => break false,
+                queued = rx.pushes.next() => fallback.reroute(&state, queued.push, "no session"),
+            }
+        };
+        if stopping {
+            break;
         }
     }
 }
@@ -1089,7 +1138,8 @@ async fn run(
 /// pairing's envelopes before they reach this channel.
 async fn park_until_pairing_requested(
     stop: &mut watch::Receiver<bool>,
-    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    rx: &mut AppRx,
+    fallback: &PushFallback<'_>,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     exclude: &mut HashSet<String>,
@@ -1098,7 +1148,13 @@ async fn park_until_pairing_requested(
         let msg = tokio::select! {
             biased;
             _ = stopped(stop) => return None,
-            msg = outbound_rx.recv() => msg?,
+            // Posted anyway: the relay will refuse it (it no longer knows this
+            // device), and that refusal is logged — nothing is held.
+            queued = rx.pushes.next() => {
+                fallback.reroute(state, queued.push, "parked");
+                continue;
+            }
+            msg = rx.outbound.recv() => msg?,
         };
         match msg {
             RemoteOutbound::RequestPairing { .. } => return Some(msg),
@@ -1123,7 +1179,7 @@ fn outbound_kind(msg: &RemoteOutbound) -> &'static str {
         RemoteOutbound::Ack { .. } => "ack",
         RemoteOutbound::RequestPairing { .. } => "pairing request",
         RemoteOutbound::Unpair { .. } => "unpair",
-        RemoteOutbound::PushNotify(..) => "push",
+        RemoteOutbound::PushNotify { .. } => "push",
     }
 }
 
@@ -1219,11 +1275,12 @@ async fn run_session(
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     inbound_tx: &InboundTx,
-    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    rx: &mut AppRx,
     stop: &mut watch::Receiver<bool>,
     tuning: &ClientTuning,
     pending_in: Option<RemoteOutbound>,
     push_link: &PushLink,
+    fallback: &PushFallback<'_>,
     bootstrap: Bootstrap<'_>,
 ) -> SessionEnd {
     let Bootstrap {
@@ -1357,7 +1414,12 @@ async fn run_session(
                 return ended_unauthed();
             }
 
-            queued = next_pre_auth(&mut carried, outbound_rx), if offer_window => {
+            // Not authenticated yet, so no socket to trust a push to.
+            queued = rx.pushes.next() => {
+                fallback.reroute(state, queued.push, "no session yet");
+            }
+
+            queued = next_pre_auth(&mut carried, &mut rx.outbound), if offer_window => {
                 match queued {
                     Some(RemoteOutbound::RequestPairing { claim_token_hint }) => {
                         let offer = match build_pairing_offer(
@@ -1590,6 +1652,8 @@ async fn run_session(
         inbound_tx,
         push_only_logged: &push_only_logged,
         recent: &recent,
+        push_link,
+        fallback,
     };
 
     // Re-send an envelope whose write failed on the previous session BEFORE any
@@ -1629,7 +1693,7 @@ async fn run_session(
         identity,
         state,
         store,
-        outbound_rx,
+        rx,
         stop,
         write,
         &mut gate,
@@ -1973,7 +2037,7 @@ async fn pump(
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
-    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    rx: &mut AppRx,
     stop: &mut watch::Receiver<bool>,
     write: SessionWrite<'_>,
     gate: &mut CursorFlushGate,
@@ -2028,7 +2092,20 @@ async fn pump(
                 };
             }
 
-            queued = outbound_rx.recv() => match queued {
+            // A push before the rest of the app's traffic: it is the
+            // time-sensitive one, and it never breaks the stream's order.
+            queued = rx.pushes.next() => {
+                if let Sent::Broke { .. } =
+                    send_push(sink, state, write, queued.push, queued.queued_at).await
+                {
+                    break SessionEnd::Ended {
+                        authed_for: Some(authed_at.elapsed()),
+                        pending: None,
+                    };
+                }
+            }
+
+            queued = rx.outbound.recv() => match queued {
                 Some(out) => {
                     if let Sent::Broke { retry } =
                         handle_outbound(sink, identity, state, store, gate, write, out).await
@@ -2063,6 +2140,7 @@ async fn pump(
                     // nothing but ws pings is exactly the half-open case 0ef.1 is
                     // about.
                     alive = true;
+                    write.push_link.mark_inbound();
                     if !handle_frame(sink, state, store, gate, write, *frame).await {
                         break SessionEnd::Ended {
                             authed_for: Some(authed_at.elapsed()),
@@ -2115,6 +2193,10 @@ struct SessionWrite<'a> {
     push_only_logged: &'a AtomicBool,
     /// What was last written per pairing, to attribute pairing-scoped errors.
     recent: &'a RecentWrites,
+    /// When the socket last delivered a relay frame (push freshness).
+    push_link: &'a PushLink,
+    /// Where a push the socket cannot be trusted with goes instead.
+    fallback: &'a PushFallback<'a>,
 }
 
 impl SessionWrite<'_> {
@@ -2269,39 +2351,8 @@ async fn handle_outbound(
                 Sent::Broke { retry: None }
             }
         }
-        RemoteOutbound::PushNotify(push) => {
-            // Queued while the push link said this socket carries v4 frames,
-            // but a reconnect may have landed on an older relay since: such a
-            // relay would answer `bad_frame` and drop the session, so the push
-            // is dropped here instead (logged, never retried or spun on).
-            if write.negotiated_version < PUSH_NOTIFY_MIN_VERSION {
-                crate::remote::debuglog::log(&format!(
-                    "push pairing={} event={} class={} route=RelaySocket dropped: relay negotiated v{}",
-                    push.pairing_id, push.event_id, push.class, write.negotiated_version
-                ));
-                return Sent::Ok;
-            }
-            let (pairing, event, class) =
-                (push.pairing_id.clone(), push.event_id.clone(), push.class);
-            if send_frame(sink, &RelayFrame::PushNotify(push.clone()))
-                .await
-                .is_err()
-            {
-                crate::remote::debuglog::log(&format!(
-                    "push pairing={pairing} event={event} class={class} route=RelaySocket \
-                     write failed — holding for the next session"
-                ));
-                // The same event id makes a duplicate harmless (it is the APNs
-                // collapse id), so holding it for the next session is safe.
-                return Sent::Broke {
-                    retry: Some(RemoteOutbound::PushNotify(push)),
-                };
-            }
-            write.recent.record(pairing.as_str(), WriteKind::Push);
-            crate::remote::debuglog::log(&format!(
-                "push pairing={pairing} event={event} class={class} route=RelaySocket sent"
-            ));
-            Sent::Ok
+        RemoteOutbound::PushNotify { push, queued_at } => {
+            send_push(sink, state, write, push, queued_at).await
         }
         RemoteOutbound::Unpair { pairing_id } => {
             // Local clear only (no relay-plane unpair frame in v1): drop the
@@ -2314,6 +2365,116 @@ async fn handle_outbound(
             Sent::Ok
         }
     }
+}
+
+/// A push on its way from the app to the relay, with when it was queued.
+struct QueuedPush {
+    push: PushNotifyBody,
+    queued_at: Instant,
+}
+
+/// The pushes inbox. Once the app's side is gone it never yields again (rather
+/// than resolving `None` forever and spinning every `select!` it sits in).
+struct PushInbox {
+    rx: UnboundedReceiver<QueuedPush>,
+    open: bool,
+}
+
+impl PushInbox {
+    fn new(rx: UnboundedReceiver<QueuedPush>) -> Self {
+        PushInbox { rx, open: true }
+    }
+
+    /// The next queued push. Cancel-safe (`recv` is).
+    async fn next(&mut self) -> QueuedPush {
+        if self.open {
+            match self.rx.recv().await {
+                Some(queued) => return queued,
+                None => self.open = false,
+            }
+        }
+        std::future::pending().await
+    }
+}
+
+/// The task's two receivers from the app: ordered relay traffic, and pushes.
+struct AppRx {
+    outbound: UnboundedReceiver<RemoteOutbound>,
+    pushes: PushInbox,
+}
+
+/// Posts a push over HTTPS when the relay socket cannot be trusted with it
+/// (spec §5.5.1): signed by this device, to the relay URL in effect now.
+struct PushFallback<'a> {
+    identity: &'a DeviceIdentity,
+    cfg: &'a RemoteConfig,
+    poster: &'a dyn PushPoster,
+}
+
+impl PushFallback<'_> {
+    /// Post `push` over HTTPS, logging `why` it left the socket.
+    fn reroute(&self, state: &RemoteState, push: PushNotifyBody, why: &str) {
+        let endpoint = push_endpoint_url(&effective_url(self.cfg, state));
+        post_https(
+            self.poster,
+            self.identity,
+            endpoint.as_deref(),
+            effective_relay_password(self.cfg),
+            push,
+            now_ms(),
+            why,
+        );
+    }
+}
+
+/// Write one push on the live session, or reroute it over HTTPS when the
+/// socket cannot be trusted with it (spec §5.5.1):
+/// * the session negotiated below v4 (a reconnect landed on an older relay,
+///   which would answer `bad_frame`);
+/// * it waited longer than [`ClientTuning::push_max_queue_age`] to be written;
+/// * no relay frame arrived within [`ClientTuning::push_max_silence`] — the
+///   socket may be half-open, swallowing writes until the liveness teardown;
+/// * the write itself failed (the session then ends).
+///
+/// Never held for a later session: hours later is worse than a duplicate, and
+/// the shared `event_id` collapses a WS + HTTPS double delivery on APNs.
+async fn send_push(
+    sink: &mut RelaySink,
+    state: &RemoteState,
+    write: SessionWrite<'_>,
+    push: PushNotifyBody,
+    queued_at: Instant,
+) -> Sent {
+    let tuning = write.tuning;
+    let why = if write.negotiated_version < PUSH_NOTIFY_MIN_VERSION {
+        Some(format!("relay negotiated v{}", write.negotiated_version))
+    } else if queued_at.elapsed() > tuning.push_max_queue_age {
+        Some(format!("queued {}ms ago", queued_at.elapsed().as_millis()))
+    } else if !write.push_link.heard_within(tuning.push_max_silence) {
+        Some("socket silent, may be half-open".to_string())
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        write.fallback.reroute(state, push, &why);
+        return Sent::Ok;
+    }
+    let (pairing, event, class) = (push.pairing_id.clone(), push.event_id.clone(), push.class);
+    if send_frame(sink, &RelayFrame::PushNotify(push.clone()))
+        .await
+        .is_err()
+    {
+        crate::remote::debuglog::log(&format!(
+            "push pairing={pairing} event={event} class={class} route=RelaySocket write failed"
+        ));
+        write.fallback.reroute(state, push, "socket write failed");
+        return Sent::Broke { retry: None };
+    }
+    write.recent.record(pairing.as_str(), WriteKind::Push);
+    crate::remote::debuglog::log(&format!(
+        "push pairing={pairing} event={event} class={class} route=RelaySocket sent"
+    ));
+    Sent::Ok
 }
 
 /// Remove every pairing that `keeping` supersedes — any OTHER pairing to the
