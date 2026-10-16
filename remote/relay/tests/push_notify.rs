@@ -558,7 +558,7 @@ async fn pairing_claimed_carries_direct_endpoint_to_phone_and_identity_key_to_de
             ..
         } => {
             assert_eq!(pairing_id, pairing);
-            assert_eq!(direct_endpoint, Some(endpoint));
+            assert_eq!(direct_endpoint, Some(endpoint.clone()));
             assert_eq!(peer_device_public_key, None, "phone-bound copy omits it");
         }
         other => panic!("expected pairing_claimed, got {other:?}"),
@@ -572,7 +572,68 @@ async fn pairing_claimed_carries_direct_endpoint_to_phone_and_identity_key_to_de
             peer_device_public_key,
             ..
         } => {
-            assert_eq!(direct_endpoint, None, "desktop-bound copy omits it");
+            assert_eq!(
+                direct_endpoint,
+                Some(endpoint),
+                "a v4 phone got the endpoint, so it is echoed to the desktop: direct mode"
+            );
+            assert_eq!(peer_device_public_key, Some(phone_identity_key));
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+}
+
+/// A phone below `DIRECT_LINK_MIN_VERSION` cannot dial the direct link, so the
+/// relay withholds the endpoint from BOTH copies of `pairing_claimed`: the
+/// phone keeps using the relay, and the desktop — seeing no echo — makes the
+/// pairing relay mode too (spec §5.2).
+#[tokio::test]
+async fn a_pre_v4_phone_gets_no_direct_endpoint_and_neither_does_the_desktop() {
+    let (base, _apns) = spawn_app_with_fake_apns(|_| {}).await;
+    let endpoint = DirectEndpoint {
+        host: "ruuds-mbp.tail1234.ts.net".into(),
+        port: 47800,
+    };
+    let mut desktop = TestClient::connect(&base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing_direct(endpoint).await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect_at(
+        &base,
+        Role::Phone,
+        "dev_old_phone",
+        p256::ecdsa::SigningKey::random(&mut rand_core::OsRng),
+        flightdeck_remote_protocol::DIRECT_LINK_MIN_VERSION - 1,
+    )
+    .await;
+    let phone_identity_key = phone.public_key_b64.clone();
+    match phone.claim_pairing_frame(&token).await {
+        RelayFrame::PairingClaimed {
+            pairing_id,
+            direct_endpoint,
+            ..
+        } => {
+            assert_eq!(pairing_id, pairing);
+            assert_eq!(
+                direct_endpoint, None,
+                "an old phone is never sent the endpoint"
+            );
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+    match desktop
+        .recv_until(|f| matches!(f, RelayFrame::PairingClaimed { .. }))
+        .await
+    {
+        RelayFrame::PairingClaimed {
+            direct_endpoint,
+            peer_device_public_key,
+            ..
+        } => {
+            assert_eq!(
+                direct_endpoint, None,
+                "no echo: the desktop stays relay mode"
+            );
             assert_eq!(peer_device_public_key, Some(phone_identity_key));
         }
         other => panic!("expected pairing_claimed, got {other:?}"),

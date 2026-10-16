@@ -41,8 +41,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use flightdeck_remote_protocol::{
     negotiate_version, ClientInfo, DeviceId, DirectEndpoint, EncryptedEnvelope, PairingId,
-    PresenceState, PushNotifyBody, RelayErrorCode, RelayFrame, Role, MAX_SUPPORTED_VERSION,
-    MIN_SUPPORTED_VERSION,
+    PresenceState, PushNotifyBody, RelayErrorCode, RelayFrame, Role, DIRECT_LINK_MIN_VERSION,
+    MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 use futures_util::stream::{SplitStream, StreamExt};
 use tokio::sync::{mpsc, Notify};
@@ -143,6 +143,10 @@ pub struct Connection {
     connection_id: String,
     /// Role declared in `hello` (set once hello is accepted).
     role: Option<Role>,
+    /// Protocol version negotiated in `hello_ok` (0 until hello is accepted).
+    /// Gates the direct link on the claiming phone's capability (spec §5.2):
+    /// only a v4+ phone can reach the Mac directly.
+    negotiated_version: u16,
     /// How many `pairing_claim` frames this connection has attempted, for the
     /// per-connection rate limit ([`MAX_CLAIM_ATTEMPTS_PER_CONN`]).
     claim_attempts: u32,
@@ -183,6 +187,7 @@ impl Connection {
             out_tx,
             connection_id: ids::connection_id(),
             role: None,
+            negotiated_version: 0,
             claim_attempts: 0,
             shutdown: Arc::new(Notify::new()),
             seq_reject_streak: HashMap::new(),
@@ -383,6 +388,7 @@ impl Connection {
 
         tracing::info!(conn = %self.connection_id, ?role, ?device_id, version, "hello accepted");
         self.role = Some(role);
+        self.negotiated_version = version;
         let _ = &client as &ClientInfo; // build metadata is diagnostic only
 
         self.send(RelayFrame::HelloOk {
@@ -688,6 +694,23 @@ impl Connection {
             .await;
         let phone_ka_key = self.state.store.device_key_agreement_key(&device_id).await;
 
+        // Direct mode needs a direct-capable phone (spec §5.2): the offer must
+        // have carried an endpoint AND this phone's connection must have
+        // negotiated v4+ (a v4 build is the one that dials the direct link). An
+        // older phone would ignore the endpoint and keep using the relay, so it
+        // gets neither copy and the pairing is relay mode on both ends.
+        let offered_direct = claim.direct_endpoint.is_some();
+        let direct_endpoint = claim
+            .direct_endpoint
+            .filter(|_| self.negotiated_version >= DIRECT_LINK_MIN_VERSION);
+        if offered_direct && direct_endpoint.is_none() {
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?claim.pairing_id,
+                version = self.negotiated_version,
+                "pairing_claim: phone below v{DIRECT_LINK_MIN_VERSION}, direct endpoint withheld (relay mode)"
+            );
+        }
+
         // Tell the phone which pairing it joined, who its peer is, the
         // desktop's key-agreement public key for the E2E ECDH (spec §7.1) and,
         // for a direct-mode pairing, where to reach the Mac (spec §5.2, v4).
@@ -695,21 +718,23 @@ impl Connection {
             pairing_id: claim.pairing_id.clone(),
             peer_device_id: Some(desktop_device),
             peer_key_agreement_public_key: desktop_ka_key,
-            direct_endpoint: claim.direct_endpoint,
+            direct_endpoint: direct_endpoint.clone(),
             peer_device_public_key: None,
         })
         .await;
 
         // Notify the waiting desktop connection, if it is currently connected,
         // that a phone has joined this pairing, and hand it the phone's KA key
-        // and identity key (the latter on every v4 claim, spec §5.2).
+        // and identity key (the latter on every v4 claim, spec §5.2). The
+        // endpoint is echoed exactly when the phone got it: that echo is what
+        // puts the desktop's side of the pairing in direct mode.
         if let Some(desktop) = self.state.registry.peer(&claim.pairing_id, Role::Phone) {
             desktop
                 .send(RelayFrame::PairingClaimed {
                     pairing_id: claim.pairing_id,
                     peer_device_id: Some(device_id),
                     peer_key_agreement_public_key: phone_ka_key,
-                    direct_endpoint: None,
+                    direct_endpoint,
                     peer_device_public_key: Some(device_public_key),
                 })
                 .await;

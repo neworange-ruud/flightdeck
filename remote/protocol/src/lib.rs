@@ -31,8 +31,8 @@ pub mod relay;
 
 pub use common::{
     AgentStatus, AgentType, GitFileChange, GitFileStatus, GitIndicators, GitStatusDetail,
-    PushClass, Role, RollupDot, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION,
-    PUSH_NOTIFY_MIN_VERSION,
+    PushClass, Role, RollupDot, DIRECT_LINK_MIN_VERSION, MAX_SUPPORTED_VERSION,
+    MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, PUSH_NOTIFY_MIN_VERSION,
 };
 pub use e2e::{
     ActivityKind, AgentEvent, CommandAck, CommandBody, CommandOutcome, DeepLink, DesktopToPhone,
