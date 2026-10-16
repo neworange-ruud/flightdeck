@@ -100,10 +100,10 @@ targets:
         FlightDeckSharedKeychainGroup: "$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared"
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
-        # Wake the app on a silent APNs push to reconnect + resume queued events
-        # (spec §11); the relay's push is content-available (zero-knowledge).
-        UIBackgroundModes:
-          - remote-notification
+        # No UIBackgroundModes: pushes are visible alerts whose sealed payload the
+        # Notification Service Extension decrypts (spec §7.2, remote-control-bza0).
+        # The silent `remote-notification` wake path is gone, and nothing else
+        # runs in the background.
         # No `~ipad` variant: the app is iPhone-only (see the target's
         # TARGETED_DEVICE_FAMILY). Declaring iPad orientations while omitting
         # UIInterfaceOrientationPortraitUpsideDown is what App Store Connect

@@ -159,6 +159,13 @@ struct DistributionMetadataTests {
         #expect(ext["CFBundleVersion"] as? String == info["CFBundleVersion"] as? String)
     }
 
+    /// The silent wake path is gone; declaring `remote-notification` anyway
+    /// would invite App Review questions for a mode the app no longer uses.
+    @Test func noRemoteNotificationBackgroundMode() {
+        let modes = info["UIBackgroundModes"] as? [String] ?? []
+        #expect(!modes.contains("remote-notification"))
+    }
+
     // MARK: - Push environment
 
     /// The single most breakage-prone pairing in the whole distribution setup:

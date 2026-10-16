@@ -243,20 +243,6 @@ struct MainTabView: View {
                 if let token = pushCoordinator.deviceTokenHex {
                     registerPushTokenEverywhere(token)
                 }
-                // Register the background wake performer (remote-control-0ef.4):
-                // a silent wake push while backgrounded runs this to reconnect
-                // the torn-down transport, replay queued envelopes, and schedule
-                // their notifications. Capture the live objects (not `self`, a
-                // recreated View value) so the stored closure stays valid.
-                let coordinator = self.coordinator
-                let scheduler = self.notificationScheduler
-                let preferences = self.notificationPreferences
-                pushCoordinator.registerWakeHandler { @MainActor in
-                    await Self.performBackgroundWake(
-                        coordinator: coordinator,
-                        scheduler: scheduler,
-                        preferences: preferences)
-                }
             }
 
             VStack(spacing: 0) {
@@ -277,79 +263,6 @@ struct MainTabView: View {
     /// No-op when nothing is paired.
     private func registerPushTokenEverywhere(_ token: String) {
         coordinator.registerPushToken(token, environment: pushCoordinator.environment)
-    }
-
-    /// The silent-wake-push performer (remote-control-0ef.4), run by
-    /// `PushCoordinator.handleWakePush` while the app is backgrounded and the
-    /// transport has been torn down. It reconnects every paired machine, waits a
-    /// bounded window for `resume`d envelopes to replay, schedules a local
-    /// notification for every freshly-decrypted event across ALL machines
-    /// (deduped by `event_id`, so a later foreground re-ingest is a no-op), then
-    /// tears the transport back down so the next foreground reconnects cleanly.
-    /// Returns whether the link came back live (drives the fetch result).
-    ///
-    /// Bracketed by `beginBackgroundWake()`/`endBackgroundWake()` rather than
-    /// `startAll()`/`stopAll()` (remote-control-aew): iOS delivers silent pushes
-    /// to a FOREGROUNDED app too, and the foreground transport is not this
-    /// path's to stop. `begin` declines the wake outright while foregrounded,
-    /// and `end` skips its teardown if the app foregrounded mid-wake — without
-    /// either guard, a wake arriving as the user opens the app kills the fresh
-    /// link, which detaches the phone at the relay, which makes the relay push
-    /// again for the next envelope: an endless connect/"Reconnecting…" flap.
-    ///
-    /// Static (captures no `View`) so the closure stored on `PushCoordinator`
-    /// outlives any given `MainTabView` value. The reconnect-then-teardown here
-    /// is background-lifecycle behavior that can only be exercised on a real
-    /// device/simulator app-lifecycle, so it is integration-level, not unit
-    /// tested (the pieces it composes — the wake bracket, reconnect,
-    /// resume/snapshot, notification scheduling — are each covered on their own).
-    @MainActor
-    private static func performBackgroundWake(
-        coordinator: TransportCoordinator,
-        scheduler: NotificationScheduler,
-        preferences: NotificationPreferences
-    ) async -> Bool {
-        // Reconnect every paired machine (they were stopped on background).
-        // Declined while foregrounded — the link is already live and owned by
-        // the scenePhase lifecycle, so there is nothing to wake and nothing
-        // fetched that the live transport isn't already ingesting.
-        guard await coordinator.beginBackgroundWake() else { return false }
-
-        // Bounded wait for the sockets to reach `auth_ok` — the background
-        // execution budget is short, so give up rather than hang if the phone
-        // still can't reach the relay.
-        let deadline = ContinuousClock.now + .seconds(12)
-        while ContinuousClock.now < deadline {
-            let stores = coordinator.stores
-            let allLive = !stores.isEmpty && stores.allSatisfy {
-                if case .connected = $0.linkState { return true }
-                return false
-            }
-            if allLive { break }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        // Let any `resume`d envelopes finish folding into `agentEvents`.
-        try? await Task.sleep(for: .milliseconds(500))
-
-        // Schedule notifications for every machine's events, stamped with the
-        // originating pairing so a tap deep-links to it.
-        for handle in coordinator.handles {
-            scheduler.ingest(
-                handle.store.agentEvents,
-                settings: preferences.settings,
-                pairingId: handle.pairingId)
-        }
-
-        let reachedLive = coordinator.stores.contains {
-            if case .connected = $0.linkState { return true }
-            return false
-        }
-        // Tear back down so the next foreground reconnects from a clean state
-        // (APNs owns the wake in between) — unless the app foregrounded while
-        // this wake ran, in which case the link is the foreground's now and
-        // `endBackgroundWake` leaves it up.
-        await coordinator.endBackgroundWake()
-        return reachedLive
     }
 
     /// Whether the currently-selected tab has a chat route pushed (the tab

@@ -2,12 +2,12 @@
 //  NotificationScheduler.swift
 //  FlightDeckRemote
 //
-//  Posts local notifications for incoming `Wire.AgentEvent`s, deduped by
-//  `event_id` (PRD §5.8, spec §6.4: a queued-then-replayed event must not
-//  double-fire). Because the relay is zero-knowledge it can only send a silent
-//  *wake* push (see `remote/relay/src/apns.rs`); the phone reconnects,
-//  `resume`s the queued envelope, and this scheduler renders the real, typed,
-//  deep-linked notification locally from the decrypted event.
+//  Posts local notifications for `Wire.AgentEvent`s that arrive over the live
+//  transport, deduped by `event_id` (PRD §5.8, spec §6.4: a queued-then-replayed
+//  event must not double-fire). While the app is away, the desktop's sealed
+//  visible push covers the same moments instead: the Notification Service
+//  Extension decrypts it and rewrites it into an equivalent notification
+//  (`PushNotificationRewriter`, spec §7.2).
 //
 //  The `UNUserNotificationCenter` dependency is behind a tiny seam so `ingest`
 //  is unit-testable (dedup + settings gating) without a notification host.
