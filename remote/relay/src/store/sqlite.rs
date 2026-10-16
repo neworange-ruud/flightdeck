@@ -909,12 +909,16 @@ mod tests {
             s.enqueue(env(&pairing, Role::Desktop, 4)).await,
             Ok(AppendOutcome::Accepted { overflow: true })
         );
-        // The oldest (seq 1) was shed, so a resume from 0 asks for a lost seq and
-        // must RESYNC rather than replay a hole (remote-control-0ef.7). Resuming
-        // from seq 2 (the front's predecessor) replays the retained tail cleanly.
+        // The oldest (seq 1) was shed. A resume from 0 is the post-advisory
+        // recovery and replays the retained tail (remote-control-uj2t); the
+        // resync applies to 0 < from_seq with a lost seq in between
+        // (remote-control-0ef.7), covered by the deeper-overflow test below.
         assert_eq!(
-            s.resume(&pairing, Role::Desktop, 0).await,
-            ResumeOutcome::Resync
+            replayed(s.resume(&pairing, Role::Desktop, 0).await)
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
         );
         let seqs: Vec<u64> = replayed(s.resume(&pairing, Role::Desktop, 1).await)
             .iter()
@@ -975,12 +979,16 @@ mod tests {
         // A fresh receiver (needs seq 1) and one that last saw seq 1 (needs seq 2)
         // both ask for shed seqs → resync.
         assert_eq!(
-            s.resume(&pairing, Role::Desktop, 0).await,
-            ResumeOutcome::Resync
-        );
-        assert_eq!(
             s.resume(&pairing, Role::Desktop, 1).await,
             ResumeOutcome::Resync
+        );
+        // from_seq 0 recovers by replaying the retained tail (remote-control-uj2t).
+        assert_eq!(
+            replayed(s.resume(&pairing, Role::Desktop, 0).await)
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
         );
         // An unknown queue is a clean, empty replay (no stream row).
         assert_eq!(

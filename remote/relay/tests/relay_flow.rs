@@ -856,19 +856,16 @@ async fn queue_overflow_emits_advisory_and_keeps_newest() {
         }
     ));
 
-    // Reconnect the phone and resume from 0. Drop-oldest shed seq 1 and 2, so a
-    // contiguous replay starting at seq 1 is impossible. Rather than silently
-    // hand over a gapped stream (seq 3,4,5) that the phone's gapless-seq
-    // enforcement would stall on forever, the relay now signals a resync
-    // (SeqViolation) so the phone abandons its stale cursor and requests a fresh
-    // snapshot (remote-control-0ef.7).
+    // Reconnect the phone with a stale cursor (seq 1). Drop-oldest shed seq 1
+    // and 2, so a contiguous replay is impossible: the relay signals a resync
+    // (SeqViolation) rather than hand over a gapped stream (remote-control-0ef.7).
     let mut phone =
         TestClient::connect_with_key(&base, Role::Phone, "dev_phone", phone_key.clone()).await;
     phone.authenticate(vec![pairing.clone()]).await;
     phone
         .send(RelayFrame::Resume {
             pairing_id: pairing.clone(),
-            from_seq: 0,
+            from_seq: 1,
         })
         .await;
     let resync = phone
@@ -885,6 +882,22 @@ async fn queue_overflow_emits_advisory_and_keeps_newest() {
         "resume across an overflow gap must signal resync, got {resync:?}"
     );
     // No gapped envelope stream follows the resync signal.
+    phone.expect_idle(300).await;
+
+    // The phone's recovery is `resume { from_seq: 0 }`. It must replay what is
+    // retained (the dropped seqs are given up), NOT answer seq_violation again —
+    // that was a livelock (remote-control-uj2t).
+    phone
+        .send(RelayFrame::Resume {
+            pairing_id: pairing.clone(),
+            from_seq: 0,
+        })
+        .await;
+    let mut got0 = Vec::new();
+    for _ in 0..3 {
+        got0.push(env_seq(&phone.recv_until(is_envelope).await));
+    }
+    assert_eq!(got0, vec![3, 4, 5]);
     phone.expect_idle(300).await;
 
     // A receiver that resumes from just above the drop (seq 2) still gets a
