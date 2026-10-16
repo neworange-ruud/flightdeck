@@ -9,8 +9,12 @@
 //!    version_incompatible      pairing_offer / pairing_claim        envelope routing,
 //!    (close)                   (self-register key, mint/redeem       ack pruning, resume
 //!                               claim token), auth_challenge         replay, presence,
-//!                                                                    ping/pong, push tokens
+//!                                                                    ping/pong, push tokens,
+//!                                                                    push_notify (desktop)
 //! ```
+//!
+//! Queued envelopes never trigger a push (spec §5.5, v4); a desktop asks for
+//! one explicitly with `push_notify`, handled by [`crate::push`].
 //!
 //! Wrong-order frames, unknown devices, and bad signatures are answered with a
 //! [`RelayFrame::Error`] carrying the appropriate [`RelayErrorCode`] and, for
@@ -27,8 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
 use flightdeck_remote_protocol::{
-    negotiate_version, ClientInfo, DeviceId, EncryptedEnvelope, PairingId, PresenceState,
-    RelayErrorCode, RelayFrame, Role, MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
+    negotiate_version, ClientInfo, DeviceId, DirectEndpoint, EncryptedEnvelope, PairingId,
+    PresenceState, PushNotifyBody, RelayErrorCode, RelayFrame, RelayMode, Role,
+    MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 use futures_util::stream::{SplitStream, StreamExt};
 use tokio::sync::{mpsc, Notify};
@@ -48,18 +53,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Constant-time byte-slice equality for the shared relay-password gate
-/// (remote-control-uq7). Delegates to [`subtle::ConstantTimeEq`] so the compare
-/// takes the same time whether the presented password is wrong in the first
-/// byte or the last — a naive `==`/`str` compare short-circuits on the first
-/// mismatch and leaks the shared secret to a network attacker over many probes.
-/// Slice length is not itself secret (and `subtle` short-circuits on differing
-/// lengths); the password *contents* are what must not leak via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq as _;
-    a.ct_eq(b).into()
 }
 
 /// Maximum `pairing_claim` attempts a single connection may make before the
@@ -341,19 +334,18 @@ impl Connection {
         // closes — deliberately identical for a missing vs a wrong password, so
         // no signal leaks about which was the problem. The secret never appears
         // in any log line.
-        if let Some(expected) = self.state.config.relay_password.as_deref() {
-            if !relay_password.as_deref().is_some_and(|presented| {
-                constant_time_eq(presented.as_bytes(), expected.as_bytes())
-            }) {
-                tracing::warn!(
-                    conn = %self.connection_id,
-                    ?role,
-                    "hello rejected: missing or incorrect relay password"
-                );
-                self.send_error(RelayErrorCode::AuthFailed, "relay password required", None)
-                    .await;
-                return Flow::Close;
-            }
+        if !auth::relay_password_ok(
+            self.state.config.relay_password.as_deref(),
+            relay_password.as_deref(),
+        ) {
+            tracing::warn!(
+                conn = %self.connection_id,
+                ?role,
+                "hello rejected: missing or incorrect relay password"
+            );
+            self.send_error(RelayErrorCode::AuthFailed, "relay password required", None)
+                .await;
+            return Flow::Close;
         }
 
         let Some(version) = negotiate_version(
@@ -378,7 +370,9 @@ impl Connection {
             protocol_version: version,
             server_time_ms: now_ms(),
             connection_id: self.connection_id.clone(),
-            relay_mode: None,
+            // Spec §5.9. Always `full` until the push-only mode lands
+            // (remote-control-ck44), which makes it config-driven.
+            relay_mode: Some(RelayMode::Full),
         })
         .await;
 
@@ -406,7 +400,7 @@ impl Connection {
                 key_agreement_public_key,
                 role,
                 claim_token_hint,
-                direct_endpoint: _,
+                direct_endpoint,
             } => {
                 self.on_pairing_offer(
                     device_id,
@@ -414,6 +408,7 @@ impl Connection {
                     key_agreement_public_key,
                     role,
                     claim_token_hint,
+                    direct_endpoint,
                 )
                 .await
             }
@@ -461,10 +456,21 @@ impl Connection {
         key_agreement_public_key: String,
         role: Role,
         claim_token_hint: Option<String>,
+        direct_endpoint: Option<DirectEndpoint>,
     ) -> Flow {
         // The offer must come from the connection's own (desktop) identity.
         if !self.hello_device_matches(&device_id) || role != Role::Desktop {
             self.send_error(RelayErrorCode::BadFrame, "invalid pairing_offer", None)
+                .await;
+            return Flow::Close;
+        }
+        // The relay never dials the direct endpoint, but it stores it and hands
+        // it to the phone, so keep it to a plausible host:port (spec §5.2).
+        if direct_endpoint
+            .as_ref()
+            .is_some_and(|e| !is_valid_direct_endpoint(e))
+        {
+            self.send_error(RelayErrorCode::BadFrame, "malformed direct_endpoint", None)
                 .await;
             return Flow::Close;
         }
@@ -529,7 +535,7 @@ impl Connection {
                 pairing_id.clone(),
                 members.desktop,
                 expires_at_ms,
-                None,
+                direct_endpoint,
             )
             .await;
 
@@ -625,10 +631,12 @@ impl Connection {
         };
 
         // Register the phone's identity + key-agreement keys and attach it to
-        // the pairing.
+        // the pairing. The identity key is also handed to the desktop below
+        // (`peer_device_public_key`, v4) so it can authenticate the phone on the
+        // direct link (spec §5.10).
         self.state
             .store
-            .register_device(device_id.clone(), device_public_key)
+            .register_device(device_id.clone(), device_public_key.clone())
             .await;
         self.state
             .store
@@ -661,19 +669,21 @@ impl Connection {
             .await;
         let phone_ka_key = self.state.store.device_key_agreement_key(&device_id).await;
 
-        // Tell the phone which pairing it joined, who its peer is, and the
-        // desktop's key-agreement public key for the E2E ECDH (spec §7.1).
+        // Tell the phone which pairing it joined, who its peer is, the
+        // desktop's key-agreement public key for the E2E ECDH (spec §7.1) and,
+        // for a direct-mode pairing, where to reach the Mac (spec §5.2, v4).
         self.send(RelayFrame::PairingClaimed {
             pairing_id: claim.pairing_id.clone(),
             peer_device_id: Some(desktop_device),
             peer_key_agreement_public_key: desktop_ka_key,
-            direct_endpoint: None,
+            direct_endpoint: claim.direct_endpoint,
             peer_device_public_key: None,
         })
         .await;
 
         // Notify the waiting desktop connection, if it is currently connected,
-        // that a phone has joined this pairing, and hand it the phone's KA key.
+        // that a phone has joined this pairing, and hand it the phone's KA key
+        // and identity key (the latter on every v4 claim, spec §5.2).
         if let Some(desktop) = self.state.registry.peer(&claim.pairing_id, Role::Phone) {
             desktop
                 .send(RelayFrame::PairingClaimed {
@@ -681,7 +691,7 @@ impl Connection {
                     peer_device_id: Some(device_id),
                     peer_key_agreement_public_key: phone_ka_key,
                     direct_endpoint: None,
-                    peer_device_public_key: None,
+                    peer_device_public_key: Some(device_public_key),
                 })
                 .await;
         }
@@ -879,7 +889,7 @@ impl Connection {
                 key_agreement_public_key,
                 role,
                 claim_token_hint,
-                direct_endpoint: _,
+                direct_endpoint,
             } => {
                 self.on_pairing_offer(
                     device_id,
@@ -887,9 +897,11 @@ impl Connection {
                     key_agreement_public_key,
                     role,
                     claim_token_hint,
+                    direct_endpoint,
                 )
                 .await
             }
+            RelayFrame::PushNotify(push) => self.on_push_notify(push).await,
             RelayFrame::Revoke { pairing_id } => self.on_revoke(pairing_id).await,
             RelayFrame::Bye { .. } => Flow::Close,
             _ => {
@@ -998,6 +1010,39 @@ impl Connection {
         Flow::Continue
     }
 
+    /// Handle a desktop-requested push (spec §5.5.1). Fire-and-forget: success
+    /// sends nothing back; a refusal is an advisory `error` frame and the
+    /// connection stays open.
+    ///
+    /// A phone connection is refused with `bad_frame` before anything else (the
+    /// role it declared in `hello` is enough). Everything after that —
+    /// membership, field limits, rate limit, token lookup and the APNs send — is
+    /// [`crate::push::accept_push`], shared with `POST /v1/push`.
+    async fn on_push_notify(&mut self, push: PushNotifyBody) -> Flow {
+        let device_id = match &self.phase {
+            Phase::Authed { device_id, .. } => device_id.clone(),
+            _ => unreachable!("on_push_notify only called in Authed"),
+        };
+        let pairing_id = push.pairing_id.clone();
+        if self.role != Some(Role::Desktop) {
+            self.send_error(
+                RelayErrorCode::BadFrame,
+                "push_notify is accepted only from a desktop",
+                Some(pairing_id),
+            )
+            .await;
+            return Flow::Continue;
+        }
+        if let Err(rejection) =
+            crate::push::accept_push(&self.state, &device_id, push, crate::push::Via::WebSocket)
+                .await
+        {
+            self.send_error(rejection.code(), rejection.message(), Some(pairing_id))
+                .await;
+        }
+        Flow::Continue
+    }
+
     async fn on_envelope(&mut self, env: EncryptedEnvelope) -> Flow {
         let role = self.role.expect("role set at hello");
         if !self.is_activated(&env.pairing_id) {
@@ -1095,9 +1140,10 @@ impl Connection {
                     .await;
                 }
                 // Forward verbatim to the peer if connected (ciphertext never
-                // inspected). Offline phones pick it up via resume/replay — and
-                // are woken by an APNs push so they reconnect promptly.
-                deliver_or_push(&self.state, &env, role).await;
+                // inspected). An offline peer picks it up via resume/replay on
+                // its next connect; queuing never triggers a push (spec §5.5,
+                // v4 — the desktop asks for pushes itself with `push_notify`).
+                deliver_to_peer(&self.state, &env, role);
             }
         }
         Flow::Continue
@@ -1127,7 +1173,7 @@ impl Connection {
         // what the phone did, so it could not tell a receiving phone from a dark
         // one and fed a dead pairing 33,000 envelopes over 17 days
         // (remote-control-5qu). Non-blocking, exactly like the envelope forward
-        // in `deliver_or_push`: a stuck peer must never back-pressure this leg,
+        // in `deliver_to_peer`: a stuck peer must never back-pressure this leg,
         // and a dropped ack costs nothing (the next one is cumulative, and the
         // cursor is re-sent on the peer's next auth).
         if let Some(peer) = self.state.registry.peer(&pairing_id, role) {
@@ -1339,16 +1385,18 @@ impl Connection {
     }
 }
 
-/// Deliver an accepted envelope to its peer, or — when the peer is an
-/// **offline phone** — fire an APNs wake push so the phone reconnects and
-/// `resume`s the queued envelope (spec §11 step 1).
+/// Forward an accepted (already durably queued) envelope to its peer, if the
+/// peer is connected. An offline peer gets nothing now: it `resume`s the queued
+/// envelope on its next connect (spec §6.3).
+///
+/// **No push.** Before protocol v4 this fired an APNs wake push for every
+/// envelope queued for an offline phone; that path is gone (spec §5.5). The
+/// desktop alone decides what is push-worthy and asks with `push_notify`
+/// ([`crate::push`]).
 ///
 /// Never inspects `ciphertext` (PRD §9.1): the peer receives the envelope
-/// verbatim, and the push carries no user content (see [`crate::apns`], which
-/// keeps the relay's zero-knowledge guarantee). Only a **phone** is ever
-/// push-addressed — the desktop holds its own persistent outbound connection
-/// and does not receive pushes.
-async fn deliver_or_push(state: &AppState, env: &EncryptedEnvelope, sender: Role) {
+/// verbatim. Synchronous on purpose — it never awaits (see below).
+fn deliver_to_peer(state: &AppState, env: &EncryptedEnvelope, sender: Role) {
     if let Some(peer) = state.registry.peer(&env.pairing_id, sender) {
         // Non-blocking forward (remote-control-0ef.6). A slow or half-open peer
         // whose outbound channel is full (or already closed) must NOT be awaited
@@ -1390,22 +1438,29 @@ async fn deliver_or_push(state: &AppState, env: &EncryptedEnvelope, sender: Role
     }
     tracing::info!(
         pairing = ?env.pairing_id, sender = ?sender, seq = env.seq,
-        "DIAG deliver -> NO PEER attached (envelope queued; push if desktop)"
+        "DIAG deliver -> NO PEER attached (envelope queued for resume; no push)"
     );
-    if sender == Role::Desktop {
-        if let Some((token, apns_env)) = state.store.push_token(&env.pairing_id).await {
-            state
-                .push
-                .notify_offline(&env.pairing_id, &token, apns_env)
-                .await;
-        }
-    }
+}
+
+/// Whether a `pairing_offer.direct_endpoint` is plausible enough to store and
+/// hand to the phone (spec §5.2): a non-zero port and a host of 1–253 bytes
+/// with no whitespace or control characters (a DNS name, IPv4 or IPv6
+/// literal). The relay never dials it; this only keeps junk out of the store
+/// and the phone's `pairing_claimed`.
+fn is_valid_direct_endpoint(endpoint: &DirectEndpoint) -> bool {
+    endpoint.port != 0
+        && !endpoint.host.is_empty()
+        && endpoint.host.len() <= 253
+        && endpoint
+            .host
+            .chars()
+            .all(|c| !c.is_whitespace() && !c.is_control())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apns::PushService;
+    use crate::apns::{PushOutcome, PushService};
     use crate::config::{Config, LogFormat};
     use crate::router::ConnHandle;
     use crate::AppState;
@@ -1415,25 +1470,26 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
-    /// Records every offline-wake request so tests can assert whether — and for
-    /// which pairing/token/env — a push was fired.
+    /// Records every push the relay asks to send, so tests can assert that the
+    /// envelope path never pushes.
     #[derive(Default)]
     struct RecordingPush {
-        fired: Mutex<Vec<(PairingId, String, ApnsEnvironment)>>,
+        fired: Mutex<Vec<(String, ApnsEnvironment, PushNotifyBody)>>,
     }
 
     #[async_trait]
     impl PushService for RecordingPush {
-        async fn notify_offline(
+        async fn push_alert(
             &self,
-            pairing: &PairingId,
             token: &str,
             environment: ApnsEnvironment,
-        ) {
+            push: &PushNotifyBody,
+        ) -> PushOutcome {
             self.fired
                 .lock()
                 .unwrap()
-                .push((pairing.clone(), token.to_string(), environment));
+                .push((token.to_string(), environment, push.clone()));
+            PushOutcome::Sent
         }
     }
 
@@ -1493,8 +1549,33 @@ mod tests {
         assert!(bounded.chars().all(|c| c == '🦀'));
     }
 
+    #[test]
+    fn direct_endpoint_validation() {
+        let ep = |host: &str, port: u16| DirectEndpoint {
+            host: host.into(),
+            port,
+        };
+        assert!(is_valid_direct_endpoint(&ep(
+            "ruuds-mbp.tail1234.ts.net",
+            47800
+        )));
+        assert!(is_valid_direct_endpoint(&ep("100.101.102.103", 1)));
+        assert!(is_valid_direct_endpoint(&ep("fd7a:115c:a1e0::1", 47800)));
+        assert!(!is_valid_direct_endpoint(&ep("", 47800)), "empty host");
+        assert!(!is_valid_direct_endpoint(&ep("host", 0)), "port 0");
+        assert!(!is_valid_direct_endpoint(&ep("bad host", 1)), "whitespace");
+        assert!(!is_valid_direct_endpoint(&ep("bad\nhost", 1)), "control");
+        assert!(
+            !is_valid_direct_endpoint(&ep(&"a".repeat(254), 1)),
+            "over 253 bytes"
+        );
+    }
+
+    /// Spec §5.5 (v4): an envelope queued for an offline phone triggers no push
+    /// at all, even with a registered token — and neither does one queued for
+    /// an offline desktop.
     #[tokio::test]
-    async fn offline_phone_with_token_is_woken() {
+    async fn queued_envelope_to_offline_peer_never_pushes() {
         let push = Arc::new(RecordingPush::default());
         let state = state_with_push(push.clone());
         let pairing = PairingId::new("pair");
@@ -1504,13 +1585,11 @@ mod tests {
             .await;
 
         // Desktop sends; the phone leg is not attached (offline).
-        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+        deliver_to_peer(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop);
+        // Phone sends; the desktop leg is not attached either.
+        deliver_to_peer(&state, &envelope("pair", Role::Phone, 1), Role::Phone);
 
-        let fired = push.fired.lock().unwrap();
-        assert_eq!(
-            *fired,
-            vec![(pairing, "tok".to_string(), ApnsEnvironment::Sandbox)]
-        );
+        assert!(push.fired.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1526,7 +1605,7 @@ mod tests {
         let (phone, mut rx) = conn_handle("conn_phone");
         state.registry.attach(&pairing, Role::Phone, phone);
 
-        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
+        deliver_to_peer(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop);
 
         // Forwarded to the phone, and no push fired.
         assert!(matches!(rx.try_recv(), Ok(RelayFrame::Envelope(_))));
@@ -1534,20 +1613,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_phone_without_token_is_not_pushed() {
-        let push = Arc::new(RecordingPush::default());
-        let state = state_with_push(push.clone());
-        deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop).await;
-        assert!(push.fired.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn stuck_peer_does_not_block_the_forwarding_sender() {
         // remote-control-0ef.6: a peer whose outbound channel is jammed (a slow
         // or half-open zombie that never drains) must not back-pressure the
-        // healthy sender. `deliver_or_push` is the exact call the sender's read
-        // loop awaits per envelope; it must return promptly instead of parking
-        // on the full channel.
+        // healthy sender. `deliver_to_peer` is the exact call the sender's read
+        // loop makes per envelope; it is synchronous and must return instead of
+        // parking on the full channel.
         let push = Arc::new(RecordingPush::default());
         let state = state_with_push(push.clone());
         let pairing = PairingId::new("pair");
@@ -1564,33 +1635,9 @@ mod tests {
             .expect("prime the jammed channel");
         state.registry.attach(&pairing, Role::Phone, phone);
 
-        // The forward must complete without awaiting the drained channel. A
-        // regression (reverting to `send().await`) would hang here until the
-        // test's timeout fires.
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            deliver_or_push(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop),
-        )
-        .await
-        .expect("deliver_or_push must not block on a jammed peer outbox");
-
-        // The peer is 'connected' (just slow), so no APNs push is fired — the
-        // dropped envelope stays buffered for the peer to resume.
-        assert!(push.fired.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn offline_desktop_is_never_pushed() {
-        let push = Arc::new(RecordingPush::default());
-        let state = state_with_push(push.clone());
-        let pairing = PairingId::new("pair");
-        state
-            .store
-            .register_push_token(pairing.clone(), "tok".into(), ApnsEnvironment::Sandbox)
-            .await;
-        // A phone→desktop envelope with the desktop offline must NOT push (only
-        // phones are push-addressed).
-        deliver_or_push(&state, &envelope("pair", Role::Phone, 1), Role::Phone).await;
+        // Returns (it cannot await); the dropped envelope stays buffered for
+        // the peer to resume, and nothing is pushed.
+        deliver_to_peer(&state, &envelope("pair", Role::Desktop, 1), Role::Desktop);
         assert!(push.fired.lock().unwrap().is_empty());
     }
 }

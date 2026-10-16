@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::apns::ApnsConfig;
+use crate::push::DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE;
 
 /// Log output format. Controlled by `LOG_FORMAT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,8 +121,8 @@ pub struct Config {
     pub claim_sweep_interval: Duration,
 
     /// APNs push credentials, if configured (spec §5.5). `None` disables push:
-    /// the relay still queues events for `resume`, it just can't wake a
-    /// backgrounded phone. Populated from `APNS_*` env vars by
+    /// the relay still authenticates and validates the desktop's `push_notify`
+    /// requests, it just cannot deliver the alerts. Populated from `APNS_*` env vars by
     /// [`ApnsConfig::from_env`]; never set by [`Config::new`] (test builds) so
     /// tests never need Apple secrets.
     pub apns: Option<ApnsConfig>,
@@ -142,6 +143,14 @@ pub struct Config {
     /// replaces — per-device challenge-response auth and the E2E crypto. It
     /// replaces the deploy-time IP allowlist that blocked roaming phones.
     pub relay_password: Option<String>,
+
+    /// Per-desktop budget of accepted pushes (`push_notify` over the WebSocket
+    /// and `POST /v1/push` together) per minute; over it the relay answers
+    /// `rate_limited` / HTTP 429 (spec §5.5.1, §5.5.3).
+    /// `PUSH_RATE_LIMIT_PER_MINUTE`, default
+    /// [`DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE`] (60). Zero or malformed falls back
+    /// to the default.
+    pub push_rate_limit_per_minute: u32,
 }
 
 impl Config {
@@ -163,6 +172,7 @@ impl Config {
             apns: None,
             store: StoreBackend::Memory,
             relay_password: None,
+            push_rate_limit_per_minute: DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE,
         }
     }
 
@@ -190,6 +200,8 @@ impl Config {
         // The relay password is read outside `from_vars` (like the store/APNs)
         // so no test ever has to thread a secret through the parser.
         config.relay_password = parse_relay_password(env::var("FLIGHTDECK_RELAY_PASSWORD").ok());
+        config.push_rate_limit_per_minute =
+            parse_push_rate_limit(env::var("PUSH_RATE_LIMIT_PER_MINUTE").ok());
         config
     }
 
@@ -260,6 +272,7 @@ impl Config {
             apns: None,
             store: StoreBackend::Memory,
             relay_password: None,
+            push_rate_limit_per_minute: DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE,
         }
     }
 }
@@ -274,6 +287,14 @@ impl Config {
 /// operator set.
 fn parse_relay_password(raw: Option<String>) -> Option<String> {
     raw.filter(|s| !s.trim().is_empty())
+}
+
+/// Parse `PUSH_RATE_LIMIT_PER_MINUTE`: a positive integer, else the default
+/// (unset, zero and malformed all fall back, per this module's convention).
+fn parse_push_rate_limit(raw: Option<String>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE)
 }
 
 #[cfg(test)]
@@ -394,6 +415,23 @@ mod tests {
         assert_eq!(
             parse_relay_password(Some(" pad ".to_string())),
             Some(" pad ".to_string())
+        );
+    }
+
+    #[test]
+    fn push_rate_limit_parses_or_defaults() {
+        assert_eq!(parse_push_rate_limit(None), 60);
+        assert_eq!(parse_push_rate_limit(Some("120".into())), 120);
+        assert_eq!(parse_push_rate_limit(Some(" 5 ".into())), 5);
+        assert_eq!(
+            parse_push_rate_limit(Some("0".into())),
+            60,
+            "zero → default"
+        );
+        assert_eq!(parse_push_rate_limit(Some("lots".into())), 60);
+        assert_eq!(
+            Config::new(0, LogFormat::Pretty, "t").push_rate_limit_per_minute,
+            60
         );
     }
 

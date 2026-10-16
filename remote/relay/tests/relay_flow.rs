@@ -1115,8 +1115,8 @@ async fn revoke_is_idempotent() {
 // ── push-token deregistration / per-machine mute (spec §5.5) ─────────────────
 
 /// A member phone registers then unregisters a pairing's push token: the relay
-/// acks both, the pairing survives (unlike revoke), and the token is gone — so an
-/// offline-phone envelope no longer wakes it via push.
+/// acks both, the pairing survives (unlike revoke), and the token is gone — so
+/// the desktop's `push_notify` no longer reaches this phone.
 #[tokio::test]
 async fn member_unregisters_push_token_without_unpairing() {
     let base = spawn_app().await;

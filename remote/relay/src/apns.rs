@@ -1,39 +1,38 @@
 //! APNs push sender (PRD §5.2/§9.1, spec §5.5/§11).
 //!
-//! When the desktop seals a `DesktopToPhone::Event` (needs-input / finished /
-//! error) and the phone is **offline**, the relay queues the envelope *and*
-//! fires an APNs notification against the pairing's registered token so the
-//! phone wakes, reconnects, `resume`s the queued envelope, and lands the user
-//! on the agent (spec §11 step 1).
+//! **The desktop decides pushes; the relay only delivers them (protocol v4).**
+//! When an agent needs input, hits an error, or is done, the desktop seals a
+//! `PushPayload` under the pairing's push key (spec §7.2) and asks the relay for
+//! exactly one visible alert with `push_notify` (over its WebSocket) or
+//! `POST /v1/push` (over HTTPS) — see [`crate::push`]. The relay builds one APNs
+//! request per accepted push ([`ApnsRequest::encrypted_alert`]) and sends it
+//! through the [`PushService`] seam. Queued envelopes trigger **no** push: an
+//! offline phone catches up on its next open/reconnect.
 //!
-//! **Zero-knowledge is preserved.** The relay is a blind pipe — it never
-//! decrypts an `EncryptedEnvelope`, so it *cannot* read an event's typed
-//! payload or deep link. The live offline path therefore fires a
-//! **content-available background wake** push ([`ApnsRequest::background_wake`]):
-//! no user content crosses the relay; the phone rebuilds the rich, typed,
-//! deep-linked notification locally from the decrypted `AgentEvent` (that
-//! mapping lives on the iOS side, `Features/Push`).
+//! **Zero-knowledge is preserved.** The alert's visible text is generic per
+//! class ([`generic_alert_body`], title [`ALERT_TITLE`]); the real title, body
+//! and deep link travel sealed in the `fd_push` object, which the phone's
+//! Notification Service Extension opens (`mutable-content: 1`) to replace the
+//! generic text. The relay copies `nonce`/`ciphertext` verbatim and never opens
+//! them; the only plaintext it sees is the pairing id, the event id and the
+//! `class`.
 //!
-//! The **typed** `AgentEvent → alert payload` mapping
-//! ([`notification_content`] / [`ApnsRequest::alert_for_event`]) is nonetheless
-//! implemented and tested here: it is the canonical, cross-checked contract for
-//! the APNs alert shape (aps alert + `deep_link` + `event_id`, deduped via
-//! `apns-collapse-id = event_id`, spec §6.4), usable directly by any
-//! plaintext-aware pusher (e.g. a future desktop-driven push once notification
-//! content is explicitly carried outside E2E, spec §5.5).
+//! The pre-v4 silent `content-available` wake push (one per envelope queued for
+//! an offline phone) and the plaintext `AgentEvent → alert` mapping are gone:
+//! iOS throttles and drops silent pushes, and one wake per envelope was noisy.
 //!
 //! **Credentials are injected, never hardcoded.** [`ApnsConfig`] carries the
 //! `.p8` ES256 auth key (PEM), key id, team id, and topic; a real network
 //! transport ([`ApnsTransport`]) is only compiled under the `apns-live` feature
 //! (it needs Apple credentials to exercise and is the deployment's manual
-//! step). Everything else — JWT construction, payload/request construction, and
-//! the offline-delivery decision — is unit-tested without any Apple secret,
-//! using a generated test key and a recording transport.
+//! step). Everything else — JWT construction, request construction, retry and
+//! dead-token purge — is unit-tested without any Apple secret, using a
+//! generated test key and a recording transport.
 
 use crate::store::RelayStore;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use flightdeck_remote_protocol::{AgentEvent, ApnsEnvironment, EventKind, PairingId};
+use flightdeck_remote_protocol::{ApnsEnvironment, PairingId, PushClass, PushNotifyBody};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use std::sync::{Arc, Mutex};
@@ -55,7 +54,7 @@ pub struct ApnsConfig {
     pub auth_key_pem: String,
     /// Which APNs host to target when a token doesn't carry its own
     /// environment (tokens registered by the phone do — see
-    /// [`ApnsPushService::notify_offline`]).
+    /// [`PushService::push_alert`]).
     pub default_environment: ApnsEnvironment,
 }
 
@@ -76,7 +75,7 @@ impl ApnsConfig {
     /// Read the APNs config from the environment, returning `None` (push
     /// disabled) unless *all* required pieces are present. Missing or unreadable
     /// pieces disable push rather than failing relay startup — the relay still
-    /// routes and queues; it just cannot wake an offline phone.
+    /// routes and queues; it just cannot deliver the desktop's alerts.
     ///
     /// Required: `APNS_TEAM_ID`, `APNS_KEY_ID`, `APNS_TOPIC`, and the auth key
     /// via **either** `APNS_AUTH_KEY_PEM` (the `.p8` contents inline) or
@@ -99,8 +98,8 @@ impl ApnsConfig {
     /// Split out to be testable without mutating process environment, which is
     /// global state shared by every test in the binary. Returning `None` here is
     /// what silently disables push in production, so it is worth asserting
-    /// directly rather than inferring from a relay that simply never wakes a
-    /// phone.
+    /// directly rather than inferring from a relay whose alerts simply never
+    /// arrive.
     fn from_vars(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
         let non_empty = |key: &str| var(key).filter(|s| !s.trim().is_empty());
 
@@ -139,13 +138,13 @@ pub enum JwtError {
 /// (remote-control-0ef.15).
 pub const JWT_REFRESH_SECS: i64 = 20 * 60;
 
-/// Store-and-forward window for the background wake push, in seconds. The
-/// `apns-expiration` header is an *absolute* unix time; a non-zero value tells
-/// APNs to hold and retry delivery to a briefly-unreachable phone rather than
-/// deliver-once-or-discard (`apns-expiration: 0`). Five minutes survives a
-/// short offline/low-power blip while bounding how stale a wake can be
-/// (remote-control-0ef.5).
-pub const WAKE_EXPIRATION_WINDOW_SECS: i64 = 5 * 60;
+/// Store-and-forward window for an alert push, in seconds (spec §5.5.2: now +
+/// 24 h). The `apns-expiration` header is an *absolute* unix time; a non-zero
+/// value tells APNs to hold and retry delivery to an unreachable phone rather
+/// than deliver-once-or-discard (`apns-expiration: 0`). A day covers a phone
+/// that is off or out of coverage for a while; the collapse id keeps a retried
+/// push for the same event from stacking up.
+pub const ALERT_EXPIRATION_WINDOW_SECS: i64 = 24 * 60 * 60;
 
 /// Default number of send attempts (1 initial + retries) for a transient push
 /// failure before giving up (remote-control-0ef.14).
@@ -188,11 +187,20 @@ pub fn build_jwt(config: &ApnsConfig, now_secs: i64) -> Result<String, JwtError>
 pub enum InterruptionLevel {
     /// Presented immediately, may break through Focus (needs-input, PRD §5.2).
     TimeSensitive,
-    /// Standard delivery (finished / error).
+    /// Standard delivery (error / done).
     Active,
 }
 
 impl InterruptionLevel {
+    /// The level for a push class (spec §5.5.2): `time-sensitive` for
+    /// `needs_input`, `active` for `error` and `done`.
+    pub fn for_class(class: PushClass) -> Self {
+        match class {
+            PushClass::NeedsInput => InterruptionLevel::TimeSensitive,
+            PushClass::Error | PushClass::Done => InterruptionLevel::Active,
+        }
+    }
+
     /// The `aps."interruption-level"` wire string.
     pub fn wire(self) -> &'static str {
         match self {
@@ -202,73 +210,25 @@ impl InterruptionLevel {
     }
 }
 
-/// The display content of a typed notification. The deep link and event id are
-/// carried separately on [`ApnsRequest`] (they are routing/dedup metadata, not
-/// shown text).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NotificationContent {
-    /// Notification title, e.g. `fix-login needs your input`.
-    pub title: String,
-    /// Notification body, e.g. the pending question or the finish summary.
-    pub body: String,
-    /// The sound file to play (`needs_input.caf` for the urgent case, else the
-    /// system default) — the "distinct sound" of PRD §5.2.
-    pub sound: String,
-    /// How urgently to present it.
-    pub interruption_level: InterruptionLevel,
-}
+/// The generic `aps.alert.title` of every push (spec §5.5.2). Never content:
+/// the phone's Notification Service Extension replaces it with the sealed
+/// title.
+pub const ALERT_TITLE: &str = "FlightDeck";
 
-/// Sound played for a *needs input* notification (PRD §5.2 "distinct sound").
-/// Bundled with the app; falls back to the default if absent.
-pub const NEEDS_INPUT_SOUND: &str = "needs_input.caf";
 /// The system default notification sound.
 pub const DEFAULT_SOUND: &str = "default";
 
-/// Map a typed [`AgentEvent`] to its notification display content (PRD §5.2
-/// copy). This is the canonical mapping shared, in spirit, with the iOS
-/// `NotificationContentMapper` (mirrored, then cross-checked in tests).
-pub fn notification_content(event: &AgentEvent) -> NotificationContent {
-    match &event.kind {
-        EventKind::NeedsInput { preview } => NotificationContent {
-            title: event.title.clone(),
-            body: preview.clone(),
-            sound: NEEDS_INPUT_SOUND.to_string(),
-            interruption_level: InterruptionLevel::TimeSensitive,
-        },
-        EventKind::Finished {
-            summary,
-            files_changed,
-            ready_to_push,
-        } => {
-            // "18 files changed · ready to push" (PRD §5.2). The summary, when
-            // present, follows as extra context.
-            let files = format!(
-                "{files_changed} file{} changed",
-                if *files_changed == 1 { "" } else { "s" }
-            );
-            let ready = if *ready_to_push {
-                " · ready to push"
-            } else {
-                ""
-            };
-            let body = if summary.is_empty() {
-                format!("{files}{ready}")
-            } else {
-                format!("{files}{ready} · {summary}")
-            };
-            NotificationContent {
-                title: event.title.clone(),
-                body,
-                sound: DEFAULT_SOUND.to_string(),
-                interruption_level: InterruptionLevel::Active,
-            }
-        }
-        EventKind::Error { message } => NotificationContent {
-            title: event.title.clone(),
-            body: message.clone(),
-            sound: DEFAULT_SOUND.to_string(),
-            interruption_level: InterruptionLevel::Active,
-        },
+/// Version of the `fd_push` object layout in the APNs payload (spec §5.5.2).
+pub const FD_PUSH_VERSION: u32 = 1;
+
+/// The generic `aps.alert.body` for a push class (spec §5.5.2). It is what the
+/// phone shows if its Notification Service Extension cannot open the sealed
+/// payload, so it names the class and nothing else.
+pub fn generic_alert_body(class: PushClass) -> &'static str {
+    match class {
+        PushClass::NeedsInput => "An agent needs your input",
+        PushClass::Error => "An agent hit an error",
+        PushClass::Done => "An agent is done",
     }
 }
 
@@ -296,70 +256,59 @@ pub struct ApnsRequest {
 }
 
 impl ApnsRequest {
-    /// Build the **typed alert** request for an event: the aps alert (title /
-    /// body / sound / interruption level) plus `event_id` and the `deep_link`
-    /// so a tap lands on the agent. `apns-collapse-id` is set to the event id so
-    /// a queued-then-replayed event coalesces into a single notification rather
-    /// than double-firing (spec §6.4 dedup).
-    pub fn alert_for_event(
+    /// Build the **encrypted alert** request for a desktop-requested push
+    /// (spec §5.5.2): a visible alert with generic, per-class text, plus the
+    /// sealed payload in `fd_push` for the phone's Notification Service
+    /// Extension to open (`mutable-content: 1`).
+    ///
+    /// The relay stays zero-knowledge: the only plaintext beyond the generic
+    /// strings is the `class`, the pairing id (also the `thread-id`, grouping
+    /// one Mac's alerts) and the event id. `nonce` and `ciphertext` are copied
+    /// verbatim and never opened.
+    ///
+    /// Headers: `apns-push-type: alert`, `apns-priority: 10`,
+    /// `apns-collapse-id: <event_id>` (a retried push for the same event
+    /// replaces the alert instead of duplicating it) and a non-zero
+    /// `apns-expiration` of `now_secs + `[`ALERT_EXPIRATION_WINDOW_SECS`] so
+    /// APNs stores and forwards to a phone that is offline for a while.
+    pub fn encrypted_alert(
         config: &ApnsConfig,
         jwt: &str,
         device_token: &str,
         environment: ApnsEnvironment,
-        event: &AgentEvent,
+        push: &PushNotifyBody,
+        now_secs: i64,
     ) -> Self {
-        let content = notification_content(event);
-        let dl = &event.deep_link;
         let body = serde_json::json!({
             "aps": {
-                "alert": { "title": content.title, "body": content.body },
-                "sound": content.sound,
-                "interruption-level": content.interruption_level.wire(),
+                "alert": {
+                    "title": ALERT_TITLE,
+                    "body": generic_alert_body(push.class),
+                },
                 "mutable-content": 1,
+                "sound": DEFAULT_SOUND,
+                "interruption-level": InterruptionLevel::for_class(push.class).wire(),
+                "thread-id": push.pairing_id.as_str(),
             },
-            "event_id": event.event_id,
-            "deep_link": {
-                "project_id": dl.project_id,
-                "session_id": dl.session_id,
-                "item_id": dl.item_id,
+            "fd_push": {
+                "v": FD_PUSH_VERSION,
+                "pairing_id": push.pairing_id.as_str(),
+                "event_id": push.event_id.as_str(),
+                "class": push.class.as_str(),
+                "nonce": push.nonce,
+                "ciphertext": push.ciphertext,
             },
         });
-        // A user-facing alert is immediate (priority 10); it keeps the
-        // deliver-once expiration ("0") — store-and-forward is the wake push's
-        // concern (remote-control-0ef.5), and this typed-alert path is not the
-        // live offline path.
-        let mut headers = base_headers(config, jwt, "alert", "10", "0");
-        headers.push(("apns-collapse-id".to_string(), event.event_id.to_string()));
+        let expiration = (now_secs + ALERT_EXPIRATION_WINDOW_SECS).to_string();
+        let mut headers = base_headers(config, jwt, "alert", "10", &expiration);
+        headers.push((
+            "apns-collapse-id".to_string(),
+            push.event_id.as_str().to_string(),
+        ));
         Self {
             authority: host(environment).to_string(),
             path: format!("/3/device/{device_token}"),
             headers,
-            body: serde_json::to_vec(&body).expect("json serialization is infallible here"),
-        }
-    }
-
-    /// Build a **content-available background wake** request: the zero-knowledge
-    /// live path. No user content — it only nudges the phone to reconnect and
-    /// `resume` the queued envelope, after which the phone builds the real
-    /// notification locally from the decrypted event.
-    ///
-    /// `now_secs` (unix seconds) sets a **non-zero** `apns-expiration`
-    /// (`now + `[`WAKE_EXPIRATION_WINDOW_SECS`]) so APNs stores and retries the
-    /// wake to a phone that is momentarily unreachable, instead of discarding it
-    /// on the first failed attempt (remote-control-0ef.5).
-    pub fn background_wake(
-        config: &ApnsConfig,
-        jwt: &str,
-        device_token: &str,
-        environment: ApnsEnvironment,
-        now_secs: i64,
-    ) -> Self {
-        let body = serde_json::json!({ "aps": { "content-available": 1 } });
-        let expiration = (now_secs + WAKE_EXPIRATION_WINDOW_SECS).to_string();
-        Self {
-            authority: host(environment).to_string(),
-            path: format!("/3/device/{device_token}"),
-            headers: base_headers(config, jwt, "background", "5", &expiration),
             body: serde_json::to_vec(&body).expect("json serialization is infallible here"),
         }
     }
@@ -427,8 +376,9 @@ pub fn classify_apns_failure(status: u16, reason: Option<&str>) -> ApnsSendError
 pub trait ApnsTransport: Send + Sync {
     /// Deliver one request to APNs. On failure the error is classified
     /// (transient vs permanent) so the caller can retry or purge; it is never
-    /// propagated into the connection state machine (a missed wake push is
-    /// recovered by the phone's own reconnect).
+    /// propagated into the connection state machine (a dropped alert is
+    /// reported in the [`PushOutcome`]; the phone still catches up on its next
+    /// open).
     async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError>;
 }
 
@@ -452,36 +402,88 @@ impl TokenPurge for Arc<dyn RelayStore> {
     }
 }
 
-/// The relay's offline-delivery hook. Fired from the envelope path when a
-/// desktop→phone envelope is queued for a phone that is **not** currently
-/// connected (see `crate::session`). Kept as a trait so the default build wires
-/// a no-op and tests wire a recording double.
+/// What happened to one push attempt, for the per-push log line (spec §5.5.2,
+/// remote-control-ygi) and for tests. Never carries content or the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// APNs accepted the request.
+    Sent,
+    /// APNs is not configured on this relay (no `.p8` credentials, or a build
+    /// without the `apns-live` feature): nothing was sent.
+    NotConfigured,
+    /// The provider JWT could not be minted (bad `.p8` key): nothing was sent.
+    JwtFailed,
+    /// Every attempt failed with a transient error; the push was dropped.
+    TransientFailed {
+        /// How many send attempts were made.
+        attempts: u32,
+    },
+    /// APNs rejected the device token permanently (410 / `BadDeviceToken`);
+    /// it was not retried. `purged` says whether the token was removed from
+    /// the store (it is whenever a purge hook is wired, i.e. in production).
+    Permanent {
+        /// Whether the dead token was purged from the store.
+        purged: bool,
+    },
+}
+
+impl PushOutcome {
+    /// A short, stable label for log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            PushOutcome::Sent => "sent",
+            PushOutcome::NotConfigured => "apns_not_configured",
+            PushOutcome::JwtFailed => "jwt_failed",
+            PushOutcome::TransientFailed { .. } => "transient_failed_after_retries",
+            PushOutcome::Permanent { purged: true } => "permanent_token_purged",
+            PushOutcome::Permanent { purged: false } => "permanent",
+        }
+    }
+}
+
+impl std::fmt::Display for PushOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// The relay's push-delivery seam: send one encrypted alert (spec §5.5.2) for
+/// a desktop-requested push. Called only from [`crate::push`], after the push
+/// was authenticated and validated and a token was found. Kept as a trait so
+/// the default build wires a no-op and tests wire a recording double.
 #[async_trait]
 pub trait PushService: Send + Sync {
-    /// The phone for `pairing` is offline and an envelope was just queued for
-    /// it; wake it via APNs using its registered `token`/`environment`.
-    async fn notify_offline(&self, pairing: &PairingId, token: &str, environment: ApnsEnvironment);
+    /// Deliver `push` as a visible alert to the phone holding `token` in
+    /// `environment`, and report what happened. Never fails the caller: a
+    /// dropped push is reported in the outcome and logged by the caller.
+    async fn push_alert(
+        &self,
+        token: &str,
+        environment: ApnsEnvironment,
+        push: &PushNotifyBody,
+    ) -> PushOutcome;
 }
 
 /// The default [`PushService`]: does nothing. Used when APNs is not configured
-/// (no `.p8` credentials) — the relay still queues events for `resume`, it just
-/// can't wake a backgrounded phone.
+/// (no `.p8` credentials) — the relay still authenticates and validates pushes,
+/// it just cannot deliver them.
 pub struct NoopPushService;
 
 #[async_trait]
 impl PushService for NoopPushService {
-    async fn notify_offline(
+    async fn push_alert(
         &self,
-        _pairing: &PairingId,
         _token: &str,
         _environment: ApnsEnvironment,
-    ) {
+        _push: &PushNotifyBody,
+    ) -> PushOutcome {
+        PushOutcome::NotConfigured
     }
 }
 
-/// The live [`PushService`]: mints (and caches) a provider JWT and sends a
-/// background-wake push through the injected [`ApnsTransport`], retrying
-/// transient failures and purging a permanently-dead token.
+/// The live [`PushService`]: mints (and caches) a provider JWT and sends the
+/// encrypted alert through the injected [`ApnsTransport`], retrying transient
+/// failures and purging a permanently-dead token.
 pub struct ApnsPushService<T: ApnsTransport> {
     config: ApnsConfig,
     transport: T,
@@ -514,7 +516,7 @@ impl<T: ApnsTransport> ApnsPushService<T> {
     }
 
     /// Build with an injected clock (tests). Deterministic: the same `now_secs`
-    /// drives both JWT caching and the wake expiration.
+    /// drives both JWT caching and the alert expiration.
     pub fn with_clock(
         config: ApnsConfig,
         transport: T,
@@ -563,51 +565,65 @@ impl<T: ApnsTransport> ApnsPushService<T> {
 
 #[async_trait]
 impl<T: ApnsTransport> PushService for ApnsPushService<T> {
-    async fn notify_offline(&self, pairing: &PairingId, token: &str, environment: ApnsEnvironment) {
+    async fn push_alert(
+        &self,
+        token: &str,
+        environment: ApnsEnvironment,
+        push: &PushNotifyBody,
+    ) -> PushOutcome {
         let now = (self.now_secs)();
         let jwt = match self.provider_jwt(now) {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!(?e, %pairing, "apns: could not mint JWT; skipping wake push");
-                return;
+                tracing::warn!(?e, pairing = %push.pairing_id, "apns: could not mint JWT");
+                return PushOutcome::JwtFailed;
             }
         };
-        let request = ApnsRequest::background_wake(&self.config, &jwt, token, environment, now);
+        let request =
+            ApnsRequest::encrypted_alert(&self.config, &jwt, token, environment, push, now);
 
         for attempt in 1..=self.max_attempts {
             match self.transport.send(request.clone()).await {
-                Ok(()) => return,
+                Ok(()) => return PushOutcome::Sent,
                 Err(ApnsSendError::Permanent(reason)) => {
                     // The token is dead: stop firing at it and purge so the
                     // phone is prompted to re-register (remote-control-0ef.14).
-                    tracing::warn!(
-                        %reason, %pairing,
-                        "apns: token permanently rejected; purging (no retry)"
+                    tracing::debug!(
+                        %reason, pairing = %push.pairing_id,
+                        "apns: token permanently rejected (no retry)"
                     );
-                    if let Some(purge) = &self.purge {
-                        purge.purge(pairing).await;
-                    }
-                    return;
+                    let purged = match &self.purge {
+                        Some(purge) => {
+                            purge.purge(&push.pairing_id).await;
+                            true
+                        }
+                        None => false,
+                    };
+                    return PushOutcome::Permanent { purged };
                 }
                 Err(ApnsSendError::Transient(reason)) => {
                     if attempt >= self.max_attempts {
-                        // Best-effort: the phone's own reconnect recovers a
-                        // missed wake.
-                        tracing::warn!(
-                            %reason, %pairing, attempts = self.max_attempts,
-                            "apns: wake push failed after retries; giving up"
+                        tracing::debug!(
+                            %reason, pairing = %push.pairing_id, attempts = self.max_attempts,
+                            "apns: push failed after retries; giving up"
                         );
-                        return;
+                        return PushOutcome::TransientFailed {
+                            attempts: self.max_attempts,
+                        };
                     }
                     tracing::debug!(
-                        %reason, %pairing, attempt,
-                        "apns: transient wake push failure; retrying"
+                        %reason, pairing = %push.pairing_id, attempt,
+                        "apns: transient push failure; retrying"
                     );
                     if !self.backoff.is_zero() {
                         tokio::time::sleep(self.backoff).await;
                     }
                 }
             }
+        }
+        // `max_attempts >= 1`, so the loop always returns; kept total anyway.
+        PushOutcome::TransientFailed {
+            attempts: self.max_attempts,
         }
     }
 }
@@ -679,7 +695,7 @@ impl<T: ApnsTransport + ?Sized> ApnsTransport for std::sync::Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flightdeck_remote_protocol::{DeepLink, EventId, ItemId, ProjectId, SessionId};
+    use flightdeck_remote_protocol::EventId;
     use p256::ecdsa::{signature::Verifier, VerifyingKey};
     use p256::pkcs8::EncodePrivateKey;
     use p256::SecretKey;
@@ -831,20 +847,18 @@ mod tests {
         assert!(config.auth_key_pem.contains('x'));
     }
 
-    fn needs_input_event() -> AgentEvent {
-        AgentEvent {
-            event_id: EventId::new("evt_1"),
-            kind: EventKind::NeedsInput {
-                preview: "Allow `rm -rf dist/`?".into(),
-            },
-            deep_link: DeepLink {
-                project_id: ProjectId::new("proj_1"),
-                session_id: SessionId::new("sess_1"),
-                item_id: Some(ItemId::new("item_9")),
-            },
-            occurred_at_ms: 1_752_412_802_000,
-            title: "fix-login needs your input".into(),
+    fn push(class: PushClass) -> PushNotifyBody {
+        PushNotifyBody {
+            pairing_id: PairingId::new("pair_ruud_mbp"),
+            event_id: EventId::new("6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"),
+            class,
+            nonce: "AAECAwQFBgcICQoL".into(),
+            ciphertext: "AP5g0H3CJyAB8Vf8b/H9pSudjvO+qoKbU/jVgc5XAl4S".into(),
         }
+    }
+
+    fn header_map(req: &ApnsRequest) -> std::collections::HashMap<String, String> {
+        req.headers.iter().cloned().collect()
     }
 
     #[test]
@@ -881,138 +895,108 @@ mod tests {
         assert_eq!(build_jwt(&config, 0), Err(JwtError::BadKey));
     }
 
+    /// Spec §5.5.2: the encrypted alert's headers — alert push type, priority
+    /// 10, collapse id = event id, a 24 h store-and-forward expiration, topic.
     #[test]
-    fn needs_input_maps_to_urgent_distinct_sound() {
-        let content = notification_content(&needs_input_event());
-        assert_eq!(content.title, "fix-login needs your input");
-        assert_eq!(content.body, "Allow `rm -rf dist/`?");
-        assert_eq!(content.sound, NEEDS_INPUT_SOUND);
-        assert_eq!(content.interruption_level, InterruptionLevel::TimeSensitive);
-    }
-
-    #[test]
-    fn finished_maps_to_files_and_ready_copy() {
-        let event = AgentEvent {
-            event_id: EventId::new("evt_2"),
-            kind: EventKind::Finished {
-                summary: "SpecAssistant".into(),
-                files_changed: 18,
-                ready_to_push: true,
-            },
-            deep_link: DeepLink {
-                project_id: ProjectId::new("p"),
-                session_id: SessionId::new("s"),
-                item_id: None,
-            },
-            occurred_at_ms: 0,
-            title: "add-tests finished its turn".into(),
-        };
-        let content = notification_content(&event);
-        assert_eq!(
-            content.body,
-            "18 files changed · ready to push · SpecAssistant"
-        );
-        assert_eq!(content.sound, DEFAULT_SOUND);
-        assert_eq!(content.interruption_level, InterruptionLevel::Active);
-    }
-
-    #[test]
-    fn single_file_change_is_not_pluralized() {
-        let event = AgentEvent {
-            event_id: EventId::new("evt_3"),
-            kind: EventKind::Finished {
-                summary: String::new(),
-                files_changed: 1,
-                ready_to_push: false,
-            },
-            deep_link: DeepLink {
-                project_id: ProjectId::new("p"),
-                session_id: SessionId::new("s"),
-                item_id: None,
-            },
-            occurred_at_ms: 0,
-            title: "t".into(),
-        };
-        assert_eq!(notification_content(&event).body, "1 file changed");
-    }
-
-    #[test]
-    fn alert_request_carries_deeplink_and_dedup_collapse_id() {
+    fn encrypted_alert_headers() {
         let (config, _) = test_config();
-        let event = needs_input_event();
-        let req = ApnsRequest::alert_for_event(
+        let now = 1_752_412_802;
+        let req = ApnsRequest::encrypted_alert(
             &config,
             "jwt-abc",
             "devicetoken123",
             ApnsEnvironment::Sandbox,
-            &event,
+            &push(PushClass::NeedsInput),
+            now,
         );
 
         // Sandbox environment picks the sandbox host; path targets the token.
         assert_eq!(req.authority, "api.sandbox.push.apple.com");
         assert_eq!(req.path, "/3/device/devicetoken123");
 
-        let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
+        let headers = header_map(&req);
         assert_eq!(headers["authorization"], "bearer jwt-abc");
         assert_eq!(headers["apns-topic"], config.topic);
         assert_eq!(headers["apns-push-type"], "alert");
         assert_eq!(headers["apns-priority"], "10");
-        // event_id doubles as the APNs collapse id so a replayed event dedups.
-        assert_eq!(headers["apns-collapse-id"], "evt_1");
-
-        // Body: typed alert + deep link parseable straight back out (the shape
-        // the iOS `PushPayload` parser consumes) — the "both directions" check.
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-        assert_eq!(body["aps"]["alert"]["title"], "fix-login needs your input");
-        assert_eq!(body["aps"]["alert"]["body"], "Allow `rm -rf dist/`?");
-        assert_eq!(body["aps"]["interruption-level"], "time-sensitive");
-        assert_eq!(body["aps"]["sound"], NEEDS_INPUT_SOUND);
-        assert_eq!(body["event_id"], "evt_1");
-        assert_eq!(body["deep_link"]["project_id"], "proj_1");
-        assert_eq!(body["deep_link"]["session_id"], "sess_1");
-        assert_eq!(body["deep_link"]["item_id"], "item_9");
-    }
-
-    #[test]
-    fn background_wake_carries_no_content() {
-        let (config, _) = test_config();
-        let req = ApnsRequest::background_wake(
-            &config,
-            "jwt-xyz",
-            "tok",
-            ApnsEnvironment::Production,
-            1_752_412_802,
+        assert_eq!(
+            headers["apns-collapse-id"],
+            "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"
         );
-        assert_eq!(req.authority, "api.push.apple.com");
-        let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
-        assert_eq!(headers["apns-push-type"], "background");
-        assert_eq!(headers["apns-priority"], "5");
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-        assert_eq!(body["aps"]["content-available"], 1);
-        assert!(
-            body.get("deep_link").is_none(),
-            "zero-knowledge: no content"
-        );
-    }
-
-    /// remote-control-0ef.5: the wake push must use a non-zero, future
-    /// `apns-expiration` so APNs stores and retries to a briefly-offline phone.
-    #[test]
-    fn background_wake_has_nonzero_future_expiration() {
-        let (config, _) = test_config();
-        let now = 1_752_412_802;
-        let req = ApnsRequest::background_wake(
-            &config,
-            "jwt-xyz",
-            "tok",
-            ApnsEnvironment::Production,
-            now,
-        );
-        let headers: std::collections::HashMap<_, _> = req.headers.iter().cloned().collect();
         let expiration: i64 = headers["apns-expiration"].parse().unwrap();
-        assert_ne!(expiration, 0, "must not be deliver-once-or-discard");
-        assert!(expiration > now, "expiration is a future unix time");
-        assert_eq!(expiration, now + WAKE_EXPIRATION_WINDOW_SECS);
+        assert_eq!(expiration, now + 24 * 60 * 60, "now + 24 h, never 0");
+        assert_eq!(headers.len(), 6, "no unexpected headers: {headers:?}");
+    }
+
+    /// Spec §5.5.2: the body is exactly the generic alert + `fd_push`, and the
+    /// whole thing is the documented shape — nothing else leaks into it.
+    #[test]
+    fn encrypted_alert_body_is_exactly_the_spec_shape() {
+        let (config, _) = test_config();
+        let p = push(PushClass::NeedsInput);
+        let req =
+            ApnsRequest::encrypted_alert(&config, "jwt", "tok", ApnsEnvironment::Production, &p, 0);
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let expected = serde_json::json!({
+            "aps": {
+                "alert": { "title": "FlightDeck", "body": "An agent needs your input" },
+                "mutable-content": 1,
+                "sound": "default",
+                "interruption-level": "time-sensitive",
+                "thread-id": "pair_ruud_mbp",
+            },
+            "fd_push": {
+                "v": 1,
+                "pairing_id": "pair_ruud_mbp",
+                "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+                "class": "needs_input",
+                "nonce": p.nonce,
+                "ciphertext": p.ciphertext,
+            },
+        });
+        assert_eq!(body, expected);
+    }
+
+    /// Generic text and interruption level per class (spec §5.5.2).
+    #[test]
+    fn encrypted_alert_generic_text_and_level_per_class() {
+        let (config, _) = test_config();
+        for (class, text, level) in [
+            (
+                PushClass::NeedsInput,
+                "An agent needs your input",
+                "time-sensitive",
+            ),
+            (PushClass::Error, "An agent hit an error", "active"),
+            (PushClass::Done, "An agent is done", "active"),
+        ] {
+            let req = ApnsRequest::encrypted_alert(
+                &config,
+                "jwt",
+                "tok",
+                ApnsEnvironment::Production,
+                &push(class),
+                0,
+            );
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["aps"]["alert"]["title"], ALERT_TITLE);
+            assert_eq!(body["aps"]["alert"]["body"], text);
+            assert_eq!(body["aps"]["interruption-level"], level);
+            assert_eq!(body["fd_push"]["class"], class.as_str());
+        }
+    }
+
+    /// The largest push the relay accepts still fits APNs' 4 KiB payload cap.
+    #[test]
+    fn largest_accepted_push_fits_apns_payload_limit() {
+        let (config, _) = test_config();
+        let mut p = push(PushClass::NeedsInput);
+        p.ciphertext = "A".repeat(flightdeck_remote_protocol::relay::MAX_PUSH_CIPHERTEXT_B64_LEN);
+        p.event_id = EventId::new("e".repeat(crate::push::MAX_EVENT_ID_BYTES));
+        p.pairing_id = PairingId::new("p".repeat(64));
+        let req =
+            ApnsRequest::encrypted_alert(&config, "jwt", "tok", ApnsEnvironment::Production, &p, 0);
+        assert!(req.body.len() <= 4096, "payload {} bytes", req.body.len());
     }
 
     #[test]
@@ -1104,21 +1088,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_service_sends_a_background_wake() {
+    async fn push_service_sends_one_encrypted_alert() {
         let (config, _) = test_config();
         let transport = std::sync::Arc::new(RecordingTransport::default());
         let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802);
-        service
-            .notify_offline(&PairingId::new("pair_1"), "tok_1", ApnsEnvironment::Sandbox)
+        let outcome = service
+            .push_alert("tok_1", ApnsEnvironment::Sandbox, &push(PushClass::Done))
             .await;
+        assert_eq!(outcome, PushOutcome::Sent);
 
         let sent = transport.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].authority, "api.sandbox.push.apple.com");
         assert_eq!(sent[0].path, "/3/device/tok_1");
-        let headers: std::collections::HashMap<_, _> = sent[0].headers.iter().cloned().collect();
-        assert_eq!(headers["apns-push-type"], "background");
+        let headers = header_map(&sent[0]);
+        assert_eq!(headers["apns-push-type"], "alert");
+        assert_eq!(
+            headers["apns-collapse-id"],
+            "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"
+        );
         assert!(headers["authorization"].starts_with("bearer "));
+    }
+
+    #[tokio::test]
+    async fn noop_service_reports_not_configured() {
+        let outcome = NoopPushService
+            .push_alert("tok", ApnsEnvironment::Sandbox, &push(PushClass::Error))
+            .await;
+        assert_eq!(outcome, PushOutcome::NotConfigured);
+        assert_eq!(outcome.label(), "apns_not_configured");
+    }
+
+    #[tokio::test]
+    async fn bad_key_reports_jwt_failed_and_sends_nothing() {
+        let (mut config, _) = test_config();
+        config.auth_key_pem = "not a pem".into();
+        let transport = std::sync::Arc::new(RecordingTransport::default());
+        let service = ApnsPushService::with_clock(config, transport.clone(), || 1);
+        let outcome = service
+            .push_alert("tok", ApnsEnvironment::Sandbox, &push(PushClass::Error))
+            .await;
+        assert_eq!(outcome, PushOutcome::JwtFailed);
+        assert!(transport.sent.lock().unwrap().is_empty());
     }
 
     /// remote-control-0ef.15: the provider JWT is minted once, reused within the
@@ -1135,20 +1146,20 @@ mod tests {
             now_reader.load(Ordering::SeqCst) as i64
         });
 
-        let pairing = PairingId::new("pair_1");
+        let p = push(PushClass::NeedsInput);
         // First push mints.
         service
-            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .push_alert("tok", ApnsEnvironment::Sandbox, &p)
             .await;
         // A second push a minute later reuses (inside the 20-min window).
         now.store(1_000_000 + 60, Ordering::SeqCst);
         service
-            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .push_alert("tok", ApnsEnvironment::Sandbox, &p)
             .await;
         // A push past the window re-mints.
         now.store(1_000_000 + JWT_REFRESH_SECS as usize + 1, Ordering::SeqCst);
         service
-            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+            .push_alert("tok", ApnsEnvironment::Sandbox, &p)
             .await;
 
         let sent = transport.sent.lock().unwrap();
@@ -1179,10 +1190,11 @@ mod tests {
             .with_retry(3, Duration::ZERO)
             .with_purge(purge.clone());
 
-        service
-            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+        let outcome = service
+            .push_alert("tok", ApnsEnvironment::Sandbox, &push(PushClass::Done))
             .await;
 
+        assert_eq!(outcome, PushOutcome::Sent);
         assert_eq!(transport.calls(), 3, "two retries then success");
         assert!(
             purge.purged.lock().unwrap().is_empty(),
@@ -1206,10 +1218,11 @@ mod tests {
             .with_retry(3, Duration::ZERO)
             .with_purge(purge.clone());
 
-        service
-            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+        let outcome = service
+            .push_alert("tok", ApnsEnvironment::Sandbox, &push(PushClass::Done))
             .await;
 
+        assert_eq!(outcome, PushOutcome::TransientFailed { attempts: 3 });
         assert_eq!(transport.calls(), 3, "capped at max_attempts");
         assert!(purge.purged.lock().unwrap().is_empty());
     }
@@ -1227,15 +1240,17 @@ mod tests {
             .with_retry(3, Duration::ZERO)
             .with_purge(purge.clone());
 
-        let pairing = PairingId::new("pair_1");
-        service
-            .notify_offline(&pairing, "tok", ApnsEnvironment::Sandbox)
+        let p = push(PushClass::NeedsInput);
+        let outcome = service
+            .push_alert("tok", ApnsEnvironment::Sandbox, &p)
             .await;
 
+        assert_eq!(outcome, PushOutcome::Permanent { purged: true });
+        assert_eq!(outcome.label(), "permanent_token_purged");
         assert_eq!(transport.calls(), 1, "permanent failure is not retried");
         assert_eq!(
             *purge.purged.lock().unwrap(),
-            vec![pairing],
+            vec![p.pairing_id],
             "the dead token's pairing is purged"
         );
     }
@@ -1251,10 +1266,11 @@ mod tests {
         let service = ApnsPushService::with_clock(config, transport.clone(), || 1_752_412_802)
             .with_retry(3, Duration::ZERO);
 
-        service
-            .notify_offline(&PairingId::new("pair_1"), "tok", ApnsEnvironment::Sandbox)
+        let outcome = service
+            .push_alert("tok", ApnsEnvironment::Sandbox, &push(PushClass::Error))
             .await;
 
+        assert_eq!(outcome, PushOutcome::Permanent { purged: false });
         assert_eq!(transport.calls(), 1);
     }
 }

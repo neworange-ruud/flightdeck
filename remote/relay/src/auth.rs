@@ -73,14 +73,52 @@ pub fn verify_challenge(
     nonce: &[u8],
     signature_b64: &str,
 ) -> Result<(), AuthError> {
+    verify_signature(public_key_b64, nonce, signature_b64)
+}
+
+/// Verify an ECDSA P-256 / SHA-256 signature (raw `r ‖ s`, base64) over
+/// arbitrary `message` bytes against a registered device public key. The
+/// challenge-response ([`verify_challenge`]) and the HTTPS push request
+/// (spec §5.5.3, over `push_request_signing_message`) share this one check.
+pub fn verify_signature(
+    public_key_b64: &str,
+    message: &[u8],
+    signature_b64: &str,
+) -> Result<(), AuthError> {
     let verifying_key = parse_public_key(public_key_b64)?;
     let sig_bytes = b64()
         .decode(signature_b64)
         .map_err(|_| AuthError::BadSignature)?;
     let signature = Signature::from_slice(&sig_bytes).map_err(|_| AuthError::BadSignature)?;
     verifying_key
-        .verify(nonce, &signature)
+        .verify(message, &signature)
         .map_err(|_| AuthError::VerificationFailed)
+}
+
+/// Constant-time byte-slice equality for the shared relay-password gate
+/// (remote-control-uq7), used by both the WebSocket `hello` and the HTTPS push
+/// endpoint's `x-flightdeck-relay-password` header. Delegates to
+/// [`subtle::ConstantTimeEq`] so the compare takes the same time whether the
+/// presented password is wrong in the first byte or the last — a naive `==`
+/// short-circuits on the first mismatch and leaks the shared secret to a network
+/// attacker over many probes. Slice length is not itself secret (and `subtle`
+/// short-circuits on differing lengths); the password *contents* are what must
+/// not leak via timing.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    a.ct_eq(b).into()
+}
+
+/// Whether a presented relay password satisfies the configured one. An
+/// unconfigured relay (`expected == None`) admits everyone; a configured one
+/// requires a constant-time match, treating a missing password exactly like a
+/// wrong one so nothing leaks about which was the problem.
+pub fn relay_password_ok(expected: Option<&str>, presented: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(expected) => presented
+            .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes())),
+    }
 }
 
 /// Fill a fresh random challenge nonce. Uses the OS CSPRNG via `getrandom`;
