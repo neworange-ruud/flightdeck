@@ -398,6 +398,7 @@ impl TestClient {
             key_agreement_public_key: self.key_agreement_public_key_b64.clone(),
             role: self.role,
             claim_token_hint: hint.map(str::to_string),
+            direct_endpoint: None,
         })
         .await;
         match self.recv().await {

@@ -18,9 +18,11 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
+use flightdeck_remote_protocol::relay::MAX_PUSH_CIPHERTEXT_B64_LEN;
 use flightdeck_remote_protocol::{
-    CommandBody, DesktopToPhone, PermissionOption, PhoneCommand, PromptKind, PromptQuestion,
-    QuestionAnswer, RelayFrame, TranscriptItem,
+    CommandBody, DesktopToPhone, DirectEndpoint, PermissionOption, PhoneCommand, PromptKind,
+    PromptQuestion, PushClass, PushErrorBody, PushPayload, PushRequest, QuestionAnswer,
+    RelayErrorCode, RelayFrame, RelayMode, TranscriptItem,
 };
 use flightdeck_remote_protocol::{CommandId, ItemId, PromptId, SessionId};
 
@@ -70,6 +72,30 @@ where
     }
 }
 
+/// Round-trip one named fixture file `<fixtures>/<plane>/<name>.json` through
+/// `T`, returning the parsed value. For planes whose files are different types.
+fn check_file<T>(plane: &str, name: &str) -> T
+where
+    T: DeserializeOwned + Serialize,
+{
+    let path = fixtures_dir().join(plane).join(format!("{name}.json"));
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let original: Value = serde_json::from_str(&raw).unwrap();
+    let parsed: T = serde_json::from_value(original.clone())
+        .unwrap_or_else(|e| panic!("{plane}/{name}: deserialize failed: {e}"));
+    let reserialized = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(
+        reserialized, original,
+        "{plane}/{name}: re-serialized JSON differs from the fixture"
+    );
+    parsed
+}
+
+/// Parse one relay fixture by file name.
+fn relay_fixture(name: &str) -> RelayFrame {
+    check_file::<RelayFrame>("relay", name)
+}
+
 #[test]
 fn relay_frames_round_trip() {
     check_plane::<RelayFrame>("relay");
@@ -83,6 +109,145 @@ fn desktop_to_phone_round_trips() {
 #[test]
 fn phone_to_desktop_round_trips() {
     check_plane::<PhoneCommand>("phone_to_desktop");
+}
+
+#[test]
+fn push_payloads_round_trip() {
+    check_plane::<PushPayload>("push_payload");
+}
+
+#[test]
+fn push_http_bodies_round_trip() {
+    check_file::<PushRequest>("push_http", "push_request");
+    let err = check_file::<PushErrorBody>("push_http", "push_error");
+    assert_eq!(err.code, RelayErrorCode::UnknownPairing);
+}
+
+/// The v2-format fixtures (`hello_ok`, `pairing_offer`, `pairing_claimed`) carry
+/// none of the v4 optional fields and must still parse, with every new field
+/// `None` — and re-serialize without growing the new keys (the round-trip test
+/// above already proves the latter byte-for-byte).
+#[test]
+fn legacy_frames_parse_without_v4_fields() {
+    match relay_fixture("hello_ok") {
+        RelayFrame::HelloOk { relay_mode, .. } => assert_eq!(relay_mode, None),
+        other => panic!("expected hello_ok, got {other:?}"),
+    }
+    match relay_fixture("pairing_offer") {
+        RelayFrame::PairingOffer {
+            direct_endpoint, ..
+        } => assert_eq!(direct_endpoint, None),
+        other => panic!("expected pairing_offer, got {other:?}"),
+    }
+    match relay_fixture("pairing_claimed") {
+        RelayFrame::PairingClaimed {
+            direct_endpoint,
+            peer_device_public_key,
+            ..
+        } => {
+            assert_eq!(direct_endpoint, None);
+            assert_eq!(peer_device_public_key, None);
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+}
+
+/// The v4 fixtures carry their new fields, and each `pairing_claimed` copy fills
+/// only its own direction's field (spec §5.2).
+#[test]
+fn v4_frames_carry_new_fields() {
+    let endpoint = DirectEndpoint {
+        host: "ruuds-mbp.tail1234.ts.net".into(),
+        port: 47800,
+    };
+    match relay_fixture("hello_ok_push_only") {
+        RelayFrame::HelloOk { relay_mode, .. } => {
+            assert_eq!(relay_mode, Some(RelayMode::PushOnly))
+        }
+        other => panic!("expected hello_ok, got {other:?}"),
+    }
+    match relay_fixture("pairing_offer_direct") {
+        RelayFrame::PairingOffer {
+            direct_endpoint, ..
+        } => assert_eq!(direct_endpoint.as_ref(), Some(&endpoint)),
+        other => panic!("expected pairing_offer, got {other:?}"),
+    }
+    match relay_fixture("pairing_claimed_direct") {
+        RelayFrame::PairingClaimed {
+            direct_endpoint,
+            peer_device_public_key,
+            ..
+        } => {
+            assert_eq!(direct_endpoint.as_ref(), Some(&endpoint));
+            assert_eq!(peer_device_public_key, None, "phone-bound copy");
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+    match relay_fixture("pairing_claimed_to_desktop") {
+        RelayFrame::PairingClaimed {
+            direct_endpoint,
+            peer_device_public_key,
+            ..
+        } => {
+            assert_eq!(direct_endpoint, None, "desktop-bound copy");
+            assert!(peer_device_public_key.is_some());
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+    match relay_fixture("error_relay_mode_push_only") {
+        RelayFrame::Error { code, .. } => assert_eq!(code, RelayErrorCode::RelayModePushOnly),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+/// The `push_notify` fixture, the HTTPS request fixture and the
+/// `push_payload/needs_input.json` plaintext are the *same push* as the first
+/// case of `e2e_crypto/push_vectors.json`, so an implementation can check the
+/// whole chain (seal → frame → APNs → open) against one example.
+#[test]
+fn push_fixtures_match_the_push_vectors() {
+    let raw = fs::read_to_string(fixtures_dir().join("e2e_crypto/push_vectors.json")).unwrap();
+    let vectors: Value = serde_json::from_str(&raw).unwrap();
+    let case = &vectors["cases"][0];
+
+    let body = match relay_fixture("push_notify") {
+        RelayFrame::PushNotify(body) => body,
+        other => panic!("expected push_notify, got {other:?}"),
+    };
+    assert_eq!(body.pairing_id.as_str(), case["pairing_id"]);
+    assert_eq!(body.event_id.as_str(), case["event_id"]);
+    assert_eq!(body.class, PushClass::NeedsInput);
+    assert_eq!(body.class.as_str(), case["class"]);
+    assert_eq!(body.nonce, case["nonce_b64"]);
+    assert_eq!(body.ciphertext, case["ciphertext_b64"]);
+    assert!(body.ciphertext.len() <= MAX_PUSH_CIPHERTEXT_B64_LEN);
+
+    let request = check_file::<PushRequest>("push_http", "push_request");
+    assert_eq!(request.push, body, "HTTPS body nests the same five fields");
+
+    let plaintext: PushPayload =
+        serde_json::from_str(case["plaintext_utf8"].as_str().unwrap()).unwrap();
+    let fixture = check_file::<PushPayload>("push_payload", "needs_input");
+    assert_eq!(fixture, plaintext);
+    assert_eq!(fixture.event_id, body.event_id);
+    assert_eq!(fixture.class, body.class);
+    assert_eq!(
+        flightdeck_remote_protocol::e2e::push_aad(&body.pairing_id, &body.event_id),
+        case["aad"]
+    );
+}
+
+/// The HTTPS signing message for the request fixture, spelled out — the string
+/// both the desktop and the relay must produce byte-for-byte (spec §5.5).
+#[test]
+fn push_request_fixture_signing_message() {
+    let request = check_file::<PushRequest>("push_http", "push_request");
+    let expected = format!(
+        "flightdeck-remote-push-v1\ndev_mac_7b21\n1752412800500\npair_ruud_mbp\n\
+         6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b\nneeds_input\nAAECAwQFBgcICQoL\n{}",
+        request.push.ciphertext
+    );
+    assert_eq!(request.signing_message(), expected);
 }
 
 /// Every relay fixture must be tagged with a `type` field (internally-tagged
@@ -420,11 +585,23 @@ fn answers_decision_round_trips() {
 #[test]
 fn fixture_counts_are_exhaustive() {
     let count = |plane: &str| read_fixtures(&fixtures_dir().join(plane)).len();
+    // Relay: every RelayFrame variant has at least one fixture (25 distinct
+    // `type` tags); some variants have extra fixtures for optional-field shapes
+    // (v2-format and v4-format `hello_ok`/`pairing_offer`/`pairing_claimed`,
+    // the push-only `error`), hence more files than variants.
+    let relay_types: std::collections::BTreeSet<String> =
+        read_fixtures(&fixtures_dir().join("relay"))
+            .into_iter()
+            .map(|(_, v)| v["type"].as_str().unwrap().to_string())
+            .collect();
     assert_eq!(
-        count("relay"),
-        24,
-        "expected one fixture per RelayFrame variant"
+        relay_types.len(),
+        25,
+        "expected at least one fixture per RelayFrame variant: {relay_types:?}"
     );
+    assert_eq!(count("relay"), 30, "relay fixture files");
+    assert_eq!(count("push_payload"), 2, "push payload fixtures");
+    assert_eq!(count("push_http"), 2, "HTTPS push body fixtures");
     assert_eq!(
         count("desktop_to_phone"),
         10,

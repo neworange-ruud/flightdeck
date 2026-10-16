@@ -77,7 +77,7 @@ async fn incompatible_version_is_rejected_and_closed() {
         RelayFrame::VersionIncompatible {
             your_version: 0,
             min_supported: 1,
-            max_supported: 3,
+            max_supported: 4,
         }
     ));
 }

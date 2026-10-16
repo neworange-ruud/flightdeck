@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "code": "relay_mode_push_only",
+  "message": "this relay runs in push_only mode and does not carry envelopes",
+  "pairing_id": "pair_ruud_mbp"
+}

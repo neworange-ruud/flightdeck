@@ -11,6 +11,10 @@
 > `remote/protocol/tests/fixtures/` are the **cross-language contract**: any
 > implementation must produce and consume JSON byte-compatible with them. When
 > this prose and the fixtures disagree, **the fixtures win**.
+>
+> **v4 amendments (epic remote-control-rjrz)** — desktop-decided, end-to-end
+> encrypted visible pushes (§5.5, §7.2), relay modes (§5.9) and the direct
+> phone ⇄ Mac link over Tailscale (§5.10) — are marked **v4** where they appear.
 
 ---
 
@@ -20,7 +24,7 @@ The protocol is split into two cleanly separated planes that share one WebSocket
 
 | Plane | Who reads it | Content | Defined in |
 |-------|--------------|---------|------------|
-| **Relay plane** | The relay **and** the peer | Plaintext, content-free metadata: versioning, auth, pairing, presence, delivery/sequencing, acks, latency, push tokens, errors | `relay::RelayFrame` |
+| **Relay plane** | The relay **and** the peer | Plaintext, content-free metadata: versioning, auth, pairing, presence, delivery/sequencing, acks, latency, push tokens, push requests, errors | `relay::RelayFrame` |
 | **E2E plane** | **Only** phone & desktop | The application messages (status, transcript, commands, shell) as end-to-end-encrypted ciphertext | `e2e::DesktopToPhone`, `e2e::PhoneCommand` |
 
 The relay is a **zero-knowledge blind pipe** (PRD §9.1): it authenticates each
@@ -37,7 +41,11 @@ the envelope is a separate layer (see §7).
 
 - **Transport:** a single **WebSocket** connection from each endpoint to the
   relay (`wss://…`). The desktop holds a long-lived outbound connection; the
-  phone connects when foregrounded / woken by push.
+  phone connects when foregrounded (e.g. after the user taps a push).
+- **Other transports (v4).** Two more carry the same JSON types: the relay's
+  HTTPS push endpoint `POST /v1/push` (§5.5.3), and the **direct link**, a
+  WebSocket the Mac serves to a phone over Tailscale for direct-mode pairings
+  (§5.10).
 - **Two roles connect per pairing:** `desktop` and `phone` (`common::Role`).
 - **Framing:** one JSON value per WebSocket **text** message. Each message on the
   relay plane is exactly one `RelayFrame`. There is no additional length prefix
@@ -70,6 +78,13 @@ These conventions are fixed so the Rust, relay, and Swift sides agree:
    omit `null` — an absent optional is written as `"field": null`. Consumers must
    accept `null`. (Deserializers also tolerate a missing key as `null`, but
    producers must emit it, per the fixtures.)
+   **Exception — fields added to an existing frame after v1** are **omitted**
+   when absent (`skip_serializing_if = "Option::is_none"`), so an older peer
+   never sees an unfamiliar key: `hello.relay_password`, `error.expected_seq`,
+   and the v4 fields `hello_ok.relay_mode`, `pairing_offer.direct_endpoint`,
+   `pairing_claimed.direct_endpoint` and `pairing_claimed.peer_device_public_key`.
+   Consumers must accept them both missing and `null`. Brand-new types (e.g.
+   `PushPayload`) follow the explicit-`null` rule.
 6. **Sequence/counter fields are unsigned** (`seq`, `cursor`, `from_seq`,
    `from_index` are `u64`; counts are `u32`).
 7. **Newtype enum variants flatten.** `RelayFrame::Envelope(EncryptedEnvelope)`
@@ -83,10 +98,18 @@ These conventions are fixed so the Rust, relay, and Swift sides agree:
 
 Every connection begins with version negotiation on the relay plane.
 
-- Constants (this build): `PROTOCOL_VERSION = 2`, `MIN_SUPPORTED_VERSION = 1`,
-  `MAX_SUPPORTED_VERSION = 2`. v2 adds multi-option prompts (see §8.1/§8.2); the
-  new prompt/decision fields are `serde` defaults, so v1 JSON still deserializes
-  and `MIN` stays 1.
+- Constants (this build): `PROTOCOL_VERSION = 4`, `MIN_SUPPORTED_VERSION = 1`,
+  `MAX_SUPPORTED_VERSION = 4`. Every addition so far is additive, so v1 JSON
+  still deserializes and `MIN` stays 1:
+  - **v2** — multi-option prompts (§8.1/§8.2).
+  - **v3** — multi-select (checklist) questions and multi-question forms.
+  - **v4** — the `push_notify` frame (§5.5) and the optional fields
+    `hello_ok.relay_mode` (§5.9), `pairing_offer.direct_endpoint`,
+    `pairing_claimed.direct_endpoint` and `pairing_claimed.peer_device_public_key`
+    (§5.2, §5.10). `push_notify` is a frame a v3 relay cannot parse, which is
+    why v4 is a real bump: a desktop sends `push_notify` only on a connection
+    negotiated at **`PUSH_NOTIFY_MIN_VERSION` (4)** or above. Against an older
+    relay it sends none (that relay still drives its own legacy wake pushes).
 - The client opens with `hello { protocol_version, role, device_id, client }`
   advertising its **preferred** version.
 - The relay replies with either:
@@ -97,9 +120,9 @@ Every connection begins with version negotiation on the relay plane.
 - **Negotiation rule** (`negotiate_version`): if the peer's preferred version is
   within `[local_min, local_max]`, use it; if it is **higher**, fall back to
   `local_max` (the relay answers `hello_ok` at its own max — forward compatible);
-  if it is **lower than `local_min`**, it is incompatible. In a v1 build only a
+  if it is **lower than `local_min`**, it is incompatible. In this build only a
   preferred version **below 1** yields `version_incompatible`; a client
-  preferring v3+ gets clamped to v2.
+  preferring v5+ gets clamped to v4.
 - The negotiated version governs the whole connection, including how the E2E
   payloads inside envelopes are interpreted. The E2E application messages do not
   carry a second version field in v1 — the relay-plane negotiated version is
@@ -113,7 +136,7 @@ Every connection begins with version negotiation on the relay plane.
 
 ```
 client → relay : hello { protocol_version, role, device_id, client }
-relay  → client: hello_ok { protocol_version, server_time_ms, connection_id }
+relay  → client: hello_ok { protocol_version, server_time_ms, connection_id, relay_mode? }
 relay  → client: auth_challenge { nonce, server_time_ms }
 client → relay : auth_response { device_id, signature, pairing_ids, machine_name? }
 relay  → client: auth_ok { pairing_ids }
@@ -163,7 +186,7 @@ needed to bootstrap the E2E channel.
 desktop → relay : hello { … role: desktop … }
 relay   → desktop: hello_ok { … }
 relay   → desktop: auth_challenge { nonce, server_time_ms }
-desktop → relay : pairing_offer { device_id, device_public_key, key_agreement_public_key, role }
+desktop → relay : pairing_offer { device_id, device_public_key, key_agreement_public_key, role, claim_token_hint, direct_endpoint? }
 relay   → desktop: pairing_offer_ok { pairing_id, claim_token, expires_at_ms }
 desktop → relay : auth_response { … }              // then proceeds as §5.1
 …
@@ -172,12 +195,14 @@ phone → relay : hello { … role: phone … }
 relay → phone : hello_ok { … }
 relay → phone : auth_challenge { nonce, server_time_ms }
 phone → relay : pairing_claim { claim_token, device_id, device_public_key, key_agreement_public_key, role }
-relay → phone : pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key }
-              // (peer_key_agreement_public_key = the desktop's KA key)
+relay → phone : pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key, direct_endpoint? }
+              // (peer_key_agreement_public_key = the desktop's KA key;
+              //  direct_endpoint = copied from the offer, v4)
               // (or error { code: pairing_claim_rejected } if token bad/expired)
-relay → desktop: pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key }
+relay → desktop: pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key, peer_device_public_key? }
               // notifies the waiting desktop connection that the phone has
-              // joined; peer_key_agreement_public_key = the phone's KA key
+              // joined; peer_key_agreement_public_key = the phone's KA key;
+              // peer_device_public_key = the phone's identity key (v4)
 phone → relay : auth_response { … }   // then proceeds as §5.1
 ```
 
@@ -224,6 +249,39 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
     desktop the keystore identity key is usable for ECDH, so the desktop **MAY**
     reuse it (i.e. `key_agreement_public_key` == `device_public_key`); it may
     also use a separate key. The two sides are symmetric on the wire regardless.
+- **Direct endpoint & direct mode (v4).** A desktop that serves the direct link
+  (§5.10) puts its address in `pairing_offer.direct_endpoint`
+  (`{ "host": "ruuds-mbp.tail1234.ts.net", "port": 47800 }` — the Mac's
+  Tailscale MagicDNS name or `100.x` address, and the port its direct-link
+  WebSocket listens on). The relay stores it with the pending pairing and copies
+  it verbatim into the **phone-bound** `pairing_claimed.direct_endpoint`; it
+  never dials it or routes by it. A pairing whose claim carried a
+  `direct_endpoint` is in **direct mode on both ends** (the desktop knows from its
+  own offer; the phone from its `pairing_claimed`); every other pairing —
+  including every pairing made before v4 — is in **relay mode** and behaves
+  exactly as before. Switching an existing pairing to direct mode means
+  re-pairing; so does changing the endpoint.
+- **Phone identity key to the desktop (v4).** The **desktop-bound**
+  `pairing_claimed` additionally carries `peer_device_public_key`: the phone's
+  identity public key, exactly the `device_public_key` from its
+  `pairing_claim` (same base64 X9.63 encoding). The desktop stores it so it can
+  authenticate the phone on the direct link itself (§5.10). The relay fills it
+  on every v4 claim, direct mode or not (the key is public and cheap to store).
+- **Which copy carries what.** One `pairing_claimed` type serves both
+  directions; each side's copy fills only its own fields:
+
+  | field | phone-bound copy (answer to `pairing_claim`) | desktop-bound copy (notification) |
+  |---|---|---|
+  | `peer_device_id` | the desktop's id | the phone's id |
+  | `peer_key_agreement_public_key` | the desktop's KA key | the phone's KA key |
+  | `direct_endpoint` (v4) | copied from the offer, if any; omitted otherwise | always omitted |
+  | `peer_device_public_key` (v4) | always omitted | the phone's identity key |
+
+  Fixtures: `relay/pairing_offer_direct.json`, `relay/pairing_claimed_direct.json`
+  (phone-bound) and `relay/pairing_claimed_to_desktop.json` (desktop-bound); the
+  v2-shaped `pairing_offer.json`/`pairing_claimed.json` still parse.
+- **Pairing bootstrap always runs through the relay,** in both relay modes and
+  for both pairing modes (§5.9 records why).
 - The **QR/code also carries the shared secret that bootstraps the E2E channel**
   (PRD §9.1). That secret is consumed by the crypto layer (§7); it is **not** part
   of any relay frame and never transits the relay. The relay only ever sees the
@@ -247,12 +305,13 @@ displays round-trip latency from `now - client_time_ms`; `server_time_ms` gives
 coarse clock-skew awareness. This measures the phone↔relay leg; end-to-end health
 also depends on `peer_presence`.
 
-### 5.5 Push-token registration
+### 5.5 Push-token registration & push notifications
 
 `register_push_token { pairing_id, token, environment }` → `push_token_ack`.
-The APNs token is **opaque and outside E2E** — the relay/desktop use it to drive
-notifications when an agent finishes or needs input (PRD §9.1). `environment` is
-`sandbox` | `production`.
+The APNs token is **opaque and outside E2E** — the relay holds it so it can
+deliver the pushes the **desktop** requests with `push_notify` (§5.5.1) for that
+pairing (PRD §9.1). `environment` is `sandbox` | `production`. A direct-mode
+pairing (§5.10) registers its token with the relay exactly the same way.
 
 **Deregistration (per-machine push mute).** A phone can drop a pairing's token
 **without unpairing** so it stops that pairing's pushes while keeping the pairing:
@@ -274,13 +333,170 @@ relay → phone : push_token_ack { pairing_id }   // shared ack, confirms remova
   pairing). `push_token_ack` is reused as the confirmation for both
   `register_push_token` and `unregister_push_token`.
 
+**The desktop decides pushes; the relay sends no pushes of its own (v4).** Before
+v4 the relay sent a silent `content-available` wake push for every envelope it
+queued for an offline phone, and the phone had to reconnect, resume, decrypt and
+post a local notification inside its background window. iOS throttles and drops
+silent pushes, and one wake per envelope was noisy. From v4:
+
+- **Queued envelopes trigger no push.** The relay never pushes on its own
+  initiative — not on enqueue, not on presence changes. An offline phone catches
+  up on its next open/reconnect (§6.3).
+- **The desktop alone decides** when something is push-worthy — an agent needs
+  input (permission prompt or question), hit an error, or is **done** (settled
+  idle after a desktop-side debounce, never a mid-turn flicker) — and asks the
+  relay for exactly one visible alert with `push_notify`.
+- **The alert is visible and carries an E2E-encrypted payload** (§7.2) that the
+  phone's Notification Service Extension decrypts to replace the generic text.
+  The relay stays zero-knowledge: it sees only the pairing, the event id and the
+  `class`.
+- The same path serves both relay modes (§5.9) and both pairing modes (§5.10).
+
+#### 5.5.1 `push_notify` (desktop → relay, v4)
+
+```json
+{ "type": "push_notify", "pairing_id": "pair_ruud_mbp",
+  "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", "class": "needs_input",
+  "nonce": "AAECAwQFBgcICQoL", "ciphertext": "AP5g0H3C…" }
+```
+
+- **Fields** (`relay::PushNotifyBody`, flattened next to `type` like
+  `envelope`): `pairing_id`; `event_id` (the `AgentEvent.event_id` this push
+  announces, a UUID string ≤ 64 bytes); `class` (`PushClass`: `needs_input` |
+  `error` | `done` — the **only** plaintext hint); `nonce` and `ciphertext`
+  (base64 standard-padded; the sealed `PushPayload`, §7.2).
+- **Who may send it.** Only an authenticated **desktop** that is a member of
+  `pairing_id`. A non-member desktop (or an unknown pairing) gets
+  `error { code: unknown_pairing, pairing_id }`; a **phone** sending it gets
+  `error { code: bad_frame }`. Before `auth_ok` it is `not_authenticated`, as for
+  any post-auth frame.
+- **Size.** A `ciphertext` longer than **3000 characters**
+  (`MAX_PUSH_CIPHERTEXT_B64_LEN`) is refused with `error { code: bad_frame,
+  pairing_id }`.
+- **Fire-and-forget.** There is no success reply on the WebSocket; failures
+  surface as `error` frames. If the pairing has **no registered push token**, the
+  relay silently does nothing (debug log, no content).
+- The relay MAY rate-limit `push_notify` per pairing, answering
+  `error { code: rate_limited, pairing_id }`.
+- **Desktop transport rule.** Send `push_notify` over the relay WebSocket when it
+  is connected **and authenticated** at a negotiated version ≥ 4; otherwise POST
+  the same fields over HTTPS (§5.5.3). It is never sent on the direct link
+  (§5.10) — the Mac is the server there and pushes always go via the relay.
+- Fixture: `relay/push_notify.json` (the same push as case 0 of
+  `e2e_crypto/push_vectors.json`).
+
+#### 5.5.2 The APNs request the relay builds
+
+For each accepted `push_notify` with a registered token, the relay sends one
+APNs request to the token's environment:
+
+- **Headers:** `apns-push-type: alert`, `apns-priority: 10`,
+  `apns-collapse-id: <event_id>` (a retried push for the same event replaces the
+  alert instead of duplicating it), `apns-expiration: <now + 24 h, unix
+  seconds>` (non-zero, so APNs stores and forwards to an offline phone),
+  `apns-topic: <bundle id>` (relay config).
+- **Body:**
+
+  ```json
+  { "aps": { "alert": { "title": "FlightDeck", "body": "An agent needs your input" },
+             "mutable-content": 1,
+             "sound": "default",
+             "interruption-level": "time-sensitive",
+             "thread-id": "pair_ruud_mbp" },
+    "fd_push": { "v": 1, "pairing_id": "pair_ruud_mbp",
+                 "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+                 "class": "needs_input",
+                 "nonce": "AAECAwQFBgcICQoL", "ciphertext": "AP5g0H3C…" } }
+  ```
+
+  - `aps.alert.body` is **generic per class**, never content:
+    `needs_input` → `"An agent needs your input"`, `error` → `"An agent hit an
+    error"`, `done` → `"An agent is done"`. `aps.alert.title` is always
+    `"FlightDeck"`.
+  - `interruption-level` is `time-sensitive` for `needs_input` and `active` for
+    `error` and `done`. `thread-id` is the `pairing_id` (groups one Mac's
+    alerts).
+  - `mutable-content: 1` lets the phone's Notification Service Extension open
+    `fd_push` (§7.2) and replace the title/body. If the extension cannot open it
+    (no pairing record, tampering, timeout), the generic alert is shown as-is.
+  - `fd_push` copies the five `push_notify` fields verbatim plus `"v": 1` (the
+    `fd_push` layout version). With the 3000-character ciphertext cap the whole
+    payload stays under APNs' 4 KiB limit.
+- **Logging.** One line per push attempt: `pairing_id`, `event_id`, `class`,
+  outcome (`ok` / `transient` / `permanent` + token purged / `no token`). Never
+  any content.
+- The pre-v4 silent `background_wake` push and the plaintext
+  `alert_for_event` path are gone.
+
+#### 5.5.3 HTTPS push endpoint `POST /v1/push` (v4)
+
+The same request over HTTPS, for a desktop with no live, authenticated relay
+WebSocket (always available; the only desktop path to a push-only relay when it
+holds no WebSocket). The desktop derives the URL from its configured relay URL:
+`wss://host[:port]/…` → `https://host[:port]/v1/push`, `ws://…` → `http://…`
+(`relay::push_endpoint_url`).
+
+```json
+{ "device_id": "dev_mac_7b21", "timestamp_ms": 1752412800500,
+  "push": { "pairing_id": "pair_ruud_mbp", "event_id": "6f9a1c2e-…",
+            "class": "needs_input", "nonce": "AAECAwQFBgcICQoL",
+            "ciphertext": "AP5g0H3C…" },
+  "signature": "<base64 raw r‖s, 64 bytes>" }
+```
+
+- **Body** (`relay::PushRequest`, `Content-Type: application/json`): the
+  requesting `device_id`, the desktop's clock `timestamp_ms`, the five
+  `push_notify` fields nested under `push` (`PushNotifyBody`), and a
+  `signature`.
+- **Signature.** ECDSA P-256 / SHA-256 by the device identity key (same key and
+  encodings as §5.1), raw `r ‖ s`, base64, over the UTF-8 bytes of this
+  canonical message — `\n`-joined, **no trailing newline**, `timestamp_ms`
+  base-10, `class` its wire value (`relay::push_request_signing_message`):
+
+  ```text
+  flightdeck-remote-push-v1
+  {device_id}
+  {timestamp_ms}
+  {pairing_id}
+  {event_id}
+  {class}
+  {nonce}
+  {ciphertext}
+  ```
+
+- **Relay checks.** The relay password, if configured, in header
+  `x-flightdeck-relay-password` (constant-time compare, as for
+  `hello.relay_password`); the signature against the device's **registered**
+  identity key; `|relay_now − timestamp_ms| ≤ 300 000` ms; the device's role is
+  **desktop**; the device is a member of `push.pairing_id`. Then it proceeds
+  exactly as for the WebSocket frame (§5.5.1, §5.5.2), including the silent
+  no-op when no token is registered.
+- **Responses.**
+
+  | Status | `code` | When |
+  |---|---|---|
+  | 202 Accepted | — | Accepted (including "no token registered"). Empty body; clients ignore any body. |
+  | 400 | `bad_frame` | Malformed JSON or fields; the device is not a desktop (mirrors the WS rule). |
+  | 401 | `auth_failed` | Missing/wrong relay password, unknown device, bad signature, or timestamp outside ±300 s. |
+  | 404 | `unknown_pairing` | The desktop is not a member of `push.pairing_id` (or it does not exist). |
+  | 413 | `bad_frame` | `ciphertext` over 3000 characters, or an oversized request body. |
+  | 429 | `rate_limited` | Rate limit hit. |
+  | 500 | `internal` | Relay-side failure. |
+
+  Every non-2xx response has the JSON body `{ "code": "<RelayErrorCode>",
+  "message": "…" }` (`relay::PushErrorBody`); `message` never contains push
+  content.
+- Fixtures: `push_http/push_request.json`, `push_http/push_error.json`.
+
 ### 5.6 Errors & shutdown
 
-- `error { code, message, pairing_id? }` — machine-readable `RelayErrorCode`
-  (`unsupported_version`, `auth_failed`, `unknown_pairing`, `not_authenticated`,
-  `pairing_claim_rejected`, `peer_unavailable`, `rate_limited`, `bad_frame`,
-  `internal`). Whether it is fatal is implied by the code (auth/version errors
-  close the socket; `peer_unavailable`/`rate_limited` are advisory).
+- `error { code, message, pairing_id?, expected_seq? }` — machine-readable
+  `RelayErrorCode` (`unsupported_version`, `auth_failed`, `unknown_pairing`,
+  `not_authenticated`, `pairing_claim_rejected`, `peer_unavailable`,
+  `rate_limited`, `bad_frame`, `seq_violation` (§6.1), `relay_mode_push_only`
+  (v4, §5.9), `internal`). Whether it is fatal is implied by the code
+  (auth/version errors close the socket; `peer_unavailable`/`rate_limited`/
+  `seq_violation`/`relay_mode_push_only` are advisory).
 - `bye { reason? }` — graceful shutdown notice before either side closes.
 
 ### 5.7 Machine name (desktop → relay → phone, v1 amendment)
@@ -346,6 +562,108 @@ relay   → phone : pairing_revoked { pairing_id }    // idempotent success conf
 - **Scope.** Only the named pairing is affected; the device's other pairings are
   untouched. The desktop, on `pairing_revoked`, drops that pairing's local record
   and tears down its E2E channel.
+
+### 5.9 Relay modes (v4)
+
+One relay binary runs in one of two modes, chosen by its `RELAY_MODE`
+configuration (`full` | `push_only`, default `full`), and announces it in
+`hello_ok.relay_mode` (`RelayMode`). A pre-v4 relay omits the field; treat
+absent as `full`.
+
+| | `full` | `push_only` |
+|---|---|---|
+| `hello` / auth / `version_incompatible` | ✓ | ✓ |
+| `pairing_offer` / `pairing_claim` (bootstrap) | ✓ | ✓ |
+| `machine_name`, `revoke` / `pairing_revoked` | ✓ | ✓ |
+| `register_push_token` / `unregister_push_token` | ✓ | ✓ |
+| `ping` / `pong`, `peer_presence` | ✓ | ✓ |
+| `push_notify` (WS) and `POST /v1/push` (HTTPS) | ✓ | ✓ |
+| `envelope`, `resume`, `ack` (the data plane, §6) | ✓ | refused |
+
+- **Refusal.** A push-only relay answers `envelope`, `resume` and `ack` with
+  `error { code: relay_mode_push_only, pairing_id }` and keeps the connection
+  open (fixture: `relay/error_relay_mode_push_only.json`). It runs no
+  per-pairing sender queues and no seq tracking.
+- **Who uses which.** `full` is today's routing relay, for adopters who want
+  relay-mode pairings. `push_only` is for deployments where every pairing is in
+  direct mode (§5.10), so the relay only needs to authenticate devices and send
+  pushes. A desktop that sees `relay_mode: push_only` SHOULD only offer
+  direct-mode pairings (a relay-mode pairing would have no data plane); the relay
+  does not police this.
+- **Decision: pairing bootstrap stays on the relay in both modes.** It would be
+  possible to pair directly over Tailscale, but the relay keeps
+  `pairing_offer`/`pairing_claim` because:
+  1. the relay needs each device's identity key and the pairing membership
+     anyway — to authenticate `push_notify` (WS and HTTPS), push-token
+     registration and `revoke` — and pairing through it is how it learns them
+     with proof (each side self-registers its key in its own frame);
+  2. the claim token needs a rendezvous both devices can reach before either
+     knows the other's address, and the phone learns the Mac's
+     `direct_endpoint` from that rendezvous;
+  3. one pairing flow for both pairing modes and both relay modes keeps the
+     desktop, the phone and the fixtures single-path.
+
+### 5.10 Direct link (phone ⇄ Mac over Tailscale, v4)
+
+A **direct-mode** pairing (§5.2) carries its whole data plane over a WebSocket
+the Mac serves, instead of through the relay. Tailscale (WireGuard) provides
+transport encryption and reachability; the E2E envelopes (§7.1) run on top
+unchanged.
+
+- **Endpoint.** `ws://<host>:<port>/remote/v1` (`relay::DirectEndpoint::ws_url`,
+  path `DIRECT_LINK_PATH`) from the pairing's `direct_endpoint`. The desktop
+  serves it only when the user opts in, and binds **only** to its Tailscale
+  interface address(es) (or loopback, for tests) — never `0.0.0.0` — mirroring
+  web network mode.
+- **Framing.** The **same `RelayFrame` JSON** as the relay, with the Mac in the
+  relay's role:
+
+  ```
+  phone → mac : hello { protocol_version, role: phone, device_id, client }
+  mac   → phone: hello_ok { protocol_version, server_time_ms, connection_id }  // relay_mode omitted
+  mac   → phone: auth_challenge { nonce, server_time_ms }
+  phone → mac : auth_response { device_id, signature, pairing_ids }
+  mac   → phone: auth_ok { pairing_ids }
+  mac   → phone: machine_name { pairing_id, machine_name }                    // per pairing
+  mac   → phone: peer_presence { pairing_id, peer: desktop, state: connected, at_ms }
+  phone → mac : resume { pairing_id, from_seq }
+  mac   → phone: envelope { … }                                               // replayed, then live
+  ```
+
+  Then `envelope` both ways, `ack`, `ping`/`pong`, `revoke`/`pairing_revoked`,
+  `error` and `bye` behave as on the relay. Version negotiation is the same
+  (§4). `hello_ok.relay_mode` is **omitted** (the Mac is not a relay and carries
+  the full data plane for its own pairings). Bootstrap and push frames
+  (`pairing_offer`, `pairing_claim`, `register_push_token`,
+  `unregister_push_token`, `push_notify`) are not served on the direct link
+  (`error { code: bad_frame }`). `hello.relay_password` is ignored.
+- **Auth.** The phone signs `b"flightdeck-remote-direct-v1:" ‖ <decoded nonce
+  bytes>` (`relay::direct_auth_message`) with its identity key — ECDSA P-256 /
+  SHA-256, raw `r ‖ s`, base64, as in §5.1. The domain prefix makes a
+  direct-link signature useless as a relay `auth_response` (which signs the bare
+  nonce) and vice versa. The Mac verifies it against the
+  `peer_device_public_key` it stored from the desktop-bound `pairing_claimed`
+  (§5.2). Every requested `pairing_id` must be a live direct-mode pairing whose
+  peer is this `device_id`; an unknown or revoked device or pairing, or a bad
+  signature, gets `error { code: auth_failed }` and the socket closes.
+- **Desktop outbox.** For direct-mode pairings the desktop sends envelopes
+  **only** to its direct outbox, never via the relay. The outbox keeps un-acked
+  desktop→phone envelopes per pairing, bounded (newest 1000 envelopes / 8 MiB,
+  oldest dropped first), **persisted** so a Mac restart keeps seq continuity;
+  it replays strictly above `resume.from_seq` and drops envelopes at or below an
+  `ack` cursor. Sequencing, AAD and gapless numbering are exactly §6.1. A
+  `from_seq` that precedes the oldest retained envelope (overflow shed the gap)
+  gets `error { code: seq_violation, pairing_id }`, and the phone recovers as in
+  §6.3 (drop its cursor, resume from 0, request a snapshot).
+- **Phone → desktop envelopes** are deduped by `seq` (§6.4) exactly as for relay
+  delivery.
+- **What still uses the relay.** A direct-mode pairing still uses the relay for
+  push-token registration (§5.5), `revoke` (the relay must drop membership and
+  the push token, so the phone always revokes there; it MAY also send `revoke`
+  on the direct link) and pushes (`push_notify`, §5.5.1). The phone never sends
+  `envelope`/`resume`/`ack` for a direct-mode pairing to the relay.
+- Pairings made before v4 are relay mode and behave exactly as before; re-pair
+  to switch.
 
 ---
 
@@ -487,7 +805,11 @@ new commands rather than sending blind.
   to JSON, seal, and place the base64 result in `ciphertext`.
 - **Sealing is out of the `flightdeck-remote-protocol` crate.** It lives in the
   desktop's `src/remote/crypto.rs` and the iOS `E2EChannel.swift`, proven
-  byte-compatible by `remote/protocol/tests/fixtures/e2e_crypto/vectors.json`.
+  byte-compatible by `remote/protocol/tests/fixtures/e2e_crypto/vectors.json`
+  (envelopes) and `e2e_crypto/push_vectors.json` (push payloads, §7.2). The
+  crate does carry the canonical *strings* both sides must agree on
+  (`e2e::push_aad`, `relay::push_request_signing_message`,
+  `relay::direct_auth_message`), so no implementation re-spells them.
 - The relay **cannot** read, and must not depend on, anything inside
   `ciphertext`. All routing decisions use `pairing_id` (and connection role).
 
@@ -563,6 +885,62 @@ The desktop API is `E2eChannel::{derive, seal, open}` (plus a test-only
 derives one channel per pairing per endpoint and feeds `salt` (the QR
 `pairing_secret` or the code's claim-token bytes) in at derive time.
 
+### 7.2 Push payload sealing (normative, v4)
+
+A push (§5.5) carries an encrypted `PushPayload` that the phone's Notification
+Service Extension (NSE) opens to show real text in place of the generic alert.
+The NSE has no live channel, no envelope `seq` and ~30 s of runtime, so the
+payload uses its own key and AAD, derivable from the stored pairing record
+alone.
+
+1. **Key.** HKDF-SHA256 with the **same IKM and salt as §7.1** (the KA keys'
+   static-static ECDH x-coordinate; the `claim_token` UTF-8 bytes), expanded with
+   `info = "flightdeck-remote-e2e-v1:" ‖ pairing_id ‖ ":push"` (UTF-8) → 32
+   bytes. **Direction-independent:** the desktop seals, the phone opens, and both
+   derive the identical key.
+2. **AEAD.** ChaCha20-Poly1305 with a fresh random 12-byte nonce per push; the
+   `ciphertext` is the AEAD output with the 16-byte tag appended; both base64
+   standard-padded — identical to §7.1 step 4.
+3. **AAD.** The UTF-8 of `"push:" ‖ pairing_id ‖ ":" ‖ event_id`
+   (`e2e::push_aad`). This binds the payload to the push's plaintext routing
+   fields: the relay cannot replay one event's payload as another event or
+   another pairing.
+4. **Plaintext.** The UTF-8 JSON of `e2e::PushPayload`:
+
+   ```json
+   { "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", "class": "needs_input",
+     "title": "fd-api needs input", "body": "Allow `cargo test --locked`?",
+     "deep_link": { "project_id": "proj_fd_api", "session_id": "sess_fix_login",
+                    "item_id": "item_q1" },
+     "project_name": "fd-api", "occurred_at_ms": 1752412800000 }
+   ```
+
+   `event_id` and `class` equal the push frame's; `title` is the alert title;
+   `body` the question preview, error message or turn summary (may be `""`);
+   `deep_link` where a tap lands; `project_name` is display-only and may be
+   `null`. Optionals are explicit `null` (§3 rule 5). Fixtures:
+   `push_payload/needs_input.json`, `push_payload/done.json`.
+5. **Size.** The desktop truncates on a `char` boundary and appends `…` (U+2026,
+   counted in the budget) so that `title` ≤ **120 bytes** and `body` ≤ **1000
+   bytes** (`e2e::truncate_push_text`, `MAX_PUSH_TITLE_BYTES`,
+   `MAX_PUSH_BODY_BYTES`); the serialized plaintext MUST be ≤ **2048 bytes**
+   (`MAX_PUSH_PLAINTEXT_BYTES`), which keeps the base64 ciphertext under the
+   relay's 3000-character cap (§5.5.1).
+6. **Phone behavior.** The NSE looks up the pairing by `fd_push.pairing_id`,
+   derives the push key, opens `fd_push.ciphertext` with the AAD above, and
+   replaces the alert's title/body with the payload's (keeping the deep link). On
+   any failure it delivers the generic alert unchanged. The phone dedupes pushes
+   against the `AgentEvent` with the same `event_id` it later receives over the
+   data plane (§6.4).
+
+The desktop API is `E2eChannel::{seal_push_payload, seal_push, open_push}`
+(plus test-only `seal_push_payload_with_nonce`/`seal_push_with_nonce`); the push
+key is derived alongside the directional keys in `E2eChannel::derive`.
+`push_vectors.json` holds fixed KA private keys, salt, pairing id, derived push
+key, event id, AAD, nonce, plaintext and ciphertext, plus a tampered-AAD case
+that must fail to open; it is generated and locked by a test in
+`src/remote/crypto.rs`, and the iOS tests verify against the same file.
+
 ---
 
 ## 8. E2E message taxonomy
@@ -576,7 +954,7 @@ derives one channel per pairing per endpoint and feeds `salt` (the QR
 | `rollup` | `RollupUpdate` | Refreshed per-project `StatusRollup` (dot + plain-language summary + counts) without resending sessions. |
 | `transcript` | `TranscriptFeed` | A cleaned transcript load for a session (`replace: true`). |
 | `transcript_append` | `TranscriptFeed` | Incremental transcript items appended (`replace: false`). |
-| `event` | `AgentEvent` | Typed event (`needs_input` / `finished` / `error`) with a `deep_link` payload. Drives pushes + Activity feed. |
+| `event` | `AgentEvent` | Typed event (`needs_input` / `finished` / `error`) with a `deep_link` payload. Drives the Activity feed; the desktop sends the matching push separately as `push_notify` (§5.5, v4), deduped by `event_id`. |
 | `git_status` | `GitStatusDetail` | Full git detail: branch, base, changed files, ahead/behind, drift. |
 | `shell_output` | `ShellOutput` | A per-shell ordered chunk of stdout/stderr (may contain ANSI). |
 | `shell_event` | `ShellEvent` | Shell lifecycle: `opened{cols,rows}` / `exited{code}` / `closed`. |
@@ -678,12 +1056,20 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
 ## 11. Worked end-to-end example (needs-input → reply)
 
 1. Agent stops for a permission prompt. Desktop seals a `DesktopToPhone::Event`
-   (`needs_input`, with `deep_link`) and sends `envelope { seq: N, sender: desktop }`.
-   If the phone is offline, the relay queues it and (via the push service) fires
-   an APNs notification using the registered token.
-2. Phone wakes, connects, auths, sends `resume { from_seq: N-1 }`. The relay
-   replays the queued envelope. Phone decrypts, dedupes by `event_id`, deep-links
-   the user to the agent, and sends `ack { cursor: N }`.
+   (`needs_input`, with `deep_link`) and sends `envelope { seq: N, sender: desktop }`
+   (to the relay, or to its direct outbox for a direct-mode pairing). If the phone
+   is offline the envelope is queued — **queuing triggers no push** (v4). The
+   desktop separately decides this event is push-worthy: it seals a
+   `PushPayload` under the push key (§7.2) and sends
+   `push_notify { pairing_id, event_id, class: needs_input, nonce, ciphertext }`
+   over its relay WebSocket (or `POST /v1/push` when it has none). The relay sends
+   one visible APNs alert (generic text, `fd_push` attached, §5.5.2); the phone's
+   Notification Service Extension opens `fd_push` and shows "fd-api needs input"
+   with the question preview.
+2. The user taps the alert. The phone opens at the deep link, connects, auths,
+   and sends `resume { from_seq: N-1 }`. The relay (or the Mac, on the direct
+   link) replays the queued envelope. Phone decrypts, dedupes by `event_id`, and
+   sends `ack { cursor: N }`.
 3. User taps **Deny**. Phone seals a `PhoneCommand`
    (`permission_decision`, `choice: deny`, fresh `command_id`) and sends
    `envelope { seq: M, sender: phone }`. UI marks it "sending".
@@ -704,6 +1090,9 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
 - Treat delivery as **at-least-once**; correctness relies on receiver dedup (§6.4).
 - Keep pairing-claim tokens short-TTL and single-use; rate-limit `pairing_claim`
   and `auth_response`.
+- Send pushes **only** for `push_notify` / `POST /v1/push` (§5.5); never on
+  enqueue. Log one content-free line per push attempt. Honor `RELAY_MODE`
+  (§5.9).
 
 **Desktop-bridge team:**
 - Assign gapless `seq` per pairing for outbound envelopes; persist the last `seq`
@@ -712,6 +1101,10 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
   (or `duplicate`) on repeats. Validate `git_abandon_worktree.confirm_name`.
 - Emit `command_ack` for **every** command, always — the phone's honesty UI
   depends on it.
+- Decide pushes (needs input, error, done-after-debounce), seal them (§7.2) and
+  send `push_notify` over the WS at negotiated version ≥ 4, else over HTTPS
+  (§5.5.3). For direct-mode pairings, serve the direct link and keep the outbox
+  (§5.10).
 
 **iOS team:**
 - Mirror every type in Swift `Codable` with these exact `snake_case`
@@ -721,19 +1114,38 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
   high-water `seq` per (pairing, sender) and outbound `command_id`s so
   resume/retry are safe. Never send a command while `peer_presence` shows the
   desktop down.
+- Open push payloads in a Notification Service Extension (§7.2), verified
+  against `e2e_crypto/push_vectors.json`. For direct-mode pairings, carry the
+  data plane over the direct link (§5.10) and keep using the relay for push
+  tokens and revoke.
 
 ---
 
 ## 13. File map
 
 - `remote/protocol/src/ids.rs` — id newtypes.
-- `remote/protocol/src/common.rs` — version constants, `Role`, `AgentType`,
-  `AgentStatus`, `RollupDot`, git types, `negotiate_version` lives in `lib.rs`.
+- `remote/protocol/src/common.rs` — version constants (incl.
+  `PUSH_NOTIFY_MIN_VERSION`), `Role`, `PushClass`, `AgentType`, `AgentStatus`,
+  `RollupDot`, git types; `negotiate_version` lives in `lib.rs`.
 - `remote/protocol/src/relay.rs` — relay plane (`RelayFrame`, `EncryptedEnvelope`,
-  presence/error/push enums).
+  presence/error/push enums), `RelayMode`, `DirectEndpoint`, the push request
+  types `PushNotifyBody` / `PushRequest` / `PushErrorBody`, and the shared
+  canonical-string helpers `push_request_signing_message`,
+  `direct_auth_message`, `push_endpoint_url` plus their constants.
 - `remote/protocol/src/e2e.rs` — E2E plane (`DesktopToPhone`, `PhoneCommand`,
-  transcript/event/shell/status types).
+  transcript/event/shell/status types) and the push plaintext `PushPayload`
+  with `push_aad`, `truncate_push_text` and the push size caps.
 - `remote/protocol/tests/round_trip.rs` — fixture walker + invariant tests.
 - `remote/protocol/tests/fixtures/{relay,desktop_to_phone,phone_to_desktop}/*.json`
-  — one golden fixture per message variant (23 + 10 + 17 = 50). The relay set
-  includes `machine_name`, `revoke`, and `pairing_revoked` (§5.7–§5.8).
+  — at least one golden fixture per message variant: 30 relay files covering all
+  25 `RelayFrame` variants (extra files pin optional-field shapes: v2- and
+  v4-format `hello_ok`/`pairing_offer`/`pairing_claimed`, the push-only
+  `error`), 10 desktop→phone, 17 phone→desktop. The relay set includes
+  `machine_name`, `revoke`, `pairing_revoked` (§5.7–§5.8) and `push_notify`
+  (§5.5).
+- `remote/protocol/tests/fixtures/push_payload/*.json` — `PushPayload`
+  plaintexts (§7.2); `push_http/*.json` — the `POST /v1/push` request and error
+  bodies (§5.5.3).
+- `remote/protocol/tests/fixtures/e2e_crypto/{vectors,push_vectors}.json` —
+  cross-language crypto vectors (§7.1, §7.2), generated and locked by
+  `src/remote/crypto.rs` tests.
