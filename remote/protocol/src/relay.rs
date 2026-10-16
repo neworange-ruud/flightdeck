@@ -209,10 +209,8 @@ pub const PUSH_HTTP_PATH: &str = "/v1/push";
 pub fn push_endpoint_url(relay_ws_url: &str) -> Option<String> {
     let (http_scheme, rest) = if let Some(rest) = relay_ws_url.strip_prefix("wss://") {
         ("https", rest)
-    } else if let Some(rest) = relay_ws_url.strip_prefix("ws://") {
-        ("http", rest)
     } else {
-        return None;
+        ("http", relay_ws_url.strip_prefix("ws://")?)
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() {
