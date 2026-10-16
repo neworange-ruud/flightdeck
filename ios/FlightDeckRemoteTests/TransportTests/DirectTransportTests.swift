@@ -179,7 +179,10 @@ private func pushTokenFrames(_ channel: ScriptedChannel) async -> Int {
 
         #expect(rig.connector.urls.first?.absoluteString == "wss://relay.example/ws")
         let frames = await channel.sentFrames()
-        guard case let .hello(_, _, _, _, password) = try #require(frames.first) else { return }
+        guard case let .hello(version, _, _, _, password) = try #require(frames.first) else { return }
+        // The relay forwards `direct_endpoint` only to phones that negotiated
+        // v4 (`DIRECT_LINK_MIN_VERSION`), so the relay hello must advertise 4.
+        #expect(version == 4)
         #expect(password == "relay-secret")
         let auth = try #require(frames.first { if case .authResponse = $0 { return true }; return false })
         guard case let .authResponse(_, signature, _, _) = auth else { return }
@@ -700,6 +703,14 @@ private func pushTokenFrames(_ channel: ScriptedChannel) async -> Int {
         await channel.push(.authOk(pairingIds: [Wire.PairingId("pair_direct_1")]))
         do {
             let device = try await service.pair(with: .code("4729", relayURL: URL(string: "wss://relay.example/ws")!))
+            // The relay copies `direct_endpoint` into the claim only for a
+            // phone that negotiated v4 (`DIRECT_LINK_MIN_VERSION`), so the
+            // pairing hello must advertise 4.
+            let hello = await channel.sentFrames().first
+            guard case let .hello(version, _, _, _, _)? = hello else {
+                Issue.record("pairing must open with hello"); return (recordStore, .success(device))
+            }
+            #expect(version == 4)
             return (recordStore, .success(device))
         } catch {
             return (recordStore, .failure(error))

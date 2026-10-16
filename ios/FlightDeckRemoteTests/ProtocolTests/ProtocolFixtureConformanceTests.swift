@@ -33,16 +33,16 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func fixtureInventoryIsComplete() {
         #expect(ProtocolFixtures.all.count == ProtocolFixtures.expectedCount)
-        // 30 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
+        // 31 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
         // (relay gained machine_name, unregister_push_token, revoke,
-        // pairing_revoked as their owning iOS issues landed, then the six v4
+        // pairing_revoked as their owning iOS issues landed, then the seven v4
         // frames: push_notify, hello_ok_push_only, pairing_offer_direct,
         // pairing_claimed_direct, pairing_claimed_to_desktop,
-        // error_relay_mode_push_only).
-        #expect(ProtocolFixtures.all.count >= 57)
+        // pairing_claimed_to_desktop_direct, error_relay_mode_push_only).
+        #expect(ProtocolFixtures.all.count >= 58)
         for v4 in ["push_notify", "hello_ok_push_only", "pairing_offer_direct",
                    "pairing_claimed_direct", "pairing_claimed_to_desktop",
-                   "error_relay_mode_push_only"] {
+                   "pairing_claimed_to_desktop_direct", "error_relay_mode_push_only"] {
             #expect(ProtocolFixtures.all.contains { $0.category == "relay" && $0.name == v4 },
                     "v4 fixture relay/\(v4) is not embedded — rerun ios/scripts/sync-fixtures.sh")
         }

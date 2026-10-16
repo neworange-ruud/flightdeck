@@ -96,6 +96,10 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl85ZjNhMWMiLAogICJwZWVyX2tleV9hZ3JlZW1lbnRfcHVibGljX2tleSI6ICJCRXhhbXBsZVBob25lS2V5QWdyZWVtZW50U2VjMVB1YktleUJhc2U2NFdvdWxkNjVCeXRlc0dnMkhoNEpqNktrOExsME1tMk5uNFBwNlFxOFJyMFNzMlR0NFV1NnY9PSIsCiAgInBlZXJfZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVQaG9uZVNlY3VyZUVuY2xhdmVJZGVudGl0eVNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNIaDNKajVLazdMbDlNbTFObjNQcDVRcTdScjlTczFUdDN3PT0iCn0K"),
         ProtocolFixture(
             category: "relay",
+            name: "pairing_claimed_to_desktop_direct",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl85ZjNhMWMiLAogICJwZWVyX2tleV9hZ3JlZW1lbnRfcHVibGljX2tleSI6ICJCRXhhbXBsZVBob25lS2V5QWdyZWVtZW50U2VjMVB1YktleUJhc2U2NFdvdWxkNjVCeXRlc0dnMkhoNEpqNktrOExsME1tMk5uNFBwNlFxOFJyMFNzMlR0NFV1NnY9PSIsCiAgImRpcmVjdF9lbmRwb2ludCI6IHsKICAgICJob3N0IjogInJ1dWRzLW1icC50YWlsMTIzNC50cy5uZXQiLAogICAgInBvcnQiOiA0NzgwMAogIH0sCiAgInBlZXJfZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVQaG9uZVNlY3VyZUVuY2xhdmVJZGVudGl0eVNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNIaDNKajVLazdMbDlNbTFObjNQcDVRcTdScjlTczFUdDN3PT0iCn0K"),
+        ProtocolFixture(
+            category: "relay",
             name: "pairing_offer",
             base64: "ewogICJ0eXBlIjogInBhaXJpbmdfb2ZmZXIiLAogICJkZXZpY2VfaWQiOiAiZGV2X21hY183YjIxIiwKICAiZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVEZXNrdG9wU2VjMVB1YmxpY0tleUJhc2U2NFdvdWxkQmU2NURlY29kZWRCeXRlc1EycFY4WWIzTno3V3QxUms0WGg2Wmc5TW0wQWE1QmIyQ2M0RGQ2RWU4Zj09IiwKICAia2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iLAogICJyb2xlIjogImRlc2t0b3AiLAogICJjbGFpbV90b2tlbl9oaW50IjogIjQ3MjkiCn0K"),
         ProtocolFixture(
@@ -262,5 +266,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 57
+    static let expectedCount = 58
 }
