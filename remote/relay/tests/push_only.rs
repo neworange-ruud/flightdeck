@@ -708,3 +708,114 @@ async fn invalid_relay_mode_stops_the_binary_at_startup() {
         "stderr names the variable and the accepted values: {stderr}"
     );
 }
+
+// ── claims that would make an unusable relay-mode pairing ─────────────────
+
+/// Assert `frame` is the push-only claim refusal carrying `message`.
+fn assert_claim_refused(frame: RelayFrame, message: &str, pairing: Option<&PairingId>) {
+    match frame {
+        RelayFrame::Error {
+            code,
+            message: got,
+            pairing_id,
+            ..
+        } => {
+            assert_eq!(code, RelayErrorCode::PairingClaimRejected);
+            assert_eq!(got, message);
+            assert_eq!(pairing_id.as_ref(), pairing);
+        }
+        other => panic!("expected pairing_claim_rejected, got {other:?}"),
+    }
+}
+
+/// A pre-v4 phone claiming a direct offer on a push-only relay would get the
+/// endpoint withheld and end up in a relay-mode pairing this relay can never
+/// carry. The claim is refused with a message that says what to do, the
+/// waiting desktop's offer is failed with the same words, and the half-made
+/// pairing is gone (nothing to push to, nothing to authenticate).
+#[tokio::test]
+async fn a_pre_v4_phone_claiming_on_a_push_only_relay_is_refused() {
+    let relay = spawn(RelayMode::PushOnly).await;
+    let mut desktop = TestClient::connect(&relay.base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop
+        .offer_pairing_direct(DirectEndpoint {
+            host: "ruuds-mbp.tail1234.ts.net".into(),
+            port: 47800,
+        })
+        .await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect_at(
+        &relay.base,
+        Role::Phone,
+        "dev_old_phone",
+        p256::ecdsa::SigningKey::random(&mut rand_core::OsRng),
+        flightdeck_remote_protocol::DIRECT_LINK_MIN_VERSION - 1,
+    )
+    .await;
+    let message = flightdeck_relay::session::PUSH_ONLY_CLAIM_PHONE_TOO_OLD;
+    assert_claim_refused(phone.claim_pairing_frame(&token).await, message, None);
+    assert_claim_refused(next_error(&mut desktop).await, message, Some(&pairing));
+    desktop
+        .expect_no_frame_matching(200, |f| matches!(f, RelayFrame::PairingClaimed { .. }))
+        .await;
+    assert!(
+        relay.spy.inner.pairing_members(&pairing).await.is_none(),
+        "the half-made pairing is removed"
+    );
+    // Advisory: both sockets keep serving.
+    assert_still_open(&mut phone).await;
+    assert_still_open(&mut desktop).await;
+}
+
+/// A relay-mode offer (no endpoint — an older desktop, or one whose direct
+/// link is off) is accepted at offer time, but its claim is refused: the
+/// pairing would have no data plane on this relay whatever the phone.
+#[tokio::test]
+async fn a_claim_of_a_relay_mode_offer_on_a_push_only_relay_is_refused() {
+    let relay = spawn(RelayMode::PushOnly).await;
+    let mut desktop = TestClient::connect(&relay.base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop.offer_pairing().await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+
+    let mut phone = TestClient::connect(&relay.base, Role::Phone, "dev_phone").await;
+    let message = flightdeck_relay::session::PUSH_ONLY_CLAIM_NO_DIRECT_OFFER;
+    assert_claim_refused(phone.claim_pairing_frame(&token).await, message, None);
+    assert_claim_refused(next_error(&mut desktop).await, message, Some(&pairing));
+    assert!(relay.spy.inner.pairing_members(&pairing).await.is_none());
+    assert_eq!(relay.queue_calls(), 0);
+}
+
+/// The same old phone on a FULL relay still pairs (relay mode): the refusal is
+/// the mode, not the version.
+#[tokio::test]
+async fn a_pre_v4_phone_still_pairs_in_relay_mode_on_a_full_relay() {
+    let relay = spawn(RelayMode::Full).await;
+    let mut desktop = TestClient::connect(&relay.base, Role::Desktop, "dev_mac").await;
+    let (pairing, token) = desktop
+        .offer_pairing_direct(DirectEndpoint {
+            host: "ruuds-mbp.tail1234.ts.net".into(),
+            port: 47800,
+        })
+        .await;
+    desktop.authenticate(vec![pairing.clone()]).await;
+    let mut phone = TestClient::connect_at(
+        &relay.base,
+        Role::Phone,
+        "dev_old_phone",
+        p256::ecdsa::SigningKey::random(&mut rand_core::OsRng),
+        flightdeck_remote_protocol::DIRECT_LINK_MIN_VERSION - 1,
+    )
+    .await;
+    match phone.claim_pairing_frame(&token).await {
+        RelayFrame::PairingClaimed {
+            pairing_id,
+            direct_endpoint,
+            ..
+        } => {
+            assert_eq!(pairing_id, pairing);
+            assert_eq!(direct_endpoint, None);
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+}

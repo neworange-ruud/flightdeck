@@ -179,6 +179,18 @@ const SEQ_REJECT_WARN_EVERY: u64 = 50;
 /// `relay/error_relay_mode_push_only.json` fixture).
 const PUSH_ONLY_REFUSAL: &str = "this relay runs in push_only mode and does not carry envelopes";
 
+/// The `pairing_claim_rejected` message a push-only relay sends when the
+/// desktop offered a direct link but the claiming phone negotiated below
+/// [`DIRECT_LINK_MIN_VERSION`] (spec §5.9): only a newer app can pair here.
+pub const PUSH_ONLY_CLAIM_PHONE_TOO_OLD: &str =
+    "this relay is push-only; update the iPhone app to pair over Tailscale";
+
+/// The `pairing_claim_rejected` message a push-only relay sends when the offer
+/// carried no direct endpoint (spec §5.9): the Mac must pair over its direct
+/// link here.
+pub const PUSH_ONLY_CLAIM_NO_DIRECT_OFFER: &str =
+    "this relay is push-only; turn on the Mac's direct link (Tailscale) and pair again";
+
 impl Connection {
     /// Create a connection in its initial state.
     pub fn new(state: AppState, out_tx: mpsc::Sender<RelayFrame>) -> Self {
@@ -655,6 +667,55 @@ impl Connection {
             }
         };
 
+        // Direct mode needs a direct-capable phone (spec §5.2): the offer must
+        // have carried an endpoint AND this phone's connection must have
+        // negotiated v4+ (a v4 build is the one that dials the direct link). An
+        // older phone would ignore the endpoint and keep using the relay, so it
+        // gets neither copy and the pairing is relay mode on both ends.
+        let offered_direct = claim.direct_endpoint.is_some();
+        let direct_endpoint = claim
+            .direct_endpoint
+            .clone()
+            .filter(|_| self.negotiated_version >= DIRECT_LINK_MIN_VERSION);
+
+        // A push-only relay carries no data plane (spec §5.9), so a relay-mode
+        // pairing made here could never exchange a single envelope. Refuse the
+        // claim instead of minting one: the phone hears why, the waiting
+        // desktop's offer is failed with the same words, and the half-made
+        // pairing is removed. The token is already spent (redemption is
+        // single-use), which is fine — retrying cannot succeed either.
+        if self.state.is_push_only() && direct_endpoint.is_none() {
+            let message = if offered_direct {
+                PUSH_ONLY_CLAIM_PHONE_TOO_OLD
+            } else {
+                PUSH_ONLY_CLAIM_NO_DIRECT_OFFER
+            };
+            tracing::info!(
+                conn = %self.connection_id, pairing = ?claim.pairing_id,
+                version = self.negotiated_version, offered_direct,
+                "pairing_claim REFUSED: push-only relay, the pairing would be relay mode"
+            );
+            if let Some(desktop) = self.state.registry.peer(&claim.pairing_id, Role::Phone) {
+                desktop
+                    .send(RelayFrame::Error {
+                        code: RelayErrorCode::PairingClaimRejected,
+                        message: message.to_string(),
+                        pairing_id: Some(claim.pairing_id.clone()),
+                        expected_seq: None,
+                    })
+                    .await;
+            }
+            self.state.registry.remove(&claim.pairing_id);
+            let _ = self
+                .state
+                .store
+                .revoke_pairing(&claim.pairing_id, &claim.desktop_device)
+                .await;
+            self.send_error(RelayErrorCode::PairingClaimRejected, message, None)
+                .await;
+            return Flow::Continue;
+        }
+
         // Register the phone's identity + key-agreement keys and attach it to
         // the pairing. The identity key is also handed to the desktop below
         // (`peer_device_public_key`, v4) so it can authenticate the phone on the
@@ -694,15 +755,6 @@ impl Connection {
             .await;
         let phone_ka_key = self.state.store.device_key_agreement_key(&device_id).await;
 
-        // Direct mode needs a direct-capable phone (spec §5.2): the offer must
-        // have carried an endpoint AND this phone's connection must have
-        // negotiated v4+ (a v4 build is the one that dials the direct link). An
-        // older phone would ignore the endpoint and keep using the relay, so it
-        // gets neither copy and the pairing is relay mode on both ends.
-        let offered_direct = claim.direct_endpoint.is_some();
-        let direct_endpoint = claim
-            .direct_endpoint
-            .filter(|_| self.negotiated_version >= DIRECT_LINK_MIN_VERSION);
         if offered_direct && direct_endpoint.is_none() {
             tracing::info!(
                 conn = %self.connection_id, pairing = ?claim.pairing_id,
