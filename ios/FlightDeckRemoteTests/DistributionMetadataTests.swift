@@ -130,6 +130,35 @@ struct DistributionMetadataTests {
         #expect(reasons.contains("CA92.1"))
     }
 
+    // MARK: - Notification Service Extension (remote-control-bza0)
+
+    private func extensionInfo() throws -> [String: Any] {
+        let plugIns = try #require(Bundle.main.builtInPlugInsURL)
+        let url = plugIns.appendingPathComponent("FlightDeckNotificationService.appex/Info.plist")
+        return try #require(
+            NSDictionary(contentsOf: url) as? [String: Any],
+            "FlightDeckNotificationService.appex is not embedded in the app")
+    }
+
+    /// The extension must be embedded and registered for the service point,
+    /// or every push shows only the relay's generic text.
+    @Test func notificationServiceExtensionIsEmbedded() throws {
+        let ext = try extensionInfo()
+        let point = try #require(ext["NSExtension"] as? [String: Any])
+        #expect(point["NSExtensionPointIdentifier"] as? String == "com.apple.usernotifications.service")
+        #expect((point["NSExtensionPrincipalClass"] as? String)?.hasSuffix(".NotificationService") == true)
+        #expect(ext["CFBundleIdentifier"] as? String == "agency.neworange.flightdeck.remote.notification-service")
+        #expect(ext["UIDeviceFamily"] as? [Int] == [1])
+    }
+
+    /// App Store Connect rejects an embedded extension whose version or build
+    /// number differs from the app's.
+    @Test func extensionVersionMatchesTheApp() throws {
+        let ext = try extensionInfo()
+        #expect(ext["CFBundleShortVersionString"] as? String == info["CFBundleShortVersionString"] as? String)
+        #expect(ext["CFBundleVersion"] as? String == info["CFBundleVersion"] as? String)
+    }
+
     // MARK: - Push environment
 
     /// The single most breakage-prone pairing in the whole distribution setup:

@@ -12,10 +12,11 @@
 //     with `NotificationPolicy` to produce a `UNNotificationContent`, or `nil`
 //     when the event is suppressed (toggle off / project muted).
 //
-//  The `userInfo` payload it stamps (`event_id` + `deep_link`) is byte-shape
-//  identical to the APNs alert payload the relay builds, so the one
-//  `PushPayload` parser handles both a tapped local notification and a tapped
-//  remote push (push-deeplink).
+//  The `userInfo` payload it stamps (`event_id` + `deep_link` + `pairing_id`)
+//  comes from the same `NotificationUserInfo` builder the Notification Service
+//  Extension uses when it rewrites a sealed push, so the one `PushPayload`
+//  parser handles both a tapped local notification and a tapped remote push
+//  (push-deeplink, remote-control-bza0).
 //
 
 import Foundation
@@ -116,7 +117,8 @@ enum NotificationContentMapper {
             case .needsInput:
                 // A distinct, urgent tone (PRD §5.2). Falls back to the system
                 // default if the bundled sound file is absent.
-                content.sound = UNNotificationSound(named: UNNotificationSoundName("needs_input.caf"))
+                content.sound = UNNotificationSound(
+                    named: UNNotificationSoundName(PushNotificationRewriter.needsInputSoundName))
             case .chime:
                 content.sound = .default
             case .silent:

@@ -31,6 +31,14 @@ settings:
     # command line instead (`CODE_SIGNING_ALLOWED=NO`, see scripts/test.sh and
     # the CI job), which keeps that path working without a certificate.
     CODE_SIGNING_ALLOWED: YES
+    # Backs CFBundleVersion of BOTH the app and its Notification Service
+    # Extension (see the app's info.properties comment) — App Store Connect
+    # rejects an embedded extension whose build number differs from the app's,
+    # so it lives here, once, rather than per target. `scripts/release` resets
+    # it to 1 on a version bump; the TestFlight workflow overrides it per run
+    # (a command-line setting reaches every target) so every upload gets a
+    # fresh, strictly increasing number.
+    CURRENT_PROJECT_VERSION: "1"
 
 packages:
   SwiftTerm:
@@ -58,7 +66,9 @@ targets:
         # Marketing version tracks the FlightDeck release train (Cargo.toml's
         # `version`); `scripts/release` rewrites both together so the phone and
         # the desktop never claim different versions. Surfaced in Settings →
-        # About.
+        # About. The Notification Service Extension repeats it (App Store Connect
+        # requires the two to match); `scripts/release` rewrites every
+        # occurrence.
         CFBundleShortVersionString: "1.25.1"
         # Build number. Must strictly increase on EVERY App Store Connect
         # upload, independently of the marketing version — reusing one is
@@ -69,7 +79,7 @@ targets:
         # command line, xcconfig or otherwise — can then override it: passing
         # `CURRENT_PROJECT_VERSION=99` silently produced a build still numbered
         # 1, so CI could only ever upload the same number. The default lives in
-        # the target's CURRENT_PROJECT_VERSION below, which `scripts/release`
+        # the project-level CURRENT_PROJECT_VERSION above, which `scripts/release`
         # resets and CI overrides per run.
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Export compliance (App Store Connect asks on every upload until this
@@ -131,10 +141,6 @@ targets:
         # declaring UIDeviceFamily [1, 2]. That pulled it into Apple's iPad
         # multitasking rules and got uploads rejected with ITMS-90474.
         TARGETED_DEVICE_FAMILY: "1"
-        # Backs CFBundleVersion (see the info.properties comment). `scripts/release`
-        # resets this to 1 on a version bump; the TestFlight workflow overrides it
-        # per run so every upload gets a fresh, strictly increasing number.
-        CURRENT_PROJECT_VERSION: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         GENERATE_INFOPLIST_FILE: NO
@@ -168,11 +174,61 @@ targets:
           PROVISIONING_PROFILE_SPECIFIER: "FlightDeck Remote App Store"
     dependencies:
       - package: SwiftTerm
+      # Embedded in PlugIns/ (xcodegen embeds app extensions by default).
+      - target: FlightDeckNotificationService
     scheme:
       testTargets:
         - FlightDeckRemoteTests
         - FlightDeckRemoteUITests
       gatherCoverageData: true
+
+  # Notification Service Extension (remote-control-bza0): decrypts the sealed
+  # `fd_push` payload of a visible alert and rewrites its title/body/sound/deep
+  # link before iOS shows it. Keep it small — extensions run under a ~24 MB
+  # memory limit — so it compiles only `Shared/` (no Wire types, no SwiftTerm).
+  FlightDeckNotificationService:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FlightDeckNotificationService
+        excludes:
+          - "Info.plist"
+          - "FlightDeckNotificationService.entitlements"
+      - path: Shared
+    info:
+      path: FlightDeckNotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: "FlightDeck Remote Notifications"
+        # Must equal the app's (App Store Connect rejects a mismatch);
+        # `scripts/release` rewrites both. DistributionMetadataTests guards it.
+        CFBundleShortVersionString: "1.25.1"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        FlightDeckSharedKeychainGroup: "$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: agency.neworange.flightdeck.remote.notification-service
+        # See the app target: XcodeGen's per-target default of "1,2" beats the
+        # project-level value.
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        # One file for Debug and Release: the extension carries no
+        # aps-environment, only the shared Keychain group and the App Group.
+        CODE_SIGN_ENTITLEMENTS: FlightDeckNotificationService/FlightDeckNotificationService.entitlements
+      configs:
+        Release:
+          # Same manual App Store signing as the app (see its Release config),
+          # against the extension's own explicitly managed profile.
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+          # Must match the profile name created via the App Store Connect API —
+          # see ios/README.md "Credentials".
+          PROVISIONING_PROFILE_SPECIFIER: "FlightDeck Remote Notifications App Store"
 
   FlightDeckRemoteTests:
     type: bundle.unit-test

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Notification Service Extension entitlements (remote-control-bza0), used by
+	  both Debug and Release. No aps-environment: the extension does not
+	  register for pushes, it only rewrites the app's.
+
+	  keychain-access-groups: ONLY the shared group, which holds the phone's
+	  key-agreement key and the per-pairing records — exactly what the
+	  extension needs to derive a pairing's push key. The app's default group
+	  (Secure Enclave identity blob, relay password) is out of reach.
+
+	  application-groups: the shared UserDefaults suite the app writes the
+	  notification preferences (toggles + per-project mute) to. Must be
+	  registered for team 7NKCS4AZS9 and enabled on this App ID — see
+	  ios/README.md.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.agency.neworange.flightdeck.remote</string>
+	</array>
+</dict>
+</plist>
