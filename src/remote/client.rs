@@ -2503,6 +2503,33 @@ async fn handle_frame(
             direct_endpoint,
             peer_device_public_key,
         } => {
+            // Defensive twin of the relay's own refusal (spec §5.9): on a
+            // push-only relay a claim without the endpoint echo would be a
+            // relay-mode pairing that relay can never carry. Refuse it here
+            // too — drop it, revoke it at the relay, tell the overlay — rather
+            // than mark it established and feed a pairing nothing can reach.
+            if write.relay_mode == RelayMode::PushOnly && direct_endpoint.is_none() {
+                crate::remote::debuglog::log(&format!(
+                    "client CLAIM refused pairing={} — push-only relay, no direct echo",
+                    pairing_id.as_str()
+                ));
+                state
+                    .pairings
+                    .retain(|p| p.pairing_id != pairing_id.as_str());
+                store.save(state);
+                gate.mark_clean();
+                let _ = send_frame(
+                    sink,
+                    &RelayFrame::Revoke {
+                        pairing_id: pairing_id.clone(),
+                    },
+                )
+                .await;
+                inbound_tx.send(RemoteInbound::PairingRefused {
+                    reason: PUSH_ONLY_CLAIM_REFUSED.to_string(),
+                });
+                return true;
+            }
             // The phone joined: record the peer id + its key-agreement key and
             // mark the pairing established so the E2E channel can be derived now
             // and reconstructed on the next launch (spec §5.2 / §7.1).
@@ -2720,6 +2747,36 @@ async fn handle_frame(
             inbound_tx.send(RemoteInbound::PeerBacklog { pairing_id });
             true
         }
+        // The relay refused a phone's claim of OUR pending offer (spec §5.9:
+        // a push-only relay will not mint a relay-mode pairing). The pairing
+        // never came to be: forget it and fail the pairing overlay with the
+        // relay's own words. Only a pending (unestablished) pairing qualifies;
+        // anything else is logged and otherwise ignored.
+        RelayFrame::Error {
+            code: RelayErrorCode::PairingClaimRejected,
+            pairing_id: Some(pairing_id),
+            ref message,
+            ..
+        } => {
+            let pending = state
+                .pairing(pairing_id.as_str())
+                .is_some_and(|p| !p.established);
+            crate::remote::debuglog::log(&format!(
+                "client RECV error pairing_claim_rejected pairing={} pending={pending} msg={message}",
+                pairing_id.as_str()
+            ));
+            if pending {
+                state
+                    .pairings
+                    .retain(|p| p.pairing_id != pairing_id.as_str());
+                store.save(state);
+                gate.mark_clean();
+                inbound_tx.send(RemoteInbound::PairingRefused {
+                    reason: as_sentence(message),
+                });
+            }
+            true
+        }
         // A push-only relay refusing a data-plane frame (spec §5.9) is advisory:
         // this client no longer sends those there, so it can only be a race
         // around a reconnect. Logged once per session.
@@ -2752,6 +2809,21 @@ async fn handle_frame(
         // Post-auth restatements of handshake frames or unused directions: ignore.
         _ => true,
     }
+}
+
+/// A relay's lowercase error message as a sentence for the UI: capitalised,
+/// with a full stop.
+fn as_sentence(message: &str) -> String {
+    let trimmed = message.trim();
+    let mut chars = trimmed.chars();
+    let mut out: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => return String::new(),
+    };
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
 }
 
 /// Whether a relay error tears the connection down (vs. an advisory notice).

@@ -3365,3 +3365,165 @@ fn a_refused_push_is_advisory_and_not_a_peer_backlog() {
         "the session was not torn down"
     );
 }
+
+/// A pairing offered on a push-only relay whose claim comes back as `then`:
+/// returns the persisted state, what reached the app, and what the client
+/// wrote after the claim.
+fn push_only_claim_drill(then: RelayFrame) -> (RemoteState, Vec<RemoteInbound>, Vec<RelayFrame>) {
+    use flightdeck_remote_protocol::{DirectEndpoint, RelayMode};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let endpoint = DirectEndpoint {
+        host: "ruuds-mbp.tail1234.ts.net".to_string(),
+        port: 47800,
+    };
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 4,
+                server_time_ms: 0,
+                connection_id: "conn".to_string(),
+                relay_mode: Some(RelayMode::PushOnly),
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode([3u8; 32]),
+                server_time_ms: 0,
+            },
+        );
+        assert!(matches!(
+            ws_recv(&mut ws),
+            Some(RelayFrame::PairingOffer { .. })
+        ));
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingOfferOk {
+                pairing_id: PairingId::new("pair_p"),
+                claim_token: "4321".to_string(),
+                expires_at_ms: 9_999,
+            },
+        );
+        assert!(matches!(
+            ws_recv(&mut ws),
+            Some(RelayFrame::AuthResponse { .. })
+        ));
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![PairingId::new("pair_p")],
+            },
+        );
+        ws_send(&mut ws, &then);
+        collect_writes(&mut ws, Duration::from_millis(800))
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        direct_enabled: true,
+        ..RemoteConfig::default()
+    };
+    let shared = std::sync::Arc::new(Mutex::new(RemoteState::default()));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".to_string()),
+        })
+        .unwrap();
+    let options = ClientOptions {
+        direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
+        router: None,
+    };
+    let handle = RemoteHandle::start_with_options(
+        cfg,
+        identity,
+        Box::new(SharedStore(shared.clone())),
+        in_tx,
+        out_rx,
+        options,
+    );
+    let sent = mock.join().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let inbound: Vec<RemoteInbound> = in_rx.try_iter().collect();
+    handle.stop();
+    let state = shared.lock().unwrap().clone();
+    (state, inbound, sent)
+}
+
+/// The relay refused a phone's claim of our offer (spec §5.9): the pending
+/// pairing is forgotten and the overlay fails with the relay's own words, as a
+/// sentence, on the refusal path (no relay_url/relay_password advice).
+#[test]
+fn a_relay_refused_claim_fails_the_offer_with_the_relays_words() {
+    let (state, inbound, _sent) = push_only_claim_drill(RelayFrame::Error {
+        code: RelayErrorCode::PairingClaimRejected,
+        message: "this relay is push-only; update the iPhone app to pair over Tailscale"
+            .to_string(),
+        pairing_id: Some(PairingId::new("pair_p")),
+        expected_seq: None,
+    });
+    assert!(state.pairing("pair_p").is_none(), "the offer is forgotten");
+    let reasons: Vec<&str> = inbound
+        .iter()
+        .filter_map(|m| match m {
+            RemoteInbound::PairingRefused { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["This relay is push-only; update the iPhone app to pair over Tailscale."]
+    );
+}
+
+/// Defensive twin of the relay's refusal: a claim with no endpoint echo on a
+/// push-only relay would be an unusable relay-mode pairing. The client refuses
+/// it — revokes it at the relay, forgets it, tells the overlay — and never
+/// hands the app a `PairingClaimed` to derive a channel for.
+#[test]
+fn a_push_only_claim_without_the_echo_is_revoked_and_reported() {
+    use flightdeck_remote_protocol::DeviceId;
+
+    let phone = DeviceIdentity::generate();
+    let (state, inbound, sent) = push_only_claim_drill(RelayFrame::PairingClaimed {
+        pairing_id: PairingId::new("pair_p"),
+        peer_device_id: Some(DeviceId::new(phone.device_id())),
+        peer_key_agreement_public_key: Some(phone.public_key_base64()),
+        direct_endpoint: None,
+        peer_device_public_key: Some(phone.public_key_base64()),
+    });
+    assert!(
+        state.pairing("pair_p").is_none(),
+        "nothing relay-mode is kept"
+    );
+    assert!(
+        sent.iter().any(
+            |f| matches!(f, RelayFrame::Revoke { pairing_id } if pairing_id.as_str() == "pair_p")
+        ),
+        "the half-made pairing is revoked at the relay: {sent:?}"
+    );
+    assert!(inbound.iter().any(
+        |m| matches!(m, RemoteInbound::PairingRefused { reason } if reason == PUSH_ONLY_CLAIM_REFUSED)
+    ));
+    assert!(!inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::PairingClaimed { .. })));
+}
+
+#[test]
+fn relay_messages_become_sentences() {
+    assert_eq!(
+        as_sentence("this relay is push-only"),
+        "This relay is push-only."
+    );
+    assert_eq!(as_sentence(" Already done. "), "Already done.");
+    assert_eq!(as_sentence(""), "");
+}
