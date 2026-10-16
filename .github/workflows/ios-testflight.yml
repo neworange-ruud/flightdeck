@@ -80,6 +80,18 @@ jobs:
         # The .xcodeproj is generated, not committed (see ios/README.md).
         run: brew install xcodegen
 
+      - name: Ensure the Metal Toolchain
+        # SwiftTerm ships Metal shaders, and Xcode 26+ no longer bundles the
+        # Metal compiler ("missing Metal Toolchain"). Download it only when this
+        # runner's Xcode reports it uninstalled; older Xcodes, which bundle it
+        # and do not know -showComponent, skip this.
+        run: |
+          if xcodebuild -showComponent MetalToolchain 2>/dev/null | grep -q "Status: uninstalled"; then
+            xcodebuild -downloadComponent MetalToolchain
+          else
+            echo "Metal Toolchain present or bundled; nothing to do."
+          fi
+
       - name: Import the Apple Distribution certificate
         env:
           CERT_P12: ${{ secrets.APPLE_DISTRIBUTION_CERT }}

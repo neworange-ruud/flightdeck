@@ -62,10 +62,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // Present even while foregrounded (banner + sound + Notification
-        // Center); the sound was already gated by settings when the content was
-        // built (`NotificationContentMapper`), so honoring it here is correct.
-        completionHandler([.banner, .sound, .list])
+        // Present while foregrounded, but never twice for one agent event: the
+        // same event can arrive as a push and as a live local notification
+        // (`ForegroundPresentationPolicy`). Sounds were already gated by the
+        // user's settings when the content was built.
+        let request = notification.request
+        let source: ForegroundPresentationPolicy.Source =
+            request.trigger is UNPushNotificationTrigger ? .remote : .local
+        let userInfo = request.content.userInfo
+        let isPassive = request.content.interruptionLevel == .passive
+        Task { @MainActor in
+            let presentation = PushCoordinator.shared.presentation(
+                source: source, userInfo: userInfo, isPassive: isPassive)
+            completionHandler(presentation.options)
+        }
     }
 
     func userNotificationCenter(

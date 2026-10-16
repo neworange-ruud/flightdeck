@@ -2,10 +2,11 @@
 //  NotificationContentMapper.swift
 //  FlightDeckRemote
 //
-//  Maps a typed `Wire.AgentEvent` to notification content (PRD §5.2 copy),
-//  mirroring the relay's Rust `apns::notification_content` so both platforms
-//  agree on the wire/display shape. Two layers, so the copy/deep-link logic is
-//  testable without a UserNotifications host:
+//  Maps a typed `Wire.AgentEvent` that arrived over the live transport to a
+//  local notification (PRD §5.2 copy). (The relay no longer builds any
+//  notification content; pushes carry the desktop's sealed `PushPayload`,
+//  rendered by `PushNotificationRewriter`.) Two layers, so the copy/deep-link
+//  logic is testable without a UserNotifications host:
 //   - `AgentEventNotification` — a pure, `Equatable` display model (title,
 //     body, sound kind, urgency, deep link, event id).
 //   - `NotificationContentMapper.content(for:settings:)` — combines that model

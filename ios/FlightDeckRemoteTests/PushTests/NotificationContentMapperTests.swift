@@ -2,9 +2,8 @@
 //  NotificationContentMapperTests.swift
 //  FlightDeckRemoteTests
 //
-//  The typed `Wire.AgentEvent → notification content` mapping (PRD §5.2 copy),
-//  mirroring the relay's Rust `apns::notification_content`, plus the
-//  settings-gated `UNNotificationContent` build.
+//  The typed `Wire.AgentEvent → local notification content` mapping (PRD §5.2
+//  copy), plus the settings-gated `UNNotificationContent` build.
 //
 
 import Testing
