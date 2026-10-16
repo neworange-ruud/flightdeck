@@ -123,8 +123,9 @@ struct DefaultPairingUnpairService: PairingUnpairing {
 
     @discardableResult
     func revoke(pairingId: String) async -> Bool {
-        guard let client = coordinator.client(for: pairingId) else { return false }
-        return await client.revokePairing()
+        // Relay always; plus the Mac over the direct link for a direct-mode
+        // pairing (spec §5.10) — see `TransportStore.revokePairing`.
+        await coordinator.revoke(pairingId: pairingId)
     }
 
     func stopTransport(pairingId: String) async {

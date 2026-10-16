@@ -43,7 +43,7 @@ import CryptoKit
     }
 
     private func verifySignature(_ frame: Wire.RelayFrame, identityPublicKeyB64: String, nonceB64: String) -> Bool {
-        guard case let .authResponse(_, signature, _) = frame,
+        guard case let .authResponse(_, signature, _, _) = frame,
               let pub = Data(base64Encoded: identityPublicKeyB64),
               let sig = Data(base64Encoded: signature),
               let nonce = Data(base64Encoded: nonceB64),

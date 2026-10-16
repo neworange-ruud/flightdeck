@@ -78,6 +78,7 @@ final class ScriptedConnector: WebSocketConnecting, @unchecked Sendable {
     private let make: @Sendable () -> ScriptedChannel
     private let lock = NSLock()
     private var _channels: [ScriptedChannel] = []
+    private var _urls: [URL] = []
 
     init(channel: ScriptedChannel) {
         self.make = { channel }
@@ -89,12 +90,17 @@ final class ScriptedConnector: WebSocketConnecting, @unchecked Sendable {
 
     func connect(to url: URL) async throws -> any WebSocketChannel {
         let channel = make()
-        lock.lock(); _channels.append(channel); lock.unlock()
+        lock.lock(); _channels.append(channel); _urls.append(url); lock.unlock()
         return channel
     }
 
     var channels: [ScriptedChannel] {
         lock.lock(); defer { lock.unlock() }; return _channels
+    }
+
+    /// Every URL dialed, in connect order (relay vs direct endpoint selection).
+    var urls: [URL] {
+        lock.lock(); defer { lock.unlock() }; return _urls
     }
 }
 
@@ -182,7 +188,8 @@ enum TransportFixtures {
         salt: Data = Data("bootstrap-secret-bytes-000000".utf8),
         relayURL: String = "wss://relay.example/v1",
         lastReceivedSeq: UInt64 = 0,
-        lastSentSeq: UInt64 = 0
+        lastSentSeq: UInt64 = 0,
+        directEndpoint: Wire.DirectEndpoint? = nil
     ) throws -> (peer: DesktopPeer, keyAgreement: KeyAgreementKeys) {
         let phoneKA = try KeyAgreementKeys.loadOrCreate(store: keychain)
 
@@ -197,7 +204,8 @@ enum TransportFixtures {
             saltB64: salt.base64EncodedString(),
             relayURL: relayURL,
             lastSentSeq: lastSentSeq,
-            lastReceivedSeq: lastReceivedSeq
+            lastReceivedSeq: lastReceivedSeq,
+            directEndpoint: directEndpoint
         )
 
         let desktopChannel = try E2EChannel.derive(

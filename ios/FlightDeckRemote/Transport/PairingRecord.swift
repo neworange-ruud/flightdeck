@@ -27,6 +27,24 @@
 
 import Foundation
 
+/// How a pairing carries its data plane (REMOTE_PROTOCOL §5.2 / §5.10).
+enum PairingTransportMode: String, Equatable, Sendable {
+    /// Envelopes route through the relay — every pairing made before v4, and
+    /// any pairing whose desktop offered no direct endpoint.
+    case relay
+    /// Envelopes go straight to the Mac over Tailscale (`ws://host:port`);
+    /// the relay is still used for push-token registration and revoke.
+    case direct
+
+    /// Short user-facing label for the pairing/settings detail.
+    var displayName: String {
+        switch self {
+        case .relay: return "Relay"
+        case .direct: return "Direct (Tailscale)"
+        }
+    }
+}
+
 /// The persisted state for one phone ↔ Mac pairing.
 struct PairingRecord: Codable, Equatable, Sendable {
     /// The relay-assigned pairing id — all routing is keyed by this (§5.2).
@@ -53,6 +71,20 @@ struct PairingRecord: Codable, Equatable, Sendable {
     var lastReceivedSeq: UInt64
     /// When this pairing was established.
     var pairedAt: Date
+    /// Where the Mac serves the direct link over Tailscale (v4, §5.10), copied
+    /// from the phone-bound `pairing_claimed.direct_endpoint`. `nil` for a
+    /// relay-mode pairing — including every record written before this field
+    /// existed (synthesized `Decodable` reads a missing optional as `nil`), so
+    /// old pairings keep working exactly as before. Re-pairing is the only way
+    /// to switch modes or change the endpoint (§5.2).
+    var directEndpoint: Wire.DirectEndpoint?
+
+    /// The pairing's transport, derived from `directEndpoint`: direct exactly
+    /// when the claim carried an endpoint. Derived rather than stored so the
+    /// mode can never disagree with the endpoint it implies.
+    var transportMode: PairingTransportMode {
+        directEndpoint == nil ? .relay : .direct
+    }
 
     init(
         pairingId: String,
@@ -62,7 +94,8 @@ struct PairingRecord: Codable, Equatable, Sendable {
         relayURL: String,
         lastSentSeq: UInt64 = 0,
         lastReceivedSeq: UInt64 = 0,
-        pairedAt: Date = Date()
+        pairedAt: Date = Date(),
+        directEndpoint: Wire.DirectEndpoint? = nil
     ) {
         self.pairingId = pairingId
         self.peerDeviceId = peerDeviceId
@@ -72,6 +105,7 @@ struct PairingRecord: Codable, Equatable, Sendable {
         self.lastSentSeq = lastSentSeq
         self.lastReceivedSeq = lastReceivedSeq
         self.pairedAt = pairedAt
+        self.directEndpoint = directEndpoint
     }
 
     /// The decoded E2E bootstrap salt bytes.

@@ -217,9 +217,19 @@ struct SettingsView: View {
                     Circle()
                         .fill(instance.lastKnownOnline ? Theme.statusIdle : Theme.textMutedDark)
                         .frame(width: 8, height: 8)
-                    Text(instance.displayName)
-                        .typography(Typography.body)
-                        .foregroundStyle(Theme.textPrimary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(instance.displayName)
+                            .typography(Typography.body)
+                            .foregroundStyle(Theme.textPrimary)
+                        // Which transport this pairing uses (remote-control-gz0d):
+                        // "Direct (Tailscale)" vs "Relay". Fixed per pairing.
+                        if let transport = machineTransportLabel(for: instance) {
+                            Text(transport)
+                                .typography(Typography.caption)
+                                .foregroundStyle(Theme.textMutedDark)
+                                .accessibilityIdentifier("settings-machine-transport-\(instance.pairingId)")
+                        }
+                    }
                     Spacer(minLength: Theme.Spacing.sm)
                     Image(systemName: "chevron.right")
                         .foregroundStyle(Theme.textMutedDark)
@@ -234,6 +244,18 @@ struct SettingsView: View {
             machineUnpairButton(for: instance)
         }
         .padding(Theme.Spacing.lg)
+    }
+
+    /// The transport caption for a machine row: the pairing's mode from its
+    /// live store, flagged when a relay-mode pairing's relay turned out to be
+    /// push-only (it then has no data plane until re-paired over Tailscale).
+    /// `nil` when the machine has no live store (nothing honest to show).
+    private func machineTransportLabel(for instance: PairedInstance) -> String? {
+        guard let store = coordinator.store(for: instance.pairingId) else { return nil }
+        if store.transportMode == .relay, store.relayIsPushOnly {
+            return "Relay (push only — re-pair over Tailscale)"
+        }
+        return store.transportMode.displayName
     }
 
     /// Per-machine unpair (remote-control-b8d.11): removes THIS machine from the

@@ -59,6 +59,10 @@ enum TransportEvent: Sendable {
     /// client out to it forever. A revoke the phone itself sent needs no event:
     /// it removes the pairing eagerly and never waits for the confirmation.
     case pairingRevoked
+    /// This relay-mode pairing's relay runs push-only (spec §5.9) and carries
+    /// no envelopes, so the pairing has no data plane until it is re-paired in
+    /// direct mode (Tailscale). Pushes still work through it.
+    case relayPushOnly
 }
 
 extension Duration {

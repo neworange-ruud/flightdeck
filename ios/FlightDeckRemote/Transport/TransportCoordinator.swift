@@ -68,6 +68,9 @@ final class TransportCoordinator {
         let pairingId: String
         var instance: PairedInstance
         let client: TransportClient
+        /// A direct-mode pairing's relay control-plane client (push tokens,
+        /// revoke); `nil` in relay mode. Owned by `store`'s lifecycle.
+        let controlClient: TransportClient?
         let store: TransportStore
 
         var id: String { pairingId }
@@ -109,6 +112,10 @@ final class TransportCoordinator {
     /// independent socket. A closure (not a shared instance) keeps the clients
     /// from contending on one connector.
     private let connectorFactory: @Sendable () -> any WebSocketConnecting
+    /// A fresh connector for a direct-mode pairing's data plane — the Mac's
+    /// direct link over Tailscale (`DirectConnection` in production). Defaults
+    /// to `connectorFactory` so existing constructions and tests are unchanged.
+    private let directConnectorFactory: @Sendable () -> any WebSocketConnecting
     /// Per-pairing offline cache (or `nil` to disable persistence — tests pass
     /// a no-op so nothing touches disk). `@MainActor` because `SnapshotCache`
     /// is main-actor isolated and this is invoked from `makeHandle`.
@@ -161,6 +168,7 @@ final class TransportCoordinator {
         keyAgreement: KeyAgreementKeys,
         recordStore: PairingRecordStore,
         connectorFactory: @escaping @Sendable () -> any WebSocketConnecting,
+        directConnectorFactory: (@Sendable () -> any WebSocketConnecting)? = nil,
         cacheFactory: @escaping @MainActor @Sendable (String) -> SnapshotCache? = { _ in nil },
         cap: Int = PairingLimits.maxPairedInstances,
         clientConfig: TransportClient.Config = TransportClient.Config(),
@@ -172,6 +180,7 @@ final class TransportCoordinator {
         self.keyAgreement = keyAgreement
         self.recordStore = recordStore
         self.connectorFactory = connectorFactory
+        self.directConnectorFactory = directConnectorFactory ?? connectorFactory
         self.cacheFactory = cacheFactory
         self.cap = cap
         self.clientConfig = clientConfig
@@ -300,10 +309,26 @@ final class TransportCoordinator {
         handles.first { $0.pairingId == pairingId }?.store
     }
 
-    /// The `TransportClient` for `pairingId` (per-machine push registration,
-    /// remote-control-b8d.10), or `nil` if not active.
+    /// The data-plane `TransportClient` for `pairingId` (per-machine push
+    /// registration, remote-control-b8d.10), or `nil` if not active. For a
+    /// direct-mode pairing this is the client talking to the Mac directly.
     func client(for pairingId: String) -> TransportClient? {
         handles.first { $0.pairingId == pairingId }?.client
+    }
+
+    /// The relay control-plane client of a direct-mode `pairingId`, or `nil`
+    /// (relay mode, or not active).
+    func controlClient(for pairingId: String) -> TransportClient? {
+        handles.first { $0.pairingId == pairingId }?.controlClient
+    }
+
+    /// Best-effort `revoke` for `pairingId` (spec §5.8/§5.10): to the relay
+    /// always, and to the Mac over the direct link too for a direct-mode
+    /// pairing. Returns whether any frame was sent; `false` when not active.
+    @discardableResult
+    func revoke(pairingId: String) async -> Bool {
+        guard let store = store(for: pairingId) else { return false }
+        return await store.revokePairing()
     }
 
     /// Transitional single-store bridge for the Projects/Shell/Settings tabs.
@@ -569,18 +594,54 @@ final class TransportCoordinator {
 
     // MARK: - Building a client
 
+    /// Build the handle for one pairing, choosing its transport from its
+    /// `PairingRecord` (remote-control-gz0d):
+    ///
+    ///  - relay mode (no `directEndpoint`, incl. every pre-v4 record): ONE
+    ///    `.data` client over `connectorFactory`, carrying everything through
+    ///    the relay — exactly as before;
+    ///  - direct mode: a `.data` client over `directConnectorFactory` that
+    ///    talks to the Mac at `ws://host:port/remote/v1`, PLUS a
+    ///    `.relayControl` client over `connectorFactory` for push-token
+    ///    registration and revoke, which stay on the relay (§5.10).
+    ///
+    /// The data client re-resolves relay-vs-direct from the record on every
+    /// session (`TransportLink.resolve`), so even if the record could not be
+    /// read here (it then defaults to relay mode and gets no control client) a
+    /// direct pairing's envelopes still never go to the relay.
     private func makeHandle(for instance: PairedInstance) -> ClientHandle {
+        let record = (try? recordStore.load(pairingId: instance.pairingId)) ?? nil
+        let mode = record?.transportMode ?? .relay
         let client = TransportClient(
             identity: identity,
             keyAgreement: keyAgreement,
             recordStore: recordStore,
             pairingId: instance.pairingId,
-            connector: connectorFactory(),
+            plane: .data,
+            connector: mode == .direct ? directConnectorFactory() : connectorFactory(),
             config: clientConfig,
             now: now
         )
+        let controlClient: TransportClient? = mode == .direct
+            ? TransportClient(
+                identity: identity,
+                keyAgreement: keyAgreement,
+                recordStore: recordStore,
+                pairingId: instance.pairingId,
+                plane: .relayControl,
+                connector: connectorFactory(),
+                config: clientConfig,
+                now: now
+            )
+            : nil
         let cache = cacheFactory(instance.pairingId)
-        let store = TransportStore(client: client, cache: cache, now: now)
+        let store = TransportStore(
+            client: client,
+            controlClient: controlClient,
+            transportMode: mode,
+            cache: cache,
+            now: now
+        )
         // Offline last-known-state (PRD §9.2): seed from this pairing's own
         // cache BEFORE it is ever started, so a backgrounded/offline machine
         // still shows its last feed. Never races a live snapshot (the store
@@ -592,6 +653,7 @@ final class TransportCoordinator {
             pairingId: instance.pairingId,
             instance: instance,
             client: client,
+            controlClient: controlClient,
             store: store
         )
     }

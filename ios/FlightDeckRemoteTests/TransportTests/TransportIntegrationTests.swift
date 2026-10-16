@@ -94,7 +94,7 @@ import CryptoKit
         /// KA key, then derive the desktop E2E channel.
         func deriveChannel(pairingId: String, claimToken: String) async throws {
             let claimed = try await recvUntil { if case .pairingClaimed = $0 { return true }; return false }
-            guard case let .pairingClaimed(_, _, peerKA) = claimed, let peerKA, let phonePub = Data(base64Encoded: peerKA) else {
+            guard case let .pairingClaimed(_, _, peerKA, _, _) = claimed, let peerKA, let phonePub = Data(base64Encoded: peerKA) else {
                 throw CancellationError()
             }
             e2e = try E2EChannel.derive(

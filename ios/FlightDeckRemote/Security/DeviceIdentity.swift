@@ -182,6 +182,19 @@ struct DeviceIdentity {
         return try sign(nonce: nonce).base64EncodedString()
     }
 
+    /// Direct-link variant (REMOTE_PROTOCOL §5.10): decode the base64 nonce
+    /// and sign the domain-separated `Wire.directAuthMessage(nonce:)` —
+    /// `"flightdeck-remote-direct-v1:" ‖ nonce` — instead of the bare nonce.
+    /// Same key, algorithm and encodings as `signBase64(nonceBase64:)`; only
+    /// the signed bytes differ, so a signature minted for the Mac can never be
+    /// replayed to the relay, nor the reverse.
+    func signDirectAuthBase64(nonceBase64: String) throws -> String {
+        guard let nonce = Data(base64Encoded: nonceBase64) else {
+            throw DeviceIdentityError.invalidBase64
+        }
+        return try sign(nonce: Wire.directAuthMessage(nonce: nonce)).base64EncodedString()
+    }
+
     // MARK: - Helpers
 
     private static func tagged(_ tag: BackingTag, _ payload: Data) -> Data {

@@ -113,6 +113,42 @@ just enough to compile and be navigable; feature teams fill these in.
   Info.plist, and the root view also sets `.preferredColorScheme(.dark)`
   in-process.
 
+## Direct link (Tailscale)
+
+A pairing whose `pairing_claimed` carried a `direct_endpoint` (the desktop
+offered its Tailscale address, REMOTE_PROTOCOL §5.10) is in **direct mode**:
+`PairingRecord.directEndpoint` is set and Settings → Machines shows the
+pairing as "Direct (Tailscale)" instead of "Relay". Older pairings stay in
+relay mode; re-pair to switch.
+
+- **Transport selection** happens per pairing, from the record:
+  `TransportLink.resolve` (Transport/DirectConnection.swift). A direct pairing
+  runs two `TransportClient`s under one `TransportStore`: the data plane
+  straight to the Mac at `ws://<host>:<port>/remote/v1`, and a relay
+  control-plane client for push-token registration and revoke (which stay on
+  the relay). Both share the same state machine — E2E, seq/ack/resume, dedup,
+  backoff, delivery honesty; only the URL, the auth signature
+  (`"flightdeck-remote-direct-v1:" ‖ nonce`) and which frames may ride the link
+  differ.
+- **No ATS exception.** URLSession's App Transport Security refuses cleartext
+  `ws://` to both a `*.ts.net` name and a `100.x` literal (IP literals can't be
+  exception domains and `NSAllowsLocalNetworking` does not cover `100.x`), so
+  the direct link uses Network.framework (`DirectConnection`), which ATS does
+  not govern. The app's ATS policy is unchanged; `DirectLinkATSTests` pins
+  both halves. WireGuard is the transport encryption; E2E envelopes ride on
+  top.
+- **Local Network prompt: not triggered.** `100.x` and MagicDNS destinations
+  route over Tailscale's VPN (utun) interface, not the local Wi-Fi subnet, so
+  iOS's Local Network privacy does not apply (and loopback, used by the
+  tests, is exempt). If a user's own LAN happens to use `100.64.0.0/10` and
+  Tailscale is off, iOS could ask — the app would then just fail to connect,
+  which the reconnect banner reports honestly.
+- **Honesty.** With the Mac unreachable (Tailscale off, Mac asleep) the direct
+  connect fails within seconds (`DirectConnection.defaultConnectTimeout`), the
+  store keeps showing the cached state flagged stale, commands fail as "not
+  delivered", and the client reconnects with backoff, on network-path changes
+  and on foregrounding — exactly like the relay path.
+
 ## Versioning
 
 `CFBundleShortVersionString` in `project.yml` tracks the FlightDeck release

@@ -23,12 +23,16 @@ extension Wire {
 
     // MARK: - Version constants
 
-    /// Protocol version this build speaks and prefers.
-    static let protocolVersion: UInt16 = 2
+    /// Protocol version this build speaks and prefers. v4 (spec §4) adds the
+    /// `push_notify` frame and the optional `hello_ok.relay_mode`,
+    /// `pairing_offer.direct_endpoint`, `pairing_claimed.direct_endpoint` and
+    /// `pairing_claimed.peer_device_public_key` fields — all additive, so a v4
+    /// phone still talks to an older relay or desktop.
+    static let protocolVersion: UInt16 = 4
     /// Oldest protocol version this build can still interoperate with.
     static let minSupportedVersion: UInt16 = 1
     /// Newest protocol version this build can interoperate with.
-    static let maxSupportedVersion: UInt16 = 2
+    static let maxSupportedVersion: UInt16 = 4
 
     // MARK: - Role / agent identity
 
@@ -36,6 +40,21 @@ extension Wire {
     enum Role: String, Codable, Hashable, Sendable {
         case desktop
         case phone
+    }
+
+    // MARK: - Push class (v4, spec §5.5.1 / §7.2)
+
+    /// Why a push is being sent — the only plaintext hint a `push_notify`
+    /// carries (the relay picks the APNs interruption level and generic alert
+    /// text from it), repeated inside the sealed push payload. Mirrors Rust
+    /// `common::PushClass`.
+    enum PushClass: String, Codable, Hashable, Sendable {
+        /// An agent stopped to ask the human (permission prompt or question).
+        case needsInput = "needs_input"
+        /// An agent hit an error.
+        case error
+        /// An agent settled idle after its turn.
+        case done
     }
 
     /// Which agent CLI backs a session.
