@@ -1,0 +1,13 @@
+{
+  "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+  "class": "needs_input",
+  "title": "fd-api needs input",
+  "body": "Allow `cargo test --locked`?",
+  "deep_link": {
+    "project_id": "proj_fd_api",
+    "session_id": "sess_fix_login",
+    "item_id": "item_q1"
+  },
+  "project_name": "fd-api",
+  "occurred_at_ms": 1752412800000
+}
