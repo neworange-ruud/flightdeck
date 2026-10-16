@@ -88,35 +88,11 @@ extension Wire {
     // MARK: - Structs
 
     /// Where the phone can reach a Mac directly over Tailscale (v4, spec
-    /// §5.10): the Mac's MagicDNS name (`ruuds-mbp.tail1234.ts.net`) or
-    /// Tailscale address (`100.101.102.103`) and the port its direct-link
-    /// WebSocket listens on. Carried in `pairing_offer` and copied by the relay
-    /// into the phone-bound `pairing_claimed`; a pairing whose claim carried
-    /// one is in direct mode. Mirrors Rust `relay::DirectEndpoint`.
-    struct DirectEndpoint: Codable, Hashable, Sendable {
-        /// MagicDNS name or Tailscale IP of the Mac.
-        var host: String
-        /// TCP port of the Mac's direct-link WebSocket.
-        var port: UInt16
-
-        /// Path the desktop serves the direct link on (`DIRECT_LINK_PATH`).
-        static let path = "/remote/v1"
-
-        /// `ws://<host>:<port>/remote/v1` — byte-for-byte Rust
-        /// `DirectEndpoint::ws_url`: an IPv6 literal (contains `:`) is
-        /// bracketed per RFC 3986. Plain `ws://` on purpose: Tailscale's
-        /// WireGuard tunnel is the transport encryption, and the E2E envelopes
-        /// ride on top unchanged.
-        var wsURLString: String {
-            if host.contains(":") && !host.hasPrefix("[") {
-                return "ws://[\(host)]:\(port)\(Self.path)"
-            }
-            return "ws://\(host):\(port)\(Self.path)"
-        }
-
-        /// `wsURLString` as a `URL`, or `nil` for a host that cannot form one.
-        var wsURL: URL? { URL(string: wsURLString) }
-    }
+    /// §5.10). Mirrors Rust `relay::DirectEndpoint`. Defined in
+    /// `Shared/DirectEndpoint.swift` — it is persisted on `PairingRecord`,
+    /// which the Notification Service Extension compiles without any `Wire`
+    /// types — and aliased here so the wire layer reads naturally.
+    typealias DirectEndpoint = FlightDeckRemote.DirectEndpoint
 
     /// The body of a `push_notify` frame (v4, spec §5.5.1): desktop → relay
     /// only. The phone never sends or expects one; it is mirrored so a stray

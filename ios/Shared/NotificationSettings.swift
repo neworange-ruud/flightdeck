@@ -46,7 +46,12 @@ enum NotificationOutcome: Equatable, Sendable {
 /// Which of the three notifying event kinds an event is. Spelled like the wire
 /// `PushClass` (spec §7.2: `needs_input` | `error` | `done`), which the sealed
 /// push carries; the app maps `Wire.EventKind` onto it (`finished` → `done`).
-enum PushEventClass: String, Codable, Equatable, Sendable {
+///
+/// This is the ONE push-class type for both targets: the wire layer's
+/// `Wire.PushClass` (the `push_notify` frame, Rust `common::PushClass`) is a
+/// typealias of it, so the frame, the sealed payload and the notification
+/// policy can never disagree on spelling.
+enum PushEventClass: String, Codable, Hashable, Sendable {
     case needsInput = "needs_input"
     case error
     case done

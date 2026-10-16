@@ -47,15 +47,10 @@ extension Wire {
     /// Why a push is being sent — the only plaintext hint a `push_notify`
     /// carries (the relay picks the APNs interruption level and generic alert
     /// text from it), repeated inside the sealed push payload. Mirrors Rust
-    /// `common::PushClass`.
-    enum PushClass: String, Codable, Hashable, Sendable {
-        /// An agent stopped to ask the human (permission prompt or question).
-        case needsInput = "needs_input"
-        /// An agent hit an error.
-        case error
-        /// An agent settled idle after its turn.
-        case done
-    }
+    /// `common::PushClass` (`needs_input` | `error` | `done`). One type for the
+    /// app and the Notification Service Extension: `PushEventClass` in
+    /// `Shared/NotificationSettings.swift`.
+    typealias PushClass = PushEventClass
 
     /// Which agent CLI backs a session.
     ///

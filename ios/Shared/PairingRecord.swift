@@ -77,7 +77,7 @@ struct PairingRecord: Codable, Equatable, Sendable {
     /// existed (synthesized `Decodable` reads a missing optional as `nil`), so
     /// old pairings keep working exactly as before. Re-pairing is the only way
     /// to switch modes or change the endpoint (§5.2).
-    var directEndpoint: Wire.DirectEndpoint?
+    var directEndpoint: DirectEndpoint?
 
     /// The pairing's transport, derived from `directEndpoint`: direct exactly
     /// when the claim carried an endpoint. Derived rather than stored so the
@@ -95,7 +95,7 @@ struct PairingRecord: Codable, Equatable, Sendable {
         lastSentSeq: UInt64 = 0,
         lastReceivedSeq: UInt64 = 0,
         pairedAt: Date = Date(),
-        directEndpoint: Wire.DirectEndpoint? = nil
+        directEndpoint: DirectEndpoint? = nil
     ) {
         self.pairingId = pairingId
         self.peerDeviceId = peerDeviceId
