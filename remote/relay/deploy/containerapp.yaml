@@ -70,6 +70,13 @@ properties:
           # connection at maxReplicas: 1 (see store/sqlite.rs).
           - name: FLIGHTDECK_RELAY_STORE
             value: sqlite:/data/relay.db
+          # Relay mode (spec §5.9): `full` (default — route + queue envelopes)
+          # or `push_only` (pairing, auth, push tokens, revoke and pushes only;
+          # envelope/resume/ack refused). Unset here, so the live app runs
+          # `full`. Switch to push_only only once every pairing talks to its
+          # Mac directly over Tailscale; see deploy/README.md → "Relay mode".
+          # - name: RELAY_MODE
+          #   value: push_only
           # RUST_LOG is left unset here to take the crate's `info` default;
           # override per-environment if more verbosity is needed.
 

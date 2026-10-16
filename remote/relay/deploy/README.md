@@ -121,7 +121,57 @@ with **no** password configured stays open (local/dev).
 ## Health
 
 - `GET /healthz` → `ok` (liveness) · `GET /readyz` → `ok` (readiness)
-- `GET /version` → `{"version":"…","git_sha":"…"}` — `git_sha` is the deployed revision.
+- `GET /version` → `{"version":"…","git_sha":"…","relay_mode":"full"}` — `git_sha`
+  is the deployed revision, `relay_mode` the running mode (see below). The probes
+  answer `ok` in both modes, so they need no change when the mode changes.
+
+## Relay mode (`RELAY_MODE`)
+
+One image, two modes (spec §5.9; the self-hoster view is in `../README.md` →
+"Relay modes"):
+
+- **`full`** (default, and what the live app runs today): routes and queues the
+  end-to-end-encrypted envelopes between phone and Mac, plus pairing, auth and
+  push.
+- **`push_only`**: pairing, auth, push-token registration, revoke and pushes
+  (`push_notify` over the WebSocket and `POST /v1/push`) only. `envelope`,
+  `resume` and `ack` are refused with `relay_mode_push_only`; no envelope queue
+  is ever created. Only correct once every pairing is a **direct-mode** pairing:
+  phone and Mac both on Tailscale (or another direct route), the desktop running
+  with the direct link enabled, and the pairing made after that. A relay-mode
+  pairing against a push-only relay keeps getting pushes but its phone sees no
+  data.
+
+Set it as a plain env var on the Container App (it is not a secret):
+
+```bash
+az containerapp update -g "$RG" -n "$APP" --set-env-vars RELAY_MODE=push_only
+curl -s https://<relay-host>/version     # … "relay_mode":"push_only"
+```
+
+`--set-env-vars` merges, so the value survives later deploys that re-assert
+other variables — but to keep the deployment declarative, add it to
+`relay-deploy.yml`'s `--set-env-vars` list and `containerapp.yaml` when switching.
+An unrecognized value makes the new revision exit at startup
+(`configuration error: invalid RELAY_MODE: …` in the console log, exit 2), so the
+revision never becomes ready; in single-revision mode Container Apps keeps the
+previous revision serving until a new one is ready. Switching back is the same command with `RELAY_MODE=full` (or removing
+the variable).
+
+What stays the same in `push_only`:
+
+- **Persistent store and volume.** Keep `FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db`
+  and the Azure Files mount: device keys, pairings, claim tokens and push tokens
+  must survive a reschedule, or every desktop's pushes start failing with
+  `auth_failed` until it re-pairs. The queue tables stay in the schema but are
+  never written. Envelopes queued while the relay ran `full` are left in place
+  (unreachable while `push_only`, replayable if switched back); deleting them is
+  optional.
+- **`maxReplicas: 1`.** Still required: the SQLite file is single-writer, and
+  pairing still needs both devices on the same replica (the relay hands the
+  desktop the phone's identity key over its live connection).
+- **APNs** configuration and the `apns-live` image feature (pushes are the whole
+  point of this mode), and the relay password.
 
 ## Push notifications (APNs)
 
