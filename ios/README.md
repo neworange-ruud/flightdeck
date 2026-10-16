@@ -95,9 +95,16 @@ just enough to compile and be navigable; feature teams fill these in.
   starting out; revisit once the Transport layer (actors, `Sendable` models)
   is designed in earnest.
 - **SwiftTerm dependency:** added via Swift Package Manager
-  (`https://github.com/migueldeicaza/SwiftTerm`, from `1.14.0`), linked to the
-  app target but not yet imported/used anywhere — the Shell feature will
-  consume it.
+  (`https://github.com/migueldeicaza/SwiftTerm`), **pinned to exactly
+  `1.20.0`** and used by the Shell feature. It must stay pinned: the generated
+  project (and so `Package.resolved`) is not committed, so a version range
+  resolves fresh everywhere, and an open range picked up 1.99.0, which removed
+  API the app uses. Bump it deliberately and build.
+- **Metal Toolchain:** SwiftTerm ships Metal shaders. Xcode 26+ no longer
+  bundles the Metal compiler, so a fresh Xcode fails the build with "cannot
+  execute tool 'metal' due to missing Metal Toolchain". Install it once with
+  `xcodebuild -downloadComponent MetalToolchain`; the CI workflows do this
+  automatically when the runner's Xcode reports it uninstalled.
 - **`.xcodeproj` (and the app target's generated `Info.plist`) are
   gitignored.** `project.yml` is the source of truth for both; run
   `xcodegen generate` after cloning or pulling changes to `project.yml`.
@@ -351,17 +358,31 @@ their pairings without re-pairing.
 the unsigned simulator build, all of it for a device or TestFlight build:
 
 1. Register the App Group `group.agency.neworange.flightdeck.remote`.
-2. Enable *App Groups* (with that group) on the App ID
-   `agency.neworange.flightdeck.remote`, and register the App ID
+2. Enable *App Groups* (with that group) and *Time Sensitive Notifications* on
+   the App ID `agency.neworange.flightdeck.remote`, and register the App ID
    `agency.neworange.flightdeck.remote.notification-service` with *App Groups*
-   (same group). Debug's automatic signing can do both when run from Xcode
+   (same group). Debug's automatic signing can do this when run from Xcode
    with an Admin account.
 3. **Regenerate** the "FlightDeck Remote App Store" profile (it must now carry
-   the App Group) and create "FlightDeck Remote Notifications App Store" for
-   the extension; update `APPLE_APP_STORE_PROFILE` and add
-   `APPLE_APP_STORE_PROFILE_NSE`. Without this the Release archive fails to sign.
+   the App Group and the time-sensitive entitlement) and create "FlightDeck
+   Remote Notifications App Store" for the extension; update
+   `APPLE_APP_STORE_PROFILE` and add `APPLE_APP_STORE_PROFILE_NSE`. Without
+   this the Release archive fails to sign.
 
 The Keychain access group needs no registration: profiles carry the
-`7NKCS4AZS9.*` wildcard. Time-sensitive delivery for *needs input* additionally
-needs the Time Sensitive Notifications capability on the app; without it iOS
-presents those as `active`.
+`7NKCS4AZS9.*` wildcard. The app's entitlements request
+`com.apple.developer.usernotifications.time-sensitive` so *needs input* breaks
+through Focus; a profile without that capability fails codesign.
+
+**One event, one banner.** The desktop gives a push the same `event_id` as the
+feed `AgentEvent`, and both the push (`apns-collapse-id`) and the app's local
+notification use it as the request identifier, so Notification Center keeps a
+single entry. In the foreground, `ForegroundPresentationPolicy` (via
+`AppDelegate.willPresent`) gives only the first presentation a banner and
+sound; a repeat — including a local notification for an event the extension
+already showed while the app was backgrounded (`PresentedPushLog`, App Group) —
+and anything for the chat currently on screen are list-only.
+
+**E2E harness.** `scripts/e2e/e2e.entitlements` (ad-hoc simulator signing)
+carries the shared Keychain group and the App Group, so the full-stack run
+exercises the shared-group write path. It never runs the extension itself.

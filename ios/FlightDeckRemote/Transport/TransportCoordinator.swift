@@ -13,8 +13,10 @@
 //  is where the multi-pairing lifecycle lives:
 //
 //    - Foreground → `startAll()`: every paired machine gets a live socket
-//      (bounded by `cap`, PRD: all instances live while foregrounded, APNs push
-//      takes over on background).
+//      (bounded by `cap`, PRD: all instances live while foregrounded). In the
+//      background the desktop's sealed visible pushes cover the important
+//      moments (spec §7.2); the relay's `deliver_to_peer` only queues
+//      envelopes for an absent phone and never pushes for them.
 //    - Background → `stopAll()`: every supervisor is cancelled and every
 //      `URLSessionWebSocketTask` is closed (via `TransportStore.stop` →
 //      `TransportClient.stop`). No lingering sockets, no leaked tasks.
