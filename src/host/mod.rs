@@ -849,6 +849,18 @@ impl<'a> AppHost<'a> {
                     let _ = remote_out_tx.send(out);
                 });
             }
+            // Pushes the bridge decided this tick (remote-control-fglt). The
+            // sealed `push_notify` sender is not wired yet, so they are logged
+            // (routing metadata only, never content) and dropped; draining every
+            // tick keeps the queue from holding stale pushes.
+            for intent in b.take_push_intents() {
+                crate::remote::debuglog::log(&format!(
+                    "push decided class={:?} event={} session={}",
+                    intent.class,
+                    intent.event_id.as_str(),
+                    intent.deep_link.session_id.as_str()
+                ));
+            }
             // Inbound phone commands queued by the bridge: idempotency-check,
             // translate, execute on this (main) thread through the existing
             // Command/PTY paths, and ack each with its actual outcome.

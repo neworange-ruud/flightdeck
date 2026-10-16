@@ -1,4 +1,5 @@
-//! Typed agent events for the phone, plus a notifier decorator.
+//! Typed agent events for the phone, the push decision, plus a notifier
+//! decorator.
 //!
 //! The desktop already posts OS notifications on the active→settled edge
 //! ([`crate::app::state::AppState::take_finish_notifications`]). Those
@@ -12,13 +13,60 @@
 //!   waiting/needs-attention → needs-input, failed → error) fires one event and
 //!   disarms, so a quiet agent never re-fires until it works again.
 //!
+//! # The push decision (remote-control-fglt)
+//!
+//! The Mac, not the relay, decides when the phone gets a push notification.
+//! [`PushDecider`] layers that decision on top of the same arming edge:
+//!
+//! * Only three classes ever push ([`PushClass`]): **needs input**
+//!   (waiting-for-input / needs-attention, which includes permission prompts),
+//!   **error** (failed) and **done** (settled idle/completed). No other status,
+//!   transcript item, activity or envelope ever produces a push.
+//! * Needs-input and error push **immediately**, once per active→settled edge
+//!   (the arming model above).
+//! * Done is **debounced**: it pushes only once the agent has stayed settled
+//!   idle for the configured window (`[remote].push_done_debounce_secs`,
+//!   default 5 s). A return to an active status inside the window cancels it,
+//!   and the next settle restarts the window, so a mid-turn
+//!   working→idle→working flicker never notifies. Leaving for a neutral status
+//!   (stopped, session lost, …) also cancels it. If the agent moves from idle
+//!   to needs-input or error *inside* the window, that is the turn's real
+//!   ending: that class pushes immediately and the pending done is dropped.
+//!   Outside a window the arming model holds: an idle agent that later shows
+//!   needs-input without working in between does not push.
+//! * Time is the injected clock: the bridge passes the `now_ms` it already
+//!   receives from [`crate::contracts::Clock::now_millis`] on every render
+//!   tick, and a pending done matures on whichever tick first observes the
+//!   window elapsed. Nothing sleeps, so tests drive it with plain numbers.
+//! * The startup grace window gates pushes exactly like feed events: the
+//!   bridge never reports a settle edge from inside it, so a resumed agent
+//!   settling at launch cannot open a done window or push.
+//! * A session that disappears while a done is pending never pushes: the
+//!   decider only fires for a session the bridge observes on that tick, and
+//!   [`PushDecider::retain_sessions`] drops state for sessions that are gone.
+//!
+//! **The in-app feed is deliberately NOT debounced.** The typed
+//! [`AgentEvent`] stream keeps its immediate, one-per-edge semantics
+//! (including a `Finished` per flicker): it is cheap, it lands in the phone's
+//! activity feed rather than on the lock screen, and the phone dedups by
+//! `event_id`. Only the push, the thing that interrupts a person, waits. The
+//! done push reuses the `event_id` of the feed `Finished` event that opened
+//! its window, so the phone can match a push to the feed entry it already has.
+//!
+//! **Phone notification settings are not consulted here.** The phone's
+//! toggles (needs input / finished / chime) and per-project mute live only on
+//! the phone (`NotificationPreferences` in the iOS app); no protocol message
+//! syncs them to the desktop. The phone filters what it presents.
+//!
 //! [`CompositeNotifier`] is the decorator seam named in the integration plan: it
 //! wraps the real [`crate::notify::SystemNotifier`] so OS notifications keep
 //! flowing unchanged while the remote layer taps the same stream if it wants to.
 
+use std::collections::HashMap;
+
 use crate::contracts::{InterpretedStatus, Notification, Notifier};
 
-use flightdeck_remote_protocol::{AgentEvent, DeepLink, EventId, EventKind};
+use flightdeck_remote_protocol::{AgentEvent, DeepLink, EventId, EventKind, SessionId};
 
 // ---------------------------------------------------------------------------
 // Notifier decorator
@@ -148,32 +196,37 @@ pub struct EventContext {
     pub error_message: Option<String>,
 }
 
+/// The title shared by the feed event and the push for a settled class:
+/// "`<session>` finished its turn" / "needs input" / "hit an error".
+fn event_title(class: EventClass, session_name: &str) -> String {
+    match class {
+        EventClass::Finished => format!("{session_name} finished its turn"),
+        EventClass::NeedsInput => format!("{session_name} needs input"),
+        EventClass::Error => format!("{session_name} hit an error"),
+    }
+}
+
+/// The error detail shown when the agent gave none.
+const DEFAULT_ERROR_MESSAGE: &str = "the agent hit an error";
+
 /// Build the wire [`AgentEvent`] for a settled edge.
 pub fn build_event(class: EventClass, ctx: EventContext) -> AgentEvent {
-    let (kind, title) = match class {
-        EventClass::Finished => (
-            EventKind::Finished {
-                summary: format!("{} finished its turn", ctx.session_name),
-                files_changed: ctx.files_changed,
-                ready_to_push: ctx.ready_to_push,
-            },
-            format!("{} finished its turn", ctx.session_name),
-        ),
-        EventClass::NeedsInput => (
-            EventKind::NeedsInput {
-                preview: ctx.preview.clone().unwrap_or_default(),
-            },
-            format!("{} needs input", ctx.session_name),
-        ),
-        EventClass::Error => (
-            EventKind::Error {
-                message: ctx
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "the agent hit an error".to_string()),
-            },
-            format!("{} hit an error", ctx.session_name),
-        ),
+    let title = event_title(class, &ctx.session_name);
+    let kind = match class {
+        EventClass::Finished => EventKind::Finished {
+            summary: title.clone(),
+            files_changed: ctx.files_changed,
+            ready_to_push: ctx.ready_to_push,
+        },
+        EventClass::NeedsInput => EventKind::NeedsInput {
+            preview: ctx.preview.clone().unwrap_or_default(),
+        },
+        EventClass::Error => EventKind::Error {
+            message: ctx
+                .error_message
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ERROR_MESSAGE.to_string()),
+        },
     };
     AgentEvent {
         event_id: ctx.event_id,
@@ -182,6 +235,291 @@ pub fn build_event(class: EventClass, ctx: EventContext) -> AgentEvent {
         occurred_at_ms: ctx.occurred_at_ms,
         title,
     }
+}
+
+/// A fresh, globally unique event id: a random (version 4) UUID in its
+/// canonical hyphenated form.
+///
+/// Event ids must stay unique across desktop restarts, not just within one
+/// run: the phone dedups its feed by `event_id`, and a push uses it as the
+/// APNs collapse id and in its AEAD associated data, so a counter that
+/// restarts at 1 would let a new event collide with, and silently replace, an
+/// old notification still on the lock screen.
+pub fn new_event_id() -> EventId {
+    use rand_core::RngCore;
+    let mut b = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    EventId::new(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Push decision (remote-control-fglt); see the module docs
+// ---------------------------------------------------------------------------
+
+/// Maximum push title length in UTF-8 bytes, ellipsis included (contract C1).
+pub const PUSH_TITLE_MAX_BYTES: usize = 120;
+
+/// Maximum push body length in UTF-8 bytes, ellipsis included (contract C1).
+pub const PUSH_BODY_MAX_BYTES: usize = 1000;
+
+/// The ellipsis appended to a truncated push field.
+const ELLIPSIS: &str = "…";
+
+/// The only things that ever push to the phone.
+///
+/// Desktop-side for now; the wire `PushClass` (snake_case `needs_input` |
+/// `error` | `done`) lives in the protocol crate once the `push_notify` frame
+/// lands, and maps one-to-one onto this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PushClass {
+    /// The agent stopped and needs the human (a question or a permission
+    /// prompt). Pushed immediately.
+    NeedsInput,
+    /// The agent errored out. Pushed immediately.
+    Error,
+    /// The agent finished and stayed idle for the debounce window.
+    Done,
+}
+
+impl PushClass {
+    /// The push class for a settled class.
+    fn of(class: EventClass) -> PushClass {
+        match class {
+            EventClass::Finished => PushClass::Done,
+            EventClass::NeedsInput => PushClass::NeedsInput,
+            EventClass::Error => PushClass::Error,
+        }
+    }
+
+    /// The feed class whose title/body conventions this push reuses.
+    fn event_class(self) -> EventClass {
+        match self {
+            PushClass::Done => EventClass::Finished,
+            PushClass::NeedsInput => EventClass::NeedsInput,
+            PushClass::Error => EventClass::Error,
+        }
+    }
+}
+
+/// An active→settled edge as the bridge reports it to [`PushDecider::observe`]:
+/// what [`EventArming::observe`] returned, plus the id the bridge gave the feed
+/// event for it. The bridge only reports edges it would send, never one inside
+/// the startup grace window, so a suppressed settle can never push later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleEdge {
+    /// The settled class.
+    pub class: EventClass,
+    /// The feed event's id for this edge.
+    pub event_id: EventId,
+}
+
+/// The decider's verdict for one session on one tick: push this class now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushFire {
+    /// What to push.
+    pub class: PushClass,
+    /// The id to push under: the feed event's id when the push answers that
+    /// edge (needs-input/error now, or the `Finished` edge that opened a done
+    /// window). `None` when no feed event corresponds (idle turning into
+    /// needs-input/error inside a done window); the caller mints a fresh one.
+    pub event_id: Option<EventId>,
+    /// Clock-ms of the moment the agent settled into this state (for done, the
+    /// start of its window, not the tick it matured on).
+    pub occurred_at_ms: u64,
+}
+
+/// A done push waiting out its debounce window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDone {
+    since_ms: u64,
+    event_id: EventId,
+}
+
+/// Decides, per session and per tick, whether the phone gets a push. A pure
+/// state machine over the bridge's arming edges and the injected clock; see
+/// the module docs for the rules.
+#[derive(Debug, Default)]
+pub struct PushDecider {
+    pending: HashMap<SessionId, PendingDone>,
+}
+
+impl PushDecider {
+    /// An empty decider (nothing pending).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe one session on one tick and return a push to send, if any.
+    ///
+    /// `status` is the session's current interpreted status, `edge` what
+    /// [`EventArming::observe`] produced for it this tick (only when the bridge
+    /// would send it, i.e. outside the startup grace window), `now_ms` the
+    /// injected clock and `done_debounce_ms` the effective
+    /// `[remote].push_done_debounce_secs` for the session's project, in ms.
+    /// Call it for every live session on every tick: a pending done only
+    /// matures on a tick that observes its session.
+    pub fn observe(
+        &mut self,
+        session: &SessionId,
+        status: InterpretedStatus,
+        edge: Option<SettleEdge>,
+        now_ms: u64,
+        done_debounce_ms: u64,
+    ) -> Option<PushFire> {
+        if let Some(edge) = edge {
+            match edge.class {
+                EventClass::NeedsInput | EventClass::Error => {
+                    self.pending.remove(session);
+                    return Some(PushFire {
+                        class: PushClass::of(edge.class),
+                        event_id: Some(edge.event_id),
+                        occurred_at_ms: now_ms,
+                    });
+                }
+                EventClass::Finished => {
+                    // (Re)start the window; a flicker's second settle lands here.
+                    self.pending.insert(
+                        session.clone(),
+                        PendingDone {
+                            since_ms: now_ms,
+                            event_id: edge.event_id,
+                        },
+                    );
+                }
+            }
+        }
+        match phase(status) {
+            Phase::Settled(EventClass::Finished) => {
+                let due = self
+                    .pending
+                    .get(session)
+                    .is_some_and(|p| now_ms.saturating_sub(p.since_ms) >= done_debounce_ms);
+                if !due {
+                    return None;
+                }
+                let p = self.pending.remove(session)?;
+                Some(PushFire {
+                    class: PushClass::Done,
+                    event_id: Some(p.event_id),
+                    occurred_at_ms: p.since_ms,
+                })
+            }
+            // Idle turned into a question or an error inside the done window:
+            // that is how this turn really ended. No arming edge fires here (the
+            // idle settle disarmed), so without a pending done this is a quiet
+            // agent changing state and stays silent.
+            Phase::Settled(class) => self.pending.remove(session).map(|_| PushFire {
+                class: PushClass::of(class),
+                event_id: None,
+                occurred_at_ms: now_ms,
+            }),
+            // Back to work (cancels; the next settle restarts the window), or
+            // stopped / lost / unknown (cancels for good).
+            Phase::Active | Phase::Neutral => {
+                self.pending.remove(session);
+                None
+            }
+        }
+    }
+
+    /// Forget every session `keep` rejects. Called once per tick with the
+    /// sessions that still exist, so a session removed while a done is pending
+    /// can never push (and a recycled id never inherits stale state).
+    pub fn retain_sessions(&mut self, mut keep: impl FnMut(&SessionId) -> bool) {
+        self.pending.retain(|sid, _| keep(sid));
+    }
+
+    /// Whether `session` has a done push waiting out its window.
+    pub fn has_pending_done(&self, session: &SessionId) -> bool {
+        self.pending.contains_key(session)
+    }
+}
+
+/// A decided push, ready for the phase-2 sender to seal into a `PushPayload`
+/// (contract C1) and hand to the relay as `push_notify`. Title and body are
+/// already truncated to the contract's byte limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushIntent {
+    /// What kind of push this is (the frame's only plaintext hint).
+    pub class: PushClass,
+    /// Unique id: AEAD associated data and APNs collapse id.
+    pub event_id: EventId,
+    /// e.g. "fd-api needs input"; at most [`PUSH_TITLE_MAX_BYTES`].
+    pub title: String,
+    /// The pending question, the error detail, or what the turn left behind;
+    /// may be empty; at most [`PUSH_BODY_MAX_BYTES`].
+    pub body: String,
+    /// Where a tap lands (project + session identity).
+    pub deep_link: DeepLink,
+    /// The project's display name, when known.
+    pub project_name: Option<String>,
+    /// When the agent settled (ms from the injected clock).
+    pub occurred_at_ms: i64,
+}
+
+/// Build the [`PushIntent`] for a decided push, reusing [`build_event`]'s title
+/// and preview conventions. `ctx.event_id`/`occurred_at_ms` are taken as given.
+pub fn build_push_intent(
+    class: PushClass,
+    ctx: EventContext,
+    project_name: Option<String>,
+) -> PushIntent {
+    let title = event_title(class.event_class(), &ctx.session_name);
+    let body = match class {
+        PushClass::NeedsInput => ctx.preview.unwrap_or_default(),
+        PushClass::Error => ctx
+            .error_message
+            .unwrap_or_else(|| DEFAULT_ERROR_MESSAGE.to_string()),
+        PushClass::Done => done_body(ctx.files_changed, ctx.ready_to_push),
+    };
+    PushIntent {
+        class,
+        event_id: ctx.event_id,
+        title: truncate_utf8(&title, PUSH_TITLE_MAX_BYTES),
+        body: truncate_utf8(&body, PUSH_BODY_MAX_BYTES),
+        deep_link: ctx.deep_link,
+        project_name,
+        occurred_at_ms: ctx.occurred_at_ms,
+    }
+}
+
+/// The done push's body: what the turn left behind, or nothing.
+fn done_body(files_changed: u32, ready_to_push: bool) -> String {
+    match (files_changed, ready_to_push) {
+        (0, true) => "Ready to push".to_string(),
+        (0, false) => String::new(),
+        (1, _) => "1 file changed".to_string(),
+        (n, _) => format!("{n} files changed"),
+    }
+}
+
+/// Truncate `s` to at most `max_bytes` UTF-8 bytes. A string that fits is
+/// returned unchanged; otherwise it is cut on a char boundary and "…" is
+/// appended, the ellipsis counting toward the limit (contract C1). A limit too
+/// small to hold the ellipsis just cuts.
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let (budget, suffix) = match max_bytes.checked_sub(ELLIPSIS.len()) {
+        Some(budget) => (budget, ELLIPSIS),
+        None => (max_bytes, ""),
+    };
+    let mut end = budget;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &s[..end])
 }
 
 #[cfg(test)]

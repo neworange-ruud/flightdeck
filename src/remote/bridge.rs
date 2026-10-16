@@ -7,7 +7,10 @@
 //! open project; the bridge:
 //!
 //! 1. detects per-session status edges (finish / needs-input / error) and emits
-//!    typed [`AgentEvent`]s, honouring a startup grace window;
+//!    typed [`AgentEvent`]s, honouring a startup grace window, and runs the push
+//!    decision on the same edges (needs-input/error now, done after an idle
+//!    debounce; see [`crate::remote::notifier`]), queueing each decided push as
+//!    a [`PushIntent`] for [`RemoteBridge::take_push_intents`];
 //! 2. captures the pending-question preview when an agent stops for input;
 //! 3. builds the current [`StateSnapshot`] and diffs it against what the phone
 //!    last saw, sending a full snapshot on (re)connect / request / structural
@@ -30,7 +33,7 @@
 //! sync runs unconditionally, so a late-pairing phone still gets full history
 //! on that very tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
@@ -40,7 +43,10 @@ use crate::agents::setup::{status_backend, StatusBackend};
 use crate::app::state::AppState;
 use crate::contracts::AgentDef;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
-use crate::remote::notifier::{build_event, EventArming, EventClass, EventContext};
+use crate::remote::notifier::{
+    build_event, build_push_intent, new_event_id, EventArming, EventClass, EventContext,
+    PushDecider, PushFire, PushIntent, SettleEdge,
+};
 use crate::remote::shell::ShellManager;
 use crate::remote::transcript::{StructuredPrompt, TranscriptBuilder};
 use crate::remote::{RemoteInbound, RemoteOutbound};
@@ -101,6 +107,11 @@ const MAX_UNACKED_ENVELOPES: u64 = 500;
 /// converges on the very next envelope, so a healthy stream never spends more
 /// than one.
 const MAX_REALIGN_CREDITS: u32 = 3;
+
+/// Bound on decided-but-untaken pushes (see [`RemoteBridge::take_push_intents`]).
+/// The host drains them every tick, so this only matters if nothing does: the
+/// oldest are dropped first, since a stale "done" is the least useful push.
+const MAX_QUEUED_PUSH_INTENTS: usize = 64;
 
 /// Whether a phone peer is attached to the active pairing **and** still proving
 /// it by acknowledging what we send (remote-control-5qu).
@@ -195,7 +206,12 @@ pub struct RemoteBridge {
     /// AskUserQuestion to be ingested from the JSONL before falling back to the
     /// binary allow/deny prompt (remote-control-qa1). Absent once resolved.
     needs_input_since: HashMap<SessionId, u64>,
-    event_seq: u64,
+    /// The push decision layered on the arming edges (remote-control-fglt).
+    push: PushDecider,
+    /// Pushes decided but not yet taken by the sender
+    /// ([`Self::take_push_intents`]), oldest first, bounded by
+    /// [`MAX_QUEUED_PUSH_INTENTS`].
+    push_intents: Vec<PushIntent>,
     pairing: Option<PairingId>,
     /// Whether the relay link is currently up (authenticated). While it is down
     /// the bridge PAUSES all seal/queue work: sealing StatusUpdate/Rollup/shell/
@@ -307,7 +323,8 @@ impl RemoteBridge {
             previews: HashMap::new(),
             prev_status: HashMap::new(),
             needs_input_since: HashMap::new(),
-            event_seq: 0,
+            push: PushDecider::new(),
+            push_intents: Vec::new(),
             pairing: None,
             link_up: true,
             peer_present: false,
@@ -382,6 +399,8 @@ impl RemoteBridge {
         self.out_seq = 0;
         self.reset_ack_tracking();
         self.pairing = None;
+        // Nothing decided for the old peer may reach a new one.
+        self.push_intents.clear();
         // Forget remote shells; their backing child terminals stay as ordinary
         // desktop shells (the phone is no longer trusted to drive them).
         self.shells.clear();
@@ -470,6 +489,8 @@ impl RemoteBridge {
                     // A different peer with its own ack cursor: everything the
                     // old one owed us is meaningless now.
                     self.reset_ack_tracking();
+                    // Pushes decided for the old peer are not the new one's.
+                    self.push_intents.clear();
                 }
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
@@ -833,6 +854,7 @@ impl RemoteBridge {
 
         // Pre-pass: per-session edge detection (events + needs-input preview).
         let mut events = Vec::new();
+        let mut live_sessions: HashSet<SessionId> = HashSet::new();
         for pv in projects {
             for tab in pv.state.tabs.iter() {
                 let sid = SessionId::new(&tab.meta.id);
@@ -970,15 +992,47 @@ impl RemoteBridge {
 
                 // Event edge (arming always advances; grace only gates sending).
                 let arm = self.arming.entry(sid.clone()).or_default();
-                if let Some(class) = arm.observe(interpreted) {
-                    if now_ms >= self.grace_until_ms && self.pairing.is_some() {
-                        events.push(self.make_event(class, pv, tab, &sid, now_ms));
+                let edge = arm
+                    .observe(interpreted)
+                    .filter(|_| now_ms >= self.grace_until_ms)
+                    .map(|class| SettleEdge {
+                        class,
+                        event_id: new_event_id(),
+                    });
+                if let Some(edge) = &edge {
+                    if self.pairing.is_some() {
+                        let ev_id = edge.event_id.clone();
+                        events.push(self.make_event(edge.class, ev_id, pv, tab, &sid, now_ms));
                     }
                 }
+
+                // Push decision (remote-control-fglt): needs-input/error now, done
+                // once the session has stayed idle for the project's debounce.
+                // Decided whether or not the relay link is up (the push sender
+                // has its own HTTPS path); only kept when there is a pairing to
+                // push to.
+                let debounce_ms = pv
+                    .state
+                    .config
+                    .remote
+                    .push_done_debounce_secs
+                    .saturating_mul(1_000);
+                let fire = self
+                    .push
+                    .observe(&sid, interpreted, edge, now_ms, debounce_ms);
+                if let Some(fire) = fire {
+                    if self.pairing.is_some() {
+                        let intent = self.make_push_intent(fire, pv, tab, &sid);
+                        self.queue_push_intent(intent);
+                    }
+                }
+                live_sessions.insert(sid.clone());
 
                 self.prev_status.insert(sid.clone(), status);
             }
         }
+        // A session closed while its done push was pending must never push.
+        self.push.retain_sessions(|sid| live_sessions.contains(sid));
 
         // Nothing to transmit without a pairing (state kept for the next pair), or
         // while the relay link is down — pause seal/queue during an outage so we
@@ -1144,15 +1198,40 @@ impl RemoteBridge {
 
     /// Assemble a typed [`AgentEvent`] for a settled edge.
     fn make_event(
-        &mut self,
+        &self,
         class: EventClass,
+        event_id: EventId,
         pv: &ProjectView<'_>,
         tab: &crate::app::state::RuntimeTab,
         sid: &SessionId,
         now_ms: u64,
     ) -> flightdeck_remote_protocol::AgentEvent {
-        self.event_seq += 1;
-        let event_id = EventId::new(format!("ev:{}", self.event_seq));
+        build_event(class, self.event_context(event_id, pv, tab, sid, now_ms))
+    }
+
+    /// Assemble the [`PushIntent`] for a decided push. Mints a fresh id when
+    /// no feed event corresponds to it (see [`PushFire::event_id`]).
+    fn make_push_intent(
+        &self,
+        fire: PushFire,
+        pv: &ProjectView<'_>,
+        tab: &crate::app::state::RuntimeTab,
+        sid: &SessionId,
+    ) -> PushIntent {
+        let event_id = fire.event_id.unwrap_or_else(new_event_id);
+        let ctx = self.event_context(event_id, pv, tab, sid, fire.occurred_at_ms);
+        build_push_intent(fire.class, ctx, Some(pv.name.to_string()))
+    }
+
+    /// The per-session context shared by feed events and pushes.
+    fn event_context(
+        &self,
+        event_id: EventId,
+        pv: &ProjectView<'_>,
+        tab: &crate::app::state::RuntimeTab,
+        sid: &SessionId,
+        occurred_at_ms: u64,
+    ) -> EventContext {
         let deep_link = DeepLink {
             project_id: pv.id.clone(),
             session_id: sid.clone(),
@@ -1163,17 +1242,34 @@ impl RemoteBridge {
         let ready_to_push = ws
             .map(|s| s.changes.is_empty() && s.ahead > 0)
             .unwrap_or(false);
-        let ctx = EventContext {
+        EventContext {
             event_id,
             deep_link,
-            occurred_at_ms: now_ms as i64,
+            occurred_at_ms: occurred_at_ms as i64,
             session_name: tab.meta.name.clone(),
             preview: self.previews.get(sid).cloned().flatten(),
             files_changed,
             ready_to_push,
             error_message: None,
-        };
-        build_event(class, ctx)
+        }
+    }
+
+    /// Queue a decided push for the sender, dropping the oldest past the bound.
+    fn queue_push_intent(&mut self, intent: PushIntent) {
+        if self.push_intents.len() >= MAX_QUEUED_PUSH_INTENTS {
+            self.push_intents.remove(0);
+        }
+        self.push_intents.push(intent);
+    }
+
+    /// Take every push decided since the last call, oldest first
+    /// (remote-control-fglt). This is the seam the push sender consumes: each
+    /// [`PushIntent`] is one notification to seal and send as `push_notify`.
+    /// Only produced while a pairing is active; decided regardless of whether
+    /// the relay link is up or a phone is attached (that is the point of a
+    /// push).
+    pub fn take_push_intents(&mut self) -> Vec<PushIntent> {
+        std::mem::take(&mut self.push_intents)
     }
 
     /// Seal a message and enqueue it as an outbound envelope for the pairing.

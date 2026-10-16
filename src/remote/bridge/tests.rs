@@ -1,6 +1,7 @@
 use super::*;
 use crate::contracts::{Config, InterpretedStatus, ProjectState as CoreProjectState, TabState};
 use crate::contracts::{PtySize, STATE_VERSION};
+use crate::remote::notifier::PushClass;
 use crate::testing::FakePty;
 use crate::tui::render::GitStatusCache;
 
@@ -1774,4 +1775,258 @@ fn a_restart_does_not_blame_the_phone_for_the_previous_sessions_backlog() {
             "a resumed high-water mark is not an un-acked backlog (at {now}ms)"
         );
     }
+}
+
+// --- push decision (remote-control-fglt) -----------------------------------
+
+/// Tick once with `app` in project "proj" and return the decoded messages.
+fn tick_app(b: &mut RemoteBridge, app: &AppState, now_ms: u64) -> Vec<DesktopToPhone> {
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", app, &cache)];
+    collect(b, &views, now_ms)
+}
+
+fn feed_event(msgs: &[DesktopToPhone]) -> Option<&flightdeck_remote_protocol::AgentEvent> {
+    msgs.iter().find_map(|m| match m {
+        DesktopToPhone::Event(e) => Some(e),
+        _ => None,
+    })
+}
+
+#[test]
+fn done_push_is_decided_after_the_idle_debounce_and_the_feed_is_immediate() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    let msgs = tick_app(&mut b, &app, 2_000);
+    // The feed keeps its immediate semantics...
+    let ev = feed_event(&msgs)
+        .expect("finished event right away")
+        .clone();
+    // ...while the push waits out the default 5 s window.
+    assert!(b.take_push_intents().is_empty());
+    tick_app(&mut b, &app, 6_999);
+    assert!(b.take_push_intents().is_empty(), "1 ms short of the window");
+    tick_app(&mut b, &app, 7_000);
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    let p = &pushes[0];
+    assert_eq!(p.class, PushClass::Done);
+    assert_eq!(p.event_id, ev.event_id, "the done push reuses the feed id");
+    assert_eq!(p.title, "fix-login finished its turn");
+    assert_eq!(p.deep_link.project_id.as_str(), "proj");
+    assert_eq!(p.deep_link.session_id.as_str(), "t1");
+    assert_eq!(p.project_name.as_deref(), Some("proj"));
+    assert_eq!(p.occurred_at_ms, 2_000, "when the agent settled");
+    // Held idle: never again; drained: nothing left.
+    tick_app(&mut b, &app, 60_000);
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn a_working_flicker_inside_the_window_decides_no_push_but_still_feeds() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let mut finished_events = 0;
+    for (now, s) in [
+        (1_000, InterpretedStatus::Working),
+        (2_000, InterpretedStatus::Idle),
+        (3_000, InterpretedStatus::Working),
+        (4_000, InterpretedStatus::Idle),
+        (5_000, InterpretedStatus::Working),
+        (30_000, InterpretedStatus::Working),
+    ] {
+        set_status(&mut app, 0, s);
+        if feed_event(&tick_app(&mut b, &app, now)).is_some() {
+            finished_events += 1;
+        }
+    }
+    assert_eq!(finished_events, 2, "the feed reports every settle");
+    assert!(b.take_push_intents().is_empty(), "no push for a flicker");
+}
+
+#[test]
+fn needs_input_push_is_immediate_and_shares_the_feed_event_id() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
+    let msgs = tick_app(&mut b, &app, 2_000);
+    let ev = feed_event(&msgs).expect("needs-input event").clone();
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0].class, PushClass::NeedsInput);
+    assert_eq!(pushes[0].event_id, ev.event_id);
+    assert_eq!(pushes[0].title, "fix-login needs input");
+    // Still waiting: no repeat.
+    tick_app(&mut b, &app, 30_000);
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn the_done_debounce_is_read_from_the_projects_effective_config() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    app.config.remote.push_done_debounce_secs = 0;
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    tick_app(&mut b, &app, 2_000);
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "0 s debounce pushes on the settle tick");
+    assert_eq!(pushes[0].class, PushClass::Done);
+
+    // A reload to a longer delay applies on the next tick.
+    app.config.remote.push_done_debounce_secs = 30;
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 3_000);
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    tick_app(&mut b, &app, 4_000);
+    tick_app(&mut b, &app, 33_999);
+    assert!(b.take_push_intents().is_empty());
+    tick_app(&mut b, &app, 34_000);
+    assert_eq!(b.take_push_intents().len(), 1);
+}
+
+#[test]
+fn a_tab_closed_while_its_done_is_pending_never_pushes() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![
+        tab_state("t1", "fix-login", "claude"),
+        tab_state("t2", "add-tests", "claude"),
+    ]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    set_status(&mut app, 1, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    set_status(&mut app, 1, InterpretedStatus::Idle);
+    tick_app(&mut b, &app, 2_000);
+    // t1 is closed inside its window; t2 stays.
+    let mut after = app_with_tabs(vec![tab_state("t2", "add-tests", "claude")]);
+    set_status(&mut after, 0, InterpretedStatus::Idle);
+    tick_app(&mut b, &after, 3_000);
+    tick_app(&mut b, &after, 10_000);
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0].deep_link.session_id.as_str(), "t2");
+    // The closed tab coming back (same id, idle) does not resurrect its push.
+    tick_app(&mut b, &app, 20_000);
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn startup_grace_suppresses_pushes_like_feed_events() {
+    let mut b = RemoteBridge::passthrough(10_000);
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    for now in [2_000, 9_000, 12_000, 30_000] {
+        tick_app(&mut b, &app, now);
+    }
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn pushes_are_decided_without_a_phone_attached_or_a_relay_link() {
+    // The whole point of a push: the phone is away. Paired, no presence, and
+    // the relay link down (phase 2 falls back to HTTPS).
+    let mut b = RemoteBridge::passthrough(0);
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    b.handle_inbound(RemoteInbound::Link(
+        crate::remote::RemoteLinkState::Disconnected,
+    ));
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Failed);
+    tick_app(&mut b, &app, 2_000);
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0].class, PushClass::Error);
+}
+
+#[test]
+fn no_push_without_a_pairing_and_none_carried_into_a_later_one() {
+    let mut b = RemoteBridge::passthrough(0);
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
+    tick_app(&mut b, &app, 2_000);
+    assert!(b.take_push_intents().is_empty(), "nobody to push to");
+    // Pairing later does not replay what was decided while unpaired.
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    tick_app(&mut b, &app, 3_000);
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn no_push_for_snapshots_deltas_transcripts_or_commands() {
+    // A busy, working session with the phone asking for a snapshot and a
+    // transcript: plenty of envelopes, never a push.
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    for (i, now) in (1_000..=60_000).step_by(1_000).enumerate() {
+        if i % 10 == 0 {
+            for body in [
+                CommandBody::RequestSnapshot { project_id: None },
+                CommandBody::RequestTranscript {
+                    session_id: SessionId::new("t1"),
+                    from_index: None,
+                },
+            ] {
+                let cmd = PhoneCommand {
+                    command_id: CommandId::new(format!("c{i}-{now}")),
+                    issued_at_ms: 0,
+                    body,
+                };
+                b.handle_inbound(RemoteInbound::Envelope(envelope(&cmd)));
+            }
+        }
+        let msgs = tick_app(&mut b, &app, now as u64);
+        assert!(feed_event(&msgs).is_none());
+        // Status churn between active states only.
+        let next = if i % 2 == 0 {
+            InterpretedStatus::Running
+        } else {
+            InterpretedStatus::Working
+        };
+        set_status(&mut app, 0, next);
+    }
+    assert!(b.take_push_intents().is_empty());
+}
+
+#[test]
+fn queued_push_intents_are_bounded_oldest_first() {
+    let mut b = paired_bridge();
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+    // Never drained: each working→failed edge decides one error push.
+    for i in 0..(MAX_QUEUED_PUSH_INTENTS as u64 + 10) {
+        set_status(&mut app, 0, InterpretedStatus::Working);
+        tick_app(&mut b, &app, 1_000 + i * 2);
+        set_status(&mut app, 0, InterpretedStatus::Failed);
+        tick_app(&mut b, &app, 1_001 + i * 2);
+    }
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), MAX_QUEUED_PUSH_INTENTS);
+    assert_eq!(
+        pushes.last().unwrap().occurred_at_ms,
+        (1_001 + (MAX_QUEUED_PUSH_INTENTS as u64 + 9) * 2) as i64,
+        "the newest is kept"
+    );
 }
