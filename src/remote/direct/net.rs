@@ -20,6 +20,20 @@
 //! classifies by interface *name*, and drops nothing by range — the direct link
 //! needs the opposite on all three counts. Both use the same `if-addrs` crate.
 //!
+//! ### Which addresses are Tailscale's: ask Tailscale first
+//!
+//! `100.64.0.0/10` is the shared address space of RFC 6598 — Tailscale uses it,
+//! but so does carrier-grade NAT, so a laptop tethered to a phone or on some
+//! ISPs holds a `100.x` address that is *not* Tailscale, and binding it would
+//! expose the direct link to that carrier network. So the addresses
+//! `tailscale status --json` reports for this node (`Self.TailscaleIPs`) win
+//! whenever the CLI answers: only interface addresses Tailscale itself claims
+//! are bound — none at all when it reports none (logged out, stopped). The
+//! range check ([`tailscale_addresses`]) is only the fallback for when the CLI
+//! cannot be asked (not installed or not on `PATH`, a sandbox that forbids
+//! spawning). [`select_bind_addresses`] makes that choice and reports which
+//! source it used, which the listener logs.
+//!
 //! ## Advertising: config, then MagicDNS, then the 100.x address
 //!
 //! [`advertised_host`] picks, in order: the `[remote] direct_host` override;
@@ -64,22 +78,12 @@ pub fn is_tailscale_address(ip: IpAddr) -> bool {
 /// The Tailscale addresses among `all`, de-duplicated, IPv4 first, each family
 /// in ascending order (stable across calls whatever order the OS enumerates in).
 pub fn tailscale_addresses(all: &[IpAddr]) -> Vec<IpAddr> {
-    let mut v4: Vec<Ipv4Addr> = Vec::new();
-    let mut v6: Vec<Ipv6Addr> = Vec::new();
-    for ip in all.iter().copied().filter(|ip| is_tailscale_address(*ip)) {
-        match ip {
-            IpAddr::V4(a) => v4.push(a),
-            IpAddr::V6(a) => v6.push(a),
-        }
-    }
-    v4.sort_unstable();
-    v4.dedup();
-    v6.sort_unstable();
-    v6.dedup();
-    v4.into_iter()
-        .map(IpAddr::V4)
-        .chain(v6.into_iter().map(IpAddr::V6))
-        .collect()
+    sorted_unique(
+        all.iter()
+            .copied()
+            .filter(|ip| is_tailscale_address(*ip))
+            .collect(),
+    )
 }
 
 /// The host to advertise in `pairing_offer.direct_endpoint`, or `None` when
@@ -107,13 +111,104 @@ pub fn advertised_host(
         .map(IpAddr::to_string)
 }
 
+/// What `tailscale status --json` says about this node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TailscaleStatus {
+    /// `Self.DNSName` without the trailing root dot, if MagicDNS is on.
+    pub magic_dns: Option<String>,
+    /// `Self.TailscaleIPs`: the addresses Tailscale assigned this node. Empty
+    /// when it reports none (logged out, stopped, no `Self`).
+    pub ips: Vec<IpAddr>,
+}
+
+/// Parse `tailscale status --json` output. `None` only for output that is not
+/// JSON at all; a CLI that answered (even "needs login") yields a status,
+/// possibly with no addresses — which is itself authoritative.
+pub fn status_from_json(json: &str) -> Option<TailscaleStatus> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let me = value.get("Self");
+    let magic_dns = me
+        .and_then(|m| m.get("DNSName"))
+        .and_then(|n| n.as_str())
+        .map(|n| n.trim().trim_end_matches('.').to_string())
+        .filter(|n| !n.is_empty());
+    let ips = me
+        .and_then(|m| m.get("TailscaleIPs"))
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|ip| ip.as_str()?.parse::<IpAddr>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TailscaleStatus { magic_dns, ips })
+}
+
 /// Pull `Self.DNSName` out of `tailscale status --json` output, without the
 /// trailing root dot. `None` for anything unparsable or empty.
 pub fn magic_dns_from_status_json(json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let name = value.get("Self")?.get("DNSName")?.as_str()?;
-    let name = name.trim().trim_end_matches('.');
-    (!name.is_empty()).then(|| name.to_string())
+    status_from_json(json)?.magic_dns
+}
+
+/// Where the bind addresses came from (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressOrigin {
+    /// The addresses `tailscale status --json` reports for this node.
+    TailscaleStatus,
+    /// The Tailscale address ranges, because the CLI could not be asked. A
+    /// carrier-grade-NAT `100.x` address is indistinguishable here.
+    RangeFallback,
+}
+
+impl AddressOrigin {
+    /// A short label for log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            AddressOrigin::TailscaleStatus => "tailscale status",
+            AddressOrigin::RangeFallback => "address-range fallback (tailscale CLI unavailable)",
+        }
+    }
+}
+
+/// The addresses to bind among this host's interface addresses `all`: those
+/// Tailscale `reported` for this node when the CLI answered (even an empty
+/// list — then nothing is bound), else the range filter. De-duplicated, IPv4
+/// first, each family ascending.
+pub fn select_bind_addresses(
+    all: &[IpAddr],
+    reported: Option<&[IpAddr]>,
+) -> (Vec<IpAddr>, AddressOrigin) {
+    match reported {
+        Some(reported) => {
+            let claimed: Vec<IpAddr> = all
+                .iter()
+                .copied()
+                .filter(|ip| reported.contains(ip))
+                .collect();
+            (sorted_unique(claimed), AddressOrigin::TailscaleStatus)
+        }
+        None => (tailscale_addresses(all), AddressOrigin::RangeFallback),
+    }
+}
+
+/// `ips` de-duplicated, IPv4 first, each family ascending.
+fn sorted_unique(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut v4: Vec<Ipv4Addr> = Vec::new();
+    let mut v6: Vec<Ipv6Addr> = Vec::new();
+    for ip in ips {
+        match ip {
+            IpAddr::V4(a) => v4.push(a),
+            IpAddr::V6(a) => v6.push(a),
+        }
+    }
+    v4.sort_unstable();
+    v4.dedup();
+    v6.sort_unstable();
+    v6.dedup();
+    v4.into_iter()
+        .map(IpAddr::V4)
+        .chain(v6.into_iter().map(IpAddr::V6))
+        .collect()
 }
 
 /// Enumerates this host's interface addresses (every family, loopback
@@ -151,11 +246,18 @@ impl AddressSource for FixedAddressSource {
     }
 }
 
-/// Asks Tailscale for this machine's MagicDNS name.
+/// Asks Tailscale about this machine (`tailscale status --json`).
 pub trait TailscaleProbe: Send + Sync {
+    /// This node's status, or `None` when the CLI cannot be asked at all (not
+    /// installed, not on `PATH`, spawning forbidden, timed out). Blocking: call
+    /// it off the async workers.
+    fn status(&self) -> Option<TailscaleStatus>;
+
     /// The MagicDNS name, or `None` if Tailscale is absent, logged out, or
-    /// MagicDNS is off. Blocking: call it off the async workers.
-    fn magic_dns_name(&self) -> Option<String>;
+    /// MagicDNS is off. Blocking, like [`Self::status`].
+    fn magic_dns_name(&self) -> Option<String> {
+        self.status().and_then(|s| s.magic_dns)
+    }
 }
 
 /// [`TailscaleProbe`] that runs `tailscale status --json` (argv, no shell),
@@ -173,23 +275,23 @@ const TAILSCALE_CANDIDATES: &[&str] = &[
 ];
 
 impl TailscaleProbe for CliTailscaleProbe {
-    fn magic_dns_name(&self) -> Option<String> {
+    fn status(&self) -> Option<TailscaleStatus> {
         TAILSCALE_CANDIDATES
             .iter()
             .filter(|c| !c.starts_with('/') || std::path::Path::new(c).exists())
             .find_map(|program| {
                 run_bounded(program, &["status", "--json"], PROBE_TIMEOUT)
-                    .and_then(|out| magic_dns_from_status_json(&out))
+                    .and_then(|out| status_from_json(&out))
             })
     }
 }
 
 /// A probe with a fixed answer, for tests.
 #[derive(Debug, Clone, Default)]
-pub struct FixedTailscaleProbe(pub Option<String>);
+pub struct FixedTailscaleProbe(pub Option<TailscaleStatus>);
 
 impl TailscaleProbe for FixedTailscaleProbe {
-    fn magic_dns_name(&self) -> Option<String> {
+    fn status(&self) -> Option<TailscaleStatus> {
         self.0.clone()
     }
 }
@@ -326,6 +428,61 @@ mod tests {
         assert_eq!(magic_dns_from_status_json("not json"), None);
     }
 
+    #[test]
+    fn status_reports_the_nodes_tailscale_ips() {
+        let json = r#"{"Self":{"DNSName":"mbp.tail1234.ts.net.",
+                       "TailscaleIPs":["100.100.1.2","fd7a:115c:a1e0::9","bogus"]}}"#;
+        assert_eq!(
+            status_from_json(json),
+            Some(TailscaleStatus {
+                magic_dns: Some("mbp.tail1234.ts.net".into()),
+                ips: vec![ip("100.100.1.2"), ip("fd7a:115c:a1e0::9")],
+            })
+        );
+        // The CLI answered "needs login": a status with no addresses, which is
+        // authoritative (bind nothing), not "unknown".
+        assert_eq!(
+            status_from_json(r#"{"BackendState":"NeedsLogin"}"#),
+            Some(TailscaleStatus::default())
+        );
+        assert_eq!(status_from_json("not json"), None);
+    }
+
+    /// A carrier-grade-NAT `100.x` address sits in Tailscale's range too. When
+    /// the CLI answers, only the addresses Tailscale claims for this node are
+    /// bound; the range check is the fallback for when it cannot be asked.
+    #[test]
+    fn the_cli_reported_addresses_win_over_the_range_check() {
+        let all = [
+            ip("100.71.4.9"), // carrier CGNAT on a tethered link
+            ip("100.100.1.2"),
+            ip("fd7a:115c:a1e0::9"),
+            ip("192.168.1.20"),
+        ];
+        let reported = [ip("100.100.1.2"), ip("fd7a:115c:a1e0::9"), ip("100.1.1.1")];
+        assert_eq!(
+            select_bind_addresses(&all, Some(&reported)),
+            (
+                vec![ip("100.100.1.2"), ip("fd7a:115c:a1e0::9")],
+                AddressOrigin::TailscaleStatus
+            ),
+            "the CGNAT address is not bound; a reported but unassigned one neither"
+        );
+        assert_eq!(
+            select_bind_addresses(&all, Some(&[])),
+            (vec![], AddressOrigin::TailscaleStatus),
+            "Tailscale says it has no address (logged out): bind nothing"
+        );
+        assert_eq!(
+            select_bind_addresses(&all, None),
+            (
+                vec![ip("100.71.4.9"), ip("100.100.1.2"), ip("fd7a:115c:a1e0::9")],
+                AddressOrigin::RangeFallback
+            ),
+            "no CLI: the range check, CGNAT and all"
+        );
+    }
+
     /// A missing CLI is the normal case off macOS; it must degrade to `None`,
     /// never panic or hang.
     #[test]
@@ -344,7 +501,11 @@ mod tests {
     fn fixed_seams_return_their_fixtures() {
         let src = FixedAddressSource(vec![ip("100.64.0.1")]);
         assert_eq!(src.addresses(), vec![ip("100.64.0.1")]);
-        let probe = FixedTailscaleProbe(Some("m.ts.net".into()));
+        let probe = FixedTailscaleProbe(Some(TailscaleStatus {
+            magic_dns: Some("m.ts.net".into()),
+            ips: vec![ip("100.64.0.1")],
+        }));
         assert_eq!(probe.magic_dns_name().as_deref(), Some("m.ts.net"));
+        assert_eq!(FixedTailscaleProbe(None).magic_dns_name(), None);
     }
 }

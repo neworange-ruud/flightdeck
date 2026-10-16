@@ -45,7 +45,7 @@ use flightdeck_remote_protocol::{
     MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
 };
 
-use super::net::{advertised_host, tailscale_addresses};
+use super::net::{advertised_host, select_bind_addresses, tailscale_addresses, AddressOrigin};
 use super::outbox::ResumeOutcome;
 use super::{BindPlan, Shared, FLUSH_INTERVAL};
 use crate::remote::runtime::SharedRuntime;
@@ -178,66 +178,84 @@ async fn supervise(
             host_override,
             source,
             probe,
-        } => loop {
-            let src = source.clone();
-            let wanted = tokio::task::spawn_blocking(move || tailscale_addresses(&src.addresses()))
+        } => {
+            let mut last_origin: Option<AddressOrigin> = None;
+            loop {
+                // Tailscale's own word on its addresses first (a carrier-grade
+                // NAT 100.x address is in the same range), the range check only
+                // when the CLI cannot be asked; see `net` on why.
+                let src = source.clone();
+                let p = probe.clone();
+                let (wanted, origin, magic) = tokio::task::spawn_blocking(move || {
+                    let status = p.status();
+                    let (wanted, origin) = select_bind_addresses(
+                        &src.addresses(),
+                        status.as_ref().map(|s| s.ips.as_slice()),
+                    );
+                    (wanted, origin, status.and_then(|s| s.magic_dns))
+                })
                 .await
-                .unwrap_or_default();
-            let before: HashSet<IpAddr> = listeners.keys().copied().collect();
-            listeners.retain(|ip, task| {
-                let keep = wanted.contains(ip);
-                if !keep {
-                    task.abort();
+                .unwrap_or_else(|_| (Vec::new(), AddressOrigin::RangeFallback, None));
+                if last_origin != Some(origin) {
+                    crate::remote::debuglog::log(&format!(
+                        "direct ADDRESSES from {} → {wanted:?}",
+                        origin.label()
+                    ));
+                    last_origin = Some(origin);
                 }
-                keep
-            });
-            for ip in &wanted {
-                if listeners.contains_key(ip) {
-                    continue;
-                }
-                match bind_std(SocketAddr::new(*ip, port)).and_then(TcpListener::from_std) {
-                    Ok(tl) => {
-                        crate::remote::debuglog::log(&format!("direct LISTEN {ip}:{port}"));
-                        listeners.insert(
-                            *ip,
-                            tokio::spawn(accept_loop(
-                                tl,
-                                shared.clone(),
-                                conns.clone(),
-                                stop.clone(),
-                            )),
-                        );
+                let before: HashSet<IpAddr> = listeners.keys().copied().collect();
+                listeners.retain(|ip, task| {
+                    let keep = wanted.contains(ip);
+                    if !keep {
+                        task.abort();
                     }
-                    Err(e) => crate::remote::debuglog::log(&format!(
-                        "direct LISTEN failed {ip}:{port} err={e}"
-                    )),
+                    keep
+                });
+                for ip in &wanted {
+                    if listeners.contains_key(ip) {
+                        continue;
+                    }
+                    match bind_std(SocketAddr::new(*ip, port)).and_then(TcpListener::from_std) {
+                        Ok(tl) => {
+                            crate::remote::debuglog::log(&format!("direct LISTEN {ip}:{port}"));
+                            listeners.insert(
+                                *ip,
+                                tokio::spawn(accept_loop(
+                                    tl,
+                                    shared.clone(),
+                                    conns.clone(),
+                                    stop.clone(),
+                                )),
+                            );
+                        }
+                        Err(e) => crate::remote::debuglog::log(&format!(
+                            "direct LISTEN failed {ip}:{port} err={e}"
+                        )),
+                    }
+                }
+                let now: HashSet<IpAddr> = listeners.keys().copied().collect();
+                if now != before {
+                    // Re-sorted into the stable IPv4-first order the advert picks from.
+                    let bound = tailscale_addresses(&now.iter().copied().collect::<Vec<_>>());
+                    if let Ok(mut b) = shared.bound.lock() {
+                        *b = bound.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+                    }
+                    let magic = if bound.is_empty() || !host_override.trim().is_empty() {
+                        None
+                    } else {
+                        magic.clone()
+                    };
+                    shared.set_advert(
+                        advertised_host(&host_override, magic.as_deref(), &bound)
+                            .map(|host| DirectEndpoint { host, port }),
+                    );
+                }
+                tokio::select! {
+                    _ = stopped(&mut stop) => break,
+                    _ = sleep(REBIND_INTERVAL) => {}
                 }
             }
-            let now: HashSet<IpAddr> = listeners.keys().copied().collect();
-            if now != before {
-                // Re-sorted into the stable IPv4-first order the advert picks from.
-                let bound = tailscale_addresses(&now.iter().copied().collect::<Vec<_>>());
-                if let Ok(mut b) = shared.bound.lock() {
-                    *b = bound.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
-                }
-                let magic = if bound.is_empty() || !host_override.trim().is_empty() {
-                    None
-                } else {
-                    let p = probe.clone();
-                    tokio::task::spawn_blocking(move || p.magic_dns_name())
-                        .await
-                        .unwrap_or(None)
-                };
-                shared.set_advert(
-                    advertised_host(&host_override, magic.as_deref(), &bound)
-                        .map(|host| DirectEndpoint { host, port }),
-                );
-            }
-            tokio::select! {
-                _ = stopped(&mut stop) => break,
-                _ = sleep(REBIND_INTERVAL) => {}
-            }
-        },
+        }
     }
     stopped(&mut stop).await;
     for (_, task) in listeners {
