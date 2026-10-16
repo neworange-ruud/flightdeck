@@ -116,6 +116,10 @@ const REMOTE_SECTION_COMMENT: &str = "\
 # pairing the phone again.
 # direct_host: name the phone should dial (empty = this machine's Tailscale
 # MagicDNS name, or its 100.x address).
+# push_done_debounce_secs: how long an agent must stay idle after a turn before
+# the phone gets a \"done\" push (default 5). Going back to work inside the
+# window cancels it, so mid-turn pauses never notify. 0 = push immediately.
+# Needs-input and error pushes are never delayed. Maximum 3600.
 ";
 
 /// The explanatory comment injected above the `[web]` section of any global
@@ -422,10 +426,34 @@ mod tests {
             "global: {toml}"
         );
         assert!(toml.contains("relay_password"), "global: {toml}");
+        // The done-push debounce is present with its default and documented.
+        assert!(
+            toml.contains("push_done_debounce_secs = 5"),
+            "global: {toml}"
+        );
+        assert!(
+            toml.contains("# push_done_debounce_secs:"),
+            "global: {toml}"
+        );
         // It still parses back into a valid config (comment is inert).
         let cfg = parse_config(&toml).unwrap();
         assert!(!cfg.remote.enabled);
         assert_eq!(cfg.remote.relay_url, "wss://relay.flightdeckai.app/ws");
+        assert_eq!(cfg.remote.push_done_debounce_secs, 5);
+    }
+
+    #[test]
+    fn remote_section_without_push_debounce_keeps_the_default() {
+        // An older config that predates the setting (and a project override that
+        // sets only one sibling field) still resolves the field-level default.
+        let mut toml = serialize_global_config(&default_config("x", "main")).unwrap();
+        toml = toml
+            .lines()
+            .filter(|l| !l.starts_with("push_done_debounce_secs"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = parse_config(&toml).unwrap();
+        assert_eq!(cfg.remote.push_done_debounce_secs, 5);
     }
 
     #[test]

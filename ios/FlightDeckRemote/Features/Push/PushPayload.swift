@@ -4,15 +4,17 @@
 //
 //  Parses the deep-link payload carried by a notification's `userInfo` (PRD
 //  §5.2: notifications deep-link straight to the agent). The same shape is
-//  produced by the relay's Rust APNs alert payload and by this app's own local
-//  notifications (`NotificationContentMapper`), so one parser handles a tapped
-//  remote push and a tapped local notification alike.
+//  produced by this app's own local notifications (`NotificationContentMapper`)
+//  and by the Notification Service Extension when it rewrites a sealed push
+//  (`PushNotificationRewriter`) — both through `NotificationUserInfo` — so one
+//  parser handles a tapped remote push and a tapped local notification alike.
 //
-//  Wire shape (top-level `userInfo`, matching `remote/relay/src/apns.rs`):
+//  Shape (top-level `userInfo`):
 //
 //      { "event_id": "...",
 //        "deep_link": { "project_id": "...", "session_id": "...",
-//                       "item_id": "..."|null } }
+//                       "item_id": "..."|null },
+//        "pairing_id": "..." }
 //
 //  Pure and host-free (`[AnyHashable: Any]` → typed), so it is fully unit
 //  testable.
@@ -77,17 +79,13 @@ struct PushPayload: Equatable {
         deepLink: Wire.DeepLink,
         pairingId: String? = nil
     ) -> [AnyHashable: Any] {
-        var info: [AnyHashable: Any] = [
-            "event_id": eventId,
-            "deep_link": [
-                "project_id": deepLink.projectId.rawValue,
-                "session_id": deepLink.sessionId.rawValue,
-                // `item_id` is optional; use `NSNull` for the absent case so the
-                // dictionary is a faithful mirror of the JSON `null`.
-                "item_id": deepLink.itemId?.rawValue ?? NSNull(),
-            ],
-        ]
-        if let pairingId { info["pairing_id"] = pairingId }
-        return info
+        // One builder shared with the Notification Service Extension, so a
+        // rewritten push and a local notification route a tap identically.
+        NotificationUserInfo.make(
+            eventId: eventId,
+            projectId: deepLink.projectId.rawValue,
+            sessionId: deepLink.sessionId.rawValue,
+            itemId: deepLink.itemId?.rawValue,
+            pairingId: pairingId)
     }
 }

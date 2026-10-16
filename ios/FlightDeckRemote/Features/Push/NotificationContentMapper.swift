@@ -2,20 +2,22 @@
 //  NotificationContentMapper.swift
 //  FlightDeckRemote
 //
-//  Maps a typed `Wire.AgentEvent` to notification content (PRD §5.2 copy),
-//  mirroring the relay's Rust `apns::notification_content` so both platforms
-//  agree on the wire/display shape. Two layers, so the copy/deep-link logic is
-//  testable without a UserNotifications host:
+//  Maps a typed `Wire.AgentEvent` that arrived over the live transport to a
+//  local notification (PRD §5.2 copy). (The relay no longer builds any
+//  notification content; pushes carry the desktop's sealed `PushPayload`,
+//  rendered by `PushNotificationRewriter`.) Two layers, so the copy/deep-link
+//  logic is testable without a UserNotifications host:
 //   - `AgentEventNotification` — a pure, `Equatable` display model (title,
 //     body, sound kind, urgency, deep link, event id).
 //   - `NotificationContentMapper.content(for:settings:)` — combines that model
 //     with `NotificationPolicy` to produce a `UNNotificationContent`, or `nil`
 //     when the event is suppressed (toggle off / project muted).
 //
-//  The `userInfo` payload it stamps (`event_id` + `deep_link`) is byte-shape
-//  identical to the APNs alert payload the relay builds, so the one
-//  `PushPayload` parser handles both a tapped local notification and a tapped
-//  remote push (push-deeplink).
+//  The `userInfo` payload it stamps (`event_id` + `deep_link` + `pairing_id`)
+//  comes from the same `NotificationUserInfo` builder the Notification Service
+//  Extension uses when it rewrites a sealed push, so the one `PushPayload`
+//  parser handles both a tapped local notification and a tapped remote push
+//  (push-deeplink, remote-control-bza0).
 //
 
 import Foundation
@@ -116,7 +118,8 @@ enum NotificationContentMapper {
             case .needsInput:
                 // A distinct, urgent tone (PRD §5.2). Falls back to the system
                 // default if the bundled sound file is absent.
-                content.sound = UNNotificationSound(named: UNNotificationSoundName("needs_input.caf"))
+                content.sound = UNNotificationSound(
+                    named: UNNotificationSoundName(PushNotificationRewriter.needsInputSoundName))
             case .chime:
                 content.sound = .default
             case .silent:

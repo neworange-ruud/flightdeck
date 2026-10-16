@@ -2888,6 +2888,8 @@ struct RemoteSetup {
     /// the listener and writes the outboxes. Declared before `_owner` so that
     /// happens while this process still owns the remote state.
     _direct: Option<crate::remote::direct::DirectLink>,
+    /// Routes the pushes the bridge decides to the relay (remote-control-fglt).
+    push: crate::remote::push::PushSender,
     /// Held for as long as this process is the machine's relay client (see
     /// [`RELAY_LOCK_FILE`]); `None` only on a filesystem that cannot lock.
     _owner: Option<crate::contracts::FileLock>,
@@ -2915,7 +2917,7 @@ enum RemoteStart {
     Off,
     /// Another FlightDeck on this machine is the relay client.
     HeldElsewhere,
-    Started(RemoteSetup),
+    Started(Box<RemoteSetup>),
 }
 
 /// Construct the FlightDeck Remote client thread when `[remote]` is enabled and
@@ -3002,6 +3004,15 @@ fn start_remote_at(
                         .unwrap_or(0),
                 ),
             });
+    // The push sender signs HTTPS pushes with this same identity; it gets its
+    // own copy because the client task takes ownership of the original.
+    let Ok(push_identity) = crate::remote::DeviceIdentity::from_private_bytes(&identity_scalar)
+    else {
+        return RemoteStart::Off;
+    };
+    let relay_password = crate::remote::client::effective_relay_password(&cfg);
+    // Pushes always go via the relay (WS or HTTPS), direct pairings included:
+    // the router passes `PushNotify` through untouched.
     let store = Box::new(crate::remote::client::FileRemoteStore::at(path));
     let handle = match &direct {
         Some(d) => RemoteHandle::start_with_options(
@@ -3017,14 +3028,21 @@ fn start_remote_at(
         ),
         None => RemoteHandle::start_with_store(cfg, identity, store, inbound_tx, outbound_rx),
     };
-    RemoteStart::Started(RemoteSetup {
+    let push = crate::remote::push::PushSender::new(
+        handle.push_link(),
+        push_identity,
+        &relay_url,
+        relay_password,
+    );
+    RemoteStart::Started(Box::new(RemoteSetup {
         handle,
         identity_scalar,
         relay_url,
         established,
         _direct: direct,
+        push,
         _owner: owner,
-    })
+    }))
 }
 
 #[cfg(test)]

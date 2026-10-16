@@ -584,6 +584,32 @@ absent as `full`.
   `error { code: relay_mode_push_only, pairing_id }` and keeps the connection
   open (fixture: `relay/error_relay_mode_push_only.json`). It runs no
   per-pairing sender queues and no seq tracking.
+  - The refusal is checked **first**, after authentication: it does not depend
+    on whether `pairing_id` is activated on the connection (the mode is the
+    reason, so no `unknown_pairing` is ever returned for these frames), and
+    `pairing_id` echoes the frame's. Before `auth_ok` these frames are still
+    `not_authenticated` + close, as in any mode.
+  - Nothing about a refused frame reaches the peer: no envelope is forwarded,
+    no ack is relayed, nothing is queued.
+  - The refusal repeats per frame (no escalation to a close); a client that
+    keeps sending is misconfigured and SHOULD stop after the first one.
+  - A full relay sends each freshly authenticated leg an unsolicited
+    `ack { pairing_id, cursor }` per activated pairing (its own stream's ack
+    position, which also tells the endpoint that this relay forwards acks). A
+    push-only relay **does not**: it forwards no acks, so an endpoint must not
+    arm an ack-based liveness deadline against it.
+- **Configuration.** `RELAY_MODE` unset or empty means `full`; the value is
+  trimmed and case-insensitive. Any other value is a startup error (the relay
+  refuses to start rather than silently falling back to `full`). The relay
+  logs its mode at startup and reports it on `GET /version` as `relay_mode`
+  next to `version` and `git_sha`; the `/healthz` and `/readyz` probes are
+  unchanged (plain `ok`).
+- **Storage.** A push-only relay still persists device keys, pairings, claim
+  tokens and push tokens (the `FLIGHTDECK_RELAY_STORE` backend works as in
+  `full`); the envelope-queue tables are never written, so they stay empty.
+  Switching an existing `full` relay to `push_only` leaves any already-queued
+  envelopes untouched but unreachable (they replay again if it is switched
+  back).
 - **Who uses which.** `full` is today's routing relay, for adopters who want
   relay-mode pairings. `push_only` is for deployments where every pairing is in
   direct mode (§5.10), so the relay only needs to authenticate devices and send

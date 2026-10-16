@@ -174,20 +174,6 @@ pub fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Validate the `[remote]` direct-link keys (spec §5.10). Like `[web]`, checked
-/// unconditionally: `direct_port = 0` would ask the OS for a different port every
-/// launch, silently breaking every direct pairing (each stores `host:port` on the
-/// phone), so it is rejected rather than reinterpreted.
-fn validate_remote(remote: &crate::contracts::RemoteConfig) -> Result<()> {
-    if remote.direct_port == 0 {
-        return Err(FlightDeckError::Config(
-            "remote.direct_port must not be 0 (direct pairings store a stable port on the phone)"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Largest sane `[web] replay_bytes` we accept: 64 MiB per terminal. There is
 /// no protocol reason to cap it lower, but an unbounded value is a config typo
 /// waiting to OOM a machine running several terminals at once (each terminal
@@ -246,6 +232,33 @@ fn validate_web(web: &crate::contracts::WebConfig) -> Result<()> {
         return Err(FlightDeckError::Config(format!(
             "web.replay_bytes {} exceeds the {}-byte sanity limit per terminal",
             web.replay_bytes, MAX_REPLAY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the `[remote]` section. Like `[web]` it is checked unconditionally
+/// (cheap, and a typo is better caught before the user turns Remote on):
+///
+/// - `push_done_debounce_secs` above
+///   [`crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS`] is rejected as a likely
+///   milliseconds-for-seconds typo that would silently swallow every done push.
+/// - `direct_port == 0` is rejected (spec §5.10): it would ask the OS for a
+///   different port every launch, silently breaking every direct pairing (each
+///   stores `host:port` on the phone).
+fn validate_remote(remote: &crate::contracts::RemoteConfig) -> Result<()> {
+    if remote.direct_port == 0 {
+        return Err(FlightDeckError::Config(
+            "remote.direct_port must not be 0 (direct pairings store a stable port on the phone)"
+                .to_string(),
+        ));
+    }
+    let max = crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS;
+    if remote.push_done_debounce_secs > max {
+        return Err(FlightDeckError::Config(format!(
+            "remote.push_done_debounce_secs {} exceeds the {max}-second limit \
+             (the value is in seconds, not milliseconds)",
+            remote.push_done_debounce_secs
         )));
     }
     Ok(())
@@ -491,6 +504,26 @@ mod tests {
         assert_eq!(cfg.web.port, 7420);
         assert_eq!(cfg.web.bind, "127.0.0.1");
         assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn validate_accepts_default_and_max_push_done_debounce() {
+        let mut cfg = default_config("p", "main");
+        assert_eq!(cfg.remote.push_done_debounce_secs, 5);
+        assert!(validate(&cfg).is_ok());
+        cfg.remote.push_done_debounce_secs = 0;
+        assert!(validate(&cfg).is_ok(), "0 = push done immediately");
+        cfg.remote.push_done_debounce_secs = crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_push_done_debounce_over_the_limit() {
+        let mut cfg = default_config("p", "main");
+        // 5000 reads like milliseconds typed into a seconds field.
+        cfg.remote.push_done_debounce_secs = 5_000;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("push_done_debounce_secs"), "{err}");
     }
 
     #[test]
