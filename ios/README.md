@@ -374,7 +374,9 @@ notification does). The logic is the shared, unit-tested
   decryption or JSON error, `serviceExtensionTimeWillExpire` — delivers the
   relay's generic notification unchanged. Nothing is ever dropped.
 - There is **no silent wake path** any more (`didReceiveRemoteNotification`,
-  `UIBackgroundModes: remote-notification` are gone).
+  `UIBackgroundModes: remote-notification` are gone). **Ship this app last:**
+  update the relay first, then the desktops, then release this build — until
+  the relay and desktop are v4 nobody sends the alerts this app now relies on.
 
 What the extension reads, and from where:
 

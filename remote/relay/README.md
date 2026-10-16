@@ -23,6 +23,14 @@ pushes. One binary runs in one of two **relay modes** (below).
 | `GET /ws` | WebSocket upgrade: the relay protocol (`specs/REMOTE_PROTOCOL.md` §5–§6), including the desktop's `push_notify`. |
 | `POST /v1/push` | HTTPS twin of `push_notify` for a desktop without a live WebSocket (spec §5.5.3): a signed `PushRequest`; `202` on accept, JSON `PushErrorBody` otherwise. |
 
+### Rollout order
+
+Deploy a v4 relay **before** updating desktops, and desktops before the iPhone
+app. A v4 relay sends no silent wake pushes any more, so a v3 desktop gets no
+pushes from it; a v3 relay has neither `push_notify` nor `POST /v1/push` (a v4
+desktop's push gets 404 and is dropped); and the v4 iPhone app no longer acts on
+wake pushes, so it should arrive once pushes come as v4 alerts.
+
 ### Pushes
 
 The relay sends a push only when a **desktop asks for one** (`push_notify` on the
@@ -65,7 +73,10 @@ a *direct-mode* pairing (spec §5.10):
 - Pair (or re-pair) **after** enabling the direct link. Pairings made before it,
   or against a `full` relay without it, are relay-mode pairings: on a push-only
   relay they authenticate and get pushes but their envelopes are refused, so
-  the phone shows nothing.
+  the phone shows nothing. A push-only relay will not *create* such a pairing:
+  a claim that would be relay mode (the offer had no direct endpoint, or the
+  phone app is older than v4) is refused with `pairing_claim_rejected` and a
+  message saying what to do, sent to the phone and to the waiting desktop.
 
 Pairing itself still goes through the relay in both modes — it is where the two
 devices meet before either knows the other's address, and where the relay
