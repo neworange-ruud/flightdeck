@@ -1407,6 +1407,29 @@ impl<'a> AppHost<'a> {
         self.active_state_mut().selected_mut()?.session.active_mut()
     }
 
+    /// What the program on screen copied with OSC 52 since the last call, for
+    /// the front-end to put on the system clipboard. Copies from every other
+    /// terminal are dropped, so one made off screen never lands later, when
+    /// its terminal is switched to.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        let copied = self
+            .active_terminal_mut()
+            .and_then(|terminal| terminal.take_clipboard());
+        for project in &mut self.workspace.projects {
+            for tab in project.state.tabs.iter_mut() {
+                if let Some(primary) = tab.session.primary_mut() {
+                    primary.take_clipboard();
+                }
+                for c in 0..tab.session.child_count() {
+                    if let Some(child) = tab.session.child_mut(c) {
+                        child.take_clipboard();
+                    }
+                }
+            }
+        }
+        copied
+    }
+
     /// The host state FlightDeck Web would publish right now, built by the
     /// same function a turn publishes with (activity feed left empty). For a
     /// front-end's tests: it is how a test proves that what a browser is told

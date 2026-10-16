@@ -293,6 +293,33 @@ fn streamed_bytes_render_in_the_mirrored_terminal(app: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_copy_made_in_the_program_on_screen_lands_on_this_clipboard(app: &mut TestAppContext) {
+    // Claude Code's fullscreen renderer selects with the mouse itself and
+    // copies with OSC 52; on the host that write goes nowhere useful, so the
+    // mirror makes it here, on the machine whose user selected.
+    let (model, script, cx) = open(app);
+    cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into())));
+    let clipboard = |cx: &mut VisualTestContext| cx.read_from_clipboard().and_then(|c| c.text());
+
+    // A terminal not on screen copies: nobody here selected anything.
+    script.send(LinkEvent::Bytes(TermBytes::live(
+        "s1:primary".into(),
+        0,
+        b"\x1b]52;c;b2xk\x07".to_vec(),
+    )));
+    turn(&model, cx);
+    assert_eq!(clipboard(cx).as_deref(), Some("before"));
+
+    script.send(LinkEvent::Bytes(TermBytes::live(
+        "s2:primary".into(),
+        0,
+        b"\x1b]52;c;bmV3\x07".to_vec(),
+    )));
+    turn(&model, cx);
+    assert_eq!(clipboard(cx).as_deref(), Some("new"));
+}
+
+#[gpui::test]
 fn clicking_a_row_browses_locally_and_sends_nothing(app: &mut TestAppContext) {
     let (model, mut script, cx) = open(app);
     script.sent();

@@ -276,6 +276,11 @@ impl HostModel {
         }
         self.sync_terminal_sizes();
         let changed = self.host.tick();
+        // A program on screen that draws its own selection (Claude Code's
+        // fullscreen renderer) copies with OSC 52, not through our selection.
+        if let Some(text) = self.host.take_clipboard() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
         let now = Instant::now();
         if changed {
             self.cadence.output(now);

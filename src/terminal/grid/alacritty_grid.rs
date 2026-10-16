@@ -17,7 +17,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as AnsiCursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
@@ -64,6 +64,8 @@ pub struct AlacrittyGrid {
     processor: Processor<StdSyncHandler>,
     events: Queue,
     replies: Vec<u8>,
+    /// The newest OSC 52 copy not yet taken ([`TerminalGrid::take_clipboard`]).
+    clipboard: Option<String>,
     selection: Option<Selection>,
     /// What the front-end paints the default foreground / background with, for
     /// answering OSC 10 / 11 queries (see [`TerminalGrid::set_default_colors`]).
@@ -93,6 +95,7 @@ impl AlacrittyGrid {
             processor: Processor::new(),
             events,
             replies: Vec::new(),
+            clipboard: None,
             selection: None,
             // A neutral dark default until the front-end says otherwise.
             default_fg: Rgb {
@@ -170,8 +173,15 @@ impl AlacrittyGrid {
                     let rgb = self.resolve_palette(index);
                     self.replies.extend_from_slice(format(rgb).as_bytes());
                 }
-                // Title, bell, clipboard (OSC 52), pixel-size queries: nothing
-                // in FlightDeck consumes them yet.
+                // An OSC 52 copy. `Term` only raises it for a write (its
+                // default `Osc52::OnlyCopy` refuses reads); the primary
+                // selection (`p`/`s`) has no place on macOS or Windows, so
+                // only the clipboard proper is kept.
+                Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                    self.clipboard = Some(text)
+                }
+                // Title, bell, pixel-size queries: nothing in FlightDeck
+                // consumes them yet.
                 _ => {}
             }
         }
@@ -265,6 +275,10 @@ impl TerminalGrid for AlacrittyGrid {
 
     fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
+    }
+
+    fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -461,6 +475,25 @@ mod tests {
                 GridDamage::Full => panic!("expected partial damage, got Full"),
             }
         }
+    }
+
+    #[test]
+    fn an_osc_52_copy_is_kept_for_the_front_end_and_a_read_is_refused() {
+        let mut grid = AlacrittyGrid::new(4, 20, 100);
+        // Claude Code's fullscreen renderer copies its own selection this way.
+        grid.process(b"\x1b]52;c;Y29waWVkIHRleHQ=\x07");
+        assert_eq!(grid.take_clipboard().as_deref(), Some("copied text"));
+        assert_eq!(grid.take_clipboard(), None, "drained on read");
+
+        // Two before a take: the newest wins.
+        grid.process(b"\x1b]52;c;b2xk\x07\x1b]52;c;bmV3\x1b\\");
+        assert_eq!(grid.take_clipboard().as_deref(), Some("new"));
+
+        // The primary selection is not the clipboard, and a read is never
+        // answered: a program must not learn what the user copied elsewhere.
+        grid.process(b"\x1b]52;p;b2xk\x07\x1b]52;c;?\x07");
+        assert_eq!(grid.take_clipboard(), None);
+        assert!(grid.take_replies().is_empty());
     }
 
     #[test]

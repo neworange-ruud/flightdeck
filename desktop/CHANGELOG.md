@@ -22,7 +22,13 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- Copying text from Claude Code works again when Claude draws its own
+  selection (its fullscreen renderer, which takes the mouse). Claude copies
+  with an OSC 52 escape, which the app's terminals ignored, so nothing reached
+  the clipboard. Now a copy made in the terminal on screen lands on this
+  machine's clipboard, in a local window, a remote window (where Claude runs
+  on the other machine) and a remote window's SSH shell. Copies from terminals
+  not on screen are dropped, and a program can never read the clipboard.
 
 ## [0.6.0] - 2026-10-12
 
