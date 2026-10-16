@@ -332,6 +332,18 @@ impl TestClient {
         device_id: &str,
         signing_key: SigningKey,
     ) -> Self {
+        Self::connect_at(base_url, role, device_id, signing_key, PROTOCOL_VERSION).await
+    }
+
+    /// [`Self::connect_with_key`] advertising `version` in `hello` (e.g. an
+    /// older v3 phone build). Asserts the relay answers at that version.
+    pub async fn connect_at(
+        base_url: &str,
+        role: Role,
+        device_id: &str,
+        signing_key: SigningKey,
+        version: u16,
+    ) -> Self {
         let ws_url = format!("{}/ws", base_url.replacen("http://", "ws://", 1));
         let (ws, resp) = connect_async(ws_url).await.expect("ws handshake");
         assert_eq!(resp.status(), 101, "expected protocol switch");
@@ -356,7 +368,7 @@ impl TestClient {
 
         client
             .send(RelayFrame::Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: version,
                 role,
                 device_id: DeviceId::new(device_id),
                 client: ClientInfo {
@@ -372,7 +384,7 @@ impl TestClient {
             RelayFrame::HelloOk {
                 protocol_version, ..
             } => {
-                assert_eq!(protocol_version, PROTOCOL_VERSION)
+                assert_eq!(protocol_version, version)
             }
             other => panic!("expected hello_ok, got {other:?}"),
         }

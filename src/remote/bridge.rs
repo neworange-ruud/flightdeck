@@ -241,6 +241,11 @@ pub struct RemoteBridge {
     /// preserved: a reconnect re-arms `snapshot_needed` via `Paired`, so a single
     /// fresh snapshot — not a stale backlog — is sent when the link returns.
     link_up: bool,
+    /// Pairings whose data plane is the Mac's own direct link (spec §5.10,
+    /// [`RemoteInbound::DirectTransport`]). Their envelopes go to an outbox the
+    /// desktop always holds, never to the relay client's channel, so the
+    /// relay-outage pause above does not apply to them.
+    direct_pairings: std::collections::HashSet<PairingId>,
     /// Whether a phone peer is currently attached to the pairing. While no phone
     /// is attached the bridge does NOT seal+send the per-tick snapshot/status/
     /// rollup deltas — during the 2026-07-22 incident the desktop sealed and sent
@@ -346,6 +351,7 @@ impl RemoteBridge {
             push_channel: None,
             pairing: None,
             link_up: true,
+            direct_pairings: std::collections::HashSet::new(),
             peer_present: false,
             peer_acks_observed: false,
             peer_acked_seq: 0,
@@ -578,6 +584,9 @@ impl RemoteBridge {
             // on anything other than `Link(Connected)`, and this arrives with no
             // `Link` transition of its own, so there is nothing to do here.
             RemoteInbound::HandshakeFailed { .. } => {}
+            RemoteInbound::DirectTransport { pairing_id } => {
+                self.direct_pairings.insert(pairing_id);
+            }
             RemoteInbound::Envelope(env) => {
                 if self.pairing.is_none() {
                     self.pairing = Some(env.pairing_id.clone());
@@ -675,14 +684,23 @@ impl RemoteBridge {
             // The relay no longer knows our pairing; the client dropped it and
             // will re-offer. Forget it here too and revert to the passthrough
             // sealer so we stop sealing to a dead channel (remote-control-1jy).
-            RemoteInbound::PairingRejected { .. } => {
-                self.pairing = None;
-                self.reset_to_passthrough();
+            // Only the rejected pairings are forgotten: a direct-mode pairing the
+            // client kept (spec §5.10) must go on being fed.
+            RemoteInbound::PairingRejected { pairing_ids } => {
+                if self
+                    .pairing
+                    .as_ref()
+                    .is_none_or(|p| pairing_ids.contains(p))
+                {
+                    self.pairing = None;
+                    self.reset_to_passthrough();
+                }
             }
             // The phone unpaired this Mac (spec §10.2). If it was the pairing we
             // were feeding, forget it and revert to the passthrough sealer so we
             // stop sealing to a dead channel; a different pairing is unaffected.
             RemoteInbound::PairingRevoked { pairing_id } => {
+                self.direct_pairings.remove(&pairing_id);
                 if self.pairing.as_ref() == Some(&pairing_id) {
                     self.pairing = None;
                     self.reset_to_passthrough();
@@ -717,6 +735,14 @@ impl RemoteBridge {
     /// Whether a phone pairing is currently active.
     pub fn is_paired(&self) -> bool {
         self.pairing.is_some()
+    }
+
+    /// Whether the active pairing's data plane is the direct link
+    /// ([`RemoteInbound::DirectTransport`]); `None` with no active pairing.
+    pub fn active_is_direct(&self) -> Option<bool> {
+        self.pairing
+            .as_ref()
+            .map(|p| self.direct_pairings.contains(p))
     }
 
     /// Whether the attached phone is still earning its presence — see
@@ -1087,7 +1113,13 @@ impl RemoteBridge {
         // not draining (unbounded growth + a reconnect flood), remote-control-0ef.10.
         // All per-session/transcript bookkeeping above still runs, so a reconnect
         // sends fresh, current state.
-        if self.pairing.is_none() || !self.link_up {
+        // A direct-mode pairing's outbox is local and always there (spec §5.10),
+        // so only a relay-mode pairing pauses with the relay link.
+        let direct = self
+            .pairing
+            .as_ref()
+            .is_some_and(|p| self.direct_pairings.contains(p));
+        if self.pairing.is_none() || !(self.link_up || direct) {
             return;
         }
 

@@ -40,6 +40,12 @@ pub const MAX_SUPPORTED_VERSION: u16 = 4;
 /// `error { code: bad_frame }`); such a relay still sends its own legacy wake
 /// pushes.
 pub const PUSH_NOTIFY_MIN_VERSION: u16 = 4;
+/// The first negotiated version at which a **phone** can use the direct link
+/// (spec §5.2, §5.10). The relay hands a claiming phone the offer's
+/// `direct_endpoint` — and echoes it to the desktop, which is what puts the
+/// pairing in direct mode — only when the phone's connection negotiated at least
+/// this; an older phone would ignore the endpoint and keep using the relay.
+pub const DIRECT_LINK_MIN_VERSION: u16 = 4;
 
 /// The two roles that connect to the relay for a given pairing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

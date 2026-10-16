@@ -430,6 +430,14 @@ pub struct RemoteStatus {
     pub web_viewers: usize,
     /// A phone is paired: configured at start-up or joined this session.
     pub phone_paired: bool,
+    /// How the paired phone's data travels (REMOTE_PROTOCOL §5.10):
+    /// `Some("direct")` over this machine's direct link, `Some("relay")`
+    /// through the relay, `None` while that is not known yet (no phone feed is
+    /// active).
+    pub phone_transport: Option<&'static str>,
+    /// Where the direct link listens and what it tells phones to dial
+    /// (`host:port`), when it is listening.
+    pub direct_listening: Option<String>,
     /// Who holds the web input lock, when somebody other than this desktop
     /// could be typing (the same value as [`crate::host::AppHost::input_holder`]).
     pub input_holder: Option<String>,

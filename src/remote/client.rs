@@ -81,7 +81,7 @@
 //!   held across an `.await` would make the session future non-`Send` and
 //!   therefore unspawnable on a multi-thread runtime.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -98,15 +98,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::contracts::real::RealFs;
 use crate::contracts::RemoteConfig;
+use crate::remote::direct::{advertised, DirectAdvert, OutboundRouter};
 use crate::remote::push::PushLink;
 use crate::remote::state::{load_remote_state, remote_state_path, save_remote_state, RemoteState};
 use crate::remote::{DeviceIdentity, RemoteInbound, RemoteOutbound};
 
 use flightdeck_remote_protocol::relay::{
-    ClientInfo, EncryptedEnvelope, RelayErrorCode, RelayFrame,
+    ClientInfo, EncryptedEnvelope, RelayErrorCode, RelayFrame, RelayMode,
 };
 use flightdeck_remote_protocol::{
-    DeviceId, PairingId, Role, PROTOCOL_VERSION, PUSH_NOTIFY_MIN_VERSION,
+    DeviceId, DirectEndpoint, PairingId, Role, PROTOCOL_VERSION, PUSH_NOTIFY_MIN_VERSION,
 };
 
 // --- Tuning constants ------------------------------------------------------
@@ -215,6 +216,9 @@ struct ClientTuning {
     /// reached the store set this to [`Duration::ZERO`] so every pump event
     /// flushes a dirty gate immediately; production uses the real interval.
     cursor_flush_interval: Duration,
+    /// Optional wiring from [`ClientOptions`] (not timing, but threaded the same
+    /// way so the session signatures stay put). See there.
+    options: ClientOptions,
 }
 
 impl Default for ClientTuning {
@@ -224,7 +228,28 @@ impl Default for ClientTuning {
             min_stable_session: MIN_STABLE_SESSION,
             fail_next_envelope_writes: Arc::new(AtomicU32::new(0)),
             cursor_flush_interval: CURSOR_FLUSH_INTERVAL,
+            options: ClientOptions::default(),
         }
+    }
+}
+
+/// Optional wiring for [`RemoteHandle::start_with_options`]: what the direct
+/// link (spec §5.10, [`crate::remote::direct`]) needs from the relay client.
+/// The default wires nothing, which is exactly the relay-only client.
+#[derive(Clone, Default)]
+pub struct ClientOptions {
+    /// The direct-link endpoint to put in `pairing_offer.direct_endpoint`, read
+    /// when each offer is built (`None` inside = nothing bound: offer relay mode).
+    pub direct_advert: Option<DirectAdvert>,
+    /// Splits the app's outbound traffic before it reaches the relay session:
+    /// a direct-mode pairing's envelopes go to its outbox, never the relay.
+    pub router: Option<Arc<dyn OutboundRouter>>,
+}
+
+impl ClientOptions {
+    /// The endpoint to advertise in an offer built now.
+    fn direct_endpoint(&self) -> Option<DirectEndpoint> {
+        self.direct_advert.as_ref().and_then(advertised)
     }
 }
 
@@ -301,6 +326,13 @@ impl FileRemoteStore {
     pub fn new() -> Self {
         FileRemoteStore {
             path: remote_state_path(),
+        }
+    }
+
+    /// A store at an explicit path (the caller already resolved it).
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        FileRemoteStore {
+            path: Some(path.into()),
         }
     }
 }
@@ -409,6 +441,30 @@ impl RemoteHandle {
         )
     }
 
+    /// Start with an explicit [`RemoteStore`] and the direct-link wiring in
+    /// [`ClientOptions`] (spec §5.10). With `ClientOptions::default()` this is
+    /// exactly [`start_with_store`](Self::start_with_store).
+    pub fn start_with_options(
+        cfg: RemoteConfig,
+        identity: DeviceIdentity,
+        store: Box<dyn RemoteStore>,
+        inbound_tx: Sender<RemoteInbound>,
+        outbound_rx: Receiver<RemoteOutbound>,
+        options: ClientOptions,
+    ) -> RemoteHandle {
+        Self::start_tuned(
+            cfg,
+            identity,
+            store,
+            inbound_tx,
+            outbound_rx,
+            ClientTuning {
+                options,
+                ..ClientTuning::default()
+            },
+        )
+    }
+
     /// Start with an explicit [`RemoteStore`] and [`ClientTuning`]. The tuning
     /// lets tests drive liveness/stability logic with short durations and force
     /// write failures; production uses [`start_with_store`](Self::start_with_store).
@@ -441,10 +497,21 @@ impl RemoteHandle {
         // drops its sender (shutdown) or when the session task has gone away and
         // the forward fails, so it holds nothing open past the app's lifetime.
         let (async_out_tx, async_out_rx) = unbounded_channel::<RemoteOutbound>();
+        // The direct link's router (if any) takes a direct-mode pairing's
+        // traffic here, before the relay session ever sees it — so it flows even
+        // while the relay is unreachable, and can never leak to the relay.
+        let router = tuning.options.router.clone();
         let forwarder = std::thread::Builder::new()
             .name("flightdeck-remote-outbound".to_string())
             .spawn(move || {
                 while let Ok(msg) = outbound_rx.recv() {
+                    let msg = match &router {
+                        Some(r) => match r.route(msg) {
+                            Some(m) => m,
+                            None => continue,
+                        },
+                        None => msg,
+                    };
                     if async_out_tx.send(msg).is_err() {
                         break;
                     }
@@ -895,21 +962,30 @@ async fn run(
                     // pairing(s) so the next connect is a clean offer-first
                     // bootstrap, and tell the app so it can surface a re-pair
                     // prompt instead of an endless "reconnecting" (1jy).
+                    //
+                    // Direct-mode pairings are kept, outboxes and all: their data
+                    // plane is this Mac's own link, which works whatever the
+                    // relay remembers, and dropping them would strand a phone
+                    // that is reachable right now (spec §5.10).
                     let dropped: Vec<PairingId> = state
-                        .pairing_ids()
-                        .into_iter()
-                        .map(PairingId::new)
+                        .pairings
+                        .iter()
+                        .filter(|p| !p.is_direct())
+                        .map(|p| PairingId::new(p.pairing_id.clone()))
                         .collect();
-                    state.pairings.clear();
+                    state.pairings.retain(|p| p.is_direct());
                     store.save(&state);
                     crate::remote::debuglog::log(&format!(
                         "client AUTH rejected {AUTH_REJECT_REOFFER_THRESHOLD}x — dropped {} stale \
-                         pairing(s), will re-offer on next connect",
-                        dropped.len()
+                         relay-mode pairing(s), kept {} direct, will re-offer on next connect",
+                        dropped.len(),
+                        state.pairings.len()
                     ));
-                    inbound_tx.send(RemoteInbound::PairingRejected {
-                        pairing_ids: dropped,
-                    });
+                    if !dropped.is_empty() {
+                        inbound_tx.send(RemoteInbound::PairingRejected {
+                            pairing_ids: dropped,
+                        });
+                    }
                     auth_reject_streak = 0;
                     attempt = 0;
                 }
@@ -1062,6 +1138,10 @@ async fn run_session(
     // The version `hello_ok` settled on; it decides whether this session may
     // carry `push_notify` (spec §5.5.1).
     let mut negotiated_version: u16 = 0;
+    // The relay's mode from `hello_ok` (spec §5.9): a push-only relay carries no
+    // data plane, so relay-mode pairings get no resume/ack/envelopes there and
+    // new pairings must be direct.
+    let mut relay_mode = RelayMode::Full;
     // The challenge nonce, captured until we decide to answer it.
     let mut challenge_nonce: Option<String> = None;
     // Whether we have already sent our `auth_response`.
@@ -1112,7 +1192,35 @@ async fn run_session(
             queued = outbound_rx.recv(), if offer_window => {
                 match queued {
                     Some(RemoteOutbound::RequestPairing { claim_token_hint }) => {
-                        let offer = build_pairing_offer(identity, claim_token_hint);
+                        let offer = match build_pairing_offer(
+                            identity,
+                            claim_token_hint,
+                            tuning.options.direct_endpoint(),
+                            relay_mode,
+                        ) {
+                            Ok(offer) => offer,
+                            Err(reason) => {
+                                // Refused (push-only relay, no direct link): tell
+                                // the pairing overlay, then authenticate plainly
+                                // so the link itself still comes up.
+                                inbound_tx.send(RemoteInbound::HandshakeFailed {
+                                    reason,
+                                    retrying: false,
+                                });
+                                let Some(nonce) = challenge_nonce.as_ref() else {
+                                    return ended_unauthed();
+                                };
+                                if !send_auth_response(
+                                    &mut sink, identity, nonce, state, machine.clone(),
+                                )
+                                .await
+                                {
+                                    return ended_unauthed();
+                                }
+                                sent_auth = true;
+                                continue;
+                            }
+                        };
                         if send_frame(&mut sink, &offer).await.is_err() {
                             report_handshake_failure(
                                 inbound_tx,
@@ -1158,10 +1266,14 @@ async fn run_session(
                 }
                 Incoming::Frame(frame) => match *frame {
                     RelayFrame::HelloOk {
-                        protocol_version, ..
+                        protocol_version,
+                        relay_mode: mode,
+                        ..
                     } => {
                         saw_hello_ok = true;
                         negotiated_version = protocol_version;
+                        // Absent (a pre-v4 relay) means full (spec §5.9).
+                        relay_mode = mode.unwrap_or_default();
                     }
                     RelayFrame::VersionIncompatible {
                         your_version,
@@ -1233,7 +1345,7 @@ async fn run_session(
                         // Published before `Connected` is reported, so anyone
                         // who saw the link come up also sees it carry pushes.
                         push_link.set_live(negotiated_version);
-                        on_authenticated(&mut sink, state, inbound_tx, pairing_ids).await;
+                        on_authenticated(&mut sink, state, inbound_tx, pairing_ids, relay_mode).await;
                         break;
                     }
                     RelayFrame::Error { code, message, .. } => {
@@ -1283,9 +1395,15 @@ async fn run_session(
     // coalescing the streamed cursor persists (0ef.11). Flushed on every exit
     // below so a clean end never loses a cursor.
     let mut gate = CursorFlushGate::new(tuning.cursor_flush_interval);
+    let push_only_logged = AtomicBool::new(false);
+    let recent = RecentWrites::default();
     let write = SessionWrite {
         tuning,
         negotiated_version,
+        relay_mode,
+        inbound_tx,
+        push_only_logged: &push_only_logged,
+        recent: &recent,
     };
 
     // Re-send an envelope whose write failed on the previous session BEFORE any
@@ -1325,7 +1443,6 @@ async fn run_session(
         identity,
         state,
         store,
-        inbound_tx,
         outbound_rx,
         stop,
         write,
@@ -1378,7 +1495,8 @@ async fn send_auth_response(
 /// the phone sanitizes it before display.
 ///
 /// Blocking (it may spawn a subprocess), so callers run it on the blocking pool.
-fn machine_name() -> Option<String> {
+/// Also announced by the direct link ([`crate::remote::direct`]).
+pub(crate) fn machine_name() -> Option<String> {
     fn clean(raw: &str) -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1413,17 +1531,39 @@ fn machine_name() -> Option<String> {
 /// so both public keys are the same X9.63 point — one less key to manage. The
 /// relay honors a free 4-digit `claim_token_hint`. Shared by the pre-auth
 /// bootstrap in [`run_session`] and the post-auth [`handle_outbound`] path.
-fn build_pairing_offer(identity: &DeviceIdentity, claim_token_hint: Option<String>) -> RelayFrame {
+///
+/// `direct_endpoint` is the direct link's advertised address when it is serving
+/// (spec §5.10): the offer then carries it, and whether the pairing becomes
+/// direct mode is decided at the claim — by the relay's echo of the endpoint in
+/// the desktop-bound `pairing_claimed`, which it sends only for a
+/// direct-capable phone (spec §5.2).
+///
+/// A push-only relay (spec §5.9) carries no data plane, so a pairing offered
+/// there must be direct: with no endpoint to offer, the offer is refused with a
+/// user-facing reason instead of minting a pairing that could never work.
+fn build_pairing_offer(
+    identity: &DeviceIdentity,
+    claim_token_hint: Option<String>,
+    direct_endpoint: Option<DirectEndpoint>,
+    relay_mode: RelayMode,
+) -> Result<RelayFrame, String> {
+    if relay_mode == RelayMode::PushOnly && direct_endpoint.is_none() {
+        return Err(PUSH_ONLY_NEEDS_DIRECT.to_string());
+    }
     let public_key = identity.public_key_base64();
-    RelayFrame::PairingOffer {
+    Ok(RelayFrame::PairingOffer {
         device_id: DeviceId::new(identity.device_id()),
         device_public_key: public_key.clone(),
         key_agreement_public_key: public_key,
         role: Role::Desktop,
         claim_token_hint,
-        direct_endpoint: None,
-    }
+        direct_endpoint,
+    })
 }
+
+/// Why pairing cannot start against a push-only relay without the direct link.
+pub const PUSH_ONLY_NEEDS_DIRECT: &str =
+    "This relay is push-only; enable the direct link (Tailscale) to pair.";
 
 /// Record a `pairing_offer_ok`: persist the pairing so it is activated on the
 /// next connect and store the claim token (its bytes are the E2E salt, spec
@@ -1462,9 +1602,27 @@ async fn on_authenticated(
     state: &RemoteState,
     inbound_tx: &InboundTx,
     pairing_ids: Vec<PairingId>,
+    relay_mode: RelayMode,
 ) {
     report(inbound_tx, RemoteLinkState::Connected { latency_ms: 0 });
     for pid in pairing_ids {
+        // A direct-mode pairing has no data plane on the relay (spec §5.10):
+        // no resume (a push-only relay would refuse it), and no `Paired` — the
+        // direct link announces the pairing itself, independent of the relay.
+        if state.is_direct(pid.as_str()) {
+            continue;
+        }
+        // A push-only relay carries no data plane at all (spec §5.9): a
+        // relay-mode pairing gets no resume there (it would be refused) and is
+        // not surfaced to the bridge, which would otherwise seal envelopes that
+        // can never be delivered. Such a pairing needs re-pairing in direct mode.
+        if relay_mode == RelayMode::PushOnly {
+            crate::remote::debuglog::log(&format!(
+                "client PUSH-ONLY relay: relay-mode pairing={} has no data plane here — re-pair in direct mode",
+                pid.as_str()
+            ));
+            continue;
+        }
         let from_seq = state
             .pairing(pid.as_str())
             .map(|p| p.last_received_seq)
@@ -1592,7 +1750,6 @@ async fn pump(
     identity: &DeviceIdentity,
     state: &mut RemoteState,
     store: &dyn RemoteStore,
-    inbound_tx: &InboundTx,
     outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
     stop: &mut watch::Receiver<bool>,
     write: SessionWrite<'_>,
@@ -1683,7 +1840,7 @@ async fn pump(
                     // nothing but ws pings is exactly the half-open case 0ef.1 is
                     // about.
                     alive = true;
-                    if !handle_frame(sink, state, store, gate, inbound_tx, *frame).await {
+                    if !handle_frame(sink, state, store, gate, write, *frame).await {
                         break SessionEnd::Ended {
                             authed_for: Some(authed_at.elapsed()),
                             pending: None,
@@ -1723,6 +1880,26 @@ struct SessionWrite<'a> {
     tuning: &'a ClientTuning,
     /// The protocol version `hello_ok` negotiated for this session.
     negotiated_version: u16,
+    /// The relay's mode from `hello_ok` (spec §5.9; absent = full).
+    relay_mode: RelayMode,
+    /// The app-bound channel (a refused pairing offer is reported on it).
+    inbound_tx: &'a InboundTx,
+    /// Whether this session already logged a push-only refusal or drop (they
+    /// are advisory; one line per session is enough).
+    push_only_logged: &'a AtomicBool,
+    /// What was last written per pairing, to attribute pairing-scoped errors.
+    recent: &'a RecentWrites,
+}
+
+impl SessionWrite<'_> {
+    /// Log a push-only advisory once per session (debuglog only).
+    fn log_push_only_once(&self, what: &str) {
+        if !self.push_only_logged.swap(true, Ordering::SeqCst) {
+            crate::remote::debuglog::log(&format!(
+                "client PUSH-ONLY relay: {what} (logged once per session)"
+            ));
+        }
+    }
 }
 
 /// Handle one app→relay message. Returns [`Sent::Broke`] if the socket broke.
@@ -1745,6 +1922,23 @@ async fn handle_outbound(
             ciphertext,
         } => {
             let key = pairing_id.as_str().to_string();
+            // A direct-mode pairing's envelopes never go via the relay (spec
+            // §5.10). The direct link's router takes them before they get here;
+            // this is the backstop should one arrive anyway.
+            if state.is_direct(&key) {
+                crate::remote::debuglog::log(&format!(
+                    "client DROP envelope for direct pairing={key} seq={seq}"
+                ));
+                return Sent::Ok;
+            }
+            // A push-only relay refuses envelopes (spec §5.9); sending them would
+            // only earn `relay_mode_push_only` advisories.
+            if write.relay_mode == RelayMode::PushOnly {
+                write.log_push_only_once(&format!(
+                    "dropping relay-mode envelopes (first: pairing={key} seq={seq})"
+                ));
+                return Sent::Ok;
+            }
             // Ensure the pairing exists to persist the outbound high-water mark.
             if state.pairing(&key).is_none() {
                 state
@@ -1794,6 +1988,7 @@ async fn handle_outbound(
                     }),
                 };
             }
+            write.recent.record(&key, WriteKind::Envelope);
             // Commit the high-water mark only once the send succeeded so a failed
             // write never leaves a gap the peer's dedup would stall on. The disk
             // write is debounced — under shell streaming this bumps many times a
@@ -1807,6 +2002,10 @@ async fn handle_outbound(
             gate.mark_dirty();
             Sent::Ok
         }
+        // No relay data plane for a direct pairing (spec §5.10).
+        RemoteOutbound::Ack { pairing_id, .. } if state.is_direct(pairing_id.as_str()) => Sent::Ok,
+        // Nor on a push-only relay (spec §5.9).
+        RemoteOutbound::Ack { .. } if write.relay_mode == RelayMode::PushOnly => Sent::Ok,
         RemoteOutbound::Ack { pairing_id, cursor } => {
             if send_frame(sink, &RelayFrame::Ack { pairing_id, cursor })
                 .await
@@ -1821,7 +2020,23 @@ async fn handle_outbound(
             // Desktop-initiated pairing bootstrap (spec §5.2). For a returning
             // desktop this rides the post-auth pump; a fresh desktop offers
             // pre-auth instead (see [`run_session`]). Same offer either way.
-            let offer = build_pairing_offer(identity, claim_token_hint);
+            let offer = match build_pairing_offer(
+                identity,
+                claim_token_hint,
+                tuning.options.direct_endpoint(),
+                write.relay_mode,
+            ) {
+                Ok(offer) => offer,
+                Err(reason) => {
+                    // Surfaced where pairing errors show (the overlay fails the
+                    // attempt); the link itself is fine.
+                    write.inbound_tx.send(RemoteInbound::HandshakeFailed {
+                        reason,
+                        retrying: false,
+                    });
+                    return Sent::Ok;
+                }
+            };
             if send_frame(sink, &offer).await.is_ok() {
                 Sent::Ok
             } else {
@@ -1856,6 +2071,7 @@ async fn handle_outbound(
                     retry: Some(RemoteOutbound::PushNotify(push)),
                 };
             }
+            write.recent.record(pairing.as_str(), WriteKind::Push);
             crate::remote::debuglog::log(&format!(
                 "push pairing={pairing} event={event} class={class} route=RelaySocket sent"
             ));
@@ -1915,10 +2131,23 @@ async fn handle_frame(
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     gate: &mut CursorFlushGate,
-    inbound_tx: &InboundTx,
+    write: SessionWrite<'_>,
     frame: RelayFrame,
 ) -> bool {
+    let inbound_tx = write.inbound_tx;
     match frame {
+        // A direct-mode pairing's data plane is the direct link (spec §5.10).
+        // Whatever the relay says about its envelopes, acks, or the phone's
+        // presence on the relay is not about the link that carries it — the
+        // phone stays connected to the relay for pushes and revoke even while
+        // it is away from the direct link, and vice versa.
+        RelayFrame::Envelope(ref env) if state.is_direct(env.pairing_id.as_str()) => true,
+        RelayFrame::Ack { ref pairing_id, .. }
+        | RelayFrame::PeerPresence { ref pairing_id, .. }
+            if state.is_direct(pairing_id.as_str()) =>
+        {
+            true
+        }
         RelayFrame::Envelope(env) => {
             let key = env.pairing_id.as_str().to_string();
             crate::remote::debuglog::log(&format!(
@@ -2045,7 +2274,8 @@ async fn handle_frame(
             pairing_id,
             peer_device_id,
             peer_key_agreement_public_key,
-            ..
+            direct_endpoint,
+            peer_device_public_key,
         } => {
             // The phone joined: record the peer id + its key-agreement key and
             // mark the pairing established so the E2E channel can be derived now
@@ -2058,6 +2288,28 @@ async fn handle_frame(
                     p.peer_key_agreement_public_key = Some(ka.clone());
                     p.established = true;
                 }
+                // The phone's identity key (v4) — what the direct link verifies
+                // the phone against (spec §5.10).
+                if let Some(key) = &peer_device_public_key {
+                    p.peer_device_public_key = Some(key.clone());
+                }
+                // Direct mode iff the relay echoed our offer's endpoint (spec
+                // §5.2): it does so exactly when it also handed the endpoint to
+                // a direct-capable (v4+) phone. No echo — a pre-v4 phone, a
+                // relay-mode offer, or a pre-v4 relay — means the phone uses the
+                // relay, so this pairing must too. The direct link also needs
+                // the phone's key to authenticate it.
+                let direct = direct_endpoint.is_some() && p.peer_device_public_key.is_some();
+                p.transport = if direct {
+                    crate::remote::PairingTransport::Direct
+                } else {
+                    crate::remote::PairingTransport::Relay
+                };
+                crate::remote::debuglog::log(&format!(
+                    "client CLAIM pairing={} transport={:?}",
+                    pairing_id.as_str(),
+                    p.transport
+                ));
                 store.save(state);
                 gate.mark_clean();
             }
@@ -2213,12 +2465,27 @@ async fn handle_frame(
         // while the desktop kept sealing (remote-control-5qu). Not fatal — the
         // connection is fine, the *peer* is not — so the session continues and
         // the bridge closes its per-tick feed instead.
+        //
+        // A `push_notify` the relay refused also comes back as an error with the
+        // push's pairing id — `rate_limited` among them (the push rate limit). The
+        // protocol carries no request id, so the two are told apart by what this
+        // session last wrote for that pairing (see [`RecentWrites`]): a
+        // `rate_limited` answering a push is a push rejection, logged and
+        // otherwise ignored — it says nothing about the phone draining envelopes.
         RelayFrame::Error {
             code: RelayErrorCode::RateLimited,
             pairing_id: Some(pairing_id),
             ref message,
             ..
         } => {
+            if write.recent.last(pairing_id.as_str()) == Some(WriteKind::Push) {
+                crate::remote::debuglog::log(&format!(
+                    "client RECV error rate_limited (push rejected) pairing={} msg={}",
+                    pairing_id.as_str(),
+                    message
+                ));
+                return true;
+            }
             crate::remote::debuglog::log(&format!(
                 "client RECV error rate_limited (peer backlog) pairing={} msg={}",
                 pairing_id.as_str(),
@@ -2227,20 +2494,33 @@ async fn handle_frame(
             inbound_tx.send(RemoteInbound::PeerBacklog { pairing_id });
             true
         }
+        // A push-only relay refusing a data-plane frame (spec §5.9) is advisory:
+        // this client no longer sends those there, so it can only be a race
+        // around a reconnect. Logged once per session.
+        RelayFrame::Error {
+            code: RelayErrorCode::RelayModePushOnly,
+            ..
+        } => {
+            write.log_push_only_once("relay refused a data-plane frame (relay_mode_push_only)");
+            true
+        }
         RelayFrame::Error {
             code,
             ref message,
             ref pairing_id,
             ..
         } => {
+            let fatal = is_fatal_error(code, pairing_id.as_ref());
+            let push_rejected = pairing_id
+                .as_ref()
+                .is_some_and(|p| write.recent.last(p.as_str()) == Some(WriteKind::Push));
             crate::remote::debuglog::log(&format!(
-                "client RECV error code={:?} pairing={:?} fatal={} msg={}",
+                "client RECV error code={:?} pairing={:?} fatal={fatal} push_rejected={push_rejected} msg={}",
                 code,
                 pairing_id.as_ref().map(|p| p.as_str()),
-                is_fatal_error(code),
                 message
             ));
-            !is_fatal_error(code)
+            !fatal
         }
         RelayFrame::Bye { .. } => false,
         // Post-auth restatements of handshake frames or unused directions: ignore.
@@ -2249,15 +2529,57 @@ async fn handle_frame(
 }
 
 /// Whether a relay error tears the connection down (vs. an advisory notice).
-fn is_fatal_error(code: RelayErrorCode) -> bool {
-    matches!(
-        code,
+///
+/// The rule, by code and `pairing_id`:
+/// * `auth_failed`, `unsupported_version`, `not_authenticated`, `internal` —
+///   always fatal.
+/// * `bad_frame` — fatal **unless it carries a `pairing_id`**. The relay closes
+///   the socket after every connection-level `bad_frame` (a malformed frame, a
+///   wrong first frame, an invalid claim), and those never name a pairing; a
+///   `bad_frame` naming a pairing is a per-frame refusal after which the relay
+///   keeps the connection open — a refused `push_notify` (oversized or
+///   malformed body, spec §5.5.1) or an envelope whose sender does not match.
+///   Tearing the session down for those would only reconnect into the same
+///   refusal.
+/// * everything else (`rate_limited`, `unknown_pairing`, `peer_unavailable`,
+///   `pairing_claim_rejected`, `seq_violation`, `relay_mode_push_only`) —
+///   advisory.
+fn is_fatal_error(code: RelayErrorCode, pairing_id: Option<&PairingId>) -> bool {
+    match code {
+        RelayErrorCode::BadFrame => pairing_id.is_none(),
         RelayErrorCode::AuthFailed
-            | RelayErrorCode::UnsupportedVersion
-            | RelayErrorCode::NotAuthenticated
-            | RelayErrorCode::BadFrame
-            | RelayErrorCode::Internal
-    )
+        | RelayErrorCode::UnsupportedVersion
+        | RelayErrorCode::NotAuthenticated
+        | RelayErrorCode::Internal => true,
+        _ => false,
+    }
+}
+
+/// What this session last wrote to the relay for a pairing — the only way to
+/// attribute a pairing-scoped `error` to the frame that caused it, since the
+/// protocol carries no request id (the relay answers frames in order and sends
+/// nothing on success). Best effort by design: if an envelope follows a push
+/// before the push's refusal arrives, the refusal is attributed to the envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    Envelope,
+    Push,
+}
+
+/// Per-session [`WriteKind`] by pairing id.
+#[derive(Default)]
+struct RecentWrites(std::sync::Mutex<std::collections::HashMap<String, WriteKind>>);
+
+impl RecentWrites {
+    fn record(&self, pairing_id: &str, kind: WriteKind) {
+        if let Ok(mut m) = self.0.lock() {
+            m.insert(pairing_id.to_string(), kind);
+        }
+    }
+
+    fn last(&self, pairing_id: &str) -> Option<WriteKind> {
+        self.0.lock().ok().and_then(|m| m.get(pairing_id).copied())
+    }
 }
 
 #[cfg(test)]

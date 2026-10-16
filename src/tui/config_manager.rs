@@ -663,6 +663,15 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             key: "relay_url",
             kind: FieldKind::Text,
         },
+        // The direct link (REMOTE_PROTOCOL §5.10) is a plain toggle, so it is
+        // curated here; `direct_port` is numeric (the `Text` kind would commit a
+        // TOML string) and `direct_host` is a rare override, so both stay
+        // raw-TOML-only like `[web] port`.
+        b(
+            "Direct phone link over Tailscale",
+            "remote",
+            "direct_enabled",
+        ),
         CuratedField {
             label: "Phone done-push delay (seconds)",
             section: "remote",
@@ -866,6 +875,12 @@ mod tests {
         // The default relay URL is shown as the inherited fallback.
         assert_eq!(relay.value, "wss://relay.flightdeckai.app/ws");
         assert_eq!(relay.origin, Origin::Default);
+        let direct = rows
+            .iter()
+            .find(|r| r.label == "Direct phone link over Tailscale")
+            .unwrap();
+        assert!(direct.is_bool);
+        assert!(!direct.bool_value, "the direct link is off by default");
     }
 
     #[test]

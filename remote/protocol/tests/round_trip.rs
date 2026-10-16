@@ -189,7 +189,20 @@ fn v4_frames_carry_new_fields() {
             peer_device_public_key,
             ..
         } => {
-            assert_eq!(direct_endpoint, None, "desktop-bound copy");
+            assert_eq!(direct_endpoint, None, "desktop-bound copy, relay mode");
+            assert!(peer_device_public_key.is_some());
+        }
+        other => panic!("expected pairing_claimed, got {other:?}"),
+    }
+    // A direct-capable (v4+) phone claimed a direct offer: the relay echoes the
+    // endpoint to the desktop, which is what makes the pairing direct (§5.2).
+    match relay_fixture("pairing_claimed_to_desktop_direct") {
+        RelayFrame::PairingClaimed {
+            direct_endpoint,
+            peer_device_public_key,
+            ..
+        } => {
+            assert_eq!(direct_endpoint.as_ref(), Some(&endpoint), "echoed");
             assert!(peer_device_public_key.is_some());
         }
         other => panic!("expected pairing_claimed, got {other:?}"),
@@ -599,7 +612,7 @@ fn fixture_counts_are_exhaustive() {
         25,
         "expected at least one fixture per RelayFrame variant: {relay_types:?}"
     );
-    assert_eq!(count("relay"), 30, "relay fixture files");
+    assert_eq!(count("relay"), 31, "relay fixture files");
     assert_eq!(count("push_payload"), 2, "push payload fixtures");
     assert_eq!(count("push_http"), 2, "HTTPS push body fixtures");
     assert_eq!(

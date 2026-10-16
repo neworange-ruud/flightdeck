@@ -107,6 +107,15 @@ const REMOTE_SECTION_COMMENT: &str = "\
 # relay_password: shared secret presented to the relay on connect (empty = none).
 # The FLIGHTDECK_RELAY_PASSWORD environment variable overrides this value.
 #
+# direct_enabled: serve the phone directly over Tailscale (both devices must run
+# Tailscale). Listens only on this machine's Tailscale address(es), never on
+# other networks. Pairings made while it is on talk to this machine directly;
+# the relay is then only used for pairing, push notifications and unpairing.
+# Existing pairings keep using the relay until you pair again.
+# direct_port: TCP port of that listener. Keep it stable: changing it means
+# pairing the phone again.
+# direct_host: name the phone should dial (empty = this machine's Tailscale
+# MagicDNS name, or its 100.x address).
 # push_done_debounce_secs: how long an agent must stay idle after a turn before
 # the phone gets a \"done\" push (default 5). Going back to work inside the
 # window cancels it, so mid-turn pauses never notify. 0 = push immediately.

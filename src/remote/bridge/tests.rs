@@ -1216,6 +1216,60 @@ fn disconnected_link_pauses_seal_and_queue() {
     );
 }
 
+/// The relay rejecting auth drops only the relay-mode pairings it names; a
+/// direct-mode pairing the client kept must go on being fed.
+#[test]
+fn a_rejection_of_other_pairings_keeps_the_active_one() {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+    let mut b = paired_bridge();
+    b.handle_inbound(RemoteInbound::PairingRejected {
+        pairing_ids: vec![PairingId::new("pair-stale")],
+    });
+    assert!(b.is_paired());
+    assert!(!collect_raw(&mut b, &views, 1_000).is_empty());
+    b.handle_inbound(RemoteInbound::PairingRejected {
+        pairing_ids: vec![PairingId::new("pair-1")],
+    });
+    assert!(
+        !b.is_paired(),
+        "the active pairing itself rejected: forgotten"
+    );
+}
+
+/// A direct-mode pairing (REMOTE_PROTOCOL §5.10) feeds the Mac's own outbox,
+/// which is there whether or not the relay is reachable — so a relay outage
+/// must not pause it, while a relay-mode pairing still pauses as above.
+#[test]
+fn a_direct_pairing_keeps_sealing_through_a_relay_outage() {
+    use crate::remote::RemoteLinkState;
+
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+
+    let mut b = paired_bridge();
+    b.handle_inbound(RemoteInbound::DirectTransport {
+        pairing_id: PairingId::new("pair-1"),
+    });
+    b.handle_inbound(RemoteInbound::Link(RemoteLinkState::Disconnected));
+    assert!(
+        !collect_raw(&mut b, &views, 1_000).is_empty(),
+        "the relay link is irrelevant to a direct pairing's outbox"
+    );
+
+    // Revoked: forgotten as direct, so a later relay pairing pauses again.
+    b.handle_inbound(RemoteInbound::PairingRevoked {
+        pairing_id: PairingId::new("pair-1"),
+    });
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    assert!(collect_raw(&mut b, &views, 2_000).is_empty());
+}
+
 #[test]
 fn deferred_pty_writes_fire_only_once_due() {
     // Claude's multi-select submit Enter is queued with a future due time and

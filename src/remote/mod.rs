@@ -15,6 +15,10 @@
 //!   with `src/web/server.rs` so the binary never starts a second one.
 //! * [`client`] — the connection task: connect → hello → auth → resume → pump,
 //!   with exponential backoff + jitter reconnect and periodic latency pings.
+//! * [`direct`] — the opt-in direct link: the same phone protocol served by this
+//!   Mac over Tailscale, with a Mac-held outbox, for direct-mode pairings
+//!   (spec §5.10). It splits the outbound channel by pairing in front of the
+//!   relay client, so relay-mode pairings are untouched.
 //!
 //! ## What this module does NOT do
 //!
@@ -38,6 +42,7 @@ pub mod client;
 pub mod commands;
 pub mod crypto;
 pub mod debuglog;
+pub mod direct;
 pub mod feed;
 pub mod identity;
 pub mod notifier;
@@ -52,7 +57,7 @@ pub mod transcript;
 pub use bridge::{PeerLiveness, ProjectView, RemoteBridge};
 pub use client::{RemoteHandle, RemoteLinkState};
 pub use identity::DeviceIdentity;
-pub use state::{Pairing, RemoteState};
+pub use state::{Pairing, PairingTransport, RemoteState};
 
 use flightdeck_remote_protocol::relay::{EncryptedEnvelope, PresenceState};
 use flightdeck_remote_protocol::PushNotifyBody;
@@ -215,6 +220,15 @@ pub enum RemoteInbound {
         reason: String,
         /// Whether reconnecting could plausibly succeed (see above).
         retrying: bool,
+    },
+    /// This pairing's data plane is the Mac's own direct link (spec §5.10):
+    /// its envelopes go to an outbox this process always holds, so — unlike a
+    /// relay-mode pairing — the bridge must not pause sealing for it while the
+    /// relay link is down. Emitted by [`direct::DirectLink`] at startup and when
+    /// a direct pairing is claimed.
+    DirectTransport {
+        /// The direct-mode pairing.
+        pairing_id: PairingId,
     },
 }
 

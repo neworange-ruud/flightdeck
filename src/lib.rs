@@ -2883,6 +2883,11 @@ struct RemoteSetup {
     relay_url: String,
     /// An already-paired pairing to bring live immediately, if any.
     established: Option<EstablishedPairing>,
+    /// The direct link (REMOTE_PROTOCOL §5.10), when `direct_enabled` or a
+    /// direct-mode pairing exists; also read for the remote status. Dropping it stops
+    /// the listener and writes the outboxes. Declared before `_owner` so that
+    /// happens while this process still owns the remote state.
+    direct: Option<crate::remote::direct::DirectLink>,
     /// Routes the pushes the bridge decides to the relay (remote-control-fglt).
     push: crate::remote::push::PushSender,
     /// Held for as long as this process is the machine's relay client (see
@@ -2965,6 +2970,18 @@ fn start_remote_at(
         Some(u) if !u.is_empty() => u.clone(),
         _ => cfg.relay_url.clone(),
     };
+    // The direct link (REMOTE_PROTOCOL §5.10): listening when the user opted
+    // in, and present (without a listener) whenever a direct-mode pairing
+    // exists, because such a pairing's envelopes must never go to the relay.
+    let direct = if crate::remote::direct::needed(&cfg, &state) {
+        crate::remote::direct::DirectLink::start(
+            crate::remote::direct::DirectOptions::for_config(&cfg, path),
+            &state,
+            inbound_tx.clone(),
+        )
+    } else {
+        None
+    };
     // The first already-established pairing (single-Mac UI in v1) is brought
     // live at startup so a reconnecting phone gets real ciphertext, not the
     // passthrough sealer (spec §7.1).
@@ -2977,7 +2994,15 @@ fn start_remote_at(
                 pairing_id: PairingId::new(p.pairing_id.clone()),
                 peer_ka_b64: p.peer_key_agreement_public_key.clone().unwrap_or_default(),
                 claim_token: p.claim_token.clone().unwrap_or_default(),
-                last_sent_seq: p.last_sent_seq,
+                // A direct pairing's envelopes never pass through the relay
+                // client that persists `last_sent_seq`; its outbox holds the
+                // stream's high-water mark instead.
+                last_sent_seq: p.last_sent_seq.max(
+                    direct
+                        .as_ref()
+                        .and_then(|d| d.outbound_high_water(&p.pairing_id))
+                        .unwrap_or(0),
+                ),
             });
     // The push sender signs HTTPS pushes with this same identity; it gets its
     // own copy because the client task takes ownership of the original.
@@ -2986,7 +3011,23 @@ fn start_remote_at(
         return RemoteStart::Off;
     };
     let relay_password = crate::remote::client::effective_relay_password(&cfg);
-    let handle = RemoteHandle::start(cfg, identity, inbound_tx, outbound_rx);
+    // Pushes always go via the relay (WS or HTTPS), direct pairings included:
+    // the router passes `PushNotify` through untouched.
+    let store = Box::new(crate::remote::client::FileRemoteStore::at(path));
+    let handle = match &direct {
+        Some(d) => RemoteHandle::start_with_options(
+            cfg,
+            identity,
+            d.wrap_store(store),
+            inbound_tx,
+            outbound_rx,
+            crate::remote::client::ClientOptions {
+                direct_advert: Some(d.advert()),
+                router: Some(d.router()),
+            },
+        ),
+        None => RemoteHandle::start_with_store(cfg, identity, store, inbound_tx, outbound_rx),
+    };
     let push = crate::remote::push::PushSender::new(
         handle.push_link(),
         push_identity,
@@ -2998,6 +3039,7 @@ fn start_remote_at(
         identity_scalar,
         relay_url,
         established,
+        direct,
         push,
         _owner: owner,
     }))

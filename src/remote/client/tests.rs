@@ -263,6 +263,17 @@ fn mock_authenticate(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str]) -> bool {
 
 /// [`mock_authenticate`], with `hello_ok` negotiating `version`.
 fn mock_authenticate_at(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str], version: u16) -> bool {
+    mock_authenticate_mode(ws, pubkey, pairing_ids, version, None)
+}
+
+/// [`mock_authenticate_at`], with `hello_ok` announcing `relay_mode`.
+fn mock_authenticate_mode(
+    ws: &mut Ws,
+    pubkey: &[u8],
+    pairing_ids: &[&str],
+    version: u16,
+    relay_mode: Option<flightdeck_remote_protocol::RelayMode>,
+) -> bool {
     if !matches!(ws_recv(ws), Some(RelayFrame::Hello { .. })) {
         return false;
     }
@@ -272,7 +283,7 @@ fn mock_authenticate_at(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str], versio
             protocol_version: version,
             server_time_ms: 0,
             connection_id: "conn-1".to_string(),
-            relay_mode: None,
+            relay_mode,
         },
     );
     let nonce_raw = [7u8; 32];
@@ -618,9 +629,14 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
         relay_url: format!("ws://{addr}/ws"),
         ..RemoteConfig::default()
     };
-    // Seed a persisted pairing so the client takes the auth-first path.
+    // Seed a persisted pairing so the client takes the auth-first path, plus a
+    // direct-mode pairing, which the self-heal must keep (its data plane is the
+    // Mac's own direct link, whatever the relay remembers).
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_stale"));
+    let mut direct = Pairing::new("pair_direct");
+    direct.transport = crate::remote::PairingTransport::Direct;
+    seed.pairings.push(direct);
     let shared = std::sync::Arc::new(Mutex::new(seed));
     let store = Box::new(SharedStore(shared.clone()));
 
@@ -646,9 +662,10 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
         vec![PairingId::new("pair_stale")],
         "the dropped pairing id should be reported"
     );
-    assert!(
-        shared.lock().unwrap().pairings.is_empty(),
-        "the stale pairing must be cleared from persisted state so the next connect re-offers"
+    assert_eq!(
+        shared.lock().unwrap().pairing_ids(),
+        vec!["pair_direct".to_string()],
+        "the stale relay pairing is cleared so the next connect re-offers; the direct one stays"
     );
 
     handle.stop();
@@ -2096,7 +2113,25 @@ fn only_unrecoverable_relay_errors_are_fatal() {
         RelayErrorCode::BadFrame,
         RelayErrorCode::Internal,
     ] {
-        assert!(is_fatal_error(fatal), "{fatal:?} must end the session");
+        assert!(
+            is_fatal_error(fatal, None),
+            "{fatal:?} must end the session"
+        );
+    }
+    // Pairing-scoped, the codes that are per-frame refusals stay advisory; the
+    // connection-level ones stay fatal whatever they name.
+    let pid = PairingId::new("pair_test");
+    assert!(
+        !is_fatal_error(RelayErrorCode::BadFrame, Some(&pid)),
+        "a bad_frame naming a pairing is a per-frame refusal (e.g. a rejected push)"
+    );
+    for fatal in [
+        RelayErrorCode::AuthFailed,
+        RelayErrorCode::UnsupportedVersion,
+        RelayErrorCode::NotAuthenticated,
+        RelayErrorCode::Internal,
+    ] {
+        assert!(is_fatal_error(fatal, Some(&pid)), "{fatal:?} stays fatal");
     }
     for advisory in [
         RelayErrorCode::RateLimited,
@@ -2104,9 +2139,10 @@ fn only_unrecoverable_relay_errors_are_fatal() {
         RelayErrorCode::PairingClaimRejected,
         RelayErrorCode::UnknownPairing,
         RelayErrorCode::SeqViolation,
+        RelayErrorCode::RelayModePushOnly,
     ] {
         assert!(
-            !is_fatal_error(advisory),
+            !is_fatal_error(advisory, None),
             "{advisory:?} is recoverable and must not end the session"
         );
     }
@@ -2591,4 +2627,551 @@ fn a_client_with_no_session_reports_the_push_link_down() {
     let _ = in_rx.recv_timeout(Duration::from_secs(2));
     assert_eq!(handle.push_link().live_version(), None);
     handle.stop();
+}
+
+// --- Direct link (REMOTE_PROTOCOL §5.10, remote-control-inlb) ---------------
+
+/// Drive a fresh desktop through a pairing whose offer carries the direct
+/// endpoint, then a desktop-bound `pairing_claimed` that echoes the endpoint
+/// (`echo`, a direct-capable phone) or not (a pre-v4 phone), then the relay-side
+/// data-plane frames a direct pairing must ignore. Returns the persisted state,
+/// what reached the app, and every frame the client sent after the claim.
+fn direct_offer_drill(echo: bool) -> (RemoteState, Vec<RemoteInbound>, Vec<RelayFrame>) {
+    use flightdeck_remote_protocol::{DeviceId, DirectEndpoint, PresenceState};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let phone = DeviceIdentity::generate();
+    let phone_key = phone.public_key_base64();
+    let endpoint = DirectEndpoint {
+        host: "ruuds-mbp.tail1234.ts.net".to_string(),
+        port: 47800,
+    };
+    let expected = endpoint.clone();
+    let echoed = endpoint.clone();
+
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 4,
+                server_time_ms: 0,
+                connection_id: "conn".to_string(),
+                relay_mode: None,
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode([3u8; 32]),
+                server_time_ms: 0,
+            },
+        );
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::PairingOffer {
+                direct_endpoint, ..
+            }) => assert_eq!(
+                direct_endpoint,
+                Some(expected),
+                "the offer advertises the direct link's endpoint"
+            ),
+            other => panic!("expected a pairing_offer, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingOfferOk {
+                pairing_id: PairingId::new("pair_d"),
+                claim_token: "4321".to_string(),
+                expires_at_ms: 9_999,
+            },
+        );
+        assert!(matches!(
+            ws_recv(&mut ws),
+            Some(RelayFrame::AuthResponse { .. })
+        ));
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![PairingId::new("pair_d")],
+            },
+        );
+        // Unclaimed, the new pairing is relay mode: the client resumes it.
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Resume { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingClaimed {
+                pairing_id: PairingId::new("pair_d"),
+                peer_device_id: Some(DeviceId::new(phone.device_id())),
+                peer_key_agreement_public_key: Some(phone_key.clone()),
+                direct_endpoint: echo.then_some(echoed),
+                peer_device_public_key: Some(phone_key),
+            },
+        );
+        // Relay-side data-plane frames for the pairing.
+        ws_send(
+            &mut ws,
+            &RelayFrame::PeerPresence {
+                pairing_id: PairingId::new("pair_d"),
+                peer: Role::Phone,
+                state: PresenceState::Connected,
+                at_ms: 0,
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_d"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 0,
+                nonce: "bg==".to_string(),
+                ciphertext: "Yw==".to_string(),
+            }),
+        );
+        // Collect whatever the client sends for a moment (resume, acks).
+        let mut sent = Vec::new();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        while let Some(frame) = ws_recv(&mut ws) {
+            sent.push(frame);
+        }
+        sent
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let shared = std::sync::Arc::new(Mutex::new(RemoteState::default()));
+    let store = Box::new(SharedStore(shared.clone()));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".to_string()),
+        })
+        .unwrap();
+    let options = ClientOptions {
+        direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
+        router: None,
+    };
+    let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
+
+    let mut inbound = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match in_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => {
+                let claimed = matches!(msg, RemoteInbound::PairingClaimed { .. });
+                inbound.push(msg);
+                if claimed {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    let sent = mock.join().unwrap();
+    // Drain whatever the trailing relay frames produced.
+    inbound.extend(in_rx.try_iter());
+    handle.stop();
+    let state = shared.lock().unwrap().clone();
+    (state, inbound, sent)
+}
+
+#[test]
+fn a_direct_offer_whose_claim_echoes_the_endpoint_makes_a_direct_pairing() {
+    let (state, inbound, sent) = direct_offer_drill(true);
+    let p = state.pairing("pair_d").expect("persisted");
+    assert!(p.is_direct(), "the pairing is direct mode");
+    assert!(p.established);
+    assert!(
+        p.peer_device_public_key.is_some(),
+        "the phone's identity key is kept"
+    );
+    // The relay is not this pairing's data plane: no resume, no ack for the
+    // stray envelope, and neither its presence nor its envelope reach the app.
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, RelayFrame::Resume { .. } | RelayFrame::Ack { .. })),
+        "client sent relay data-plane frames for a direct pairing: {sent:?}"
+    );
+    assert!(!inbound.iter().any(|m| matches!(
+        m,
+        RemoteInbound::Presence { .. } | RemoteInbound::Envelope(_) | RemoteInbound::Paired { .. }
+    )));
+    assert!(inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::PairingClaimed { .. })));
+}
+
+/// A direct offer claimed by a pre-v4 phone: the relay neither hands the phone
+/// the endpoint nor echoes it here (spec §5.2), so the pairing is relay mode.
+#[test]
+fn a_direct_offer_claimed_without_the_echo_is_relay_mode() {
+    let (state, inbound, sent) = direct_offer_drill(false);
+    let p = state.pairing("pair_d").expect("persisted");
+    assert!(
+        !p.is_direct(),
+        "no echo = the phone was not given the endpoint and uses the relay"
+    );
+    assert!(p.peer_device_public_key.is_some(), "the key is still kept");
+    // Now an ordinary relay pairing: its envelope is delivered and acked.
+    assert!(inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::Envelope(_))));
+    assert!(sent.iter().any(|f| matches!(f, RelayFrame::Ack { .. })));
+}
+
+/// The backstop: even without a router, the client never puts a direct
+/// pairing's envelope on the relay.
+#[test]
+fn the_client_never_sends_a_direct_pairings_envelope_to_the_relay() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_d", "pair_r"]));
+        let mut sent = Vec::new();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        while let Some(frame) = ws_recv(&mut ws) {
+            sent.push(frame);
+        }
+        sent
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut direct = Pairing::new("pair_d");
+    direct.transport = crate::remote::PairingTransport::Direct;
+    seed.pairings.push(direct);
+    seed.pairings.push(Pairing::new("pair_r"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    wait_for_connected(&in_rx);
+    for pid in ["pair_d", "pair_r"] {
+        out_tx
+            .send(RemoteOutbound::SendEnvelope {
+                pairing_id: PairingId::new(pid),
+                seq: 1,
+                sent_at_ms: 0,
+                nonce: "bg==".to_string(),
+                ciphertext: "Yw==".to_string(),
+            })
+            .unwrap();
+    }
+    let sent = mock.join().unwrap();
+    handle.stop();
+    let envelopes: Vec<&str> = sent
+        .iter()
+        .filter_map(|f| match f {
+            RelayFrame::Envelope(e) => Some(e.pairing_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        envelopes,
+        vec!["pair_r"],
+        "only the relay-mode pairing's envelope"
+    );
+    assert!(
+        !sent.iter().any(|f| matches!(
+            f,
+            RelayFrame::Resume { pairing_id, .. } if pairing_id.as_str() == "pair_d"
+        )),
+        "no resume for a direct pairing: {sent:?}"
+    );
+}
+
+// --- Push-only relays and push rejections (spec §5.9, §5.5.1) --------------
+
+/// Collect everything the client writes for `window`.
+fn collect_writes(ws: &mut Ws, window: Duration) -> Vec<RelayFrame> {
+    let mut sent = Vec::new();
+    ws.get_mut().set_read_timeout(Some(window)).unwrap();
+    while let Some(frame) = ws_recv(ws) {
+        sent.push(frame);
+    }
+    sent
+}
+
+/// Against a push-only relay a relay-mode pairing has no data plane: no
+/// resume, no envelopes, no acks, and the bridge is not handed the pairing.
+#[test]
+fn a_push_only_relay_gets_no_data_plane_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate_mode(
+            &mut ws,
+            &pubkey,
+            &["pair_r"],
+            4,
+            Some(flightdeck_remote_protocol::RelayMode::PushOnly)
+        ));
+        // An advisory refusal must not end the session…
+        ws_send(
+            &mut ws,
+            &RelayFrame::Error {
+                code: RelayErrorCode::RelayModePushOnly,
+                message: "push only".into(),
+                pairing_id: Some(PairingId::new("pair_r")),
+                expected_seq: None,
+            },
+        );
+        // …so this presence still reaches the app.
+        ws_send(
+            &mut ws,
+            &RelayFrame::PeerPresence {
+                pairing_id: PairingId::new("pair_r"),
+                peer: Role::Phone,
+                state: flightdeck_remote_protocol::PresenceState::Connected,
+                at_ms: 0,
+            },
+        );
+        collect_writes(&mut ws, Duration::from_millis(800))
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut p = Pairing::new("pair_r");
+    p.established = true;
+    p.peer_key_agreement_public_key = Some("BKa".into());
+    p.claim_token = Some("1234".into());
+    seed.pairings.push(p);
+    let store = Box::new(MemStore(Mutex::new(seed)));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    wait_for_connected(&in_rx);
+    out_tx
+        .send(RemoteOutbound::SendEnvelope {
+            pairing_id: PairingId::new("pair_r"),
+            seq: 1,
+            sent_at_ms: 0,
+            nonce: "bg==".into(),
+            ciphertext: "Yw==".into(),
+        })
+        .unwrap();
+    out_tx
+        .send(RemoteOutbound::Ack {
+            pairing_id: PairingId::new("pair_r"),
+            cursor: 3,
+        })
+        .unwrap();
+    let sent = mock.join().unwrap();
+    let inbound: Vec<RemoteInbound> = in_rx.try_iter().collect();
+    handle.stop();
+    assert!(
+        !sent.iter().any(|f| matches!(
+            f,
+            RelayFrame::Resume { .. } | RelayFrame::Envelope(_) | RelayFrame::Ack { .. }
+        )),
+        "no data-plane frames to a push-only relay: {sent:?}"
+    );
+    assert!(!inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::Paired { .. })));
+    assert!(
+        inbound
+            .iter()
+            .any(|m| matches!(m, RemoteInbound::Presence { .. })),
+        "relay_mode_push_only is advisory: the session carried on"
+    );
+}
+
+/// Pairing against a push-only relay needs the direct link: without an
+/// endpoint to offer, the client refuses (surfaced to the pairing overlay)
+/// instead of minting a pairing with no data plane — and still authenticates.
+#[test]
+fn a_push_only_relay_refuses_to_pair_without_the_direct_link() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 4,
+                server_time_ms: 0,
+                connection_id: "conn".into(),
+                relay_mode: Some(flightdeck_remote_protocol::RelayMode::PushOnly),
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode([5u8; 32]),
+                server_time_ms: 0,
+            },
+        );
+        collect_writes(&mut ws, Duration::from_millis(1500))
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".into()),
+        })
+        .unwrap();
+    // A direct link that is not serving: nothing to advertise.
+    let options = ClientOptions {
+        direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(None))),
+        router: None,
+    };
+    let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
+    let mut refusal = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && refusal.is_none() {
+        if let Ok(RemoteInbound::HandshakeFailed { reason, retrying }) =
+            in_rx.recv_timeout(Duration::from_millis(100))
+        {
+            refusal = Some((reason, retrying));
+        }
+    }
+    let sent = mock.join().unwrap();
+    handle.stop();
+    let (reason, retrying) = refusal.expect("the pairing overlay must hear why");
+    assert_eq!(reason, PUSH_ONLY_NEEDS_DIRECT);
+    assert!(!retrying, "a configuration problem; retrying cannot fix it");
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, RelayFrame::PairingOffer { .. })),
+        "no relay-mode offer to a push-only relay: {sent:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|f| matches!(f, RelayFrame::AuthResponse { .. })),
+        "the link itself still authenticates"
+    );
+}
+
+/// The relay refusing a `push_notify` answers with an `error` naming the
+/// push's pairing (spec §5.5.1). Those are advisory: the session stays up, and
+/// a refused push's `rate_limited` is not mistaken for a queue overflow.
+#[test]
+fn a_refused_push_is_advisory_and_not_a_peer_backlog() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate_at(&mut ws, &pubkey, &["pair_test"], 4));
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Resume { .. })));
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::PushNotify(_))));
+        for code in [
+            RelayErrorCode::BadFrame,
+            RelayErrorCode::RateLimited,
+            RelayErrorCode::UnknownPairing,
+        ] {
+            ws_send(
+                &mut ws,
+                &RelayFrame::Error {
+                    code,
+                    message: "push refused".into(),
+                    pairing_id: Some(PairingId::new("pair_test")),
+                    expected_seq: None,
+                },
+            );
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::PeerPresence {
+                pairing_id: PairingId::new("pair_test"),
+                peer: Role::Phone,
+                state: flightdeck_remote_protocol::PresenceState::Connected,
+                at_ms: 0,
+            },
+        );
+        // The session must still be up to write this.
+        assert!(matches!(
+            ws_recv(&mut ws),
+            Some(RelayFrame::Ack { cursor: 9, .. })
+        ));
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    wait_for_connected(&in_rx);
+    out_tx
+        .send(RemoteOutbound::PushNotify(sample_push()))
+        .unwrap();
+    let mut inbound = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(m) = in_rx.recv_timeout(Duration::from_millis(50)) {
+            let presence = matches!(m, RemoteInbound::Presence { .. });
+            inbound.push(m);
+            if presence {
+                break;
+            }
+        }
+    }
+    out_tx
+        .send(RemoteOutbound::Ack {
+            pairing_id: PairingId::new("pair_test"),
+            cursor: 9,
+        })
+        .unwrap();
+    mock.join().unwrap();
+    handle.stop();
+    assert!(inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::Presence { .. })));
+    assert!(
+        !inbound
+            .iter()
+            .any(|m| matches!(m, RemoteInbound::PeerBacklog { .. })),
+        "a refused push says nothing about the phone draining envelopes"
+    );
+    assert!(
+        !inbound
+            .iter()
+            .any(|m| matches!(m, RemoteInbound::Link(RemoteLinkState::Disconnected))),
+        "the session was not torn down"
+    );
 }

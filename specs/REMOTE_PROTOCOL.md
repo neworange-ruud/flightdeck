@@ -110,6 +110,8 @@ Every connection begins with version negotiation on the relay plane.
     why v4 is a real bump: a desktop sends `push_notify` only on a connection
     negotiated at **`PUSH_NOTIFY_MIN_VERSION` (4)** or above. Against an older
     relay it sends none (that relay still drives its own legacy wake pushes).
+    Likewise the relay puts a pairing in direct mode only for a phone that
+    negotiated **`DIRECT_LINK_MIN_VERSION` (4)** or above (§5.2).
 - The client opens with `hello { protocol_version, role, device_id, client }`
   advertising its **preferred** version.
 - The relay replies with either:
@@ -197,11 +199,13 @@ relay → phone : auth_challenge { nonce, server_time_ms }
 phone → relay : pairing_claim { claim_token, device_id, device_public_key, key_agreement_public_key, role }
 relay → phone : pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key, direct_endpoint? }
               // (peer_key_agreement_public_key = the desktop's KA key;
-              //  direct_endpoint = copied from the offer, v4)
+              //  direct_endpoint = copied from the offer when the phone
+              //  negotiated ≥ DIRECT_LINK_MIN_VERSION, v4)
               // (or error { code: pairing_claim_rejected } if token bad/expired)
-relay → desktop: pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key, peer_device_public_key? }
+relay → desktop: pairing_claimed { pairing_id, peer_device_id, peer_key_agreement_public_key, direct_endpoint?, peer_device_public_key? }
               // notifies the waiting desktop connection that the phone has
               // joined; peer_key_agreement_public_key = the phone's KA key;
+              // direct_endpoint = echoed exactly when the phone got it (v4);
               // peer_device_public_key = the phone's identity key (v4)
 phone → relay : auth_response { … }   // then proceeds as §5.1
 ```
@@ -253,14 +257,24 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
   (§5.10) puts its address in `pairing_offer.direct_endpoint`
   (`{ "host": "ruuds-mbp.tail1234.ts.net", "port": 47800 }` — the Mac's
   Tailscale MagicDNS name or `100.x` address, and the port its direct-link
-  WebSocket listens on). The relay stores it with the pending pairing and copies
-  it verbatim into the **phone-bound** `pairing_claimed.direct_endpoint`; it
-  never dials it or routes by it. A pairing whose claim carried a
-  `direct_endpoint` is in **direct mode on both ends** (the desktop knows from its
-  own offer; the phone from its `pairing_claimed`); every other pairing —
-  including every pairing made before v4 — is in **relay mode** and behaves
-  exactly as before. Switching an existing pairing to direct mode means
-  re-pairing; so does changing the endpoint.
+  WebSocket listens on). The relay stores it with the pending pairing; it never
+  dials it or routes by it.
+  - **Direct mode needs a direct-capable phone.** Only a phone whose
+    connection negotiated at least **`DIRECT_LINK_MIN_VERSION` (4)** dials the
+    direct link (a v4 iOS build is the one that implements it). So the relay
+    copies the endpoint verbatim into the **phone-bound**
+    `pairing_claimed.direct_endpoint` **and echoes the same value in the
+    desktop-bound** `pairing_claimed.direct_endpoint` if and only if the offer
+    carried one **and** the claiming phone negotiated ≥ 4. Otherwise both
+    copies omit it — an older phone would ignore the endpoint and keep using the
+    relay, and the desktop must not wait for it on the direct link.
+  - A pairing whose claims carried a `direct_endpoint` is in **direct mode on
+    both ends**: the phone knows from its `pairing_claimed`, the desktop from the
+    echo in its own (not from its offer — the offer alone says nothing about the
+    phone). Every other pairing — including every pairing made before v4, and a
+    direct offer claimed by a pre-v4 phone — is in **relay mode** and behaves
+    exactly as before. Switching an existing pairing to direct mode means
+    re-pairing; so does changing the endpoint.
 - **Phone identity key to the desktop (v4).** The **desktop-bound**
   `pairing_claimed` additionally carries `peer_device_public_key`: the phone's
   identity public key, exactly the `device_public_key` from its
@@ -274,12 +288,14 @@ phone → relay : auth_response { … }   // then proceeds as §5.1
   |---|---|---|
   | `peer_device_id` | the desktop's id | the phone's id |
   | `peer_key_agreement_public_key` | the desktop's KA key | the phone's KA key |
-  | `direct_endpoint` (v4) | copied from the offer, if any; omitted otherwise | always omitted |
+  | `direct_endpoint` (v4) | copied from the offer when the phone negotiated ≥ 4; omitted otherwise | the same value, echoed exactly when the phone got it; omitted otherwise |
   | `peer_device_public_key` (v4) | always omitted | the phone's identity key |
 
   Fixtures: `relay/pairing_offer_direct.json`, `relay/pairing_claimed_direct.json`
-  (phone-bound) and `relay/pairing_claimed_to_desktop.json` (desktop-bound); the
-  v2-shaped `pairing_offer.json`/`pairing_claimed.json` still parse.
+  (phone-bound), `relay/pairing_claimed_to_desktop.json` (desktop-bound, relay
+  mode) and `relay/pairing_claimed_to_desktop_direct.json` (desktop-bound,
+  direct mode: the echo); the v2-shaped `pairing_offer.json`/`pairing_claimed.json`
+  still parse.
 - **Pairing bootstrap always runs through the relay,** in both relay modes and
   for both pairing modes (§5.9 records why).
 - The **QR/code also carries the shared secret that bootstraps the E2E channel**
@@ -680,7 +696,10 @@ unchanged.
   `ack` cursor. Sequencing, AAD and gapless numbering are exactly §6.1. A
   `from_seq` that precedes the oldest retained envelope (overflow shed the gap)
   gets `error { code: seq_violation, pairing_id }`, and the phone recovers as in
-  §6.3 (drop its cursor, resume from 0, request a snapshot).
+  §6.3 (drop its cursor, resume from 0, request a snapshot). Having reported the
+  gap, the outbox treats the shed seqs as given up (its ack point moves to just
+  below the oldest retained envelope), so that recovery `resume { from_seq: 0 }`
+  is answered with the retained tail rather than another `seq_violation`.
 - **Phone → desktop envelopes** are deduped by `seq` (§6.4) exactly as for relay
   delivery.
 - **What still uses the relay.** A direct-mode pairing still uses the relay for
@@ -1175,7 +1194,7 @@ phone ↔ one Mac** pair. This is the extensibility hinge:
   with `push_aad`, `truncate_push_text` and the push size caps.
 - `remote/protocol/tests/round_trip.rs` — fixture walker + invariant tests.
 - `remote/protocol/tests/fixtures/{relay,desktop_to_phone,phone_to_desktop}/*.json`
-  — at least one golden fixture per message variant: 30 relay files covering all
+  — at least one golden fixture per message variant: 31 relay files covering all
   25 `RelayFrame` variants (extra files pin optional-field shapes: v2- and
   v4-format `hello_ok`/`pairing_offer`/`pairing_claimed`, the push-only
   `error`), 10 desktop→phone, 17 phone→desktop. The relay set includes
