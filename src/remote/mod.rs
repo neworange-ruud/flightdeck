@@ -232,6 +232,17 @@ pub enum RemoteInbound {
         /// Complete, human-readable sentence, safe to show in the UI.
         reason: String,
     },
+    /// The relay kept rejecting this Mac's authentication and only direct-mode
+    /// pairings are left: it has lost its record of this device (a wiped
+    /// store). Those pairings keep working over the direct link, so the client
+    /// keeps them, but the relay can no longer route their pushes — until the
+    /// phone is re-paired, which also re-registers this Mac with the relay.
+    /// The client has stopped reconnecting; a Pair Phone request wakes it and
+    /// bootstraps offer-first (spec §5.2). The UI should say so once.
+    RelayForgotDevice {
+        /// The direct-mode pairings whose pushes are unavailable.
+        pairing_ids: Vec<PairingId>,
+    },
     /// This pairing's data plane is the Mac's own direct link (spec §5.10):
     /// its envelopes go to an outbox this process always holds, so — unlike a
     /// relay-mode pairing — the bridge must not pause sealing for it while the

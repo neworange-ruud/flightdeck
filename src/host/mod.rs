@@ -819,6 +819,12 @@ impl<'a> AppHost<'a> {
                             ui.message(reason);
                         }
                     }
+                    RemoteInbound::RelayForgotDevice { .. } => {
+                        // Direct pairings keep working; only their pushes are
+                        // gone until the phone re-pairs (which re-registers this
+                        // Mac). Said once, when the client gives up on the relay.
+                        ui.message(crate::remote::client::RELAY_FORGOT_DEVICE_MESSAGE);
+                    }
                     RemoteInbound::PairingRejected { .. } => {
                         // The relay no longer recognizes our pairing; the client
                         // dropped the stale record and will re-offer. Give the

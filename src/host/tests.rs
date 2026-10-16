@@ -1683,6 +1683,55 @@ mod overlays {
         assert!(!host.remote_has_persisted_pairing);
     }
 
+    /// Feed one relay-client event to the host's inbound drain (with a
+    /// relay-less bridge, as the drain only runs while one exists).
+    fn deliver_remote(host: &mut AppHost, msg: crate::remote::RemoteInbound) {
+        host.tick();
+        host.remote_bridge = Some(RemoteBridge::passthrough(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        host.remote_in_rx = rx;
+        tx.send(msg).unwrap();
+        host.tick();
+    }
+
+    /// The relay forgot this Mac while only direct pairings remain: the user is
+    /// told pushes are gone until a re-pair, in so many words.
+    #[test]
+    fn a_relay_that_forgot_this_mac_is_announced() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        deliver_remote(
+            &mut host,
+            crate::remote::RemoteInbound::RelayForgotDevice {
+                pairing_ids: vec![flightdeck_remote_protocol::PairingId::new("pair_direct")],
+            },
+        );
+        assert_eq!(
+            message(&host),
+            crate::remote::client::RELAY_FORGOT_DEVICE_MESSAGE
+        );
+    }
+
+    /// A pairing refusal with no attempt on screen still reaches the user,
+    /// verbatim.
+    #[test]
+    fn a_pairing_refusal_without_an_overlay_is_a_message() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        deliver_remote(
+            &mut host,
+            crate::remote::RemoteInbound::PairingRefused {
+                reason: crate::remote::client::PUSH_ONLY_CLAIM_REFUSED.to_string(),
+            },
+        );
+        assert_eq!(
+            message(&host),
+            crate::remote::client::PUSH_ONLY_CLAIM_REFUSED
+        );
+    }
+
     /// Another FlightDeck on this machine is the relay client: Pair Phone says
     /// where to pair instead of claiming Remote is off.
     #[test]

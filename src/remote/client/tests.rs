@@ -672,6 +672,183 @@ fn repeated_auth_rejection_drops_stale_pairing_and_signals_repair() {
     let _ = mock.join();
 }
 
+/// The relay forgot this Mac (a wiped store) and only direct-mode pairings are
+/// persisted. The relay rejects the DEVICE, so the 1jy self-heal (which keeps
+/// direct pairings) used to drop nothing, reset the streak and reconnect into
+/// the same rejection forever — pushes dead, Pair Phone unable to ever work.
+/// Now the client tells the app once, parks instead of reconnecting, and a Pair
+/// Phone request wakes it into the offer-first bootstrap, which re-registers
+/// the device; the relay-unknown direct pairing stays out of `auth_response`.
+#[test]
+fn a_relay_that_forgot_a_direct_only_mac_parks_then_recovers_offer_first() {
+    use std::sync::atomic::AtomicBool;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+
+    let reconnected = std::sync::Arc::new(AtomicBool::new(false));
+    let reconnected_mock = reconnected.clone();
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let hello = |ws: &mut Ws| {
+            assert!(matches!(ws_recv(ws), Some(RelayFrame::Hello { .. })));
+            ws_send(
+                ws,
+                &RelayFrame::HelloOk {
+                    protocol_version: 4,
+                    server_time_ms: 0,
+                    connection_id: "conn".to_string(),
+                    relay_mode: None,
+                },
+            );
+            ws_send(
+                ws,
+                &RelayFrame::AuthChallenge {
+                    nonce: STANDARD.encode([3u8; 32]),
+                    server_time_ms: 0,
+                },
+            );
+        };
+        // The forgetful relay: every auth-first attempt is an unknown device.
+        for _ in 0..AUTH_REJECT_REOFFER_THRESHOLD {
+            let stream = accept_within(&listener).expect("client should connect");
+            let mut ws = tungstenite::accept(stream).unwrap();
+            hello(&mut ws);
+            match ws_recv(&mut ws) {
+                Some(RelayFrame::AuthResponse { pairing_ids, .. }) => assert_eq!(
+                    pairing_ids,
+                    vec![PairingId::new("pair_direct")],
+                    "auth-first with the persisted pairing"
+                ),
+                other => panic!("expected auth_response, got {other:?}"),
+            }
+            ws_send(
+                &mut ws,
+                &RelayFrame::Error {
+                    code: RelayErrorCode::AuthFailed,
+                    message: "unknown device".to_string(),
+                    pairing_id: None,
+                    expected_seq: None,
+                },
+            );
+        }
+        // Parked: the next connect only comes once the app asks to pair.
+        let stream = accept_within(&listener).expect("Pair Phone should wake the client");
+        reconnected_mock.store(true, Ordering::SeqCst);
+        let mut ws = tungstenite::accept(stream).unwrap();
+        hello(&mut ws);
+        let mut seen = Vec::new();
+        match ws_recv(&mut ws) {
+            Some(f @ RelayFrame::PairingOffer { .. }) => seen.push(f),
+            other => panic!("the recovery must offer before it authenticates: {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingOfferOk {
+                pairing_id: PairingId::new("pair_new"),
+                claim_token: "4321".to_string(),
+                expires_at_ms: i64::MAX,
+            },
+        );
+        match ws_recv(&mut ws) {
+            Some(f @ RelayFrame::AuthResponse { .. }) => seen.push(f),
+            other => panic!("expected auth_response after the offer, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![PairingId::new("pair_new")],
+            },
+        );
+        seen.extend(collect_writes(&mut ws, Duration::from_millis(500)));
+        seen
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut direct = Pairing::new("pair_direct");
+    direct.transport = crate::remote::PairingTransport::Direct;
+    seed.pairings.push(direct);
+    let shared = std::sync::Arc::new(Mutex::new(seed));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(
+        cfg,
+        identity,
+        Box::new(SharedStore(shared.clone())),
+        in_tx,
+        out_rx,
+    );
+
+    // The one-time notice, naming the direct pairing that lost its pushes.
+    let mut forgot = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && forgot.is_none() {
+        match in_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(RemoteInbound::RelayForgotDevice { pairing_ids }) => forgot = Some(pairing_ids),
+            Ok(RemoteInbound::PairingRejected { pairing_ids }) => {
+                panic!("nothing relay-mode to drop, yet PairingRejected {pairing_ids:?}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        forgot.expect("the app must hear the relay forgot this Mac"),
+        vec![PairingId::new("pair_direct")]
+    );
+    // No reconnect loop: a looping client would be back within ~1.25 s.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !reconnected.load(Ordering::SeqCst),
+        "the client must park, not reconnect into the same rejection"
+    );
+    assert_eq!(
+        shared.lock().unwrap().pairing_ids(),
+        vec!["pair_direct".to_string()],
+        "the direct pairing is kept: its data plane is the direct link"
+    );
+
+    // Pair Phone wakes it into the offer-first bootstrap.
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".into()),
+        })
+        .unwrap();
+    let mut offered = false;
+    let mut connected = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !(offered && connected) {
+        match in_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(RemoteInbound::PairingOffered { pairing_id, .. }) => {
+                assert_eq!(pairing_id, PairingId::new("pair_new"));
+                offered = true;
+            }
+            Ok(RemoteInbound::Link(RemoteLinkState::Connected { .. })) => connected = true,
+            _ => {}
+        }
+    }
+    let seen = mock.join().unwrap();
+    handle.stop();
+    assert!(offered, "the overlay gets its code");
+    assert!(connected, "the re-registered device authenticates");
+    let auth_ids = seen
+        .iter()
+        .find_map(|f| match f {
+            RelayFrame::AuthResponse { pairing_ids, .. } => Some(pairing_ids.clone()),
+            _ => None,
+        })
+        .expect("an auth_response");
+    assert_eq!(
+        auth_ids,
+        vec![PairingId::new("pair_new")],
+        "the relay-unknown direct pairing is left out of auth_response"
+    );
+}
+
 // --- Recover from a relay seq-violation (relay restart) without a fatal loop (bbf) --
 
 /// Read frames until an [`EncryptedEnvelope`] arrives (skipping pings/acks etc.),

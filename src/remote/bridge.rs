@@ -584,8 +584,10 @@ impl RemoteBridge {
             // on anything other than `Link(Connected)`, and this arrives with no
             // `Link` transition of its own, so there is nothing to do here.
             RemoteInbound::HandshakeFailed { .. } => {}
-            // A refused pairing attempt never became a pairing: a UI notice.
-            RemoteInbound::PairingRefused { .. } => {}
+            // A refused pairing attempt never became a pairing, and a relay
+            // that forgot this Mac changes nothing about a direct pairing's
+            // data plane: both are UI notices only.
+            RemoteInbound::PairingRefused { .. } | RemoteInbound::RelayForgotDevice { .. } => {}
             RemoteInbound::DirectTransport { pairing_id } => {
                 self.direct_pairings.insert(pairing_id);
             }

@@ -81,6 +81,7 @@
 //!   held across an `.await` would make the session future non-`Send` and
 //!   therefore unspawnable on a multi-thread runtime.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -807,6 +808,12 @@ enum SessionEnd {
     /// the supervisor can self-heal after repeated rejections rather than loop
     /// forever on a dead pairing (remote-control-1jy).
     AuthRejected,
+    /// The relay does not know this device and there was nothing to offer:
+    /// authenticating would only be rejected again, and only a pre-auth
+    /// `pairing_offer` re-registers a device (spec §5.2). The supervisor parks
+    /// until the app asks to pair instead of reconnecting into the same
+    /// rejection forever.
+    NeedsBootstrap,
     /// The relay speaks a protocol version outside this build's supported range.
     /// Terminal: the supervisor reports [`RemoteLinkState::Incompatible`] and
     /// stops reconnecting (remote-control-0ef.20).
@@ -883,6 +890,17 @@ async fn run(
     // An outbound envelope whose write failed on the previous session, to re-send
     // first on the next one so its `seq` is not skipped on the wire (0ef.9).
     let mut pending: Option<RemoteOutbound> = None;
+    // The relay has forgotten this device (a wiped store) while direct-mode
+    // pairings remain, so authenticating is pointless until a pre-auth offer
+    // re-registers it (spec §5.2). Set by the rejection self-heal below,
+    // cleared by the next session that authenticates.
+    let mut relay_unknown = false;
+    // Direct-mode pairings the relay no longer knows: left out of every
+    // `auth_response` for the life of this client.
+    let mut relay_unknown_ids: HashSet<String> = HashSet::new();
+    // A Pair Phone request taken off the channel while parked, offered first
+    // thing on the next connect.
+    let mut carried_request: Option<RemoteOutbound> = None;
     // Keep persisted state authoritative for the private key regardless of what
     // was on disk when the task started.
     let mut state = store.load();
@@ -901,6 +919,11 @@ async fn run(
             &tuning,
             pending.take(),
             &push_link,
+            Bootstrap {
+                relay_unknown,
+                exclude: &relay_unknown_ids,
+                request: carried_request.take(),
+            },
         )
         .await;
         // Whatever ended the session, the socket can no longer carry a push.
@@ -940,6 +963,11 @@ async fn run(
                 // Carry any failed-write envelope into the next session (0ef.9).
                 pending = p;
                 report(&inbound_tx, RemoteLinkState::Disconnected);
+                // Authenticating at all proves the relay knows this device
+                // again (the bootstrap offer re-registered it).
+                if authed_for.is_some() {
+                    relay_unknown = false;
+                }
                 // A successful (or merely dropped) session breaks any rejection
                 // streak — the relay is not persistently rejecting us.
                 auth_reject_streak = 0;
@@ -975,6 +1003,25 @@ async fn run(
                         .collect();
                     state.pairings.retain(|p| p.is_direct());
                     store.save(&state);
+                    // What is left is direct-mode only. The relay rejects the
+                    // DEVICE, not just a pairing — it rejects an auth_response
+                    // only for an unknown device or a bad signature, and filters
+                    // unknown pairing ids silently — so re-authenticating with
+                    // the direct pairings would be rejected forever. Stop
+                    // auth-first: leave those ids out of auth_response, park
+                    // until the user asks to pair (a pre-auth offer is the only
+                    // frame that re-registers a device, spec §5.2), and tell
+                    // the app the relay can no longer push for them.
+                    let kept: Vec<PairingId> = state
+                        .pairings
+                        .iter()
+                        .map(|p| PairingId::new(p.pairing_id.clone()))
+                        .collect();
+                    if !kept.is_empty() {
+                        relay_unknown = true;
+                        relay_unknown_ids.extend(kept.iter().map(|p| p.as_str().to_string()));
+                        inbound_tx.send(RemoteInbound::RelayForgotDevice { pairing_ids: kept });
+                    }
                     crate::remote::debuglog::log(&format!(
                         "client AUTH rejected {AUTH_REJECT_REOFFER_THRESHOLD}x — dropped {} stale \
                          relay-mode pairing(s), kept {} direct, will re-offer on next connect",
@@ -990,9 +1037,35 @@ async fn run(
                     attempt = 0;
                 }
             }
+            SessionEnd::NeedsBootstrap => {
+                report(&inbound_tx, RemoteLinkState::Disconnected);
+            }
         }
         if stop_requested(&stop) {
             break;
+        }
+        // The relay does not know this device and nothing asked to pair: park
+        // rather than reconnect into the same rejection (see `relay_unknown`).
+        if relay_unknown && carried_request.is_none() {
+            crate::remote::debuglog::log(
+                "client PARKED — the relay does not know this device; waiting for Pair Phone",
+            );
+            match park_until_pairing_requested(
+                &mut stop,
+                &mut outbound_rx,
+                &mut state,
+                store.as_ref(),
+                &mut relay_unknown_ids,
+            )
+            .await
+            {
+                Some(request) => {
+                    carried_request = Some(request);
+                    attempt = 0;
+                    continue;
+                }
+                None => break,
+            }
         }
         // Backoff, woken early by `stop()` instead of the blocking client's
         // 100 ms poll loop.
@@ -1001,6 +1074,95 @@ async fn run(
             _ = sleep(backoff_delay(attempt, jitter_unit())) => {}
         }
     }
+}
+
+/// Wait, with no socket open, until the app asks to pair (returned, to be
+/// offered pre-auth on the next connect) or shuts down (`None`). Used while the
+/// relay does not know this device: every connect would be rejected until a
+/// pre-auth `pairing_offer` re-registers it, so reconnecting meanwhile is a
+/// loop that can never succeed.
+///
+/// Everything else the app queues meanwhile is settled locally: an unpair is
+/// applied to the persisted state (and the id forgotten from `exclude`); a
+/// relay-plane envelope, ack or push has no relay to go to and is dropped with
+/// a log line — the direct link's router already took every direct-mode
+/// pairing's envelopes before they reach this channel.
+async fn park_until_pairing_requested(
+    stop: &mut watch::Receiver<bool>,
+    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+    state: &mut RemoteState,
+    store: &dyn RemoteStore,
+    exclude: &mut HashSet<String>,
+) -> Option<RemoteOutbound> {
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = stopped(stop) => return None,
+            msg = outbound_rx.recv() => msg?,
+        };
+        match msg {
+            RemoteOutbound::RequestPairing { .. } => return Some(msg),
+            RemoteOutbound::Unpair { pairing_id } => {
+                let key = pairing_id.as_str().to_string();
+                state.pairings.retain(|p| p.pairing_id != key);
+                exclude.remove(&key);
+                store.save(state);
+            }
+            other => crate::remote::debuglog::log(&format!(
+                "client PARKED drop {} — the relay does not know this device",
+                outbound_kind(&other)
+            )),
+        }
+    }
+}
+
+/// A short label for an outbound message, for log lines (no content).
+fn outbound_kind(msg: &RemoteOutbound) -> &'static str {
+    match msg {
+        RemoteOutbound::SendEnvelope { .. } => "envelope",
+        RemoteOutbound::Ack { .. } => "ack",
+        RemoteOutbound::RequestPairing { .. } => "pairing request",
+        RemoteOutbound::Unpair { .. } => "unpair",
+        RemoteOutbound::PushNotify(..) => "push",
+    }
+}
+
+/// How a session should treat the pre-auth bootstrap (spec §5.2), decided by
+/// the supervisor.
+struct Bootstrap<'a> {
+    /// The relay has forgotten this device: never authenticate without first
+    /// offering (which re-registers it), and end with
+    /// [`SessionEnd::NeedsBootstrap`] when there is nothing to offer.
+    relay_unknown: bool,
+    /// Pairing ids to leave out of `auth_response` (direct-mode pairings the
+    /// relay no longer knows).
+    exclude: &'a HashSet<String>,
+    /// A Pair Phone request taken off the channel while parked: offered
+    /// pre-auth as soon as the challenge arrives.
+    request: Option<RemoteOutbound>,
+}
+
+/// The pairing ids to activate in `auth_response`: the persisted ones minus
+/// `exclude`.
+fn auth_pairing_ids(state: &RemoteState, exclude: &HashSet<String>) -> Vec<String> {
+    state
+        .pairing_ids()
+        .into_iter()
+        .filter(|id| !exclude.contains(id))
+        .collect()
+}
+
+/// The next message for the pre-auth offer window: a carried request first,
+/// then the channel. Completes on its first poll when `carried` holds one, so
+/// a `select!` that drops it unpolled never loses the carried request.
+async fn next_pre_auth(
+    carried: &mut Option<RemoteOutbound>,
+    outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
+) -> Option<RemoteOutbound> {
+    if let Some(msg) = carried.take() {
+        return Some(msg);
+    }
+    outbound_rx.recv().await
 }
 
 /// The effective relay URL: a per-device `remote.json` override wins over config.
@@ -1062,7 +1224,13 @@ async fn run_session(
     tuning: &ClientTuning,
     pending_in: Option<RemoteOutbound>,
     push_link: &PushLink,
+    bootstrap: Bootstrap<'_>,
 ) -> SessionEnd {
+    let Bootstrap {
+        relay_unknown,
+        exclude,
+        request: mut carried,
+    } = bootstrap;
     let url = effective_url(cfg, state);
     let sock = match connect(&url).await {
         Ok(s) => s,
@@ -1189,7 +1357,7 @@ async fn run_session(
                 return ended_unauthed();
             }
 
-            queued = outbound_rx.recv(), if offer_window => {
+            queued = next_pre_auth(&mut carried, outbound_rx), if offer_window => {
                 match queued {
                     Some(RemoteOutbound::RequestPairing { claim_token_hint }) => {
                         let offer = match build_pairing_offer(
@@ -1207,11 +1375,18 @@ async fn run_session(
                                 inbound_tx.send(RemoteInbound::PairingRefused {
                                     reason: reason.to_string(),
                                 });
+                                // Unless the relay does not know this device:
+                                // then a plain auth is just another rejection.
+                                if relay_unknown {
+                                    let _ = send_frame(&mut sink, &RelayFrame::Bye { reason: None }).await;
+                                    close(&mut sink).await;
+                                    return SessionEnd::NeedsBootstrap;
+                                }
                                 let Some(nonce) = challenge_nonce.as_ref() else {
                                     return ended_unauthed();
                                 };
                                 if !send_auth_response(
-                                    &mut sink, identity, nonce, state, machine.clone(),
+                                    &mut sink, identity, nonce, state, exclude, machine.clone(),
                                 )
                                 .await
                                 {
@@ -1243,12 +1418,20 @@ async fn run_session(
             }
 
             _ = sleep_until(offer_lapses_at), if offer_window => {
-                // Nothing to offer in time: fall back to a plain auth so an idle
-                // desktop is never stranded mid-handshake.
+                // Nothing to offer in time. A relay that does not know this
+                // device would reject a plain auth, so hand back to the
+                // supervisor to park instead (no reconnect loop).
+                if relay_unknown {
+                    let _ = send_frame(&mut sink, &RelayFrame::Bye { reason: None }).await;
+                    close(&mut sink).await;
+                    return SessionEnd::NeedsBootstrap;
+                }
+                // Otherwise fall back to a plain auth so an idle desktop is
+                // never stranded mid-handshake.
                 let Some(nonce) = challenge_nonce.as_ref() else {
                     return ended_unauthed();
                 };
-                if !send_auth_response(&mut sink, identity, nonce, state, machine.clone()).await {
+                if !send_auth_response(&mut sink, identity, nonce, state, exclude, machine.clone()).await {
                     return ended_unauthed();
                 }
                 sent_auth = true;
@@ -1293,15 +1476,17 @@ async fn run_session(
                     RelayFrame::AuthChallenge { nonce, .. }
                         if saw_hello_ok && challenge_nonce.is_none() =>
                     {
-                        if state.pairing_ids().is_empty() {
-                            // Fresh desktop: defer auth until we have offered (or the
+                        if relay_unknown || auth_pairing_ids(state, exclude).is_empty() {
+                            // Fresh desktop — or one the relay has forgotten,
+                            // which must re-register before it can authenticate:
+                            // defer auth until we have offered (or the
                             // pending-offer wait lapses above).
                             offer_wait_until = Some(Deadline::now() + PENDING_OFFER_WAIT);
                             challenge_nonce = Some(nonce);
                         } else {
                             // Returning desktop: auth-first, exactly as before.
                             if !send_auth_response(
-                                &mut sink, identity, &nonce, state, machine.clone(),
+                                &mut sink, identity, &nonce, state, exclude, machine.clone(),
                             )
                             .await
                             {
@@ -1330,7 +1515,7 @@ async fn run_session(
                         match challenge_nonce.clone() {
                             Some(nonce) => {
                                 if !send_auth_response(
-                                    &mut sink, identity, &nonce, state, machine.clone(),
+                                    &mut sink, identity, &nonce, state, exclude, machine.clone(),
                                 )
                                 .await
                                 {
@@ -1462,6 +1647,7 @@ async fn send_auth_response(
     identity: &DeviceIdentity,
     nonce_b64: &str,
     state: &RemoteState,
+    exclude: &HashSet<String>,
     machine_name: Option<String>,
 ) -> bool {
     let signature = match identity.sign_nonce_base64(nonce_b64) {
@@ -1471,8 +1657,7 @@ async fn send_auth_response(
     let resp = RelayFrame::AuthResponse {
         device_id: DeviceId::new(identity.device_id()),
         signature,
-        pairing_ids: state
-            .pairing_ids()
+        pairing_ids: auth_pairing_ids(state, exclude)
             .into_iter()
             .map(PairingId::new)
             .collect(),
@@ -1595,6 +1780,13 @@ fn push_only_refusal(direct_enabled: bool) -> &'static str {
         PUSH_ONLY_DIRECT_DISABLED
     }
 }
+
+/// What the host shows when the relay forgot this Mac but direct pairings
+/// remain (see [`RemoteInbound::RelayForgotDevice`]).
+pub const RELAY_FORGOT_DEVICE_MESSAGE: &str =
+    "The relay no longer knows this Mac; pushes are unavailable until you \
+     re-pair the phone (Unpair Phone, then Pair Phone). The direct link keeps \
+     working meanwhile.";
 
 /// Record a `pairing_offer_ok`: persist the pairing so it is activated on the
 /// next connect and store the claim token (its bytes are the E2E salt, spec
