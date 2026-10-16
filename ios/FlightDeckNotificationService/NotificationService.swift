@@ -46,6 +46,10 @@ final class NotificationService: UNNotificationServiceExtension {
             settings: UserDefaultsNotificationSettingsStore().load())
         switch result {
         case let .rewritten(push):
+            // Let the app know this event has been shown, so the local
+            // notification its live transport may post for the same event
+            // later does not banner again (ForegroundPresentationPolicy).
+            PresentedPushLog().record(push.eventId)
             // Never log content; the outcome is enough to diagnose.
             logger.info("push rewritten (suppressed: \(push.suppressed, privacy: .public))")
         case let .fallback(reason):

@@ -119,6 +119,10 @@ struct AgentChatView: View {
         .fullScreenCover(isPresented: $showFocusMode) {
             FocusModeView(model: model, dictation: dictation)
         }
+        // Tell the push layer which session is on screen, so a notification for
+        // it is not bannered over this conversation (remote-control-bza0).
+        .onAppear { PushCoordinator.shared.visibleSessionId = model.sessionId.rawValue }
+        .onDisappear { PushCoordinator.shared.chatDidDisappear(sessionId: model.sessionId.rawValue) }
         .task {
             // Dictation drops its transcript into the field as editable text —
             // edit-before-send, always (PRD §7); it is never auto-sent.

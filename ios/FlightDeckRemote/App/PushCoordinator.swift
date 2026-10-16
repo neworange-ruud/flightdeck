@@ -38,10 +38,50 @@ final class PushCoordinator {
     /// owns it.
     weak var router: AppRouter?
 
-    private let center: UNUserNotificationCenter
+    /// The agent session whose chat is on screen right now (set by
+    /// `AgentChatView`), so a notification for it doesn't banner over the very
+    /// conversation the user is reading (`ForegroundPresentationPolicy`).
+    var visibleSessionId: String?
 
-    init(center: UNUserNotificationCenter = .current()) {
+    /// Event ids presented as LOCAL notifications this launch (local
+    /// notifications only exist while the app is foregrounded, so the process
+    /// lifetime is the right scope).
+    private var locallyPresentedEventIds: Set<String> = []
+
+    private let center: UNUserNotificationCenter
+    private let pushLog: PresentedPushLog
+
+    init(center: UNUserNotificationCenter = .current(), pushLog: PresentedPushLog = PresentedPushLog()) {
         self.center = center
+        self.pushLog = pushLog
+    }
+
+    /// Decide how a notification arriving in the foreground is presented, and
+    /// remember local presentations — see `ForegroundPresentationPolicy`.
+    func presentation(
+        source: ForegroundPresentationPolicy.Source,
+        userInfo: [AnyHashable: Any],
+        isPassive: Bool
+    ) -> ForegroundPresentationPolicy.Presentation {
+        let payload = PushPayload(userInfo: userInfo)
+        let eventId = payload?.eventId.isEmpty == false ? payload?.eventId : nil
+        let decision = ForegroundPresentationPolicy.decide(
+            source: source,
+            eventId: eventId,
+            sessionId: payload?.deepLink.sessionId.rawValue,
+            isPassive: isPassive,
+            presentedByPush: eventId.map(pushLog.contains) ?? false,
+            presentedLocally: eventId.map(locallyPresentedEventIds.contains) ?? false,
+            visibleSessionId: visibleSessionId)
+        if source == .local, let eventId {
+            locallyPresentedEventIds.insert(eventId)
+        }
+        return decision
+    }
+
+    /// `AgentChatView` left the screen; clear only if it was still the visible one.
+    func chatDidDisappear(sessionId: String) {
+        if visibleSessionId == sessionId { visibleSessionId = nil }
     }
 
     /// Attach the app's router so notification taps can navigate.
