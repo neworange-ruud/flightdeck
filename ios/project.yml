@@ -43,7 +43,11 @@ settings:
 packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
-    from: 1.14.0
+    # Pinned exactly: the `.xcodeproj` (and with it Package.resolved) is not
+    # committed, so a range resolves fresh on every machine and CI run — and
+    # `from: 1.14.0` started resolving to 1.99.0, which removed
+    # `TerminalView.getTerminal()` and broke the build. Bump deliberately.
+    exactVersion: 1.20.0
 
 targets:
   FlightDeckRemote:
