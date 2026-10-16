@@ -66,6 +66,8 @@ async fn version_reports_crate_version_and_git_sha() {
     let body: serde_json::Value = response.json().await.expect("invalid JSON body");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["git_sha"], "test-sha");
+    // Spec §5.9: the default mode is reported alongside the build.
+    assert_eq!(body["relay_mode"], "full");
 }
 
 #[tokio::test]
