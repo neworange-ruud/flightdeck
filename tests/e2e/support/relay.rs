@@ -56,9 +56,44 @@ pub struct RelayHandle {
     /// persistent store. Exposed so a test can simulate partial state loss
     /// (see [`Self::db_path`]).
     db_path: Option<PathBuf>,
+    /// Where the relay's (JSON) log goes when spawned with
+    /// [`Self::spawn_logged`]; `None` = inherited stdout/stderr.
+    log_path: Option<PathBuf>,
+    /// Owns the log file's directory for the handle's lifetime.
+    _log_dir: Option<tempfile::TempDir>,
 }
 
 impl RelayHandle {
+    /// Spawn the relay (in-memory store, APNs unconfigured) with its log written
+    /// as JSON lines to a temp file instead of the test's stdout, so a test can
+    /// assert on what the relay did — e.g. the content-free line it logs for
+    /// every push attempt (`outcome`, `via`). Read it with [`Self::log`].
+    pub fn spawn_logged() -> Self {
+        let dir = tempfile::tempdir().expect("create temp dir for the relay log");
+        let log = dir.path().join("relay.log");
+        let port = pick_free_port();
+        let child = spawn_child_logged(port, None, Some(&log));
+        let handle = RelayHandle {
+            child,
+            port,
+            store_spec: None,
+            _store_dir: None,
+            db_path: None,
+            log_path: Some(log),
+            _log_dir: Some(dir),
+        };
+        handle.wait_for_healthz();
+        handle
+    }
+
+    /// The relay's log so far (empty unless spawned with [`Self::spawn_logged`]).
+    pub fn log(&self) -> String {
+        self.log_path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    }
+
     /// Spawn the relay on an OS-chosen free port.
     ///
     /// Picks the port by binding a `TcpListener` to `127.0.0.1:0` and reading
@@ -110,6 +145,8 @@ impl RelayHandle {
             store_spec,
             _store_dir: store_dir,
             db_path,
+            log_path: None,
+            _log_dir: None,
         };
         handle.wait_for_healthz();
         handle
@@ -223,15 +260,30 @@ impl RelayHandle {
 /// `FLIGHTDECK_RELAY_STORE` spec. Does not wait for readiness — callers poll
 /// `/healthz`.
 fn spawn_child(port: u16, store_spec: Option<&str>) -> Child {
+    spawn_child_logged(port, store_spec, None)
+}
+
+/// [`spawn_child`], optionally sending the relay's output (as JSON log lines)
+/// to `log` instead of inheriting the test's stdout/stderr.
+fn spawn_child_logged(port: u16, store_spec: Option<&str>, log: Option<&Path>) -> Child {
     let bin = ensure_relay_built();
     let mut cmd = Command::new(&bin);
-    cmd.env("PORT", port.to_string())
-        .stdin(Stdio::null())
+    cmd.env("PORT", port.to_string()).stdin(Stdio::null());
+    match log {
+        // A file, not a pipe: nothing has to drain it for the child to make
+        // progress.
+        Some(path) => {
+            let out = std::fs::File::create(path).expect("create relay log file");
+            let err = out.try_clone().expect("clone relay log handle");
+            cmd.env("LOG_FORMAT", "json").stdout(out).stderr(err);
+        }
         // Inherited (not piped): the relay's tracing output is useful on
         // test failure, and piping would require a drain thread to avoid
         // the child blocking once the pipe buffer fills.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        None => {
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        }
+    }
     if let Some(spec) = store_spec {
         cmd.env("FLIGHTDECK_RELAY_STORE", spec);
     }
