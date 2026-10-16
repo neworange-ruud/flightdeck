@@ -16,6 +16,15 @@
 //! Queued envelopes never trigger a push (spec §5.5, v4); a desktop asks for
 //! one explicitly with `push_notify`, handled by [`crate::push`].
 //!
+//! **Push-only mode** (spec §5.9, `RELAY_MODE=push_only`): the lifecycle above
+//! is unchanged except that the data plane is switched off — `envelope`,
+//! `resume` and `ack` are answered with an advisory
+//! `error { code: relay_mode_push_only }` (the socket stays open), nothing is
+//! forwarded to the peer, and the store's queue methods (`enqueue`, `resume`,
+//! `ack`, `ack_cursor`, `reset_stream`) are never called, so no sender queue or
+//! seq high-water mark is created. The auth-time ack-cursor frame is not sent
+//! either: it advertises a relay that forwards acks, which this one does not.
+//!
 //! Wrong-order frames, unknown devices, and bad signatures are answered with a
 //! [`RelayFrame::Error`] carrying the appropriate [`RelayErrorCode`] and, for
 //! fatal cases (version/auth), the socket is closed. An unauthenticated
@@ -32,8 +41,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use flightdeck_remote_protocol::{
     negotiate_version, ClientInfo, DeviceId, DirectEndpoint, EncryptedEnvelope, PairingId,
-    PresenceState, PushNotifyBody, RelayErrorCode, RelayFrame, RelayMode, Role,
-    MAX_SUPPORTED_VERSION, MIN_SUPPORTED_VERSION,
+    PresenceState, PushNotifyBody, RelayErrorCode, RelayFrame, Role, MAX_SUPPORTED_VERSION,
+    MIN_SUPPORTED_VERSION,
 };
 use futures_util::stream::{SplitStream, StreamExt};
 use tokio::sync::{mpsc, Notify};
@@ -149,6 +158,11 @@ pub struct Connection {
     /// across 17 days (remote-control-zv3). Escalated to WARN so it is visible
     /// without turning on per-envelope diagnostics.
     seq_reject_streak: HashMap<String, u64>,
+    /// How many data-plane frames a push-only relay has refused on this
+    /// connection. The first is logged at WARN (a client treating a push-only
+    /// relay as a router is misconfigured — likely a relay-mode pairing); the
+    /// rest at DEBUG so a chatty client cannot flood the log.
+    push_only_refusals: u64,
     phase: Phase,
 }
 
@@ -156,6 +170,10 @@ pub struct Connection {
 /// escalated from INFO to WARN, and every multiple thereafter. High enough that
 /// a normal one-round-trip realignment never warns.
 const SEQ_REJECT_WARN_EVERY: u64 = 50;
+
+/// The `message` of the `relay_mode_push_only` refusal (spec §5.9; matches the
+/// `relay/error_relay_mode_push_only.json` fixture).
+const PUSH_ONLY_REFUSAL: &str = "this relay runs in push_only mode and does not carry envelopes";
 
 impl Connection {
     /// Create a connection in its initial state.
@@ -168,6 +186,7 @@ impl Connection {
             claim_attempts: 0,
             shutdown: Arc::new(Notify::new()),
             seq_reject_streak: HashMap::new(),
+            push_only_refusals: 0,
             phase: Phase::AwaitingHello,
         }
     }
@@ -370,9 +389,9 @@ impl Connection {
             protocol_version: version,
             server_time_ms: now_ms(),
             connection_id: self.connection_id.clone(),
-            // Spec §5.9. Always `full` until the push-only mode lands
-            // (remote-control-ck44), which makes it config-driven.
-            relay_mode: Some(RelayMode::Full),
+            // Spec §5.9: the configured `RELAY_MODE`, so a client learns up
+            // front whether this relay carries the data plane.
+            relay_mode: Some(self.state.relay_mode()),
         })
         .await;
 
@@ -761,6 +780,7 @@ impl Connection {
         // presence with any already-connected peer.
         let role = self.role.expect("role set at hello");
         let handle = self.handle();
+        let push_only = self.state.is_push_only();
         for pairing in &activated {
             // Hand this leg its OWN stream's ack position before anything else.
             // Sent unconditionally, including the very common `cursor: 0`, for two
@@ -772,12 +792,19 @@ impl Connection {
             // Without that signal a desktop could not distinguish "my phone has
             // acked nothing" from "this relay never relays acks", and enforcing a
             // deadline against an older relay would declare every phone dark.
-            let ack_cursor = self.state.store.ack_cursor(pairing, role).await;
-            self.send(RelayFrame::Ack {
-                pairing_id: pairing.clone(),
-                cursor: ack_cursor,
-            })
-            .await;
+            //
+            // A push-only relay skips it (spec §5.9): it forwards no acks, so
+            // advertising that it does would arm the desktop's ack deadline
+            // against a relay that can never satisfy it — and reading the cursor
+            // is a queue lookup this mode never makes.
+            if !push_only {
+                let ack_cursor = self.state.store.ack_cursor(pairing, role).await;
+                self.send(RelayFrame::Ack {
+                    pairing_id: pairing.clone(),
+                    cursor: ack_cursor,
+                })
+                .await;
+            }
             let peer = self.state.registry.attach(pairing, role, handle.clone());
             tracing::info!(
                 conn = %self.connection_id, pairing = ?pairing, role = ?role,
@@ -850,6 +877,20 @@ impl Connection {
     // ── Authed ────────────────────────────────────────────────────────────
 
     async fn on_authed(&mut self, frame: RelayFrame) -> Flow {
+        // Push-only relays refuse the data plane before any other check (spec
+        // §5.9): the mode, not the pairing, is the reason, and nothing about
+        // the frame is looked up, queued or forwarded.
+        if self.state.is_push_only() {
+            let refused = match &frame {
+                RelayFrame::Envelope(env) => Some(("envelope", env.pairing_id.clone())),
+                RelayFrame::Resume { pairing_id, .. } => Some(("resume", pairing_id.clone())),
+                RelayFrame::Ack { pairing_id, .. } => Some(("ack", pairing_id.clone())),
+                _ => None,
+            };
+            if let Some((kind, pairing_id)) = refused {
+                return self.refuse_push_only(kind, pairing_id).await;
+            }
+        }
         match frame {
             RelayFrame::Envelope(env) => self.on_envelope(env).await,
             RelayFrame::Ack { pairing_id, cursor } => self.on_ack(pairing_id, cursor).await,
@@ -1040,6 +1081,33 @@ impl Connection {
             self.send_error(rejection.code(), rejection.message(), Some(pairing_id))
                 .await;
         }
+        Flow::Continue
+    }
+
+    /// Refuse one data-plane frame (`kind` = `envelope` | `resume` | `ack`) on a
+    /// push-only relay with the advisory `relay_mode_push_only` error. The
+    /// connection stays open for the control frames this mode serves.
+    async fn refuse_push_only(&mut self, kind: &'static str, pairing_id: PairingId) -> Flow {
+        self.push_only_refusals += 1;
+        if self.push_only_refusals == 1 {
+            tracing::warn!(
+                conn = %self.connection_id, role = ?self.role, pairing = ?pairing_id, frame = kind,
+                "push_only relay refused a data-plane frame (client is using the relay as a \
+                 router: relay-mode pairing or misconfigured client?)"
+            );
+        } else {
+            tracing::debug!(
+                conn = %self.connection_id, pairing = ?pairing_id, frame = kind,
+                refusals = self.push_only_refusals,
+                "push_only relay refused a data-plane frame"
+            );
+        }
+        self.send_error(
+            RelayErrorCode::RelayModePushOnly,
+            PUSH_ONLY_REFUSAL,
+            Some(pairing_id),
+        )
+        .await;
         Flow::Continue
     }
 

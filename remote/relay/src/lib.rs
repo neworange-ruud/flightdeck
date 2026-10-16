@@ -17,6 +17,15 @@
 //! WebSocket or `POST /v1/push` ([`handlers::push_http`]) both go through
 //! [`push::accept_push`], which hands one encrypted alert to [`apns`]. Queued
 //! envelopes never trigger a push.
+//!
+//! **Relay modes** (spec §5.9, [`config::Config::relay_mode`], `RELAY_MODE`).
+//! `full` (the default) is all of the above. `push_only` keeps the control
+//! plane — auth, pairing bootstrap, machine name, revoke, push-token
+//! registration, presence and push — and refuses the data plane (`envelope`,
+//! `resume`, `ack`) with `relay_mode_push_only`, for deployments whose pairings
+//! all talk to the Mac directly (spec §5.10). In push-only mode the session
+//! never calls the store's queue methods, so no sender queue, seq high-water
+//! mark or queued envelope is ever created.
 
 pub mod apns;
 pub mod auth;
@@ -33,6 +42,8 @@ pub mod telemetry;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use flightdeck_remote_protocol::RelayMode;
 
 use axum::{
     routing::{get, post},
@@ -88,6 +99,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The relay's configured mode ([`Config::relay_mode`]), as announced in
+    /// `hello_ok.relay_mode` and reported on `/version`.
+    pub fn relay_mode(&self) -> RelayMode {
+        self.config.relay_mode
+    }
+
+    /// Whether this relay refuses the data plane ([`RelayMode::PushOnly`]).
+    pub fn is_push_only(&self) -> bool {
+        self.relay_mode() == RelayMode::PushOnly
+    }
+
     /// Build application state from `config`, wiring up the default in-memory
     /// store, an empty connection registry, and a push service derived from the
     /// config (the live APNs sender when both configured and built with the

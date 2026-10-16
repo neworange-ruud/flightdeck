@@ -15,7 +15,9 @@ use axum::{
     Json,
 };
 use flightdeck_remote_protocol::relay::{PUSH_REQUEST_MAX_SKEW_MS, RELAY_PASSWORD_HEADER};
-use flightdeck_remote_protocol::{PushErrorBody, PushRequest, RelayErrorCode, RelayFrame};
+use flightdeck_remote_protocol::{
+    PushErrorBody, PushRequest, RelayErrorCode, RelayFrame, RelayMode,
+};
 use futures_util::{
     stream::{SplitSink, StreamExt},
     SinkExt,
@@ -65,14 +67,21 @@ pub struct VersionInfo {
     /// Git commit SHA of the running build; see [`crate::config::Config::git_sha`]
     /// for how it's sourced.
     pub git_sha: String,
+    /// The configured relay mode (`full` | `push_only`, spec §5.9) — the same
+    /// value every client sees in `hello_ok.relay_mode`, so an operator can
+    /// confirm a `RELAY_MODE` change took effect with one HTTP GET.
+    pub relay_mode: RelayMode,
 }
 
-/// Reports the running build's crate version and git SHA. Useful for
-/// confirming which revision a Container Apps replica is actually running.
+/// Reports the running build's crate version, git SHA and relay mode. Useful
+/// for confirming which revision (and mode) a Container Apps replica is
+/// actually running. The probes (`/healthz`, `/readyz`) stay plain `ok` so
+/// platform health checks are unaffected by the mode.
 pub async fn version(State(state): State<AppState>) -> Json<VersionInfo> {
     Json(VersionInfo {
         version: env!("CARGO_PKG_VERSION"),
         git_sha: state.config.git_sha.clone(),
+        relay_mode: state.relay_mode(),
     })
 }
 

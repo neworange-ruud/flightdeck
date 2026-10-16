@@ -6,8 +6,11 @@
 //! likely extend `Config`, not replace this pattern.
 
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use flightdeck_remote_protocol::RelayMode;
 
 use crate::apns::ApnsConfig;
 use crate::push::DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE;
@@ -151,7 +154,43 @@ pub struct Config {
     /// [`DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE`] (60). Zero or malformed falls back
     /// to the default.
     pub push_rate_limit_per_minute: u32,
+
+    /// Which planes this relay serves (spec §5.9), announced to every client in
+    /// `hello_ok.relay_mode`. `RELAY_MODE`, `full` (default) or `push_only`.
+    ///
+    /// - [`RelayMode::Full`]: today's routing relay — control plane plus the
+    ///   data plane (queued envelopes, seq tracking, `resume`, `ack`).
+    /// - [`RelayMode::PushOnly`]: control plane only — auth, pairing bootstrap,
+    ///   machine name, revoke, push-token registration, presence and
+    ///   `push_notify` (WebSocket + `POST /v1/push`). `envelope`, `resume` and
+    ///   `ack` are refused with `relay_mode_push_only` and the envelope queues
+    ///   are never touched, so they stay empty.
+    ///
+    /// Unlike this module's other optional values, a malformed `RELAY_MODE` is
+    /// a **startup error** ([`Config::from_env`]): silently falling back to
+    /// `full` would turn a push-only deployment back into a ciphertext router.
+    /// Unset or empty means `full`.
+    pub relay_mode: RelayMode,
 }
+
+/// A configuration value the relay refuses to start with. Only values whose
+/// silent fallback would change what the relay *is* (today: `RELAY_MODE`) fail
+/// startup; every other malformed optional value falls back to its default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError {
+    /// The environment variable at fault, e.g. `RELAY_MODE`.
+    pub var: &'static str,
+    /// What was wrong with it, naming the accepted values.
+    pub message: String,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {}: {}", self.var, self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 impl Config {
     /// Build a config directly, bypassing the environment. Useful for tests
@@ -173,13 +212,15 @@ impl Config {
             store: StoreBackend::Memory,
             relay_password: None,
             push_rate_limit_per_minute: DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE,
+            relay_mode: RelayMode::Full,
         }
     }
 
-    /// Read configuration from the environment. Panics only on truly
-    /// unrecoverable input (none today); malformed optional values fall back
-    /// to their defaults rather than failing startup.
-    pub fn from_env() -> Self {
+    /// Read configuration from the environment. Malformed optional values fall
+    /// back to their defaults rather than failing startup — except
+    /// `RELAY_MODE`, whose fallback would change the relay's role, so an
+    /// unrecognized value is a [`ConfigError`] (see [`Config::relay_mode`]).
+    pub fn from_env() -> Result<Self, ConfigError> {
         let mut config = Self::from_vars(
             env::var("PORT").ok(),
             env::var("LOG_FORMAT").ok(),
@@ -202,7 +243,8 @@ impl Config {
         config.relay_password = parse_relay_password(env::var("FLIGHTDECK_RELAY_PASSWORD").ok());
         config.push_rate_limit_per_minute =
             parse_push_rate_limit(env::var("PUSH_RATE_LIMIT_PER_MINUTE").ok());
-        config
+        config.relay_mode = parse_relay_mode(env::var("RELAY_MODE").ok())?;
+        Ok(config)
     }
 
     /// Pure parsing logic, factored out of [`Config::from_env`] so it can be
@@ -273,8 +315,35 @@ impl Config {
             store: StoreBackend::Memory,
             relay_password: None,
             push_rate_limit_per_minute: DEFAULT_PUSH_RATE_LIMIT_PER_MINUTE,
+            relay_mode: RelayMode::Full,
         }
     }
+}
+
+/// Parse `RELAY_MODE` (spec §5.9). Unset, empty or whitespace-only means
+/// [`RelayMode::Full`]; otherwise the trimmed value, ASCII-lowercased, must be a
+/// [`RelayMode`] wire spelling (`full` | `push_only`). Anything else is a
+/// [`ConfigError`] naming the accepted values — never a silent fallback.
+pub fn parse_relay_mode(raw: Option<String>) -> Result<RelayMode, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(RelayMode::Full);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(RelayMode::Full);
+    }
+    value
+        .to_ascii_lowercase()
+        .parse::<RelayMode>()
+        // Name the operator's value as written, not the lowercased one.
+        .map_err(|_| ConfigError {
+            var: "RELAY_MODE",
+            message: format!(
+                "unknown relay mode {value:?} (expected \"{}\" or \"{}\")",
+                RelayMode::Full,
+                RelayMode::PushOnly
+            ),
+        })
 }
 
 /// Normalize the `FLIGHTDECK_RELAY_PASSWORD` env value into a gate decision.
@@ -433,6 +502,47 @@ mod tests {
             Config::new(0, LogFormat::Pretty, "t").push_rate_limit_per_minute,
             60
         );
+    }
+
+    #[test]
+    fn relay_mode_defaults_to_full() {
+        assert_eq!(parse_relay_mode(None), Ok(RelayMode::Full));
+        assert_eq!(parse_relay_mode(Some(String::new())), Ok(RelayMode::Full));
+        assert_eq!(parse_relay_mode(Some("  ".into())), Ok(RelayMode::Full));
+        assert_eq!(
+            Config::new(0, LogFormat::Pretty, "t").relay_mode,
+            RelayMode::Full
+        );
+        let parsed = Config::from_vars(None, None, None, None, None, None, None, None, None);
+        assert_eq!(parsed.relay_mode, RelayMode::Full);
+    }
+
+    #[test]
+    fn relay_mode_parses_both_modes() {
+        assert_eq!(parse_relay_mode(Some("full".into())), Ok(RelayMode::Full));
+        assert_eq!(
+            parse_relay_mode(Some("push_only".into())),
+            Ok(RelayMode::PushOnly)
+        );
+        // Surrounding whitespace and ASCII case are forgiven.
+        assert_eq!(
+            parse_relay_mode(Some(" PUSH_ONLY\n".into())),
+            Ok(RelayMode::PushOnly)
+        );
+    }
+
+    #[test]
+    fn invalid_relay_mode_is_a_startup_error() {
+        for bad in ["pushonly", "push-only", "PushOnly", "relay", "0"] {
+            let err = parse_relay_mode(Some(bad.into())).expect_err(bad);
+            assert_eq!(err.var, "RELAY_MODE");
+            let text = err.to_string();
+            assert!(text.starts_with("invalid RELAY_MODE: "), "{text}");
+            assert!(
+                text.contains(bad) && text.contains("full") && text.contains("push_only"),
+                "message names the value and the accepted values: {text}"
+            );
+        }
     }
 
     #[test]
