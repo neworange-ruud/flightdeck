@@ -221,6 +221,17 @@ pub enum RemoteInbound {
         /// Whether reconnecting could plausibly succeed (see above).
         retrying: bool,
     },
+    /// A pairing attempt was refused for a reason no relay URL or password can
+    /// fix (spec §5.9): a push-only relay with the direct link off or not yet
+    /// listening, or a phone too old to pair over the direct link. `reason` is
+    /// the complete user-facing sentence; the pairing overlay shows it verbatim
+    /// and fails the attempt, whether the code was still being requested or
+    /// already on screen. Distinct from [`Self::HandshakeFailed`], whose
+    /// refusals get configuration advice appended.
+    PairingRefused {
+        /// Complete, human-readable sentence, safe to show in the UI.
+        reason: String,
+    },
     /// This pairing's data plane is the Mac's own direct link (spec §5.10):
     /// its envelopes go to an outbox this process always holds, so — unlike a
     /// relay-mode pairing — the bridge must not pause sealing for it while the

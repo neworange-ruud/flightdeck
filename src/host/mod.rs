@@ -810,6 +810,15 @@ impl<'a> AppHost<'a> {
                             ps.on_handshake_failed(reason, *retrying);
                         }
                     }
+                    RemoteInbound::PairingRefused { reason } => {
+                        // A refusal no configuration change of relay URL or
+                        // password fixes: shown verbatim, no advice appended.
+                        if let Some(ps) = self.pairing_session.as_mut() {
+                            ps.on_refused(reason);
+                        } else {
+                            ui.message(reason);
+                        }
+                    }
                     RemoteInbound::PairingRejected { .. } => {
                         // The relay no longer recognizes our pairing; the client
                         // dropped the stale record and will re-offer. Give the

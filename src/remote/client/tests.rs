@@ -3009,6 +3009,17 @@ fn a_push_only_relay_gets_no_data_plane_frames() {
 /// instead of minting a pairing with no data plane — and still authenticates.
 #[test]
 fn a_push_only_relay_refuses_to_pair_without_the_direct_link() {
+    push_only_refusal_drill(false, PUSH_ONLY_DIRECT_DISABLED);
+}
+
+/// The direct link is switched on but has nothing bound (Tailscale down): the
+/// refusal tells the user to check Tailscale, not to switch the link on.
+#[test]
+fn a_push_only_refusal_with_the_direct_link_on_points_at_tailscale() {
+    push_only_refusal_drill(true, PUSH_ONLY_DIRECT_NOT_LISTENING);
+}
+
+fn push_only_refusal_drill(direct_enabled: bool, expected: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let identity = DeviceIdentity::generate();
@@ -3037,6 +3048,7 @@ fn a_push_only_relay_refuses_to_pair_without_the_direct_link() {
     let cfg = RemoteConfig {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
+        direct_enabled,
         ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
@@ -3056,17 +3068,18 @@ fn a_push_only_relay_refuses_to_pair_without_the_direct_link() {
     let mut refusal = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && refusal.is_none() {
-        if let Ok(RemoteInbound::HandshakeFailed { reason, retrying }) =
-            in_rx.recv_timeout(Duration::from_millis(100))
-        {
-            refusal = Some((reason, retrying));
+        match in_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(RemoteInbound::PairingRefused { reason }) => refusal = Some(reason),
+            Ok(RemoteInbound::HandshakeFailed { reason, .. }) => {
+                panic!("a push-only refusal must not take the config-advice path: {reason}")
+            }
+            _ => {}
         }
     }
     let sent = mock.join().unwrap();
     handle.stop();
-    let (reason, retrying) = refusal.expect("the pairing overlay must hear why");
-    assert_eq!(reason, PUSH_ONLY_NEEDS_DIRECT);
-    assert!(!retrying, "a configuration problem; retrying cannot fix it");
+    let reason = refusal.expect("the pairing overlay must hear why");
+    assert_eq!(reason, expected);
     assert!(
         !sent
             .iter()

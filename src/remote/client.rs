@@ -1197,15 +1197,15 @@ async fn run_session(
                             claim_token_hint,
                             tuning.options.direct_endpoint(),
                             relay_mode,
+                            cfg.direct_enabled,
                         ) {
                             Ok(offer) => offer,
                             Err(reason) => {
                                 // Refused (push-only relay, no direct link): tell
                                 // the pairing overlay, then authenticate plainly
                                 // so the link itself still comes up.
-                                inbound_tx.send(RemoteInbound::HandshakeFailed {
-                                    reason,
-                                    retrying: false,
+                                inbound_tx.send(RemoteInbound::PairingRefused {
+                                    reason: reason.to_string(),
                                 });
                                 let Some(nonce) = challenge_nonce.as_ref() else {
                                     return ended_unauthed();
@@ -1401,6 +1401,7 @@ async fn run_session(
         tuning,
         negotiated_version,
         relay_mode,
+        direct_enabled: cfg.direct_enabled,
         inbound_tx,
         push_only_logged: &push_only_logged,
         recent: &recent,
@@ -1546,9 +1547,10 @@ fn build_pairing_offer(
     claim_token_hint: Option<String>,
     direct_endpoint: Option<DirectEndpoint>,
     relay_mode: RelayMode,
-) -> Result<RelayFrame, String> {
+    direct_enabled: bool,
+) -> Result<RelayFrame, &'static str> {
     if relay_mode == RelayMode::PushOnly && direct_endpoint.is_none() {
-        return Err(PUSH_ONLY_NEEDS_DIRECT.to_string());
+        return Err(push_only_refusal(direct_enabled));
     }
     let public_key = identity.public_key_base64();
     Ok(RelayFrame::PairingOffer {
@@ -1561,9 +1563,38 @@ fn build_pairing_offer(
     })
 }
 
-/// Why pairing cannot start against a push-only relay without the direct link.
-pub const PUSH_ONLY_NEEDS_DIRECT: &str =
-    "This relay is push-only; enable the direct link (Tailscale) to pair.";
+/// Why pairing cannot start against a push-only relay: the direct link is
+/// switched off (`[remote] direct_enabled = false`).
+pub const PUSH_ONLY_DIRECT_DISABLED: &str =
+    "This relay is push-only, so a phone can only pair over the direct link. \
+     Turn on [remote] direct_enabled (it needs Tailscale on this Mac and the \
+     iPhone), then try again.";
+
+/// Why pairing cannot start against a push-only relay: the direct link is on
+/// but has no Tailscale address to listen on yet (Tailscale stopped, logged
+/// out, or still coming up).
+pub const PUSH_ONLY_DIRECT_NOT_LISTENING: &str =
+    "This relay is push-only, so a phone can only pair over the direct link, \
+     which is not listening yet. Check that Tailscale is running and connected \
+     on this Mac, then try again.";
+
+/// Why a phone's claim was refused on a push-only relay (spec §5.9): the
+/// pairing would have been relay mode, which that relay cannot carry — in
+/// practice a phone app too old for the direct link.
+pub const PUSH_ONLY_CLAIM_REFUSED: &str =
+    "This relay is push-only and the phone could not pair over the direct \
+     link. Update the FlightDeck iPhone app so it can pair over Tailscale, then \
+     try again.";
+
+/// The user-facing refusal for an offer a push-only relay cannot use, worded
+/// by whether the direct link is switched off or merely not listening.
+fn push_only_refusal(direct_enabled: bool) -> &'static str {
+    if direct_enabled {
+        PUSH_ONLY_DIRECT_NOT_LISTENING
+    } else {
+        PUSH_ONLY_DIRECT_DISABLED
+    }
+}
 
 /// Record a `pairing_offer_ok`: persist the pairing so it is activated on the
 /// next connect and store the claim token (its bytes are the E2E salt, spec
@@ -1882,6 +1913,9 @@ struct SessionWrite<'a> {
     negotiated_version: u16,
     /// The relay's mode from `hello_ok` (spec §5.9; absent = full).
     relay_mode: RelayMode,
+    /// `[remote] direct_enabled`: words a push-only refusal (off vs. not
+    /// listening yet).
+    direct_enabled: bool,
     /// The app-bound channel (a refused pairing offer is reported on it).
     inbound_tx: &'a InboundTx,
     /// Whether this session already logged a push-only refusal or drop (they
@@ -2025,14 +2059,14 @@ async fn handle_outbound(
                 claim_token_hint,
                 tuning.options.direct_endpoint(),
                 write.relay_mode,
+                write.direct_enabled,
             ) {
                 Ok(offer) => offer,
                 Err(reason) => {
                     // Surfaced where pairing errors show (the overlay fails the
-                    // attempt); the link itself is fine.
-                    write.inbound_tx.send(RemoteInbound::HandshakeFailed {
-                        reason,
-                        retrying: false,
+                    // attempt, verbatim); the link itself is fine.
+                    write.inbound_tx.send(RemoteInbound::PairingRefused {
+                        reason: reason.to_string(),
                     });
                     return Sent::Ok;
                 }

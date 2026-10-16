@@ -584,6 +584,8 @@ impl RemoteBridge {
             // on anything other than `Link(Connected)`, and this arrives with no
             // `Link` transition of its own, so there is nothing to do here.
             RemoteInbound::HandshakeFailed { .. } => {}
+            // A refused pairing attempt never became a pairing: a UI notice.
+            RemoteInbound::PairingRefused { .. } => {}
             RemoteInbound::DirectTransport { pairing_id } => {
                 self.direct_pairings.insert(pairing_id);
             }

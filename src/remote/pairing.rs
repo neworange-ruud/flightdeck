@@ -236,6 +236,9 @@ impl PairingSession {
         if !matches!(self.phase, PairingPhase::Offering) {
             return;
         }
+        // The reason is a clause, but a relay's message may already end its
+        // sentence; never print "..". before the advice.
+        let reason = reason.trim_end().trim_end_matches('.');
         if retrying {
             self.stall_reason = Some(format!("{reason} — retrying…"));
         } else {
@@ -245,6 +248,25 @@ impl PairingSession {
                  configuration, then try again."
             ));
         }
+    }
+
+    /// Apply a [`crate::remote::RemoteInbound::PairingRefused`] report: this
+    /// pairing attempt cannot work for a reason the relay URL and password have
+    /// nothing to do with (a push-only relay without the direct link, a phone
+    /// too old for one). `message` is the complete user-facing sentence and is
+    /// shown verbatim, with no configuration advice appended.
+    ///
+    /// Applies while the code is being requested *and* while it is on screen
+    /// (a refused claim arrives then); an established pairing is never failed.
+    pub fn on_refused(&mut self, message: &str) {
+        if !matches!(
+            self.phase,
+            PairingPhase::Offering | PairingPhase::Displaying { .. }
+        ) {
+            return;
+        }
+        self.stall_reason = None;
+        self.fail(message.to_string());
     }
 
     /// The transient reason a code has not arrived yet, if the relay handshake
