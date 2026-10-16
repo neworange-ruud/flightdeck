@@ -468,6 +468,19 @@ impl<'a> AppHost<'a> {
             if let (Some(b), Some(setup)) =
                 (self.remote_bridge.as_mut(), self.remote_setup.as_ref())
             {
+                // Every established pairing's channel goes in the bridge's
+                // book, so its channel follows whichever pairing it feeds
+                // (the direct link and the relay each announce theirs).
+                for known in &setup.known_pairings {
+                    if let Ok(channel) = build_e2e_channel(
+                        &setup.identity_scalar,
+                        &known.peer_ka_b64,
+                        known.pairing_id.as_str(),
+                        &known.claim_token,
+                    ) {
+                        b.remember_channel(channel, known.last_sent_seq);
+                    }
+                }
                 if let Some(est) = &setup.established {
                     if let Ok(channel) = build_e2e_channel(
                         &setup.identity_scalar,
@@ -793,6 +806,7 @@ impl<'a> AppHost<'a> {
                                 {
                                     let (seal, open) = channel_seal_open(&channel);
                                     b.install_channel(seal, open, 0);
+                                    b.remember_channel(Arc::clone(&channel), 0);
                                     b.install_push_channel(channel);
                                 }
                             }

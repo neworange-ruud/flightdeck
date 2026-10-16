@@ -2270,3 +2270,104 @@ fn unpairing_forgets_the_push_channel() {
     tick_app(&mut b, &app, 2_000);
     assert!(b.take_push_notifies().is_empty());
 }
+
+// --- the channel follows the fed pairing (multi-pairing startup) -------------
+
+/// Seal the next tick for whatever pairing `b` feeds and return the raw
+/// envelopes.
+fn tick_raw(b: &mut RemoteBridge, now_ms: u64) -> Vec<RemoteOutbound> {
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let views = vec![view("proj", &app, &cache)];
+    collect_raw(b, &views, now_ms)
+}
+
+fn attach_phone(b: &mut RemoteBridge, pairing: &str) {
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new(pairing),
+        peer_device_id: None,
+    });
+    b.handle_inbound(RemoteInbound::Presence {
+        pairing_id: PairingId::new(pairing),
+        peer: Role::Phone,
+        state: flightdeck_remote_protocol::PresenceState::Connected,
+    });
+}
+
+/// Startup installs pairing A's channel, but the direct link announces B
+/// first (it does so for every direct pairing before the relay authenticates).
+/// The bridge feeds B, so B's channel must be the one sealing — envelopes the
+/// B phone can open, numbered from B's own high-water mark — and pushes must be
+/// sealed for B rather than dropped for a mismatched channel.
+#[test]
+fn the_channel_follows_the_pairing_the_bridge_feeds() {
+    let mut b = RemoteBridge::passthrough(0);
+    let (desk_a, phone_a) = channel_pair("pair-A");
+    let (desk_b, phone_b) = channel_pair("pair-B");
+    b.remember_channel(desk_a.clone(), 10);
+    b.remember_channel(desk_b.clone(), 40);
+    let (seal, open) = crate::remote::pairing::channel_seal_open(&desk_a);
+    b.install_channel(seal, open, 10);
+    b.install_push_channel(desk_a);
+
+    attach_phone(&mut b, "pair-B");
+    assert_eq!(b.push_channel_pairing(), Some("pair-B"));
+    let out = tick_raw(&mut b, 1_000);
+    let RemoteOutbound::SendEnvelope {
+        pairing_id,
+        seq,
+        sent_at_ms,
+        nonce,
+        ciphertext,
+    } = out.first().expect("a snapshot for B")
+    else {
+        panic!("expected an envelope, got {out:?}");
+    };
+    assert_eq!(pairing_id.as_str(), "pair-B");
+    assert_eq!(*seq, 41, "B's stream resumes from B's high-water mark");
+    assert!(
+        phone_b
+            .open(*seq, Role::Desktop, *sent_at_ms, nonce, ciphertext)
+            .is_ok(),
+        "sealed with B's keys"
+    );
+    assert!(
+        phone_a
+            .open(*seq, Role::Desktop, *sent_at_ms, nonce, ciphertext)
+            .is_err(),
+        "not A's"
+    );
+
+    // Switching back to A resumes A's stream where it was, with A's keys.
+    attach_phone(&mut b, "pair-A");
+    assert_eq!(b.push_channel_pairing(), Some("pair-A"));
+    let out = tick_raw(&mut b, 2_000);
+    match out.first() {
+        Some(RemoteOutbound::SendEnvelope {
+            pairing_id,
+            seq,
+            sent_at_ms,
+            nonce,
+            ciphertext,
+        }) => {
+            assert_eq!(pairing_id.as_str(), "pair-A");
+            assert_eq!(*seq, 11);
+            assert!(phone_a
+                .open(*seq, Role::Desktop, *sent_at_ms, nonce, ciphertext)
+                .is_ok());
+        }
+        other => panic!("expected an envelope for A, got {other:?}"),
+    }
+}
+
+/// A pairing the host has no channel for leaves the installed one alone (and
+/// its pushes are then dropped by the channel check, as before).
+#[test]
+fn a_pairing_without_a_known_channel_changes_nothing() {
+    let mut b = RemoteBridge::passthrough(0);
+    let (desk_a, _) = channel_pair("pair-A");
+    b.remember_channel(desk_a.clone(), 0);
+    b.install_push_channel(desk_a);
+    attach_phone(&mut b, "pair-unknown");
+    assert_eq!(b.push_channel_pairing(), Some("pair-A"));
+}

@@ -199,6 +199,13 @@ pub struct ProjectView<'a> {
     pub cache: &'a GitStatusCache,
 }
 
+/// A remembered channel and how far its outbound stream got (see
+/// [`RemoteBridge::remember_channel`]).
+struct BookEntry {
+    channel: Arc<E2eChannel>,
+    out_seq: u64,
+}
+
 /// Owns all outbound-feed state for the desktop side of one relay link.
 pub struct RemoteBridge {
     feed: FeedState,
@@ -229,6 +236,15 @@ pub struct RemoteBridge {
     /// (spec §7.2). Installed alongside the envelope sealer
     /// ([`Self::install_push_channel`]); `None` until a channel is derived.
     push_channel: Option<Arc<E2eChannel>>,
+    /// Every pairing's channel the host knows how to derive, with the outbound
+    /// high-water mark to resume it from ([`Self::remember_channel`]). When
+    /// the pairing this bridge feeds changes on `Paired` — the direct link
+    /// announces its pairings before the relay authenticates, so with several
+    /// pairings the fed one need not be the one installed at startup — the
+    /// sealer, opener and push channel follow it from here, so pairing B is
+    /// never sealed with A's keys (and B's pushes are not dropped for want of
+    /// a matching push channel).
+    channel_book: HashMap<PairingId, BookEntry>,
     pairing: Option<PairingId>,
     /// Whether the relay link is currently up (authenticated). While it is down
     /// the bridge PAUSES all seal/queue work: sealing StatusUpdate/Rollup/shell/
@@ -349,6 +365,7 @@ impl RemoteBridge {
             push_intents: Vec::new(),
             held_needs_input: HashMap::new(),
             push_channel: None,
+            channel_book: HashMap::new(),
             pairing: None,
             link_up: true,
             direct_pairings: std::collections::HashSet::new(),
@@ -512,6 +529,13 @@ impl RemoteBridge {
                 // resume, or a repeat claim) must NOT rewind `out_seq`, so the
                 // phone's resumed cursor keeps matching (remote-control-bbf).
                 if self.pairing.is_some() && self.pairing.as_ref() != Some(&pairing_id) {
+                    // Remember how far the stream we are leaving got, so
+                    // coming back to it resumes rather than restarts.
+                    if let Some(old) = self.pairing.as_ref() {
+                        if let Some(entry) = self.channel_book.get_mut(old) {
+                            entry.out_seq = entry.out_seq.max(self.out_seq);
+                        }
+                    }
                     self.out_seq = 0;
                     // A different peer with its own ack cursor: everything the
                     // old one owed us is meaningless now.
@@ -520,6 +544,7 @@ impl RemoteBridge {
                     self.push_intents.clear();
                     self.held_needs_input.clear();
                 }
+                self.follow_channel(&pairing_id);
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
             }
@@ -1353,6 +1378,62 @@ impl RemoteBridge {
     /// push).
     pub fn take_push_intents(&mut self) -> Vec<PushIntent> {
         std::mem::take(&mut self.push_intents)
+    }
+
+    /// Record `channel` (for its own pairing) so the bridge can switch to it
+    /// when that pairing becomes the one it feeds, resuming the outbound
+    /// stream at `resume_from_seq` (the persisted or outbox high-water mark;
+    /// 0 for a fresh claim). Never lowers a remembered mark.
+    pub fn remember_channel(&mut self, channel: Arc<E2eChannel>, resume_from_seq: u64) {
+        let pairing_id = PairingId::new(channel.pairing_id());
+        let out_seq = self
+            .channel_book
+            .get(&pairing_id)
+            .map_or(resume_from_seq, |e| e.out_seq.max(resume_from_seq));
+        self.channel_book
+            .insert(pairing_id, BookEntry { channel, out_seq });
+    }
+
+    /// The pairing whose channel seals pushes right now, if any.
+    pub fn push_channel_pairing(&self) -> Option<&str> {
+        self.push_channel.as_deref().map(E2eChannel::pairing_id)
+    }
+
+    /// Make the installed channel the one for `pairing_id`, if it is not
+    /// already and the book has it (see [`Self::channel_book`]). Without a
+    /// book entry nothing changes, and the mismatch is logged: pushes are then
+    /// dropped by [`Self::take_push_notifies`]' channel check.
+    fn follow_channel(&mut self, pairing_id: &PairingId) {
+        if self.push_channel_pairing() == Some(pairing_id.as_str()) {
+            return;
+        }
+        let Some(entry) = self.channel_book.get(pairing_id) else {
+            if self.push_channel.is_some() {
+                crate::remote::debuglog::log(&format!(
+                    "bridge FEED pairing={} has no known channel (installed: {:?})",
+                    pairing_id.as_str(),
+                    self.push_channel_pairing()
+                ));
+            }
+            return;
+        };
+        let channel = Arc::clone(&entry.channel);
+        let resume = entry.out_seq;
+        // The installed channel belongs to another pairing, so the counter
+        // in hand is that stream's: bank it, and start this one from its own.
+        if let Some(current) = self.push_channel_pairing().map(PairingId::new) {
+            if let Some(banked) = self.channel_book.get_mut(&current) {
+                banked.out_seq = banked.out_seq.max(self.out_seq);
+            }
+        }
+        self.out_seq = 0;
+        let (seal, open) = crate::remote::pairing::channel_seal_open(&channel);
+        self.install_channel(seal, open, resume);
+        self.push_channel = Some(channel);
+        crate::remote::debuglog::log(&format!(
+            "bridge CHANNEL follows pairing={} resume_seq={resume}",
+            pairing_id.as_str()
+        ));
     }
 
     /// Install the active pairing's E2E channel for sealing pushes (spec §7.2).

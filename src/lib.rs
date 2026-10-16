@@ -2863,8 +2863,18 @@ fn web_started_message(
     }
 }
 
+/// The established pairing whose channel is installed at startup: the first
+/// direct-mode one, else the first relay-mode one. The direct link announces
+/// its pairings before the relay has authenticated, so a direct pairing is
+/// what the bridge feeds first; the bridge's channel book covers the rest.
+fn primary_pairing(state: &crate::remote::RemoteState) -> Option<&crate::remote::Pairing> {
+    let ready = || state.pairings.iter().filter(|p| p.is_e2e_ready());
+    ready().find(|p| p.is_direct()).or_else(|| ready().next())
+}
+
 /// An already-established pairing found in `remote.json` at startup: everything
 /// needed to reconstruct its live E2E channel before the phone reconnects.
+#[derive(Clone)]
 struct EstablishedPairing {
     pairing_id: PairingId,
     peer_ka_b64: String,
@@ -2883,6 +2893,9 @@ struct RemoteSetup {
     relay_url: String,
     /// An already-paired pairing to bring live immediately, if any.
     established: Option<EstablishedPairing>,
+    /// Every already-established pairing (`established` among them), so the
+    /// bridge's channel can follow whichever one it ends up feeding.
+    known_pairings: Vec<EstablishedPairing>,
     /// The direct link (REMOTE_PROTOCOL §5.10), when `direct_enabled` or a
     /// direct-mode pairing exists; also read for the remote status. Dropping it stops
     /// the listener and writes the outboxes. Declared before `_owner` so that
@@ -2982,28 +2995,38 @@ fn start_remote_at(
     } else {
         None
     };
-    // The first already-established pairing (single-Mac UI in v1) is brought
-    // live at startup so a reconnecting phone gets real ciphertext, not the
-    // passthrough sealer (spec §7.1).
-    let established =
-        state
-            .pairings
+    // Every already-established pairing, so the bridge can bring live
+    // whichever one it ends up feeding (spec §7.1): a reconnecting phone then
+    // gets real ciphertext, not the passthrough sealer.
+    let known_pairings: Vec<EstablishedPairing> = state
+        .pairings
+        .iter()
+        .filter(|p| p.is_e2e_ready())
+        .map(|p| EstablishedPairing {
+            pairing_id: PairingId::new(p.pairing_id.clone()),
+            peer_ka_b64: p.peer_key_agreement_public_key.clone().unwrap_or_default(),
+            claim_token: p.claim_token.clone().unwrap_or_default(),
+            // A direct pairing's envelopes never pass through the relay
+            // client that persists `last_sent_seq`; its outbox holds the
+            // stream's high-water mark instead.
+            last_sent_seq: p.last_sent_seq.max(
+                direct
+                    .as_ref()
+                    .and_then(|d| d.outbound_high_water(&p.pairing_id))
+                    .unwrap_or(0),
+            ),
+        })
+        .collect();
+    // The one installed up front (single-Mac UI in v1): a direct pairing
+    // first, because the direct link announces its pairings before the relay
+    // has even authenticated, so that is what the bridge feeds first. The
+    // bridge re-derives from `known_pairings` if it then feeds another.
+    let established = primary_pairing(&state).and_then(|p| {
+        known_pairings
             .iter()
-            .find(|p| p.is_e2e_ready())
-            .map(|p| EstablishedPairing {
-                pairing_id: PairingId::new(p.pairing_id.clone()),
-                peer_ka_b64: p.peer_key_agreement_public_key.clone().unwrap_or_default(),
-                claim_token: p.claim_token.clone().unwrap_or_default(),
-                // A direct pairing's envelopes never pass through the relay
-                // client that persists `last_sent_seq`; its outbox holds the
-                // stream's high-water mark instead.
-                last_sent_seq: p.last_sent_seq.max(
-                    direct
-                        .as_ref()
-                        .and_then(|d| d.outbound_high_water(&p.pairing_id))
-                        .unwrap_or(0),
-                ),
-            });
+            .find(|k| k.pairing_id.as_str() == p.pairing_id)
+            .cloned()
+    });
     // The push sender signs HTTPS pushes with this same identity; it gets its
     // own copy because the client task takes ownership of the original.
     let Ok(push_identity) = crate::remote::DeviceIdentity::from_private_bytes(&identity_scalar)
@@ -3040,10 +3063,49 @@ fn start_remote_at(
         identity_scalar,
         relay_url,
         established,
+        known_pairings,
         direct,
         push,
         _owner: owner,
     }))
+}
+
+#[cfg(test)]
+mod primary_pairing_tests {
+    use super::*;
+    use crate::remote::{Pairing, PairingTransport, RemoteState};
+
+    fn ready(id: &str, transport: PairingTransport) -> Pairing {
+        let mut p = Pairing::new(id);
+        p.established = true;
+        p.peer_key_agreement_public_key = Some("ka".into());
+        p.claim_token = Some("4729".into());
+        p.transport = transport;
+        p
+    }
+
+    #[test]
+    fn a_direct_pairing_is_installed_first_then_any_ready_one() {
+        let mut state = RemoteState::default();
+        state.pairings.push(Pairing::new("pair_pending"));
+        state
+            .pairings
+            .push(ready("pair_relay", PairingTransport::Relay));
+        state
+            .pairings
+            .push(ready("pair_direct", PairingTransport::Direct));
+        assert_eq!(
+            primary_pairing(&state).map(|p| p.pairing_id.as_str()),
+            Some("pair_direct")
+        );
+        state.pairings.retain(|p| p.pairing_id != "pair_direct");
+        assert_eq!(
+            primary_pairing(&state).map(|p| p.pairing_id.as_str()),
+            Some("pair_relay")
+        );
+        state.pairings.retain(|p| p.pairing_id != "pair_relay");
+        assert!(primary_pairing(&state).is_none(), "nothing established");
+    }
 }
 
 #[cfg(test)]
