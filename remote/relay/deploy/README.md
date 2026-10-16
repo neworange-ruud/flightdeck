@@ -98,7 +98,9 @@ allowlist is incompatible with a roaming phone (a 5G/carrier egress IP is dynami
 and cannot be allowlisted; that broke "control your Mac from anywhere"). Instead,
 the relay reads `FLIGHTDECK_RELAY_PASSWORD` from its environment and rejects any
 WebSocket `hello` whose `relay_password` is missing or wrong, comparing in
-constant time. A relay with **no** password configured stays open (local/dev).
+constant time. The HTTPS push endpoint `POST /v1/push` enforces the same password
+via the `x-flightdeck-relay-password` header (401 when missing or wrong). A relay
+with **no** password configured stays open (local/dev).
 
 - Set the secret via CI: add a `FLIGHTDECK_RELAY_PASSWORD` secret to the repo's
   `production` environment. `relay-deploy.yml` stores it as a Container App secret
@@ -119,19 +121,72 @@ constant time. A relay with **no** password configured stays open (local/dev).
 ## Health
 
 - `GET /healthz` → `ok` (liveness) · `GET /readyz` → `ok` (readiness)
-- `GET /version` → `{"version":"…","git_sha":"…"}` — `git_sha` is the deployed revision.
+- `GET /version` → `{"version":"…","git_sha":"…","relay_mode":"full"}` — `git_sha`
+  is the deployed revision, `relay_mode` the running mode (see below). The probes
+  answer `ok` in both modes, so they need no change when the mode changes.
+
+## Relay mode (`RELAY_MODE`)
+
+One image, two modes (spec §5.9; the self-hoster view is in `../README.md` →
+"Relay modes"):
+
+- **`full`** (default, and what the live app runs today): routes and queues the
+  end-to-end-encrypted envelopes between phone and Mac, plus pairing, auth and
+  push.
+- **`push_only`**: pairing, auth, push-token registration, revoke and pushes
+  (`push_notify` over the WebSocket and `POST /v1/push`) only. `envelope`,
+  `resume` and `ack` are refused with `relay_mode_push_only`; no envelope queue
+  is ever created. Only correct once every pairing is a **direct-mode** pairing:
+  phone and Mac both on Tailscale (or another direct route), the desktop running
+  with the direct link enabled, and the pairing made after that. A relay-mode
+  pairing against a push-only relay keeps getting pushes but its phone sees no
+  data.
+
+Set it as a plain env var on the Container App (it is not a secret):
+
+```bash
+az containerapp update -g "$RG" -n "$APP" --set-env-vars RELAY_MODE=push_only
+curl -s https://<relay-host>/version     # … "relay_mode":"push_only"
+```
+
+`--set-env-vars` merges, so the value survives later deploys that re-assert
+other variables — but to keep the deployment declarative, add it to
+`relay-deploy.yml`'s `--set-env-vars` list and `containerapp.yaml` when switching.
+An unrecognized value makes the new revision exit at startup
+(`configuration error: invalid RELAY_MODE: …` in the console log, exit 2), so the
+revision never becomes ready; in single-revision mode Container Apps keeps the
+previous revision serving until a new one is ready. Switching back is the same command with `RELAY_MODE=full` (or removing
+the variable).
+
+What stays the same in `push_only`:
+
+- **Persistent store and volume.** Keep `FLIGHTDECK_RELAY_STORE=sqlite:/data/relay.db`
+  and the Azure Files mount: device keys, pairings, claim tokens and push tokens
+  must survive a reschedule, or every desktop's pushes start failing with
+  `auth_failed` until it re-pairs. The queue tables stay in the schema but are
+  never written. Envelopes queued while the relay ran `full` are left in place
+  (unreachable while `push_only`, replayable if switched back); deleting them is
+  optional.
+- **`maxReplicas: 1`.** Still required: the SQLite file is single-writer, and
+  pairing still needs both devices on the same replica (the relay hands the
+  desktop the phone's identity key over its live connection).
+- **APNs** configuration and the `apns-live` image feature (pushes are the whole
+  point of this mode), and the relay password.
 
 ## Push notifications (APNs)
 
-Waking an offline phone needs **two** things, and getting either wrong disables
-push *silently* — the relay keeps routing and queueing, so nothing looks broken
-until someone notices their phone is never woken. That is exactly how the relay
+Since protocol v4 the relay sends exactly one **visible, encrypted alert** per
+`push_notify` (WebSocket) or `POST /v1/push` (HTTPS) the desktop sends — never a
+push of its own, and never one per queued envelope (spec §5.5). Delivering those
+alerts needs **two** things, and getting either wrong disables push *silently* —
+the relay keeps routing and accepting push requests, so nothing looks broken
+until someone notices their phone never alerts. That is exactly how the relay
 ran without APNs from 1.10.0 to 1.12.0.
 
 1. **The image must be built with `--features apns-live`.** The feature is off by
    default so the crate builds and unit-tests without Apple credentials; without
    it the push sender is compiled out and replaced by a no-op
-   (`lib.rs::push_sender`). `remote/relay/Dockerfile` passes it on both `cargo
+   (`lib.rs::default_push_service`). `remote/relay/Dockerfile` passes it on both `cargo
    build` invocations.
 2. **All four config variables must be present.** `ApnsConfig::from_env` returns
    `None` — push disabled — unless it has `APNS_TEAM_ID`, `APNS_KEY_ID`,
@@ -158,13 +213,17 @@ good, whereas `403 InvalidProviderToken` means they are not:
 ```bash
 curl -s --http2 -H "authorization: bearer $JWT" \
   -H "apns-topic: agency.neworange.flightdeck.remote" \
-  -H "apns-push-type: background" -d '{"aps":{"content-available":1}}' \
+  -H "apns-push-type: alert" -d '{"aps":{"alert":{"title":"FlightDeck","body":"test"}}}' \
   "https://api.push.apple.com/3/device/$(printf '0%.0s' {1..64})"
 ```
 
-Once live, `az containerapp logs show -g <rg> -n <app>` surfaces the APNs
-response, so a token registered against the wrong environment shows up as
-`BadDeviceToken` rather than silence.
+Once live, `az containerapp logs show -g <rg> -n <app>` shows one `push` line per
+attempt with `pairing`, `event`, `class` and `outcome` (`sent`,
+`apns_not_configured`, `transient_failed_after_retries`, `permanent_token_purged`,
+`jwt_failed`; a pairing with no registered token logs `no_token` at debug). A
+token registered against the wrong environment therefore shows up as
+`permanent_token_purged` (APNs `BadDeviceToken`) rather than silence. Push content
+and device tokens are never logged.
 
 ## How deploys happen
 

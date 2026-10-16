@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
+use flightdeck_remote_protocol::{
+    ApnsEnvironment, DeviceId, DirectEndpoint, EncryptedEnvelope, PairingId, Role,
+};
 
 use crate::claims::{ClaimError, ClaimTable, RedeemedClaim};
 use crate::queue::{AppendOutcome, QueueError, ResumeOutcome, SenderQueue};
@@ -132,12 +134,16 @@ pub trait RelayStore: Send + Sync {
     async fn revoke_pairing(&self, pairing: &PairingId, requester: &DeviceId) -> RevokeOutcome;
 
     /// Issue a single-use claim token bound to `pairing` / `desktop`.
+    /// `direct_endpoint` is the offer's direct-link address (spec §5.2, v4),
+    /// returned on redemption so the phone-bound `pairing_claimed` can carry it;
+    /// `None` for a relay-mode pairing.
     async fn issue_claim(
         &self,
         token: String,
         pairing: PairingId,
         desktop: DeviceId,
         expires_at_ms: i64,
+        direct_endpoint: Option<DirectEndpoint>,
     );
 
     /// Whether `token` is free to issue at wall-clock `now_ms` — i.e. not
@@ -204,8 +210,8 @@ pub trait RelayStore: Send + Sync {
     /// only mutates the token slot).
     async fn unregister_push_token(&self, pairing: &PairingId);
 
-    /// The pairing's registered APNs token + environment, if any. Read by the
-    /// envelope path to wake an offline phone via push (spec §5.5/§11).
+    /// The pairing's registered APNs token + environment, if any. Read by
+    /// [`crate::push`] to deliver a desktop-requested alert (spec §5.5).
     async fn push_token(&self, pairing: &PairingId) -> Option<(String, ApnsEnvironment)>;
 }
 
@@ -393,10 +399,11 @@ impl RelayStore for InMemoryStore {
         pairing: PairingId,
         desktop: DeviceId,
         expires_at_ms: i64,
+        direct_endpoint: Option<DirectEndpoint>,
     ) {
         self.lock()
             .claims
-            .issue(token, pairing, desktop, expires_at_ms);
+            .issue(token, pairing, desktop, expires_at_ms, direct_endpoint);
     }
 
     async fn claim_token_is_free(&self, token: &str, now_ms: i64) -> bool {
@@ -625,7 +632,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .issue_claim("tok_live".into(), pairing.clone(), desktop.clone(), 10_000)
+            .issue_claim(
+                "tok_live".into(),
+                pairing.clone(),
+                desktop.clone(),
+                10_000,
+                None,
+            )
             .await;
         // Populate this pairing's own queues (env() uses a fixed pairing id, so
         // enqueue against the real pairing id directly).
@@ -858,6 +871,7 @@ mod tests {
                 PairingId::new("p1"),
                 DeviceId::new("d1"),
                 10_000,
+                None,
             )
             .await;
         store
@@ -866,6 +880,7 @@ mod tests {
                 PairingId::new("p2"),
                 DeviceId::new("d2"),
                 5_000,
+                None,
             )
             .await;
 

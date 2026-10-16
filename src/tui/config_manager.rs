@@ -663,6 +663,14 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             key: "relay_url",
             kind: FieldKind::Text,
         },
+        CuratedField {
+            label: "Phone done-push delay (seconds)",
+            section: "remote",
+            key: "push_done_debounce_secs",
+            // A curated subset of what validation accepts (0 to 3600); any other
+            // delay is a raw-TOML edit away. 0 pushes done immediately.
+            kind: FieldKind::IntegerChoice(vec![0, 2, 5, 10, 15, 30, 60]),
+        },
         // FlightDeck Web (embedded browser server, specs/WEB_INTERFACE.md D10),
         // sitting beside the FlightDeck Remote row above. Only the toggle and
         // the (string) bind address are curated here: `port` and
@@ -931,6 +939,21 @@ mod tests {
         let err = m.set_selected(FieldValue::Text("17".into())).unwrap_err();
         assert!(err.contains("one of"), "{err}");
         assert!(m.set_selected(FieldValue::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn the_done_push_delay_defaults_to_five_and_is_written_as_an_integer() {
+        let mut m = mgr(toml::Table::new(), toml::Table::new());
+        goto(&mut m, "Phone done-push delay (seconds)");
+        let row = m.rows().into_iter().find(|r| r.selected).unwrap();
+        assert_eq!(row.key, "remote.push_done_debounce_secs");
+        assert_eq!(row.value, "5");
+        assert!(row.choices.contains(&"0".to_string()));
+        m.toggle_selected();
+        let body = &m.outputs().unwrap()[0].1;
+        assert!(body.contains("[remote]"), "{body}");
+        // An integer, so the u64 field loads back (a string would not).
+        assert!(body.contains("push_done_debounce_secs = 10"), "{body}");
     }
 
     #[test]

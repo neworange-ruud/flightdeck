@@ -1,6 +1,6 @@
 //
 //  PairingRecord.swift
-//  FlightDeckRemote
+//  FlightDeckRemote + FlightDeckNotificationService
 //
 //  The persisted state of an established pairing (REMOTE_PROTOCOL §5.2/§6):
 //  everything the transport needs to reconnect, re-derive the E2E channel, and
@@ -131,11 +131,11 @@ enum PairingRecordError: Error, Equatable {
 /// first stored record. New code should prefer the keyed API.
 final class PairingRecordStore {
     /// Keychain service shared with the identity keys.
-    static let service = DeviceIdentity.service
+    static let service = SharedContainer.keychainService
     /// Account prefix for the keyed per-pairing items:
     /// `"pairing-record-v1.<pairingId>"`. The trailing dot keeps these items
     /// disjoint from the legacy account and from other services' items.
-    static let accountPrefix = "pairing-record-v1."
+    static let accountPrefix = SharedContainer.pairingRecordAccountPrefix
     /// Legacy account for the single pre-multi-pairing record. Migrated into the
     /// keyed store on first read after upgrade, then removed.
     static let legacyAccount = "pairing-record-v1"
@@ -173,6 +173,18 @@ final class PairingRecordStore {
     /// The record for `pairingId`, or `nil` if no such pairing is stored.
     func load(pairingId: String) throws -> PairingRecord? {
         try migrateLegacyRecordIfNeeded()
+        guard let blob = try store.get(account: Self.account(for: pairingId)) else {
+            return nil
+        }
+        return try decode(blob)
+    }
+
+    /// Read-only lookup of `pairingId`'s record for the Notification Service
+    /// Extension (remote-control-bza0). Unlike `load(pairingId:)` it never runs
+    /// the legacy migration: the extension must not write the app's Keychain
+    /// (and a legacy, pre-multi-pairing item would not be in the shared group
+    /// anyway — the app migrates it on its next launch).
+    func peek(pairingId: String) throws -> PairingRecord? {
         guard let blob = try store.get(account: Self.account(for: pairingId)) else {
             return nil
         }

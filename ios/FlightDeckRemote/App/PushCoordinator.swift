@@ -38,42 +38,55 @@ final class PushCoordinator {
     /// owns it.
     weak var router: AppRouter?
 
-    /// The background wake performer, registered by `MainTabView` (which owns
-    /// the live `TransportCoordinator` + `NotificationScheduler`). A silent wake
-    /// push (spec §11 step 1, remote-control-0ef.4) runs this to reconnect the
-    /// backgrounded-and-torn-down transport, let queued envelopes replay,
-    /// schedule their local notifications, and tear back down — all before the
-    /// background execution window closes. `nil` until the paired UI mounts and
-    /// registers it (an unpaired app has nothing to wake). Returns whether any
-    /// new data was fetched (drives the `UIBackgroundFetchResult`).
-    private var wakeHandler: (@MainActor () async -> Bool)?
+    /// The agent session whose chat is on screen right now (set by
+    /// `AgentChatView`), so a notification for it doesn't banner over the very
+    /// conversation the user is reading (`ForegroundPresentationPolicy`).
+    var visibleSessionId: String?
+
+    /// Event ids presented as LOCAL notifications this launch (local
+    /// notifications only exist while the app is foregrounded, so the process
+    /// lifetime is the right scope).
+    private var locallyPresentedEventIds: Set<String> = []
 
     private let center: UNUserNotificationCenter
+    private let pushLog: PresentedPushLog
 
-    init(center: UNUserNotificationCenter = .current()) {
+    init(center: UNUserNotificationCenter = .current(), pushLog: PresentedPushLog = PresentedPushLog()) {
         self.center = center
+        self.pushLog = pushLog
+    }
+
+    /// Decide how a notification arriving in the foreground is presented, and
+    /// remember local presentations — see `ForegroundPresentationPolicy`.
+    func presentation(
+        source: ForegroundPresentationPolicy.Source,
+        userInfo: [AnyHashable: Any],
+        isPassive: Bool
+    ) -> ForegroundPresentationPolicy.Presentation {
+        let payload = PushPayload(userInfo: userInfo)
+        let eventId = payload?.eventId.isEmpty == false ? payload?.eventId : nil
+        let decision = ForegroundPresentationPolicy.decide(
+            source: source,
+            eventId: eventId,
+            sessionId: payload?.deepLink.sessionId.rawValue,
+            isPassive: isPassive,
+            presentedByPush: eventId.map(pushLog.contains) ?? false,
+            presentedLocally: eventId.map(locallyPresentedEventIds.contains) ?? false,
+            visibleSessionId: visibleSessionId)
+        if source == .local, let eventId {
+            locallyPresentedEventIds.insert(eventId)
+        }
+        return decision
+    }
+
+    /// `AgentChatView` left the screen; clear only if it was still the visible one.
+    func chatDidDisappear(sessionId: String) {
+        if visibleSessionId == sessionId { visibleSessionId = nil }
     }
 
     /// Attach the app's router so notification taps can navigate.
     func attach(router: AppRouter) {
         self.router = router
-    }
-
-    /// Register the background wake performer (remote-control-0ef.4). Called by
-    /// `MainTabView` once its live transport is wired; overwriting on remount is
-    /// fine (the newest coordinator wins). See `wakeHandler`.
-    func registerWakeHandler(_ handler: @escaping @MainActor () async -> Bool) {
-        self.wakeHandler = handler
-    }
-
-    /// Handle a silent wake push (spec §11 step 1, remote-control-0ef.4): run
-    /// the registered wake performer to completion (reconnect → resume/fetch →
-    /// schedule notifications → tear down) and report the fetch result. With no
-    /// handler registered (unpaired, or the UI not yet mounted) there is nothing
-    /// to wake, so `.noData`.
-    func handleWakePush() async -> UIBackgroundFetchResult {
-        guard let wakeHandler else { return .noData }
-        return await wakeHandler() ? .newData : .noData
     }
 
     /// Ask for notification authorization and, if granted, register for remote

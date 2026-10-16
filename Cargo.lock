@@ -2331,6 +2331,9 @@ dependencies = [
  "flightdeck-remote-protocol",
  "futures-util",
  "hkdf",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "if-addrs",
  "insta",
  "libc",
@@ -2350,11 +2353,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-native-tls",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
  "tungstenite 0.30.0",
  "vt100",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

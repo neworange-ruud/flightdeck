@@ -14,10 +14,12 @@
 //     for `E2EChannel.derive(...)`. Its public point is sent to the desktop as
 //     `pairing_claim.key_agreement_public_key`.
 //
-//  Persistence mirrors `DeviceIdentity` exactly: the raw scalar is stored in
-//  the Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` +
-//  `ThisDeviceOnly` (via `KeychainStore`), so the key survives relaunch, can
-//  be read after a background wake, and never syncs off-device.
+//  Persistence mirrors `DeviceIdentity`: the raw scalar is stored in the
+//  Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (via
+//  `KeychainStore`), so the key survives relaunch and never syncs off-device.
+//  Unlike the identity key it lives in the SHARED Keychain group
+//  (`SharedContainer`): the Notification Service Extension needs it to derive
+//  each pairing's push key (spec §7.2), including while the phone is locked.
 //
 //  Wire encoding for the public key (REMOTE_PROTOCOL §5.2): base64(standard,
 //  padded) of the X9.63 uncompressed SEC1 point (65 bytes, 0x04 ‖ x ‖ y) —
@@ -37,7 +39,7 @@ struct KeyAgreementKeys {
     /// Keychain service shared with `DeviceIdentity` (same app secret namespace).
     static let service = DeviceIdentity.service
     /// Keychain account under which the raw key-agreement scalar is stored.
-    static let keyAccount = "device-key-agreement-key"
+    static let keyAccount = SharedContainer.keyAgreementAccount
 
     private let privateKey: P256.KeyAgreement.PrivateKey
 

@@ -258,13 +258,18 @@ fn ws_send(ws: &mut Ws, frame: &RelayFrame) {
 /// Run the relay side of the handshake, verifying the auth signature against
 /// `pubkey` exactly as the real relay would. Returns `true` on success.
 fn mock_authenticate(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str]) -> bool {
+    mock_authenticate_at(ws, pubkey, pairing_ids, 1)
+}
+
+/// [`mock_authenticate`], with `hello_ok` negotiating `version`.
+fn mock_authenticate_at(ws: &mut Ws, pubkey: &[u8], pairing_ids: &[&str], version: u16) -> bool {
     if !matches!(ws_recv(ws), Some(RelayFrame::Hello { .. })) {
         return false;
     }
     ws_send(
         ws,
         &RelayFrame::HelloOk {
-            protocol_version: 1,
+            protocol_version: version,
             server_time_ms: 0,
             connection_id: "conn-1".to_string(),
             relay_mode: None,
@@ -1306,6 +1311,7 @@ fn half_open_socket_is_torn_down_by_liveness_deadline() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     // A persisted pairing makes conn #1 auth-first (no pre-auth offer wait).
     let mut seed = RemoteState::default();
@@ -1405,6 +1411,7 @@ fn failed_envelope_write_is_held_and_resent_without_a_seq_gap() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -1473,6 +1480,7 @@ fn version_incompatible_is_terminal_and_stops_reconnecting() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
@@ -2454,4 +2462,133 @@ fn a_queue_overflow_advisory_is_surfaced_as_a_peer_backlog() {
     drop(out_tx);
     handle.stop();
     let _ = mock.join();
+}
+
+// --- push_notify over the relay socket (remote-control-fglt) ---------------
+
+fn sample_push() -> flightdeck_remote_protocol::PushNotifyBody {
+    flightdeck_remote_protocol::PushNotifyBody {
+        pairing_id: PairingId::new("pair_test"),
+        event_id: flightdeck_remote_protocol::EventId::new("6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"),
+        class: flightdeck_remote_protocol::PushClass::NeedsInput,
+        nonce: "AAECAwQFBgcICQoL".to_string(),
+        ciphertext: "AP5g0H3C".to_string(),
+    }
+}
+
+/// The app's ends of a client started against a push mock.
+struct PushSession {
+    handle: RemoteHandle,
+    in_rx: std::sync::mpsc::Receiver<RemoteInbound>,
+    out_tx: std::sync::mpsc::Sender<RemoteOutbound>,
+    mock: std::thread::JoinHandle<()>,
+}
+
+/// Start a client for `pair_test` against a mock that authenticates at
+/// `version`, then hands the socket to `relay`.
+fn push_session(version: u16, relay: impl FnOnce(&mut Ws) + Send + 'static) -> PushSession {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+    let mock = std::thread::spawn(move || {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate_at(
+            &mut ws,
+            &pubkey,
+            &["pair_test"],
+            version
+        ));
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Resume { .. })));
+        relay(&mut ws);
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    seed.pairings.push(Pairing::new("pair_test"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    PushSession {
+        handle,
+        in_rx,
+        out_tx,
+        mock,
+    }
+}
+
+#[test]
+fn a_v4_session_publishes_its_version_and_writes_push_notify_frames() {
+    let s = push_session(4, |ws| {
+        match ws_recv(ws) {
+            Some(RelayFrame::PushNotify(body)) => assert_eq!(body, sample_push()),
+            other => panic!("expected push_notify, got {other:?}"),
+        }
+        // Hang up: the link must report down again.
+    });
+    let link = s.handle.push_link();
+    wait_for_connected(&s.in_rx);
+    assert_eq!(link.live_version(), Some(4), "authenticated at v4");
+    s.out_tx
+        .send(RemoteOutbound::PushNotify(sample_push()))
+        .unwrap();
+    s.mock.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while link.live_version().is_some() && Instant::now() < deadline {
+        let _ = s.in_rx.recv_timeout(Duration::from_millis(50));
+    }
+    assert_eq!(link.live_version(), None, "session ended → link down");
+    s.handle.stop();
+}
+
+#[test]
+fn a_push_queued_for_an_older_relay_is_dropped_not_written() {
+    let s = push_session(3, |ws| {
+        // The push is dropped; the ack sent after it is the next frame.
+        match ws_recv(ws) {
+            Some(RelayFrame::Ack { cursor, .. }) => assert_eq!(cursor, 7),
+            other => panic!("expected the ack, not a push: {other:?}"),
+        }
+    });
+    wait_for_connected(&s.in_rx);
+    assert_eq!(s.handle.push_link().live_version(), Some(3));
+    s.out_tx
+        .send(RemoteOutbound::PushNotify(sample_push()))
+        .unwrap();
+    s.out_tx
+        .send(RemoteOutbound::Ack {
+            pairing_id: PairingId::new("pair_test"),
+            cursor: 7,
+        })
+        .unwrap();
+    s.mock.join().unwrap();
+    s.handle.stop();
+}
+
+#[test]
+fn a_client_with_no_session_reports_the_push_link_down() {
+    // Nothing listens here: the client never authenticates.
+    let addr = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
+    let (in_tx, in_rx) = channel();
+    let (_out_tx, out_rx) = channel();
+    let handle =
+        RemoteHandle::start_with_store(cfg, DeviceIdentity::generate(), store, in_tx, out_rx);
+    // Wait for the first attempt to be reported, then check the link.
+    let _ = in_rx.recv_timeout(Duration::from_secs(2));
+    assert_eq!(handle.push_link().live_version(), None);
+    handle.stop();
 }

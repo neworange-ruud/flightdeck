@@ -12,12 +12,16 @@ import SwiftUI
 @main
 struct FlightDeckRemoteApp: App {
     // Adopt a UIKit delegate purely for the push-notification callbacks SwiftUI
-    // doesn't surface (registration, wake pushes, tap handling) — see
-    // `AppDelegate` / `PushCoordinator`.
+    // doesn't surface (registration, tap handling, foreground presentation) —
+    // see `AppDelegate` / `PushCoordinator`.
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var router: AppRouter
 
     init() {
+        // First thing, before anything reads the Keychain or the notification
+        // settings: move what the Notification Service Extension needs into the
+        // shared Keychain group / App Group (remote-control-bza0).
+        SharedStorageMigration.run()
         let pairingStore = PairingStore()
         let isUITestLaunch = ProcessInfo.processInfo.arguments.contains {
             $0.hasPrefix("-uitest")

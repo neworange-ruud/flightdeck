@@ -1,19 +1,23 @@
 //! HTTP and WebSocket handlers.
 //!
-//! No business logic lives here yet — just the surface: liveness/readiness
-//! probes, a version endpoint, and a WebSocket endpoint that accepts a
-//! connection and closes cleanly. Pairing-ID routing plugs into
-//! [`ws_handler`] later; see the [`crate::router`] module doc comment.
+//! The surface: liveness/readiness probes, a version endpoint, the `/ws`
+//! WebSocket (driven by [`crate::session`]), and the HTTPS push endpoint
+//! `POST /v1/push` ([`push_http`], spec §5.5.3).
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
-use flightdeck_remote_protocol::RelayFrame;
+use flightdeck_remote_protocol::relay::{PUSH_REQUEST_MAX_SKEW_MS, RELAY_PASSWORD_HEADER};
+use flightdeck_remote_protocol::{
+    PushErrorBody, PushRequest, RelayErrorCode, RelayFrame, RelayMode,
+};
 use futures_util::{
     stream::{SplitSink, StreamExt},
     SinkExt,
@@ -22,8 +26,16 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, MissedTickBehavior};
 
+use crate::auth;
+use crate::push::{accept_push, Via};
 use crate::session::Connection;
 use crate::AppState;
+
+/// Largest `POST /v1/push` body the relay reads, in bytes. A maximal valid
+/// request — a 3000-character ciphertext plus ids, nonce, signature and JSON
+/// keys — is well under 4 KiB; anything past this is refused with 413 before it
+/// is parsed.
+pub const MAX_PUSH_REQUEST_BYTES: usize = 16 * 1024;
 
 /// Bound on a connection's outbound frame channel. Small: the queue's job is to
 /// smooth momentary write bursts, not to buffer without limit — a peer that
@@ -55,15 +67,133 @@ pub struct VersionInfo {
     /// Git commit SHA of the running build; see [`crate::config::Config::git_sha`]
     /// for how it's sourced.
     pub git_sha: String,
+    /// The configured relay mode (`full` | `push_only`, spec §5.9) — the same
+    /// value every client sees in `hello_ok.relay_mode`, so an operator can
+    /// confirm a `RELAY_MODE` change took effect with one HTTP GET.
+    pub relay_mode: RelayMode,
 }
 
-/// Reports the running build's crate version and git SHA. Useful for
-/// confirming which revision a Container Apps replica is actually running.
+/// Reports the running build's crate version, git SHA and relay mode. Useful
+/// for confirming which revision (and mode) a Container Apps replica is
+/// actually running. The probes (`/healthz`, `/readyz`) stay plain `ok` so
+/// platform health checks are unaffected by the mode.
 pub async fn version(State(state): State<AppState>) -> Json<VersionInfo> {
     Json(VersionInfo {
         version: env!("CARGO_PKG_VERSION"),
         git_sha: state.config.git_sha.clone(),
+        relay_mode: state.relay_mode(),
     })
+}
+
+/// `POST /v1/push` — a desktop requesting one encrypted alert over HTTPS
+/// (spec §5.5.3), for when it has no live, authenticated relay WebSocket.
+///
+/// Checks, in order (each failure answers with a [`PushErrorBody`]):
+/// 1. the relay password header [`RELAY_PASSWORD_HEADER`], if a password is
+///    configured (constant-time) → 401 `auth_failed`;
+/// 2. body size ≤ [`MAX_PUSH_REQUEST_BYTES`] → 413 `bad_frame`;
+/// 3. the JSON parses as a [`PushRequest`] → 400 `bad_frame`;
+/// 4. `|now − timestamp_ms| ≤ PUSH_REQUEST_MAX_SKEW_MS` → 401 `auth_failed`;
+/// 5. the device has a registered identity key and `signature` verifies over
+///    [`PushRequest::signing_message`] → 401 `auth_failed`;
+/// 6. then the path shared with the WebSocket ([`accept_push`]): desktop
+///    membership (phone → 400, non-member → 404), field limits (oversized
+///    ciphertext → 413), rate limit (429), token lookup and the APNs send.
+///
+/// Success is `202 Accepted` with an empty body — also when the pairing has no
+/// push token (the desktop cannot tell, by design). The password, the
+/// signature and the push content never appear in a log line or a response.
+pub async fn push_http(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    let presented = headers
+        .get(RELAY_PASSWORD_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if !auth::relay_password_ok(state.config.relay_password.as_deref(), presented) {
+        tracing::warn!("push http rejected: missing or incorrect relay password");
+        return push_error(
+            StatusCode::UNAUTHORIZED,
+            RelayErrorCode::AuthFailed,
+            "relay password required",
+        );
+    }
+
+    // Bounded read: an oversized body is refused before it is buffered whole.
+    // (A body that cannot be read at all — the client went away — gets the
+    // same answer; nobody is left to read it.)
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_PUSH_REQUEST_BYTES).await else {
+        return push_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            RelayErrorCode::BadFrame,
+            "request body too large",
+        );
+    };
+    let request: PushRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return push_error(
+                StatusCode::BAD_REQUEST,
+                RelayErrorCode::BadFrame,
+                "malformed push request",
+            )
+        }
+    };
+
+    let skew = now_ms().abs_diff(request.timestamp_ms);
+    if skew > PUSH_REQUEST_MAX_SKEW_MS.unsigned_abs() {
+        tracing::info!(device = %request.device_id, skew_ms = skew, "push http rejected: stale timestamp");
+        return push_error(
+            StatusCode::UNAUTHORIZED,
+            RelayErrorCode::AuthFailed,
+            "timestamp outside the allowed window",
+        );
+    }
+
+    let Some(public_key) = state.store.device_public_key(&request.device_id).await else {
+        tracing::info!(device = %request.device_id, "push http rejected: unknown device");
+        return push_error(
+            StatusCode::UNAUTHORIZED,
+            RelayErrorCode::AuthFailed,
+            "unknown device",
+        );
+    };
+    let message = request.signing_message();
+    if auth::verify_signature(&public_key, message.as_bytes(), &request.signature).is_err() {
+        tracing::info!(device = %request.device_id, "push http rejected: bad signature");
+        return push_error(
+            StatusCode::UNAUTHORIZED,
+            RelayErrorCode::AuthFailed,
+            "signature verification failed",
+        );
+    }
+
+    match accept_push(&state, &request.device_id, request.push, Via::Https).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(rejection) => push_error(
+            rejection.http_status(),
+            rejection.code(),
+            rejection.message(),
+        ),
+    }
+}
+
+/// A non-2xx `POST /v1/push` response: `status` with the JSON
+/// [`PushErrorBody`] `{ code, message }` (spec §5.5.3).
+fn push_error(status: StatusCode, code: RelayErrorCode, message: &str) -> Response {
+    (
+        status,
+        Json(PushErrorBody {
+            code,
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Current wall-clock time in unix milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Upgrades an HTTP connection to a WebSocket and hands it to

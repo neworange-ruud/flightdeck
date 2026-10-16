@@ -584,6 +584,32 @@ absent as `full`.
   `error { code: relay_mode_push_only, pairing_id }` and keeps the connection
   open (fixture: `relay/error_relay_mode_push_only.json`). It runs no
   per-pairing sender queues and no seq tracking.
+  - The refusal is checked **first**, after authentication: it does not depend
+    on whether `pairing_id` is activated on the connection (the mode is the
+    reason, so no `unknown_pairing` is ever returned for these frames), and
+    `pairing_id` echoes the frame's. Before `auth_ok` these frames are still
+    `not_authenticated` + close, as in any mode.
+  - Nothing about a refused frame reaches the peer: no envelope is forwarded,
+    no ack is relayed, nothing is queued.
+  - The refusal repeats per frame (no escalation to a close); a client that
+    keeps sending is misconfigured and SHOULD stop after the first one.
+  - A full relay sends each freshly authenticated leg an unsolicited
+    `ack { pairing_id, cursor }` per activated pairing (its own stream's ack
+    position, which also tells the endpoint that this relay forwards acks). A
+    push-only relay **does not**: it forwards no acks, so an endpoint must not
+    arm an ack-based liveness deadline against it.
+- **Configuration.** `RELAY_MODE` unset or empty means `full`; the value is
+  trimmed and case-insensitive. Any other value is a startup error (the relay
+  refuses to start rather than silently falling back to `full`). The relay
+  logs its mode at startup and reports it on `GET /version` as `relay_mode`
+  next to `version` and `git_sha`; the `/healthz` and `/readyz` probes are
+  unchanged (plain `ok`).
+- **Storage.** A push-only relay still persists device keys, pairings, claim
+  tokens and push tokens (the `FLIGHTDECK_RELAY_STORE` backend works as in
+  `full`); the envelope-queue tables are never written, so they stay empty.
+  Switching an existing `full` relay to `push_only` leaves any already-queued
+  envelopes untouched but unreachable (they replay again if it is switched
+  back).
 - **Who uses which.** `full` is today's routing relay, for adopters who want
   relay-mode pairings. `push_only` is for deployments where every pairing is in
   direct mode (§5.10), so the relay only needs to authenticate devices and send
@@ -752,8 +778,8 @@ install / first connect sends `from_seq: 0`.
 The relay answers `error { code: seq_violation }` instead of a replay when the
 resume cannot be served without stranding the receiver:
 
-- `from_seq` precedes the oldest envelope still buffered, because a drop-oldest
-  overflow shed the ones in between. Replaying would hand the receiver a stream
+- `from_seq > 0` precedes the oldest envelope still buffered, because a
+  drop-oldest overflow shed the ones in between. Replaying would hand the receiver a stream
   with a permanent hole its gapless enforcement stalls on.
 - `from_seq` is **above** the stream's `high_water` on a stream the relay knows.
   The sender restarted underneath this receiver (§6.1 rewind) while it kept the
@@ -763,6 +789,18 @@ resume cannot be served without stranding the receiver:
 
 Either way the receiver applies the §6.1 `seq_violation` recovery: drop
 `last_received_seq`, re-`resume` from 0, request a fresh snapshot.
+
+**`resume { from_seq: 0 }` is never answered with `seq_violation` for an overflow
+gap.** It means "I hold nothing for this pairing" — a fresh install, or a
+receiver that just dropped its cursor in response to the advisory. The seqs shed
+by overflow are given up for good: the relay replays whatever it still retains
+(e.g. 3, 4, 5 after 1 and 2 were dropped) and the receiver accepts the first
+replayed `seq` as its new cursor base (§6.4 dedup is `seq > last_received_seq`,
+with no gap check), relying on the fresh snapshot for state it never saw.
+Answering `from_seq: 0` with another `seq_violation` would make the recovery
+itself fail and loop forever (remote-control-uj2t). The sequence for one
+overflowed pairing is therefore: `resume(k)` with `0 < k < oldest−1` →
+`seq_violation` once; `resume(0)` → replay of the retained tail.
 
 ### 6.4 Dedup / idempotency (normative)
 

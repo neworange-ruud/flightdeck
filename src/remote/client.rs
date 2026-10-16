@@ -98,13 +98,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::contracts::real::RealFs;
 use crate::contracts::RemoteConfig;
+use crate::remote::push::PushLink;
 use crate::remote::state::{load_remote_state, remote_state_path, save_remote_state, RemoteState};
 use crate::remote::{DeviceIdentity, RemoteInbound, RemoteOutbound};
 
 use flightdeck_remote_protocol::relay::{
     ClientInfo, EncryptedEnvelope, RelayErrorCode, RelayFrame,
 };
-use flightdeck_remote_protocol::{DeviceId, PairingId, Role, PROTOCOL_VERSION};
+use flightdeck_remote_protocol::{
+    DeviceId, PairingId, Role, PROTOCOL_VERSION, PUSH_NOTIFY_MIN_VERSION,
+};
 
 // --- Tuning constants ------------------------------------------------------
 
@@ -366,6 +369,9 @@ pub struct RemoteHandle {
     /// this receiver reports `Disconnected`, which is how [`Self::stop`] waits
     /// for the socket to be closed without needing a runtime context.
     done: Option<Receiver<()>>,
+    /// Whether the relay WebSocket can carry `push_notify` right now, published
+    /// by the task (see [`Self::push_link`]).
+    push_link: PushLink,
 }
 
 impl RemoteHandle {
@@ -423,6 +429,7 @@ impl RemoteHandle {
             return RemoteHandle {
                 stop: None,
                 done: None,
+                push_link: PushLink::new(),
             };
         };
 
@@ -448,11 +455,14 @@ impl RemoteHandle {
             return RemoteHandle {
                 stop: None,
                 done: None,
+                push_link: PushLink::new(),
             };
         }
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let push_link = PushLink::new();
+        let task_link = push_link.clone();
         runtime.spawn(async move {
             // Owned by the task: dropped when it returns, which is what unblocks
             // `stop()`. Never sent on — its drop is the signal.
@@ -463,7 +473,10 @@ impl RemoteHandle {
                 store,
                 InboundTx::new(inbound_tx),
                 async_out_rx,
-                stop_rx,
+                TaskSignals {
+                    stop: stop_rx,
+                    push_link: task_link,
+                },
                 tuning,
             )
             .await;
@@ -471,7 +484,15 @@ impl RemoteHandle {
         RemoteHandle {
             stop: Some(stop_tx),
             done: Some(done_rx),
+            push_link,
         }
+    }
+
+    /// The link state the push sender routes by (spec §5.5.1): the negotiated
+    /// protocol version while the relay session is authenticated, nothing
+    /// otherwise. Always down when no task was started.
+    pub fn push_link(&self) -> PushLink {
+        self.push_link.clone()
     }
 
     /// Signal the task to shut down and wait (briefly) for it to finish, so the
@@ -766,6 +787,14 @@ fn report(inbound_tx: &InboundTx, state: RemoteLinkState) {
     inbound_tx.send(RemoteInbound::Link(state));
 }
 
+/// The two pieces of shared state between the handle and the task beyond the
+/// channels: the stop request (handle → task) and the push link (task → push
+/// sender, see [`RemoteHandle::push_link`]).
+struct TaskSignals {
+    stop: watch::Receiver<bool>,
+    push_link: PushLink,
+}
+
 /// The reconnect supervisor: attempt after attempt with backoff until stopped.
 async fn run(
     cfg: RemoteConfig,
@@ -773,9 +802,13 @@ async fn run(
     store: Box<dyn RemoteStore>,
     inbound_tx: InboundTx,
     mut outbound_rx: UnboundedReceiver<RemoteOutbound>,
-    mut stop: watch::Receiver<bool>,
+    signals: TaskSignals,
     tuning: ClientTuning,
 ) {
+    let TaskSignals {
+        mut stop,
+        push_link,
+    } = signals;
     let mut attempt: u32 = 0;
     // Consecutive auth rejections of our persisted pairing (see
     // [`AUTH_REJECT_REOFFER_THRESHOLD`]). Any non-rejection outcome resets it.
@@ -800,8 +833,11 @@ async fn run(
             &mut stop,
             &tuning,
             pending.take(),
+            &push_link,
         )
         .await;
+        // Whatever ended the session, the socket can no longer carry a push.
+        push_link.set_down();
 
         match end {
             SessionEnd::Stopped => {
@@ -911,7 +947,7 @@ fn effective_url(cfg: &RemoteConfig, state: &RemoteState) -> String {
 /// local/dev relay with no password configured still connects (the relay stays
 /// open when it has no password). The value is sent verbatim — never trimmed —
 /// so it byte-matches the relay's constant-time compare.
-fn effective_relay_password(cfg: &RemoteConfig) -> Option<String> {
+pub(crate) fn effective_relay_password(cfg: &RemoteConfig) -> Option<String> {
     resolve_relay_password(
         std::env::var("FLIGHTDECK_RELAY_PASSWORD").ok(),
         &cfg.relay_password,
@@ -949,6 +985,7 @@ async fn run_session(
     stop: &mut watch::Receiver<bool>,
     tuning: &ClientTuning,
     pending_in: Option<RemoteOutbound>,
+    push_link: &PushLink,
 ) -> SessionEnd {
     let url = effective_url(cfg, state);
     let sock = match connect(&url).await {
@@ -1022,6 +1059,9 @@ async fn run_session(
     let deadline = sleep(AUTH_DEADLINE);
     tokio::pin!(deadline);
     let mut saw_hello_ok = false;
+    // The version `hello_ok` settled on; it decides whether this session may
+    // carry `push_notify` (spec §5.5.1).
+    let mut negotiated_version: u16 = 0;
     // The challenge nonce, captured until we decide to answer it.
     let mut challenge_nonce: Option<String> = None;
     // Whether we have already sent our `auth_response`.
@@ -1117,7 +1157,12 @@ async fn run_session(
                     return ended_unauthed();
                 }
                 Incoming::Frame(frame) => match *frame {
-                    RelayFrame::HelloOk { .. } => saw_hello_ok = true,
+                    RelayFrame::HelloOk {
+                        protocol_version, ..
+                    } => {
+                        saw_hello_ok = true;
+                        negotiated_version = protocol_version;
+                    }
                     RelayFrame::VersionIncompatible {
                         your_version,
                         min_supported,
@@ -1185,6 +1230,9 @@ async fn run_session(
                         }
                     }
                     RelayFrame::AuthOk { pairing_ids } if sent_auth => {
+                        // Published before `Connected` is reported, so anyone
+                        // who saw the link come up also sees it carry pushes.
+                        push_link.set_live(negotiated_version);
                         on_authenticated(&mut sink, state, inbound_tx, pairing_ids).await;
                         break;
                     }
@@ -1235,6 +1283,10 @@ async fn run_session(
     // coalescing the streamed cursor persists (0ef.11). Flushed on every exit
     // below so a clean end never loses a cursor.
     let mut gate = CursorFlushGate::new(tuning.cursor_flush_interval);
+    let write = SessionWrite {
+        tuning,
+        negotiated_version,
+    };
 
     // Re-send an envelope whose write failed on the previous session BEFORE any
     // freshly-queued traffic, so its `seq` slots back into the stream contiguously
@@ -1242,7 +1294,7 @@ async fn run_session(
     // again, hold it once more for the next session.
     if let Some(out) = pending_in {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sink, identity, state, store, &mut gate, tuning, out).await
+            handle_outbound(&mut sink, identity, state, store, &mut gate, write, out).await
         {
             gate.flush(store, state);
             return SessionEnd::Ended {
@@ -1256,7 +1308,7 @@ async fn run_session(
     // steady-state pump takes over (normally nothing).
     for out in deferred {
         if let Sent::Broke { retry } =
-            handle_outbound(&mut sink, identity, state, store, &mut gate, tuning, out).await
+            handle_outbound(&mut sink, identity, state, store, &mut gate, write, out).await
         {
             gate.flush(store, state);
             return SessionEnd::Ended {
@@ -1276,7 +1328,7 @@ async fn run_session(
         inbound_tx,
         outbound_rx,
         stop,
-        tuning,
+        write,
         &mut gate,
         authed_at,
     )
@@ -1543,10 +1595,11 @@ async fn pump(
     inbound_tx: &InboundTx,
     outbound_rx: &mut UnboundedReceiver<RemoteOutbound>,
     stop: &mut watch::Receiver<bool>,
-    tuning: &ClientTuning,
+    write: SessionWrite<'_>,
     gate: &mut CursorFlushGate,
     authed_at: Instant,
 ) -> SessionEnd {
+    let tuning = write.tuning;
     // `interval_at` (not `interval`) so the first tick is one full period away:
     // `interval` fires immediately, which would ping the instant we authenticate.
     let mut ping = interval_at(Deadline::now() + PING_INTERVAL, PING_INTERVAL);
@@ -1598,7 +1651,7 @@ async fn pump(
             queued = outbound_rx.recv() => match queued {
                 Some(out) => {
                     if let Sent::Broke { retry } =
-                        handle_outbound(sink, identity, state, store, gate, tuning, out).await
+                        handle_outbound(sink, identity, state, store, gate, write, out).await
                     {
                         break SessionEnd::Ended {
                             authed_for: Some(authed_at.elapsed()),
@@ -1663,6 +1716,15 @@ async fn pump(
     end
 }
 
+/// What a write needs to know about the live, authenticated session.
+#[derive(Clone, Copy)]
+struct SessionWrite<'a> {
+    /// The session's timing knobs and test seams.
+    tuning: &'a ClientTuning,
+    /// The protocol version `hello_ok` negotiated for this session.
+    negotiated_version: u16,
+}
+
 /// Handle one app→relay message. Returns [`Sent::Broke`] if the socket broke.
 async fn handle_outbound(
     sink: &mut RelaySink,
@@ -1670,9 +1732,10 @@ async fn handle_outbound(
     state: &mut RemoteState,
     store: &dyn RemoteStore,
     gate: &mut CursorFlushGate,
-    tuning: &ClientTuning,
+    write: SessionWrite<'_>,
     out: RemoteOutbound,
 ) -> Sent {
+    let tuning = write.tuning;
     match out {
         RemoteOutbound::SendEnvelope {
             pairing_id,
@@ -1764,6 +1827,39 @@ async fn handle_outbound(
             } else {
                 Sent::Broke { retry: None }
             }
+        }
+        RemoteOutbound::PushNotify(push) => {
+            // Queued while the push link said this socket carries v4 frames,
+            // but a reconnect may have landed on an older relay since: such a
+            // relay would answer `bad_frame` and drop the session, so the push
+            // is dropped here instead (logged, never retried or spun on).
+            if write.negotiated_version < PUSH_NOTIFY_MIN_VERSION {
+                crate::remote::debuglog::log(&format!(
+                    "push pairing={} event={} class={} route=RelaySocket dropped: relay negotiated v{}",
+                    push.pairing_id, push.event_id, push.class, write.negotiated_version
+                ));
+                return Sent::Ok;
+            }
+            let (pairing, event, class) =
+                (push.pairing_id.clone(), push.event_id.clone(), push.class);
+            if send_frame(sink, &RelayFrame::PushNotify(push.clone()))
+                .await
+                .is_err()
+            {
+                crate::remote::debuglog::log(&format!(
+                    "push pairing={pairing} event={event} class={class} route=RelaySocket \
+                     write failed — holding for the next session"
+                ));
+                // The same event id makes a duplicate harmless (it is the APNs
+                // collapse id), so holding it for the next session is safe.
+                return Sent::Broke {
+                    retry: Some(RemoteOutbound::PushNotify(push)),
+                };
+            }
+            crate::remote::debuglog::log(&format!(
+                "push pairing={pairing} event={event} class={class} route=RelaySocket sent"
+            ));
+            Sent::Ok
         }
         RemoteOutbound::Unpair { pairing_id } => {
             // Local clear only (no relay-plane unpair frame in v1): drop the

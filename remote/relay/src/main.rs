@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use flightdeck_relay::{build, config::Config, shutdown_signal, telemetry};
+use flightdeck_remote_protocol::RelayMode;
 
 /// Upper bound on the *entire* graceful-shutdown window: once the shutdown
 /// signal fires, connections are notified (see `shutdown_signal`,
@@ -22,7 +23,16 @@ const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
-    let config = Config::from_env();
+    // A config error (today only an unrecognized `RELAY_MODE`) refuses to
+    // start. Logging is not up yet — its format is part of the config — so the
+    // message goes straight to stderr, where container platforms collect it.
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("flightdeck-relay: configuration error: {err}");
+            std::process::exit(2);
+        }
+    };
     telemetry::init(config.log_format);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -38,8 +48,18 @@ async fn main() {
         %addr,
         version = env!("CARGO_PKG_VERSION"),
         git_sha = %config.git_sha,
+        relay_mode = %config.relay_mode,
         "flightdeck-relay listening"
     );
+    match config.relay_mode {
+        RelayMode::Full => {
+            tracing::info!("relay mode: full (control plane + envelope routing, queues, resume)")
+        }
+        RelayMode::PushOnly => tracing::info!(
+            "relay mode: push_only (auth, pairing, push tokens, revoke and push_notify only; \
+             envelope/resume/ack are refused with relay_mode_push_only)"
+        ),
+    }
 
     let (router, shutdown_tx) = build(config);
 

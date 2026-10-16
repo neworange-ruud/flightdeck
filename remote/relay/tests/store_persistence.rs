@@ -111,6 +111,7 @@ async fn sqlite_store_survives_a_restart() {
                 pairing.clone(),
                 desktop.clone(),
                 9_000_000_000_000,
+                None,
             )
             .await;
         store
@@ -119,6 +120,7 @@ async fn sqlite_store_survives_a_restart() {
                 pairing.clone(),
                 desktop.clone(),
                 1_000, // long past
+                None,
             )
             .await;
 
