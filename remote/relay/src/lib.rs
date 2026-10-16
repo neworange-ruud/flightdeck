@@ -287,6 +287,7 @@ mod tests {
                 PairingId::new("p"),
                 DeviceId::new("d"),
                 past,
+                None,
             )
             .await;
         assert_eq!(store.claim_entry_count(), 1, "token is physically present");

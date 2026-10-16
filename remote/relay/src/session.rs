@@ -529,6 +529,7 @@ impl Connection {
                 pairing_id.clone(),
                 members.desktop,
                 expires_at_ms,
+                None,
             )
             .await;
 
