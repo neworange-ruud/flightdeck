@@ -400,6 +400,38 @@ Supported initial agents:
 
 Agent definitions must be config-driven.
 
+### `[remote]` direct link — phone ⇄ desktop over Tailscale (`specs/REMOTE_PROTOCOL.md` §5.10)
+
+FlightDeck Remote's `[remote]` table (`enabled`, `relay_url`,
+`relay_password`) also carries the opt-in **direct link**, which serves the
+phone protocol from this machine over Tailscale instead of through the relay's
+data plane:
+
+```toml
+[remote]
+direct_enabled = false   # serve the phone directly over Tailscale
+direct_port = 47800      # stable: each direct pairing stores host:port on the phone
+direct_host = ""         # empty = Tailscale MagicDNS name, else the 100.x address
+```
+
+- **`direct_enabled`** (bool, default `false`) — when on (and `enabled` is on),
+  FlightDeck listens for the phone on this machine's **Tailscale addresses
+  only** (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), never `0.0.0.0` or another
+  network; Tailscale coming up after launch is picked up within 30 s. Pairings
+  made while it is on are **direct mode**: their envelopes are kept in a bounded
+  per-pairing outbox on this machine (`~/.flightdeck/remote-direct/`; newest
+  1000 envelopes / 8 MiB) and replayed to the phone when it reconnects, and
+  never sent through the relay. The relay still carries pairing, push
+  notifications and unpairing. Existing pairings keep using the relay until
+  re-paired. Also a toggle in the configuration manager.
+- **`direct_port`** (integer, default `47800`) — the listener's TCP port. A
+  configured `0` is rejected at load (SPECS §26): a port that changes every
+  launch would break every direct pairing.
+- **`direct_host`** (string, default `""`) — the host name advertised to the
+  phone. Empty means this machine's Tailscale MagicDNS name (from
+  `tailscale status --json`), or else its Tailscale `100.x` address when the
+  `tailscale` CLI is unavailable.
+
 ### `[web]` section — FlightDeck Web (`specs/WEB_INTERFACE.md`)
 
 The embedded browser server (M1) is configured by an optional `[web]` table,

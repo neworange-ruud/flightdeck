@@ -169,7 +169,22 @@ pub fn validate(config: &Config) -> Result<()> {
 
     validate_containers(&config.containers)?;
     validate_web(&config.web)?;
+    validate_remote(&config.remote)?;
 
+    Ok(())
+}
+
+/// Validate the `[remote]` direct-link keys (spec §5.10). Like `[web]`, checked
+/// unconditionally: `direct_port = 0` would ask the OS for a different port every
+/// launch, silently breaking every direct pairing (each stores `host:port` on the
+/// phone), so it is rejected rather than reinterpreted.
+fn validate_remote(remote: &crate::contracts::RemoteConfig) -> Result<()> {
+    if remote.direct_port == 0 {
+        return Err(FlightDeckError::Config(
+            "remote.direct_port must not be 0 (direct pairings store a stable port on the phone)"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -385,6 +400,39 @@ mod tests {
         cfg.ui.agent_tab_position = "rihgt".to_string();
         let err = validate(&cfg).unwrap_err();
         assert!(err.to_string().contains("ui.agent_tab_position"));
+    }
+
+    // --- [remote] direct-link validation (REMOTE_PROTOCOL §5.10) ---
+
+    #[test]
+    fn direct_link_is_off_by_default_on_a_stable_port() {
+        let cfg = default_config("proj", "main");
+        assert!(!cfg.remote.direct_enabled, "the direct link is opt-in");
+        assert_eq!(
+            cfg.remote.direct_port,
+            crate::contracts::DEFAULT_DIRECT_PORT
+        );
+        assert!(cfg.remote.direct_host.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_direct_port() {
+        let mut cfg = default_config("proj", "main");
+        cfg.remote.direct_port = 0;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("remote.direct_port"), "{err}");
+    }
+
+    /// A partial `[remote]` table (an old config, or one that only sets
+    /// `enabled`) back-fills every direct-link key field by field.
+    #[test]
+    fn a_partial_remote_table_backfills_the_direct_keys() {
+        let cfg: crate::contracts::RemoteConfig =
+            toml::from_str("enabled = true\nrelay_url = \"wss://x/ws\"\n").unwrap();
+        assert!(cfg.enabled);
+        assert!(!cfg.direct_enabled);
+        assert_eq!(cfg.direct_port, crate::contracts::DEFAULT_DIRECT_PORT);
+        assert_eq!(cfg.direct_host, "");
     }
 
     // --- [containers] validation (SPECS §31) ---

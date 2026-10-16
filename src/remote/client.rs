@@ -98,13 +98,14 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::contracts::real::RealFs;
 use crate::contracts::RemoteConfig;
+use crate::remote::direct::{advertised, DirectAdvert, OutboundRouter};
 use crate::remote::state::{load_remote_state, remote_state_path, save_remote_state, RemoteState};
 use crate::remote::{DeviceIdentity, RemoteInbound, RemoteOutbound};
 
 use flightdeck_remote_protocol::relay::{
     ClientInfo, EncryptedEnvelope, RelayErrorCode, RelayFrame,
 };
-use flightdeck_remote_protocol::{DeviceId, PairingId, Role, PROTOCOL_VERSION};
+use flightdeck_remote_protocol::{DeviceId, DirectEndpoint, PairingId, Role, PROTOCOL_VERSION};
 
 // --- Tuning constants ------------------------------------------------------
 
@@ -212,6 +213,9 @@ struct ClientTuning {
     /// reached the store set this to [`Duration::ZERO`] so every pump event
     /// flushes a dirty gate immediately; production uses the real interval.
     cursor_flush_interval: Duration,
+    /// Optional wiring from [`ClientOptions`] (not timing, but threaded the same
+    /// way so the session signatures stay put). See there.
+    options: ClientOptions,
 }
 
 impl Default for ClientTuning {
@@ -221,7 +225,28 @@ impl Default for ClientTuning {
             min_stable_session: MIN_STABLE_SESSION,
             fail_next_envelope_writes: Arc::new(AtomicU32::new(0)),
             cursor_flush_interval: CURSOR_FLUSH_INTERVAL,
+            options: ClientOptions::default(),
         }
+    }
+}
+
+/// Optional wiring for [`RemoteHandle::start_with_options`]: what the direct
+/// link (spec §5.10, [`crate::remote::direct`]) needs from the relay client.
+/// The default wires nothing, which is exactly the relay-only client.
+#[derive(Clone, Default)]
+pub struct ClientOptions {
+    /// The direct-link endpoint to put in `pairing_offer.direct_endpoint`, read
+    /// when each offer is built (`None` inside = nothing bound: offer relay mode).
+    pub direct_advert: Option<DirectAdvert>,
+    /// Splits the app's outbound traffic before it reaches the relay session:
+    /// a direct-mode pairing's envelopes go to its outbox, never the relay.
+    pub router: Option<Arc<dyn OutboundRouter>>,
+}
+
+impl ClientOptions {
+    /// The endpoint to advertise in an offer built now.
+    fn direct_endpoint(&self) -> Option<DirectEndpoint> {
+        self.direct_advert.as_ref().and_then(advertised)
     }
 }
 
@@ -298,6 +323,13 @@ impl FileRemoteStore {
     pub fn new() -> Self {
         FileRemoteStore {
             path: remote_state_path(),
+        }
+    }
+
+    /// A store at an explicit path (the caller already resolved it).
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        FileRemoteStore {
+            path: Some(path.into()),
         }
     }
 }
@@ -403,6 +435,30 @@ impl RemoteHandle {
         )
     }
 
+    /// Start with an explicit [`RemoteStore`] and the direct-link wiring in
+    /// [`ClientOptions`] (spec §5.10). With `ClientOptions::default()` this is
+    /// exactly [`start_with_store`](Self::start_with_store).
+    pub fn start_with_options(
+        cfg: RemoteConfig,
+        identity: DeviceIdentity,
+        store: Box<dyn RemoteStore>,
+        inbound_tx: Sender<RemoteInbound>,
+        outbound_rx: Receiver<RemoteOutbound>,
+        options: ClientOptions,
+    ) -> RemoteHandle {
+        Self::start_tuned(
+            cfg,
+            identity,
+            store,
+            inbound_tx,
+            outbound_rx,
+            ClientTuning {
+                options,
+                ..ClientTuning::default()
+            },
+        )
+    }
+
     /// Start with an explicit [`RemoteStore`] and [`ClientTuning`]. The tuning
     /// lets tests drive liveness/stability logic with short durations and force
     /// write failures; production uses [`start_with_store`](Self::start_with_store).
@@ -434,10 +490,21 @@ impl RemoteHandle {
         // drops its sender (shutdown) or when the session task has gone away and
         // the forward fails, so it holds nothing open past the app's lifetime.
         let (async_out_tx, async_out_rx) = unbounded_channel::<RemoteOutbound>();
+        // The direct link's router (if any) takes a direct-mode pairing's
+        // traffic here, before the relay session ever sees it — so it flows even
+        // while the relay is unreachable, and can never leak to the relay.
+        let router = tuning.options.router.clone();
         let forwarder = std::thread::Builder::new()
             .name("flightdeck-remote-outbound".to_string())
             .spawn(move || {
                 while let Ok(msg) = outbound_rx.recv() {
+                    let msg = match &router {
+                        Some(r) => match r.route(msg) {
+                            Some(m) => m,
+                            None => continue,
+                        },
+                        None => msg,
+                    };
                     if async_out_tx.send(msg).is_err() {
                         break;
                     }
@@ -1072,7 +1139,12 @@ async fn run_session(
             queued = outbound_rx.recv(), if offer_window => {
                 match queued {
                     Some(RemoteOutbound::RequestPairing { claim_token_hint }) => {
-                        let offer = build_pairing_offer(identity, claim_token_hint);
+                        let offer = build_pairing_offer(
+                            identity,
+                            claim_token_hint,
+                            state,
+                            tuning.options.direct_endpoint(),
+                        );
                         if send_frame(&mut sink, &offer).await.is_err() {
                             report_handshake_failure(
                                 inbound_tx,
@@ -1326,7 +1398,8 @@ async fn send_auth_response(
 /// the phone sanitizes it before display.
 ///
 /// Blocking (it may spawn a subprocess), so callers run it on the blocking pool.
-fn machine_name() -> Option<String> {
+/// Also announced by the direct link ([`crate::remote::direct`]).
+pub(crate) fn machine_name() -> Option<String> {
     fn clean(raw: &str) -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1361,15 +1434,27 @@ fn machine_name() -> Option<String> {
 /// so both public keys are the same X9.63 point — one less key to manage. The
 /// relay honors a free 4-digit `claim_token_hint`. Shared by the pre-auth
 /// bootstrap in [`run_session`] and the post-auth [`handle_outbound`] path.
-fn build_pairing_offer(identity: &DeviceIdentity, claim_token_hint: Option<String>) -> RelayFrame {
+///
+/// `direct_endpoint` is the direct link's advertised address when it is serving
+/// (spec §5.10): the offer then carries it, the relay copies it to the phone, and
+/// the pairing it mints is direct mode on both ends. The relay does not echo the
+/// endpoint back, so whether this offer carried one is noted on `state` for
+/// [`persist_pairing_offer`] to stamp onto the minted pairing.
+fn build_pairing_offer(
+    identity: &DeviceIdentity,
+    claim_token_hint: Option<String>,
+    state: &mut RemoteState,
+    direct_endpoint: Option<DirectEndpoint>,
+) -> RelayFrame {
     let public_key = identity.public_key_base64();
+    state.pending_direct_offer = direct_endpoint.is_some();
     RelayFrame::PairingOffer {
         device_id: DeviceId::new(identity.device_id()),
         device_public_key: public_key.clone(),
         key_agreement_public_key: public_key,
         role: Role::Desktop,
         claim_token_hint,
-        direct_endpoint: None,
+        direct_endpoint,
     }
 }
 
@@ -1392,8 +1477,15 @@ fn persist_pairing_offer(
             .pairings
             .push(crate::remote::Pairing::new(key.clone()));
     }
+    let direct = std::mem::take(&mut state.pending_direct_offer);
     if let Some(p) = state.pairing_mut(&key) {
         p.claim_token = Some(claim_token.clone());
+        // Provisional until the claim: a claim without the phone's identity
+        // key came through a pre-v4 relay that never forwarded the endpoint,
+        // and reverts the pairing to relay mode (see `PairingClaimed`).
+        if direct {
+            p.transport = crate::remote::PairingTransport::Direct;
+        }
     }
     store.save(state);
     inbound_tx.send(RemoteInbound::PairingOffered {
@@ -1413,6 +1505,12 @@ async fn on_authenticated(
 ) {
     report(inbound_tx, RemoteLinkState::Connected { latency_ms: 0 });
     for pid in pairing_ids {
+        // A direct-mode pairing has no data plane on the relay (spec §5.10):
+        // no resume (a push-only relay would refuse it), and no `Paired` — the
+        // direct link announces the pairing itself, independent of the relay.
+        if state.is_direct(pid.as_str()) {
+            continue;
+        }
         let from_seq = state
             .pairing(pid.as_str())
             .map(|p| p.last_received_seq)
@@ -1682,6 +1780,15 @@ async fn handle_outbound(
             ciphertext,
         } => {
             let key = pairing_id.as_str().to_string();
+            // A direct-mode pairing's envelopes never go via the relay (spec
+            // §5.10). The direct link's router takes them before they get here;
+            // this is the backstop should one arrive anyway.
+            if state.is_direct(&key) {
+                crate::remote::debuglog::log(&format!(
+                    "client DROP envelope for direct pairing={key} seq={seq}"
+                ));
+                return Sent::Ok;
+            }
             // Ensure the pairing exists to persist the outbound high-water mark.
             if state.pairing(&key).is_none() {
                 state
@@ -1744,6 +1851,8 @@ async fn handle_outbound(
             gate.mark_dirty();
             Sent::Ok
         }
+        // No relay data plane for a direct pairing (spec §5.10).
+        RemoteOutbound::Ack { pairing_id, .. } if state.is_direct(pairing_id.as_str()) => Sent::Ok,
         RemoteOutbound::Ack { pairing_id, cursor } => {
             if send_frame(sink, &RelayFrame::Ack { pairing_id, cursor })
                 .await
@@ -1758,7 +1867,12 @@ async fn handle_outbound(
             // Desktop-initiated pairing bootstrap (spec §5.2). For a returning
             // desktop this rides the post-auth pump; a fresh desktop offers
             // pre-auth instead (see [`run_session`]). Same offer either way.
-            let offer = build_pairing_offer(identity, claim_token_hint);
+            let offer = build_pairing_offer(
+                identity,
+                claim_token_hint,
+                state,
+                tuning.options.direct_endpoint(),
+            );
             if send_frame(sink, &offer).await.is_ok() {
                 Sent::Ok
             } else {
@@ -1823,6 +1937,18 @@ async fn handle_frame(
     frame: RelayFrame,
 ) -> bool {
     match frame {
+        // A direct-mode pairing's data plane is the direct link (spec §5.10).
+        // Whatever the relay says about its envelopes, acks, or the phone's
+        // presence on the relay is not about the link that carries it — the
+        // phone stays connected to the relay for pushes and revoke even while
+        // it is away from the direct link, and vice versa.
+        RelayFrame::Envelope(ref env) if state.is_direct(env.pairing_id.as_str()) => true,
+        RelayFrame::Ack { ref pairing_id, .. }
+        | RelayFrame::PeerPresence { ref pairing_id, .. }
+            if state.is_direct(pairing_id.as_str()) =>
+        {
+            true
+        }
         RelayFrame::Envelope(env) => {
             let key = env.pairing_id.as_str().to_string();
             crate::remote::debuglog::log(&format!(
@@ -1949,6 +2075,7 @@ async fn handle_frame(
             pairing_id,
             peer_device_id,
             peer_key_agreement_public_key,
+            peer_device_public_key,
             ..
         } => {
             // The phone joined: record the peer id + its key-agreement key and
@@ -1961,6 +2088,22 @@ async fn handle_frame(
                 if let Some(ka) = &peer_key_agreement_public_key {
                     p.peer_key_agreement_public_key = Some(ka.clone());
                     p.established = true;
+                }
+                // The phone's identity key (v4) — what the direct link verifies
+                // the phone against (spec §5.10). A v4 relay sends it on every
+                // claim. Its absence means a pre-v4 relay, which also never
+                // copied our `direct_endpoint` to the phone: the phone will use
+                // the relay, so this pairing must too.
+                match peer_device_public_key {
+                    Some(key) => p.peer_device_public_key = Some(key),
+                    None if p.is_direct() => {
+                        crate::remote::debuglog::log(&format!(
+                            "client CLAIM pairing={} without the phone's key (pre-v4 relay) — relay mode",
+                            pairing_id.as_str()
+                        ));
+                        p.transport = crate::remote::PairingTransport::Relay;
+                    }
+                    None => {}
                 }
                 store.save(state);
                 gate.mark_clean();

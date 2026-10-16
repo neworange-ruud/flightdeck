@@ -493,6 +493,32 @@ pub struct RemoteConfig {
     /// replaces the per-device pairing auth or the end-to-end crypto.
     #[serde(default)]
     pub relay_password: String,
+    /// Serve the phone protocol **directly** over Tailscale (spec §5.10,
+    /// remote-control-inlb). Off by default. When on (and `enabled` is on), the
+    /// desktop listens on its Tailscale interface address(es) only — never
+    /// `0.0.0.0` — and new pairings advertise that address, so the phone talks to
+    /// this Mac directly for the whole data plane; the relay is then used only
+    /// for pairing bootstrap, push-token registration, revoke and push. Pairings
+    /// made while this is off stay on the relay (re-pair to switch).
+    #[serde(default)]
+    pub direct_enabled: bool,
+    /// TCP port of the direct-link listener. Each direct pairing stores
+    /// `host:port` on the phone, so it must stay stable; `0` is rejected at load.
+    #[serde(default = "default_direct_port")]
+    pub direct_port: u16,
+    /// Host name advertised to the phone for the direct link. Empty (the
+    /// default) means this Mac's Tailscale MagicDNS name, or else its Tailscale
+    /// `100.x` address. Set it only when the phone must dial a different name.
+    #[serde(default)]
+    pub direct_host: String,
+}
+
+/// Default TCP port for the FlightDeck Remote **direct link** (spec §5.10): the
+/// WebSocket a direct-mode phone dials over Tailscale.
+pub const DEFAULT_DIRECT_PORT: u16 = 47800;
+
+fn default_direct_port() -> u16 {
+    DEFAULT_DIRECT_PORT
 }
 
 impl Default for RemoteConfig {
@@ -501,6 +527,9 @@ impl Default for RemoteConfig {
             enabled: false,
             relay_url: default_relay_url(),
             relay_password: String::new(),
+            direct_enabled: false,
+            direct_port: default_direct_port(),
+            direct_host: String::new(),
         }
     }
 }

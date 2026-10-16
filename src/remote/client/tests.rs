@@ -1306,6 +1306,7 @@ fn half_open_socket_is_torn_down_by_liveness_deadline() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     // A persisted pairing makes conn #1 auth-first (no pre-auth offer wait).
     let mut seed = RemoteState::default();
@@ -1405,6 +1406,7 @@ fn failed_envelope_write_is_held_and_resent_without_a_seq_gap() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -1473,6 +1475,7 @@ fn version_incompatible_is_terminal_and_stops_reconnecting() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
@@ -2454,4 +2457,270 @@ fn a_queue_overflow_advisory_is_surfaced_as_a_peer_backlog() {
     drop(out_tx);
     handle.stop();
     let _ = mock.join();
+}
+
+// --- Direct link (REMOTE_PROTOCOL §5.10, remote-control-inlb) ---------------
+
+/// Drive a fresh desktop through a pairing whose offer carries the direct
+/// endpoint, then a `pairing_claimed` with (`with_key`) or without the phone's
+/// identity key, then the relay-side data-plane frames a direct pairing must
+/// ignore. Returns the persisted state, what reached the app, and every frame
+/// the client sent after authenticating.
+fn direct_offer_drill(with_key: bool) -> (RemoteState, Vec<RemoteInbound>, Vec<RelayFrame>) {
+    use flightdeck_remote_protocol::{DeviceId, DirectEndpoint, PresenceState};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let phone = DeviceIdentity::generate();
+    let phone_key = phone.public_key_base64();
+    let endpoint = DirectEndpoint {
+        host: "ruuds-mbp.tail1234.ts.net".to_string(),
+        port: 47800,
+    };
+    let expected = endpoint.clone();
+
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(matches!(ws_recv(&mut ws), Some(RelayFrame::Hello { .. })));
+        ws_send(
+            &mut ws,
+            &RelayFrame::HelloOk {
+                protocol_version: 4,
+                server_time_ms: 0,
+                connection_id: "conn".to_string(),
+                relay_mode: None,
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthChallenge {
+                nonce: STANDARD.encode([3u8; 32]),
+                server_time_ms: 0,
+            },
+        );
+        match ws_recv(&mut ws) {
+            Some(RelayFrame::PairingOffer {
+                direct_endpoint, ..
+            }) => assert_eq!(
+                direct_endpoint,
+                Some(expected),
+                "the offer advertises the direct link's endpoint"
+            ),
+            other => panic!("expected a pairing_offer, got {other:?}"),
+        }
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingOfferOk {
+                pairing_id: PairingId::new("pair_d"),
+                claim_token: "4321".to_string(),
+                expires_at_ms: 9_999,
+            },
+        );
+        assert!(matches!(
+            ws_recv(&mut ws),
+            Some(RelayFrame::AuthResponse { .. })
+        ));
+        ws_send(
+            &mut ws,
+            &RelayFrame::AuthOk {
+                pairing_ids: vec![PairingId::new("pair_d")],
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::PairingClaimed {
+                pairing_id: PairingId::new("pair_d"),
+                peer_device_id: Some(DeviceId::new(phone.device_id())),
+                peer_key_agreement_public_key: Some(phone_key.clone()),
+                direct_endpoint: None,
+                peer_device_public_key: with_key.then_some(phone_key),
+            },
+        );
+        // Relay-side data-plane frames for the pairing.
+        ws_send(
+            &mut ws,
+            &RelayFrame::PeerPresence {
+                pairing_id: PairingId::new("pair_d"),
+                peer: Role::Phone,
+                state: PresenceState::Connected,
+                at_ms: 0,
+            },
+        );
+        ws_send(
+            &mut ws,
+            &RelayFrame::Envelope(EncryptedEnvelope {
+                pairing_id: PairingId::new("pair_d"),
+                seq: 1,
+                sender: Role::Phone,
+                sent_at_ms: 0,
+                nonce: "bg==".to_string(),
+                ciphertext: "Yw==".to_string(),
+            }),
+        );
+        // Collect whatever the client sends for a moment (resume, acks).
+        let mut sent = Vec::new();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        while let Some(frame) = ws_recv(&mut ws) {
+            sent.push(frame);
+        }
+        sent
+    });
+
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let shared = std::sync::Arc::new(Mutex::new(RemoteState::default()));
+    let store = Box::new(SharedStore(shared.clone()));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    out_tx
+        .send(RemoteOutbound::RequestPairing {
+            claim_token_hint: Some("4321".to_string()),
+        })
+        .unwrap();
+    let options = ClientOptions {
+        direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
+        router: None,
+    };
+    let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
+
+    let mut inbound = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match in_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(msg) => {
+                let claimed = matches!(msg, RemoteInbound::PairingClaimed { .. });
+                inbound.push(msg);
+                if claimed {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    let sent = mock.join().unwrap();
+    // Drain whatever the trailing relay frames produced.
+    inbound.extend(in_rx.try_iter());
+    handle.stop();
+    let state = shared.lock().unwrap().clone();
+    (state, inbound, sent)
+}
+
+#[test]
+fn a_direct_offer_whose_claim_carries_the_phone_key_makes_a_direct_pairing() {
+    let (state, inbound, sent) = direct_offer_drill(true);
+    let p = state.pairing("pair_d").expect("persisted");
+    assert!(p.is_direct(), "the pairing is direct mode");
+    assert!(p.established);
+    assert!(
+        p.peer_device_public_key.is_some(),
+        "the phone's identity key is kept"
+    );
+    // The relay is not this pairing's data plane: no resume, no ack for the
+    // stray envelope, and neither its presence nor its envelope reach the app.
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, RelayFrame::Resume { .. } | RelayFrame::Ack { .. })),
+        "client sent relay data-plane frames for a direct pairing: {sent:?}"
+    );
+    assert!(!inbound.iter().any(|m| matches!(
+        m,
+        RemoteInbound::Presence { .. } | RemoteInbound::Envelope(_) | RemoteInbound::Paired { .. }
+    )));
+    assert!(inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::PairingClaimed { .. })));
+}
+
+#[test]
+fn a_claim_through_a_pre_v4_relay_falls_back_to_relay_mode() {
+    let (state, inbound, sent) = direct_offer_drill(false);
+    let p = state.pairing("pair_d").expect("persisted");
+    assert!(
+        !p.is_direct(),
+        "no phone key = the relay never forwarded the endpoint; the phone uses the relay"
+    );
+    assert_eq!(p.peer_device_public_key, None);
+    // Now an ordinary relay pairing: its envelope is delivered and acked.
+    assert!(inbound
+        .iter()
+        .any(|m| matches!(m, RemoteInbound::Envelope(_))));
+    assert!(sent.iter().any(|f| matches!(f, RelayFrame::Ack { .. })));
+}
+
+/// The backstop: even without a router, the client never puts a direct
+/// pairing's envelope on the relay.
+#[test]
+fn the_client_never_sends_a_direct_pairings_envelope_to_the_relay() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = DeviceIdentity::generate();
+    let pubkey = identity.public_key_x963().to_vec();
+    let mock = std::thread::spawn(move || -> Vec<RelayFrame> {
+        let stream = accept_within(&listener).expect("client should connect");
+        let mut ws = tungstenite::accept(stream).unwrap();
+        assert!(mock_authenticate(&mut ws, &pubkey, &["pair_d", "pair_r"]));
+        let mut sent = Vec::new();
+        ws.get_mut()
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        while let Some(frame) = ws_recv(&mut ws) {
+            sent.push(frame);
+        }
+        sent
+    });
+    let cfg = RemoteConfig {
+        enabled: true,
+        relay_url: format!("ws://{addr}/ws"),
+        ..RemoteConfig::default()
+    };
+    let mut seed = RemoteState::default();
+    let mut direct = Pairing::new("pair_d");
+    direct.transport = crate::remote::PairingTransport::Direct;
+    seed.pairings.push(direct);
+    seed.pairings.push(Pairing::new("pair_r"));
+    let store = Box::new(MemStore(Mutex::new(seed)));
+    let (in_tx, in_rx) = channel();
+    let (out_tx, out_rx) = channel();
+    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    wait_for_connected(&in_rx);
+    for pid in ["pair_d", "pair_r"] {
+        out_tx
+            .send(RemoteOutbound::SendEnvelope {
+                pairing_id: PairingId::new(pid),
+                seq: 1,
+                sent_at_ms: 0,
+                nonce: "bg==".to_string(),
+                ciphertext: "Yw==".to_string(),
+            })
+            .unwrap();
+    }
+    let sent = mock.join().unwrap();
+    handle.stop();
+    let envelopes: Vec<&str> = sent
+        .iter()
+        .filter_map(|f| match f {
+            RelayFrame::Envelope(e) => Some(e.pairing_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        envelopes,
+        vec!["pair_r"],
+        "only the relay-mode pairing's envelope"
+    );
+    assert!(
+        !sent.iter().any(|f| matches!(
+            f,
+            RelayFrame::Resume { pairing_id, .. } if pairing_id.as_str() == "pair_d"
+        )),
+        "no resume for a direct pairing: {sent:?}"
+    );
 }
