@@ -493,7 +493,29 @@ pub struct RemoteConfig {
     /// replaces the per-device pairing auth or the end-to-end crypto.
     #[serde(default)]
     pub relay_password: String,
+    /// How long, in seconds, an agent must stay settled idle after a turn before
+    /// the desktop decides to push a **done** notification to the phone
+    /// (remote-control-fglt). Going back to work inside the window cancels it,
+    /// so a mid-turn working→idle→working flicker never notifies; the next
+    /// settle restarts the window. `0` pushes done the moment the agent settles.
+    /// Needs-input and error pushes are never delayed. Validated at load
+    /// ([`crate::config::schema::validate`]): at most
+    /// [`MAX_PUSH_DONE_DEBOUNCE_SECS`].
+    #[serde(default = "default_push_done_debounce_secs")]
+    pub push_done_debounce_secs: u64,
 }
+
+/// Default for [`RemoteConfig::push_done_debounce_secs`]: long enough to ride
+/// out an agent's mid-turn idle flickers, short enough that "done" still feels
+/// immediate on the phone.
+fn default_push_done_debounce_secs() -> u64 {
+    5
+}
+
+/// Upper bound accepted for [`RemoteConfig::push_done_debounce_secs`]. An hour
+/// is already far past any useful delay; a larger value is almost certainly a
+/// milliseconds-for-seconds typo that would silently swallow every done push.
+pub const MAX_PUSH_DONE_DEBOUNCE_SECS: u64 = 3_600;
 
 impl Default for RemoteConfig {
     fn default() -> Self {
@@ -501,6 +523,7 @@ impl Default for RemoteConfig {
             enabled: false,
             relay_url: default_relay_url(),
             relay_password: String::new(),
+            push_done_debounce_secs: default_push_done_debounce_secs(),
         }
     }
 }

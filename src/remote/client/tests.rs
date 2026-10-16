@@ -1302,6 +1302,7 @@ fn half_open_socket_is_torn_down_by_liveness_deadline() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     // A persisted pairing makes conn #1 auth-first (no pre-auth offer wait).
     let mut seed = RemoteState::default();
@@ -1401,6 +1402,7 @@ fn failed_envelope_write_is_held_and_resent_without_a_seq_gap() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let mut seed = RemoteState::default();
     seed.pairings.push(Pairing::new("pair_test"));
@@ -1469,6 +1471,7 @@ fn version_incompatible_is_terminal_and_stops_reconnecting() {
         enabled: true,
         relay_url: format!("ws://{addr}/ws"),
         relay_password: String::new(),
+        ..RemoteConfig::default()
     };
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, in_rx) = channel();
