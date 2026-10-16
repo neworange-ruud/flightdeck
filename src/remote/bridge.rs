@@ -684,9 +684,17 @@ impl RemoteBridge {
             // The relay no longer knows our pairing; the client dropped it and
             // will re-offer. Forget it here too and revert to the passthrough
             // sealer so we stop sealing to a dead channel (remote-control-1jy).
-            RemoteInbound::PairingRejected { .. } => {
-                self.pairing = None;
-                self.reset_to_passthrough();
+            // Only the rejected pairings are forgotten: a direct-mode pairing the
+            // client kept (spec §5.10) must go on being fed.
+            RemoteInbound::PairingRejected { pairing_ids } => {
+                if self
+                    .pairing
+                    .as_ref()
+                    .is_none_or(|p| pairing_ids.contains(p))
+                {
+                    self.pairing = None;
+                    self.reset_to_passthrough();
+                }
             }
             // The phone unpaired this Mac (spec §10.2). If it was the pairing we
             // were feeding, forget it and revert to the passthrough sealer so we

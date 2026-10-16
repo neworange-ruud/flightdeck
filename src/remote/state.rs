@@ -152,14 +152,6 @@ pub struct RemoteState {
     /// Known pairings, in no particular order.
     #[serde(default)]
     pub pairings: Vec<Pairing>,
-    /// In-memory only: whether the `pairing_offer` most recently sent on the
-    /// relay carried a `direct_endpoint`. The relay does not echo the endpoint in
-    /// `pairing_offer_ok`, so the client notes it when it sends the offer and
-    /// stamps the minted pairing [`PairingTransport::Direct`] when the
-    /// `pairing_offer_ok` lands. Never persisted: an offer does not outlive the
-    /// process (its claim token is short-lived anyway).
-    #[serde(skip)]
-    pub pending_direct_offer: bool,
 }
 
 impl Default for RemoteState {
@@ -169,7 +161,6 @@ impl Default for RemoteState {
             device_private_key: String::new(),
             relay_url: None,
             pairings: Vec::new(),
-            pending_direct_offer: false,
         }
     }
 }
@@ -273,7 +264,6 @@ mod tests {
                 peer_device_public_key: Some("BPhoneIdKey".to_string()),
                 transport: PairingTransport::Direct,
             }],
-            pending_direct_offer: false,
         };
         save_remote_state(&fs, path, &state).expect("save");
         let loaded = load_remote_state(&fs, path).expect("load");
@@ -343,23 +333,19 @@ mod tests {
         assert!(!loaded.is_direct("pair_old"));
     }
 
-    /// The transport is persisted in snake_case, and the in-memory offer flag
-    /// never reaches disk.
+    /// The transport is persisted in snake_case.
     #[test]
-    fn transport_is_persisted_and_the_offer_flag_is_not() {
+    fn transport_is_persisted() {
         let fs = FakeFs::new();
         let path = Path::new("/home/user/.flightdeck/remote.json");
         let mut state = RemoteState::default();
         let mut p = Pairing::new("pair_d");
         p.transport = PairingTransport::Direct;
         state.pairings.push(p);
-        state.pending_direct_offer = true;
         save_remote_state(&fs, path, &state).expect("save");
         let raw = fs.file_contents(path).expect("written");
         assert!(raw.contains(r#""transport": "direct""#), "{raw}");
-        assert!(!raw.contains("pending_direct_offer"), "{raw}");
         let loaded = load_remote_state(&fs, path).expect("load");
         assert!(loaded.is_direct("pair_d"));
-        assert!(!loaded.pending_direct_offer);
     }
 }
