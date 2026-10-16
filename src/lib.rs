@@ -2884,10 +2884,10 @@ struct RemoteSetup {
     /// An already-paired pairing to bring live immediately, if any.
     established: Option<EstablishedPairing>,
     /// The direct link (REMOTE_PROTOCOL §5.10), when `direct_enabled` or a
-    /// direct-mode pairing exists. Held for its lifetime only: dropping it stops
+    /// direct-mode pairing exists; also read for the remote status. Dropping it stops
     /// the listener and writes the outboxes. Declared before `_owner` so that
     /// happens while this process still owns the remote state.
-    _direct: Option<crate::remote::direct::DirectLink>,
+    direct: Option<crate::remote::direct::DirectLink>,
     /// Routes the pushes the bridge decides to the relay (remote-control-fglt).
     push: crate::remote::push::PushSender,
     /// Held for as long as this process is the machine's relay client (see
@@ -3039,7 +3039,7 @@ fn start_remote_at(
         identity_scalar,
         relay_url,
         established,
-        _direct: direct,
+        direct,
         push,
         _owner: owner,
     }))

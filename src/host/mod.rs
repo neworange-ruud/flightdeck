@@ -1796,6 +1796,17 @@ impl<'a> AppHost<'a> {
             web_running: handle.is_some(),
             web_viewers: handle.map_or(0, |h| h.viewer_count()),
             phone_paired: self.ui.remote_paired,
+            phone_transport: self
+                .remote_bridge
+                .as_ref()
+                .and_then(RemoteBridge::active_is_direct)
+                .map(|direct| if direct { "direct" } else { "relay" }),
+            direct_listening: self
+                .remote_setup
+                .as_ref()
+                .and_then(|s| s.direct.as_ref())
+                .and_then(|d| d.endpoint())
+                .map(|e| format!("{}:{}", e.host, e.port)),
             input_holder: self.ui.input_holder.clone(),
         }
     }

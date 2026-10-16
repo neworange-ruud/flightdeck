@@ -737,6 +737,14 @@ impl RemoteBridge {
         self.pairing.is_some()
     }
 
+    /// Whether the active pairing's data plane is the direct link
+    /// ([`RemoteInbound::DirectTransport`]); `None` with no active pairing.
+    pub fn active_is_direct(&self) -> Option<bool> {
+        self.pairing
+            .as_ref()
+            .map(|p| self.direct_pairings.contains(p))
+    }
+
     /// Whether the attached phone is still earning its presence — see
     /// [`PeerLiveness`], which also records who reads this (today: the tests,
     /// and nothing on screen). `Dark` means the relay link is up but the phone
