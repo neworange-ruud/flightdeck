@@ -48,6 +48,9 @@ targets:
           - "Info.plist"
           - "FlightDeckRemote.entitlements"
           - "FlightDeckRemote-Release.entitlements"
+      # Code compiled into both the app and the Notification Service Extension
+      # (crypto, pairing-record read, settings, notification rewrite).
+      - path: Shared
     info:
       path: FlightDeckRemote/Info.plist
       properties:
@@ -81,6 +84,10 @@ targets:
         # custom domain (remote-control-edn) fronting the Azure Container Apps
         # relay, so it survives any rename/recreate of the Azure resources.
         FlightDeckRelayURL: "wss://relay.flightdeckai.app/ws"
+        # The fully-qualified Keychain group shared with the Notification Service
+        # Extension (SharedContainer.keychainAccessGroup). Resolved here because
+        # the team prefix is only known at build time.
+        FlightDeckSharedKeychainGroup: "$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared"
         UILaunchScreen: {}
         UIUserInterfaceStyle: Dark
         # Wake the app on a silent APNs push to reconnect + resume queued events

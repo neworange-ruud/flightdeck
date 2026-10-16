@@ -44,7 +44,7 @@ enum DeviceIdentityError: Error, Equatable {
 /// `publicKeyBase64` are stable until `destroy()` (unpair) is called.
 struct DeviceIdentity {
     /// Keychain service shared by all identity items.
-    static let service = "agency.neworange.flightdeck.remote"
+    static let service = SharedContainer.keychainService
     /// Keychain account under which the private-key blob is stored.
     static let keyAccount = "device-identity-key"
 
