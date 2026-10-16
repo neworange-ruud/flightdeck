@@ -21,7 +21,18 @@ later tasks. See `src/router.rs`'s doc comment for the seam they plug into.
 | `GET /healthz` | Liveness — is the process up at all. |
 | `GET /readyz` | Readiness — should traffic be routed here. |
 | `GET /version` | Crate version + git SHA of the running build. |
-| `GET /ws` | WebSocket upgrade. Today: accepts, answers pings, closes cleanly. No routing. |
+| `GET /ws` | WebSocket upgrade: the relay protocol (`specs/REMOTE_PROTOCOL.md` §5–§6), including the desktop's `push_notify`. |
+| `POST /v1/push` | HTTPS twin of `push_notify` for a desktop without a live WebSocket (spec §5.5.3): a signed `PushRequest`; `202` on accept, JSON `PushErrorBody` otherwise. |
+
+### Pushes
+
+The relay sends a push only when a **desktop asks for one** (`push_notify` on the
+WebSocket, or `POST /v1/push`): one visible APNs alert with generic per-class
+text and the E2E-sealed payload in `fd_push`, which the phone's Notification
+Service Extension decrypts. Queued envelopes never trigger a push. Both paths
+share `src/push.rs` (membership, limits, per-desktop rate limit, token lookup);
+`src/apns.rs` builds and sends the request. One log line per push attempt
+records the pairing, event id, class and outcome — never content or tokens.
 
 ## Configuration
 
@@ -33,6 +44,7 @@ Entirely via environment variables (see `src/config.rs`):
 | `LOG_FORMAT` | unset (pretty) | `json` for structured logs; anything else (or unset) for human-readable. |
 | `RUST_LOG` | `info` | Standard `tracing_subscriber` filter syntax, e.g. `RUST_LOG=info,flightdeck_relay=debug`. |
 | `GIT_SHA` | `unknown` | Surfaced on `/version`; set by the deploy environment (see `deploy/containerapp.yaml`). |
+| `PUSH_RATE_LIMIT_PER_MINUTE` | `60` | Accepted pushes per desktop per minute (WebSocket + HTTPS together); over it → `rate_limited` / 429. |
 
 The process shuts down gracefully on SIGTERM (what Container Apps sends on
 scale-down/redeploy) or Ctrl-C, draining in-flight requests/connections

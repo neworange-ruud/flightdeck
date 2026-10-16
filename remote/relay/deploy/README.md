@@ -98,7 +98,9 @@ allowlist is incompatible with a roaming phone (a 5G/carrier egress IP is dynami
 and cannot be allowlisted; that broke "control your Mac from anywhere"). Instead,
 the relay reads `FLIGHTDECK_RELAY_PASSWORD` from its environment and rejects any
 WebSocket `hello` whose `relay_password` is missing or wrong, comparing in
-constant time. A relay with **no** password configured stays open (local/dev).
+constant time. The HTTPS push endpoint `POST /v1/push` enforces the same password
+via the `x-flightdeck-relay-password` header (401 when missing or wrong). A relay
+with **no** password configured stays open (local/dev).
 
 - Set the secret via CI: add a `FLIGHTDECK_RELAY_PASSWORD` secret to the repo's
   `production` environment. `relay-deploy.yml` stores it as a Container App secret
@@ -123,15 +125,18 @@ constant time. A relay with **no** password configured stays open (local/dev).
 
 ## Push notifications (APNs)
 
-Waking an offline phone needs **two** things, and getting either wrong disables
-push *silently* — the relay keeps routing and queueing, so nothing looks broken
-until someone notices their phone is never woken. That is exactly how the relay
+Since protocol v4 the relay sends exactly one **visible, encrypted alert** per
+`push_notify` (WebSocket) or `POST /v1/push` (HTTPS) the desktop sends — never a
+push of its own, and never one per queued envelope (spec §5.5). Delivering those
+alerts needs **two** things, and getting either wrong disables push *silently* —
+the relay keeps routing and accepting push requests, so nothing looks broken
+until someone notices their phone never alerts. That is exactly how the relay
 ran without APNs from 1.10.0 to 1.12.0.
 
 1. **The image must be built with `--features apns-live`.** The feature is off by
    default so the crate builds and unit-tests without Apple credentials; without
    it the push sender is compiled out and replaced by a no-op
-   (`lib.rs::push_sender`). `remote/relay/Dockerfile` passes it on both `cargo
+   (`lib.rs::default_push_service`). `remote/relay/Dockerfile` passes it on both `cargo
    build` invocations.
 2. **All four config variables must be present.** `ApnsConfig::from_env` returns
    `None` — push disabled — unless it has `APNS_TEAM_ID`, `APNS_KEY_ID`,
@@ -158,13 +163,17 @@ good, whereas `403 InvalidProviderToken` means they are not:
 ```bash
 curl -s --http2 -H "authorization: bearer $JWT" \
   -H "apns-topic: agency.neworange.flightdeck.remote" \
-  -H "apns-push-type: background" -d '{"aps":{"content-available":1}}' \
+  -H "apns-push-type: alert" -d '{"aps":{"alert":{"title":"FlightDeck","body":"test"}}}' \
   "https://api.push.apple.com/3/device/$(printf '0%.0s' {1..64})"
 ```
 
-Once live, `az containerapp logs show -g <rg> -n <app>` surfaces the APNs
-response, so a token registered against the wrong environment shows up as
-`BadDeviceToken` rather than silence.
+Once live, `az containerapp logs show -g <rg> -n <app>` shows one `push` line per
+attempt with `pairing`, `event`, `class` and `outcome` (`sent`,
+`apns_not_configured`, `transient_failed_after_retries`, `permanent_token_purged`,
+`jwt_failed`; a pairing with no registered token logs `no_token` at debug). A
+token registered against the wrong environment therefore shows up as
+`permanent_token_purged` (APNs `BadDeviceToken`) rather than silence. Push content
+and device tokens are never logged.
 
 ## How deploys happen
 
