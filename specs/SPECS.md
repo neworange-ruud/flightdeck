@@ -442,6 +442,35 @@ Like `[remote]`, this section is off by default and behaves bit-for-bit as
 before (no listener opened) until `enabled` is set or the palette starts it
 explicitly.
 
+### `[remote]` section — FlightDeck Remote (`specs/REMOTE_PROTOCOL.md`)
+
+The phone link is configured by an optional `[remote]` table, layered like
+every other section:
+
+```toml
+[remote]
+enabled = false
+relay_url = "wss://relay.flightdeckai.app/ws"
+relay_password = ""            # FLIGHTDECK_RELAY_PASSWORD overrides it
+push_done_debounce_secs = 5
+```
+
+- **`enabled`**, **`relay_url`**, **`relay_password`**: the master switch, the
+  relay to connect to, and the shared relay password, documented in the
+  generated global config.
+- **`push_done_debounce_secs`** (integer, default `5`): how long an agent must
+  stay settled idle after a turn before the desktop decides to push a **done**
+  notification to the paired phone. The desktop decides every push itself and
+  only ever pushes three things: *needs input* (a question or permission
+  prompt) and *error*, both immediately and once per active→settled edge, and
+  *done*, after this window. Going back to work inside the window cancels the
+  done, and the next settle restarts the window, so mid-turn pauses never
+  notify; moving from idle to needs input or error inside the window pushes
+  that instead. `0` pushes done the moment the agent settles. A value above
+  `3600` is rejected at load (SPECS §26) as a likely milliseconds-for-seconds
+  typo. A project may override it. Editable in the configuration manager as
+  "Phone done-push delay (seconds)".
+
 ---
 
 ## 9. Runtime State

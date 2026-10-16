@@ -204,6 +204,21 @@ axum = { version = "0.8", default-features = false, features = [
 # src/web/interfaces.rs.
 if-addrs = "0.13"
 
+# --- HTTPS push fallback (src/remote/push.rs, spec §5.5.3) -------------------
+# One small JSON POST to the relay's `/v1/push` when no authenticated relay
+# WebSocket is up. No new crates: `hyper` (and `hyper-util`, `http-body-util`)
+# are already in the graph as axum's server stack; this only turns on hyper's
+# HTTP/1 *client* half, so the desktop speaks HTTP with the same implementation
+# that serves the web interface rather than hand-rolling request parsing. TLS
+# reuses exactly the per-OS backend the relay WebSocket already uses (rustls +
+# webpki roots off Windows, SChannel via native-tls on Windows; see the two
+# target tables below), so `wss://` and the derived `https://` endpoint trust
+# the same roots. reqwest was rejected: it is only in the graph through the
+# optional updater, off Windows, and would bring a second TLS configuration.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
 # Deps built on every platform EXCEPT Windows: the self-updater, rustls (the
 # relay client's TLS backend off Windows) and rusqlite. Target-gating them here
 # (rather than only behind a feature) keeps the Windows build pure-Rust even when
@@ -237,6 +252,11 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # off-Windows dependency graph is unchanged; it is also why this table, and not
 # the shared one, is where rustls may appear at all.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws-lc-rs"] }
+# The HTTPS push fallback's TLS (src/remote/push.rs): the same tokio-rustls and
+# webpki root set tokio-tungstenite pulls in for `wss://` above, named directly
+# so the push POST trusts exactly what the relay WebSocket trusts.
+tokio-rustls = { version = "0.26", default-features = false }
+webpki-roots = "0.26"
 # OpenCode moved its conversation store from per-message JSON files to a single
 # live SQLite DB (`~/.local/share/opencode/opencode.db`, WAL mode). Rebuilding an
 # OpenCode agent's remote chat means reading that DB (remote-control-fyj), and
@@ -258,6 +278,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # no-connector path is unambiguous and `MaybeTlsStream` has exactly one TLS arm.
 [target.'cfg(windows)'.dependencies]
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+# The HTTPS push fallback's TLS on Windows (src/remote/push.rs): the same
+# SChannel-backed tokio-native-tls tokio-tungstenite uses for `wss://` here.
+tokio-native-tls = "0.3"
 
 # POSIX-only: shutdown-signal handling (run teardown on SIGTERM/SIGINT) and the
 # raw kill(2)/killpg used for graceful, process-group agent termination.

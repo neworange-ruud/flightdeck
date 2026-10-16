@@ -43,6 +43,7 @@ pub mod identity;
 pub mod notifier;
 pub mod opencode;
 pub mod pairing;
+pub mod push;
 pub mod runtime;
 pub mod shell;
 pub mod state;
@@ -54,6 +55,7 @@ pub use identity::DeviceIdentity;
 pub use state::{Pairing, RemoteState};
 
 use flightdeck_remote_protocol::relay::{EncryptedEnvelope, PresenceState};
+use flightdeck_remote_protocol::PushNotifyBody;
 use flightdeck_remote_protocol::{DeviceId, PairingId, Role};
 
 /// A message from the relay-client thread to the app (drained each tick).
@@ -266,4 +268,11 @@ pub enum RemoteOutbound {
         /// The pairing to forget.
         pairing_id: PairingId,
     },
+    /// Ask the relay to push the phone (spec §5.5.1): send a `push_notify`
+    /// frame on the live session. Queued by [`push::PushSender`] only while
+    /// [`push::PushLink`] reports an authenticated session at a version that
+    /// carries the frame; the client re-checks the negotiated version before
+    /// writing, holds a push whose write failed for the next session, and drops
+    /// (with a log line) one a reconnect landed on an older relay.
+    PushNotify(PushNotifyBody),
 }
