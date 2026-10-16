@@ -529,30 +529,14 @@ fn sessions_are_debounced_independently() {
 // --- push intent + truncation (contract C1) --------------------------------
 
 #[test]
-fn truncate_leaves_fitting_strings_alone() {
-    assert_eq!(truncate_utf8("", 10), "");
-    assert_eq!(truncate_utf8("hello", 10), "hello");
-    let exact = "x".repeat(120);
-    assert_eq!(truncate_utf8(&exact, 120), exact, "exactly at the limit");
-}
-
-#[test]
-fn truncate_ascii_appends_an_ellipsis_within_the_limit() {
-    let long = "a".repeat(500);
-    let out = truncate_utf8(&long, 120);
-    assert_eq!(out.len(), 120);
-    assert!(out.ends_with('…'));
-    assert_eq!(out.trim_end_matches('…'), "a".repeat(117));
-}
-
-#[test]
-fn truncate_cuts_multibyte_text_on_a_char_boundary() {
+fn push_truncation_cuts_multibyte_text_on_a_char_boundary() {
+    // The protocol's truncate_push_text, as the desktop uses it for push fields.
     // 2-byte (é), 3-byte (日), 4-byte (🚀) characters, and a mix that puts the
     // cut point mid-character for every width.
     for unit in ["é", "日", "🚀", "aé日🚀"] {
         let long = unit.repeat(1_000); // ≥ 2000 bytes: over every limit below
         for max in [120, 1000, 121, 122, 123, 999] {
-            let out = truncate_utf8(&long, max);
+            let out = truncate_push_text(&long, max);
             assert!(out.len() <= max, "{unit:?} max {max}: {} bytes", out.len());
             assert!(out.ends_with('…'), "{unit:?} max {max}");
             // The prefix is an intact prefix of the input: no split character.
@@ -566,13 +550,6 @@ fn truncate_cuts_multibyte_text_on_a_char_boundary() {
             );
         }
     }
-}
-
-#[test]
-fn truncate_with_a_limit_below_the_ellipsis_just_cuts() {
-    assert_eq!(truncate_utf8("日本", 2), "");
-    assert_eq!(truncate_utf8("abcdef", 2), "ab");
-    assert_eq!(truncate_utf8("abcdef", 3), "…");
 }
 
 fn push_ctx(name: &str, preview: Option<&str>, files_changed: u32) -> EventContext {
@@ -640,9 +617,9 @@ fn push_intent_truncates_title_and_body_to_the_contract_limits() {
         push_ctx(&name, Some(&preview), 0),
         None,
     );
-    assert!(intent.title.len() <= PUSH_TITLE_MAX_BYTES);
+    assert!(intent.title.len() <= MAX_PUSH_TITLE_BYTES);
     assert!(intent.title.ends_with('…'));
-    assert!(intent.body.len() <= PUSH_BODY_MAX_BYTES);
+    assert!(intent.body.len() <= MAX_PUSH_BODY_BYTES);
     assert!(intent.body.ends_with('…'));
     assert!(preview.starts_with(intent.body.strip_suffix('…').unwrap()));
 }

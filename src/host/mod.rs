@@ -47,7 +47,7 @@ use crate::persistence::workspace::{
     WORKSPACE_VERSION,
 };
 use crate::remote::commands::{CommandLedger, PendingFirstTask};
-use crate::remote::pairing::{build_channel, PairingSession};
+use crate::remote::pairing::{build_e2e_channel, channel_seal_open, PairingSession};
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::{
     answer_prompt, apply_host_event, apply_update_notice, build_web_host_state,
@@ -440,7 +440,7 @@ impl<'a> AppHost<'a> {
         // nothing and returns `None`, so every tee/tick below is a cheap no-op.
         if let Some((remote_in_tx, remote_out_rx)) = self.remote_wiring.take() {
             self.remote_setup = match start_remote(env, workspace, remote_in_tx, remote_out_rx) {
-                RemoteStart::Started(setup) => Some(setup),
+                RemoteStart::Started(setup) => Some(*setup),
                 RemoteStart::HeldElsewhere => {
                     self.ui.remote_held_elsewhere = true;
                     None
@@ -469,13 +469,15 @@ impl<'a> AppHost<'a> {
                 (self.remote_bridge.as_mut(), self.remote_setup.as_ref())
             {
                 if let Some(est) = &setup.established {
-                    if let Ok((seal, open)) = build_channel(
+                    if let Ok(channel) = build_e2e_channel(
                         &setup.identity_scalar,
                         &est.peer_ka_b64,
                         est.pairing_id.as_str(),
                         &est.claim_token,
                     ) {
+                        let (seal, open) = channel_seal_open(&channel);
                         b.install_channel(seal, open, est.last_sent_seq);
+                        b.install_push_channel(channel);
                     }
                 }
             }
@@ -787,8 +789,11 @@ impl<'a> AppHost<'a> {
                             ) {
                                 // The instant a phone joins: derive the real
                                 // channel and swap it in for the passthrough.
-                                if let Ok((_pid, seal, open)) = ps.derive_channel(identity_scalar) {
+                                if let Ok((_pid, channel)) = ps.derive_e2e_channel(identity_scalar)
+                                {
+                                    let (seal, open) = channel_seal_open(&channel);
                                     b.install_channel(seal, open, 0);
+                                    b.install_push_channel(channel);
                                 }
                             }
                         }
@@ -849,17 +854,17 @@ impl<'a> AppHost<'a> {
                     let _ = remote_out_tx.send(out);
                 });
             }
-            // Pushes the bridge decided this tick (remote-control-fglt). The
-            // sealed `push_notify` sender is not wired yet, so they are logged
-            // (routing metadata only, never content) and dropped; draining every
-            // tick keeps the queue from holding stale pushes.
-            for intent in b.take_push_intents() {
-                crate::remote::debuglog::log(&format!(
-                    "push decided class={:?} event={} session={}",
-                    intent.class,
-                    intent.event_id.as_str(),
-                    intent.deep_link.session_id.as_str()
-                ));
+            // Pushes the bridge decided this tick (remote-control-fglt), sealed
+            // for the pairing: over the relay socket when it can carry them,
+            // otherwise a signed HTTPS POST on the shared runtime. Never blocks.
+            let pushes = b.take_push_notifies();
+            if let Some(setup) = self.remote_setup.as_ref() {
+                let now_unix_ms = (env.clock.now_unix_secs() as i64).saturating_mul(1_000);
+                for push in pushes {
+                    setup.push.dispatch(push, now_unix_ms, &mut |out| {
+                        let _ = remote_out_tx.send(out);
+                    });
+                }
             }
             // Inbound phone commands queued by the bridge: idempotency-check,
             // translate, execute on this (main) thread through the existing

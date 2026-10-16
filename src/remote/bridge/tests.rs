@@ -1,9 +1,9 @@
 use super::*;
 use crate::contracts::{Config, InterpretedStatus, ProjectState as CoreProjectState, TabState};
 use crate::contracts::{PtySize, STATE_VERSION};
-use crate::remote::notifier::PushClass;
 use crate::testing::FakePty;
 use crate::tui::render::GitStatusCache;
+use flightdeck_remote_protocol::PushClass;
 
 use flightdeck_remote_protocol::relay::EncryptedEnvelope;
 use flightdeck_remote_protocol::{
@@ -1937,7 +1937,7 @@ fn startup_grace_suppresses_pushes_like_feed_events() {
 #[test]
 fn pushes_are_decided_without_a_phone_attached_or_a_relay_link() {
     // The whole point of a push: the phone is away. Paired, no presence, and
-    // the relay link down (phase 2 falls back to HTTPS).
+    // the relay link down (the sender falls back to HTTPS).
     let mut b = RemoteBridge::passthrough(0);
     b.handle_inbound(RemoteInbound::Paired {
         pairing_id: PairingId::new("pair-1"),
@@ -2029,4 +2029,190 @@ fn queued_push_intents_are_bounded_oldest_first() {
         (1_001 + (MAX_QUEUED_PUSH_INTENTS as u64 + 9) * 2) as i64,
         "the newest is kept"
     );
+}
+
+// --- needs-input preview hold ----------------------------------------------
+
+/// A Claude session whose last prose is `prose`, working at t=1000, then
+/// waiting (with no question ingested yet) at t=2000.
+fn claude_waiting_without_a_question(prose: &str) -> (tempfile::TempDir, RemoteBridge, AppState) {
+    let home = tempfile::tempdir().unwrap();
+    let line = format!(
+        r#"{{"type":"assistant","uuid":"a1","message":{{"content":[{{"type":"text","text":"{prose}"}}]}}}}"#
+    );
+    seed_claude_session(home.path(), "/repo/worktrees/fix-login", &[line.as_str()]);
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::WaitingForInput);
+    (home, b, app)
+}
+
+#[test]
+fn a_needs_input_push_waits_for_the_permission_preview_to_settle() {
+    let (_home, mut b, app) = claude_waiting_without_a_question("May I run the installer script?");
+    let msgs = tick_app(&mut b, &app, 2_000);
+    let ev = feed_event(&msgs)
+        .expect("the feed event is immediate")
+        .clone();
+    assert!(
+        b.take_push_intents().is_empty(),
+        "held: the preview is still being settled"
+    );
+    tick_app(&mut b, &app, 2_000 + super::PROMPT_SETTLE_MS - 1);
+    assert!(b.take_push_intents().is_empty(), "still inside the window");
+    tick_app(&mut b, &app, 2_000 + super::PROMPT_SETTLE_MS);
+    let pushes = b.take_push_intents();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert_eq!(pushes[0].class, PushClass::NeedsInput);
+    assert_eq!(pushes[0].event_id, ev.event_id, "same id as the feed event");
+    assert!(
+        pushes[0].body.contains("installer script"),
+        "released with the settled preview: {:?}",
+        pushes[0].body
+    );
+    tick_app(&mut b, &app, 30_000);
+    assert!(b.take_push_intents().is_empty(), "exactly once");
+}
+
+#[test]
+fn a_held_needs_input_push_is_released_as_soon_as_the_question_lands() {
+    let (home, mut b, app) = claude_waiting_without_a_question("Working on it.");
+    tick_app(&mut b, &app, 2_000);
+    assert!(b.take_push_intents().is_empty());
+    append_claude_line(
+        home.path(),
+        "/repo/worktrees/fix-login",
+        r#"{"type":"assistant","uuid":"aq1","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Pizza or sushi?","header":"Lunch","multiSelect":false,"options":[{"label":"Pizza"},{"label":"Sushi"}]}]}}]}}"#,
+    );
+    tick_app(&mut b, &app, 2_100);
+    let pushes = b.take_push_intents();
+    assert_eq!(
+        pushes.len(),
+        1,
+        "released before the window ends: {pushes:?}"
+    );
+    assert!(
+        pushes[0].body.contains("Pizza or sushi?"),
+        "carries the question: {:?}",
+        pushes[0].body
+    );
+}
+
+#[test]
+fn a_needs_input_answered_before_its_preview_settles_never_pushes() {
+    let (_home, mut b, mut app) = claude_waiting_without_a_question("May I run it?");
+    tick_app(&mut b, &app, 2_000);
+    // Answered at the desk inside the window.
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 2_300);
+    tick_app(&mut b, &app, 2_000 + super::PROMPT_SETTLE_MS + 100);
+    assert!(b.take_push_intents().is_empty());
+}
+
+// --- sealing for the pairing ------------------------------------------------
+
+/// A desktop/phone channel pair for `pairing`, as both ends derive it.
+fn channel_pair(pairing: &str) -> (Arc<E2eChannel>, E2eChannel) {
+    let desktop = crate::remote::DeviceIdentity::generate();
+    let phone = crate::remote::DeviceIdentity::generate();
+    let d = E2eChannel::derive(
+        &desktop.private_key_bytes(),
+        phone.public_key_x963(),
+        pairing,
+        b"4729",
+        Role::Desktop,
+    )
+    .unwrap();
+    let p = E2eChannel::derive(
+        &phone.private_key_bytes(),
+        desktop.public_key_x963(),
+        pairing,
+        b"4729",
+        Role::Phone,
+    )
+    .unwrap();
+    (Arc::new(d), p)
+}
+
+#[test]
+fn decided_pushes_are_sealed_for_the_active_pairing_and_open_on_the_phone() {
+    let mut b = paired_bridge();
+    let (desktop, phone) = channel_pair("pair-1");
+    b.install_push_channel(desktop);
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Failed);
+    let msgs = tick_app(&mut b, &app, 2_000);
+    let ev = feed_event(&msgs).expect("error event").clone();
+    let bodies = b.take_push_notifies();
+    assert_eq!(bodies.len(), 1);
+    let body = &bodies[0];
+    assert_eq!(body.pairing_id.as_str(), "pair-1");
+    assert_eq!(body.event_id, ev.event_id, "the feed event's id");
+    assert_eq!(body.class, PushClass::Error);
+    let plain = phone
+        .open_push(&body.event_id, &body.nonce, &body.ciphertext)
+        .expect("the phone opens it");
+    let payload: flightdeck_remote_protocol::PushPayload = serde_json::from_slice(&plain).unwrap();
+    assert_eq!(payload.title, "fix-login hit an error");
+    assert_eq!(payload.class, PushClass::Error);
+    assert_eq!(payload.deep_link.session_id.as_str(), "t1");
+    assert_eq!(payload.project_name.as_deref(), Some("proj"));
+    assert!(b.take_push_notifies().is_empty(), "drained");
+}
+
+#[test]
+fn pushes_without_a_channel_for_the_active_pairing_are_dropped() {
+    for channel in [None, Some(channel_pair("some-other-pairing").0)] {
+        let mut b = paired_bridge();
+        if let Some(c) = channel {
+            b.install_push_channel(c);
+        }
+        let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+        set_status(&mut app, 0, InterpretedStatus::Working);
+        tick_app(&mut b, &app, 1_000);
+        set_status(&mut app, 0, InterpretedStatus::Failed);
+        tick_app(&mut b, &app, 2_000);
+        assert!(b.take_push_notifies().is_empty());
+        assert!(b.take_push_intents().is_empty(), "consumed, not kept");
+    }
+}
+
+#[test]
+fn nothing_is_sealed_or_sent_without_a_pairing() {
+    let mut b = RemoteBridge::passthrough(0);
+    b.install_push_channel(channel_pair("pair-1").0);
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+    for (now, s) in [
+        (1_000, InterpretedStatus::Working),
+        (2_000, InterpretedStatus::WaitingForInput),
+        (3_000, InterpretedStatus::Working),
+        (4_000, InterpretedStatus::Idle),
+        (30_000, InterpretedStatus::Idle),
+    ] {
+        set_status(&mut app, 0, s);
+        assert!(tick_app(&mut b, &app, now).is_empty(), "no envelopes");
+        assert!(b.take_push_notifies().is_empty(), "no pushes at {now}");
+    }
+}
+
+#[test]
+fn unpairing_forgets_the_push_channel() {
+    let mut b = paired_bridge();
+    b.install_push_channel(channel_pair("pair-1").0);
+    b.reset_to_passthrough();
+    b.handle_inbound(RemoteInbound::Paired {
+        pairing_id: PairingId::new("pair-1"),
+        peer_device_id: None,
+    });
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "codex")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    tick_app(&mut b, &app, 1_000);
+    set_status(&mut app, 0, InterpretedStatus::Failed);
+    tick_app(&mut b, &app, 2_000);
+    assert!(b.take_push_notifies().is_empty());
 }

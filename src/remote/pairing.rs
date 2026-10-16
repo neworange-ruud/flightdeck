@@ -273,6 +273,17 @@ impl PairingSession {
         &self,
         identity_private_scalar: &[u8],
     ) -> Result<(PairingId, SealFn, OpenFn)> {
+        let (pairing_id, channel) = self.derive_e2e_channel(identity_private_scalar)?;
+        let (seal, open) = channel_seal_open(&channel);
+        Ok((pairing_id, seal, open))
+    }
+
+    /// [`Self::derive_channel`], returning the shared [`E2eChannel`] itself so
+    /// the caller can install it for both envelopes and pushes.
+    pub fn derive_e2e_channel(
+        &self,
+        identity_private_scalar: &[u8],
+    ) -> Result<(PairingId, Arc<E2eChannel>)> {
         let PairingPhase::Established { pairing_id } = &self.phase else {
             return Err(FlightDeckError::State(
                 "pairing not established; cannot derive channel".to_string(),
@@ -284,13 +295,13 @@ impl PairingSession {
         let claim_token = self.claim_token.as_ref().ok_or_else(|| {
             FlightDeckError::State("pairing has no claim token for the salt".to_string())
         })?;
-        let (seal, open) = build_channel(
+        let channel = build_e2e_channel(
             identity_private_scalar,
             peer_ka_b64,
             pairing_id.as_str(),
             claim_token,
         )?;
-        Ok((pairing_id.clone(), seal, open))
+        Ok((pairing_id.clone(), channel))
     }
 }
 
@@ -304,6 +315,25 @@ pub fn build_channel(
     pairing_id: &str,
     claim_token: &str,
 ) -> Result<(SealFn, OpenFn)> {
+    let channel = build_e2e_channel(
+        identity_private_scalar,
+        peer_ka_b64,
+        pairing_id,
+        claim_token,
+    )?;
+    Ok(channel_seal_open(&channel))
+}
+
+/// Derive the desktop's [`E2eChannel`] for a pairing from the raw inputs (see
+/// [`build_channel`]). Shared, so the host can hand the same channel to the
+/// bridge's envelope sealer ([`channel_seal_open`]) and its push sealer
+/// ([`crate::remote::RemoteBridge::install_push_channel`]).
+pub fn build_e2e_channel(
+    identity_private_scalar: &[u8],
+    peer_ka_b64: &str,
+    pairing_id: &str,
+    claim_token: &str,
+) -> Result<Arc<E2eChannel>> {
     let peer_ka = STANDARD
         .decode(peer_ka_b64)
         .map_err(|e| FlightDeckError::State(format!("peer KA key not base64: {e}")))?;
@@ -314,7 +344,12 @@ pub fn build_channel(
         claim_token.as_bytes(),
         Role::Desktop,
     )?;
-    let channel = Arc::new(channel);
+    Ok(Arc::new(channel))
+}
+
+/// The bridge's envelope `(seal, open)` pair over a shared channel.
+pub fn channel_seal_open(channel: &Arc<E2eChannel>) -> (SealFn, OpenFn) {
+    let channel = Arc::clone(channel);
     let seal_channel = Arc::clone(&channel);
     let seal: SealFn =
         Box::new(move |plain, seq, sent_at_ms| seal_channel.seal(plain, seq, sent_at_ms).ok());
@@ -323,7 +358,7 @@ pub fn build_channel(
             .open(seq, sender, sent_at_ms, nonce, ciphertext)
             .ok()
     });
-    Ok((seal, open))
+    (seal, open)
 }
 
 /// The JSON body of the QR payload (spec §5.2). Field order is fixed so the

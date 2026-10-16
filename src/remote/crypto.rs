@@ -148,6 +148,11 @@ impl E2eChannel {
         })
     }
 
+    /// The pairing this channel was derived for (bound into every AAD).
+    pub fn pairing_id(&self) -> &str {
+        &self.pairing_id
+    }
+
     /// Seal an outgoing plaintext payload. Uses this endpoint's send key (chosen by
     /// [`Role`]) and a fresh random nonce. Returns `(nonce_b64, ciphertext_b64)`
     /// ready to drop into an

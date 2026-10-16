@@ -23,7 +23,11 @@
 //!   **error** (failed) and **done** (settled idle/completed). No other status,
 //!   transcript item, activity or envelope ever produces a push.
 //! * Needs-input and error push **immediately**, once per active→settled edge
-//!   (the arming model above).
+//!   (the arming model above). The one exception is in the bridge: a Claude
+//!   needs-input whose question preview is still being settled is held up to
+//!   `PROMPT_SETTLE_MS` so the push carries the question, not an empty body.
+//! * Sealing and transport live in [`crate::remote::push`]; the bridge seals
+//!   each decided [`PushIntent`] for the active pairing.
 //! * Done is **debounced**: it pushes only once the agent has stayed settled
 //!   idle for the configured window (`[remote].push_done_debounce_secs`,
 //!   default 5 s). A return to an active status inside the window cancels it,
@@ -66,7 +70,12 @@ use std::collections::HashMap;
 
 use crate::contracts::{InterpretedStatus, Notification, Notifier};
 
-use flightdeck_remote_protocol::{AgentEvent, DeepLink, EventId, EventKind, SessionId};
+use flightdeck_remote_protocol::e2e::{
+    truncate_push_text, MAX_PUSH_BODY_BYTES, MAX_PUSH_TITLE_BYTES,
+};
+use flightdeck_remote_protocol::{
+    AgentEvent, DeepLink, EventId, EventKind, PushClass, PushPayload, SessionId,
+};
 
 // ---------------------------------------------------------------------------
 // Notifier decorator
@@ -266,48 +275,21 @@ pub fn new_event_id() -> EventId {
 // Push decision (remote-control-fglt); see the module docs
 // ---------------------------------------------------------------------------
 
-/// Maximum push title length in UTF-8 bytes, ellipsis included (contract C1).
-pub const PUSH_TITLE_MAX_BYTES: usize = 120;
-
-/// Maximum push body length in UTF-8 bytes, ellipsis included (contract C1).
-pub const PUSH_BODY_MAX_BYTES: usize = 1000;
-
-/// The ellipsis appended to a truncated push field.
-const ELLIPSIS: &str = "…";
-
-/// The only things that ever push to the phone.
-///
-/// Desktop-side for now; the wire `PushClass` (snake_case `needs_input` |
-/// `error` | `done`) lives in the protocol crate once the `push_notify` frame
-/// lands, and maps one-to-one onto this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PushClass {
-    /// The agent stopped and needs the human (a question or a permission
-    /// prompt). Pushed immediately.
-    NeedsInput,
-    /// The agent errored out. Pushed immediately.
-    Error,
-    /// The agent finished and stayed idle for the debounce window.
-    Done,
+/// The push class a settled class produces.
+fn push_class_of(class: EventClass) -> PushClass {
+    match class {
+        EventClass::Finished => PushClass::Done,
+        EventClass::NeedsInput => PushClass::NeedsInput,
+        EventClass::Error => PushClass::Error,
+    }
 }
 
-impl PushClass {
-    /// The push class for a settled class.
-    fn of(class: EventClass) -> PushClass {
-        match class {
-            EventClass::Finished => PushClass::Done,
-            EventClass::NeedsInput => PushClass::NeedsInput,
-            EventClass::Error => PushClass::Error,
-        }
-    }
-
-    /// The feed class whose title/body conventions this push reuses.
-    fn event_class(self) -> EventClass {
-        match self {
-            PushClass::Done => EventClass::Finished,
-            PushClass::NeedsInput => EventClass::NeedsInput,
-            PushClass::Error => EventClass::Error,
-        }
+/// The feed class whose title/body conventions a push reuses.
+fn feed_class_of(class: PushClass) -> EventClass {
+    match class {
+        PushClass::Done => EventClass::Finished,
+        PushClass::NeedsInput => EventClass::NeedsInput,
+        PushClass::Error => EventClass::Error,
     }
 }
 
@@ -381,7 +363,7 @@ impl PushDecider {
                 EventClass::NeedsInput | EventClass::Error => {
                     self.pending.remove(session);
                     return Some(PushFire {
-                        class: PushClass::of(edge.class),
+                        class: push_class_of(edge.class),
                         event_id: Some(edge.event_id),
                         occurred_at_ms: now_ms,
                     });
@@ -419,7 +401,7 @@ impl PushDecider {
             // idle settle disarmed), so without a pending done this is a quiet
             // agent changing state and stays silent.
             Phase::Settled(class) => self.pending.remove(session).map(|_| PushFire {
-                class: PushClass::of(class),
+                class: push_class_of(class),
                 event_id: None,
                 occurred_at_ms: now_ms,
             }),
@@ -445,19 +427,19 @@ impl PushDecider {
     }
 }
 
-/// A decided push, ready for the phase-2 sender to seal into a `PushPayload`
-/// (contract C1) and hand to the relay as `push_notify`. Title and body are
-/// already truncated to the contract's byte limits.
+/// A decided push, ready to seal into a [`PushPayload`] (spec §7.2,
+/// [`Self::to_payload`]) and send to the relay as `push_notify`. Title and body
+/// are already truncated to the protocol's byte limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushIntent {
     /// What kind of push this is (the frame's only plaintext hint).
     pub class: PushClass,
     /// Unique id: AEAD associated data and APNs collapse id.
     pub event_id: EventId,
-    /// e.g. "fd-api needs input"; at most [`PUSH_TITLE_MAX_BYTES`].
+    /// e.g. "fd-api needs input"; at most [`MAX_PUSH_TITLE_BYTES`].
     pub title: String,
     /// The pending question, the error detail, or what the turn left behind;
-    /// may be empty; at most [`PUSH_BODY_MAX_BYTES`].
+    /// may be empty; at most [`MAX_PUSH_BODY_BYTES`].
     pub body: String,
     /// Where a tap lands (project + session identity).
     pub deep_link: DeepLink,
@@ -474,7 +456,7 @@ pub fn build_push_intent(
     ctx: EventContext,
     project_name: Option<String>,
 ) -> PushIntent {
-    let title = event_title(class.event_class(), &ctx.session_name);
+    let title = event_title(feed_class_of(class), &ctx.session_name);
     let body = match class {
         PushClass::NeedsInput => ctx.preview.unwrap_or_default(),
         PushClass::Error => ctx
@@ -485,11 +467,27 @@ pub fn build_push_intent(
     PushIntent {
         class,
         event_id: ctx.event_id,
-        title: truncate_utf8(&title, PUSH_TITLE_MAX_BYTES),
-        body: truncate_utf8(&body, PUSH_BODY_MAX_BYTES),
+        title: truncate_push_text(&title, MAX_PUSH_TITLE_BYTES),
+        body: truncate_push_text(&body, MAX_PUSH_BODY_BYTES),
         deep_link: ctx.deep_link,
         project_name,
         occurred_at_ms: ctx.occurred_at_ms,
+    }
+}
+
+impl PushIntent {
+    /// The sealed plaintext for this push (spec §7.2): the intent's fields
+    /// verbatim. Title and body are already within their byte limits.
+    pub fn to_payload(&self) -> PushPayload {
+        PushPayload {
+            event_id: self.event_id.clone(),
+            class: self.class,
+            title: self.title.clone(),
+            body: self.body.clone(),
+            deep_link: self.deep_link.clone(),
+            project_name: self.project_name.clone(),
+            occurred_at_ms: self.occurred_at_ms,
+        }
     }
 }
 
@@ -501,25 +499,6 @@ fn done_body(files_changed: u32, ready_to_push: bool) -> String {
         (1, _) => "1 file changed".to_string(),
         (n, _) => format!("{n} files changed"),
     }
-}
-
-/// Truncate `s` to at most `max_bytes` UTF-8 bytes. A string that fits is
-/// returned unchanged; otherwise it is cut on a char boundary and "…" is
-/// appended, the ellipsis counting toward the limit (contract C1). A limit too
-/// small to hold the ellipsis just cuts.
-pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let (budget, suffix) = match max_bytes.checked_sub(ELLIPSIS.len()) {
-        Some(budget) => (budget, ELLIPSIS),
-        None => (max_bytes, ""),
-    };
-    let mut end = budget;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &s[..end])
 }
 
 #[cfg(test)]
