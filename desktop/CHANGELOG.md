@@ -14,14 +14,25 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.7.0] - 2026-10-17
+
+### New features
+
 - **Reliable, private phone notifications.** Your Mac now decides when your phone gets a push and sends it as a visible alert whose text only the iPhone can read: the payload is end-to-end encrypted and the iOS app decrypts it. Notifications arrive even when the app was force-quit. There are three kinds: an agent needs input or permission, hit an error, or is done. A done alert waits until the agent has stayed idle for `[remote] push_done_debounce_secs` (default 5), so a pause mid-turn does not notify. The silent wake-up pushes and the push per queued message are gone. When the relay connection might be stale, or a push could not go out on it promptly, the Mac sends that push over HTTPS instead of letting it arrive late.
 - **Direct link over Tailscale (opt-in).** Set `[remote] direct_enabled = true` and the iPhone can talk to your Mac directly over Tailscale instead of through the relay. `direct_port` (default 47800) and `direct_host` control where it listens and what address the phone is given. The Mac keeps an outbox, so nothing is lost while the phone is away. A pairing made with the direct link on uses it automatically; it needs the updated iPhone app, so re-pair phones you paired before. The remote-access status shows each phone as "paired · direct" or "paired · relay" and the address the Mac listens on. The Mac listens only on the addresses Tailscale itself reports, so a carrier-NAT `100.x` address on a tethered connection is never used. If the relay ever loses its record of your Mac, the direct link keeps working and FlightDeck tells you to re-pair the phone to get notifications back, instead of reconnecting in a loop.
 - **Push-only relay mode.** Relay operators can run with `RELAY_MODE=push_only` for a relay that only delivers notifications, for use with the direct link. The relay also accepts pushes from the Mac on `POST /v1/push` and logs the outcome of each one. A push-only relay will not pair a phone whose app is too old for the direct link (or a Mac without it); both sides are told why. On the Mac, Pair Phone says whether the direct link is off or just not listening yet (check Tailscale).
 - **Upgrade order: relay first, then desktops, then the iPhone app.** The new relay stops sending the old silent wake-up pushes, so a desktop that has not been updated gets no notifications through it; an old relay cannot accept the new pushes; and the new iPhone app no longer reacts to wake-up pushes, so update it last.
 
-### Improvements
-
-- None yet.
 
 ### Bug fixes
 
