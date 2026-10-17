@@ -15,22 +15,37 @@ use crate::ids::SessionId;
 /// (a list of `PromptQuestion`, each with its own options + `multi_select`) and
 /// `PermissionDecision.answers` (a per-question `QuestionAnswer` list). Both are
 /// `#[serde(default)]` and the flat single-question fields keep mirroring the
-/// first question, so this needs no version bump — a peer that ignores the new
-/// fields sees exactly the single-question prompt it did before.
+/// first question, so this needed no version bump of its own
+/// (remote-control-ssw).
 ///
-/// **Deliberately kept at v3 (remote-control-ssw).** Now that both desktop and
-/// iOS produce and consume the multi-question fields, we reviewed whether to bump
-/// to v4. Decision: no. The fields are `#[serde(default)]` and wire-compatible in
-/// both directions, so a v3↔v3 exchange is fully correct and a mixed-build peer
-/// degrades cleanly to the single-question view. Bumping would signal a
-/// capability the wire format does not actually gate on, and would force a
-/// lockstep update of the relay's `max_supported` compatibility assertion for no
-/// interop benefit. Revisit only if a future field is *not* backward-compatible.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// **v4 (epic remote-control-rjrz): desktop-decided encrypted push, the direct
+/// link, and relay modes.** v4 adds a frame an older relay cannot parse —
+/// [`crate::relay::RelayFrame::PushNotify`] — which is exactly the
+/// non-backward-compatible case the v3 note above reserved a bump for. A
+/// desktop sends `push_notify` only on a connection negotiated at
+/// [`PUSH_NOTIFY_MIN_VERSION`] or above (an older relay still drives its own
+/// per-envelope wake pushes). Every other v4 addition is an optional,
+/// `skip_serializing_if = "Option::is_none"` field
+/// (`hello_ok.relay_mode`, `pairing_offer.direct_endpoint`,
+/// `pairing_claimed.direct_endpoint`, `pairing_claimed.peer_device_public_key`),
+/// so v1–v3 JSON still parses and [`MIN_SUPPORTED_VERSION`] stays 1.
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Oldest protocol version this build can still interoperate with.
 pub const MIN_SUPPORTED_VERSION: u16 = 1;
 /// Newest protocol version this build can interoperate with.
-pub const MAX_SUPPORTED_VERSION: u16 = 3;
+pub const MAX_SUPPORTED_VERSION: u16 = 4;
+/// The first negotiated version at which the relay understands
+/// [`crate::relay::RelayFrame::PushNotify`]. A desktop whose relay connection
+/// negotiated below this must not send `push_notify` (the relay would answer
+/// `error { code: bad_frame }`); such a relay still sends its own legacy wake
+/// pushes.
+pub const PUSH_NOTIFY_MIN_VERSION: u16 = 4;
+/// The first negotiated version at which a **phone** can use the direct link
+/// (spec §5.2, §5.10). The relay hands a claiming phone the offer's
+/// `direct_endpoint` — and echoes it to the desktop, which is what puts the
+/// pairing in direct mode — only when the phone's connection negotiated at least
+/// this; an older phone would ignore the endpoint and keep using the relay.
+pub const DIRECT_LINK_MIN_VERSION: u16 = 4;
 
 /// The two roles that connect to the relay for a given pairing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +55,44 @@ pub enum Role {
     Desktop,
     /// The FlightDeck Remote iOS app.
     Phone,
+}
+
+/// The kind of agent event a push notification announces (spec §5.5, §7.2).
+///
+/// It is the **only** plaintext hint a push carries past the relay: the relay
+/// uses it to pick the APNs interruption level and the generic fallback alert
+/// text, and it is repeated inside the sealed [`crate::e2e::PushPayload`].
+/// Shared by [`crate::relay::PushNotifyBody`] and the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushClass {
+    /// An agent stopped to ask the human (permission prompt or question).
+    /// Wire value: `needs_input`.
+    NeedsInput,
+    /// An agent hit an error. Wire value: `error`.
+    Error,
+    /// An agent settled idle after its turn (desktop-side debounce). Wire
+    /// value: `done`.
+    Done,
+}
+
+impl PushClass {
+    /// The `snake_case` wire spelling — identical to the serde form. Used where
+    /// the class is embedded in a canonical string (the HTTPS push signing
+    /// message, spec §5.5) rather than serialized as JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PushClass::NeedsInput => "needs_input",
+            PushClass::Error => "error",
+            PushClass::Done => "done",
+        }
+    }
+}
+
+impl std::fmt::Display for PushClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Which agent CLI backs a session. Matches FlightDeck's supported agents.
@@ -170,7 +223,24 @@ pub struct GitStatusDetail {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentType;
+    use super::{AgentType, PushClass};
+
+    #[test]
+    fn push_class_as_str_matches_serde() {
+        for (class, wire) in [
+            (PushClass::NeedsInput, "needs_input"),
+            (PushClass::Error, "error"),
+            (PushClass::Done, "done"),
+        ] {
+            assert_eq!(class.as_str(), wire);
+            assert_eq!(class.to_string(), wire);
+            assert_eq!(serde_json::to_value(class).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<PushClass>(serde_json::json!(wire)).unwrap(),
+                class
+            );
+        }
+    }
 
     #[test]
     fn agent_type_wire_values_are_stable() {

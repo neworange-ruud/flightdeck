@@ -47,7 +47,7 @@ use crate::persistence::workspace::{
     WORKSPACE_VERSION,
 };
 use crate::remote::commands::{CommandLedger, PendingFirstTask};
-use crate::remote::pairing::{build_channel, PairingSession};
+use crate::remote::pairing::{build_e2e_channel, channel_seal_open, PairingSession};
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::{
     answer_prompt, apply_host_event, apply_update_notice, build_web_host_state,
@@ -440,7 +440,7 @@ impl<'a> AppHost<'a> {
         // nothing and returns `None`, so every tee/tick below is a cheap no-op.
         if let Some((remote_in_tx, remote_out_rx)) = self.remote_wiring.take() {
             self.remote_setup = match start_remote(env, workspace, remote_in_tx, remote_out_rx) {
-                RemoteStart::Started(setup) => Some(setup),
+                RemoteStart::Started(setup) => Some(*setup),
                 RemoteStart::HeldElsewhere => {
                     self.ui.remote_held_elsewhere = true;
                     None
@@ -468,14 +468,29 @@ impl<'a> AppHost<'a> {
             if let (Some(b), Some(setup)) =
                 (self.remote_bridge.as_mut(), self.remote_setup.as_ref())
             {
+                // Every established pairing's channel goes in the bridge's
+                // book, so its channel follows whichever pairing it feeds
+                // (the direct link and the relay each announce theirs).
+                for known in &setup.known_pairings {
+                    if let Ok(channel) = build_e2e_channel(
+                        &setup.identity_scalar,
+                        &known.peer_ka_b64,
+                        known.pairing_id.as_str(),
+                        &known.claim_token,
+                    ) {
+                        b.remember_channel(channel, known.last_sent_seq);
+                    }
+                }
                 if let Some(est) = &setup.established {
-                    if let Ok((seal, open)) = build_channel(
+                    if let Ok(channel) = build_e2e_channel(
                         &setup.identity_scalar,
                         &est.peer_ka_b64,
                         est.pairing_id.as_str(),
                         &est.claim_token,
                     ) {
+                        let (seal, open) = channel_seal_open(&channel);
                         b.install_channel(seal, open, est.last_sent_seq);
+                        b.install_push_channel(channel);
                     }
                 }
             }
@@ -787,8 +802,12 @@ impl<'a> AppHost<'a> {
                             ) {
                                 // The instant a phone joins: derive the real
                                 // channel and swap it in for the passthrough.
-                                if let Ok((_pid, seal, open)) = ps.derive_channel(identity_scalar) {
+                                if let Ok((_pid, channel)) = ps.derive_e2e_channel(identity_scalar)
+                                {
+                                    let (seal, open) = channel_seal_open(&channel);
                                     b.install_channel(seal, open, 0);
+                                    b.remember_channel(Arc::clone(&channel), 0);
+                                    b.install_push_channel(channel);
                                 }
                             }
                         }
@@ -804,6 +823,21 @@ impl<'a> AppHost<'a> {
                         if let Some(ps) = self.pairing_session.as_mut() {
                             ps.on_handshake_failed(reason, *retrying);
                         }
+                    }
+                    RemoteInbound::PairingRefused { reason } => {
+                        // A refusal no configuration change of relay URL or
+                        // password fixes: shown verbatim, no advice appended.
+                        if let Some(ps) = self.pairing_session.as_mut() {
+                            ps.on_refused(reason);
+                        } else {
+                            ui.message(reason);
+                        }
+                    }
+                    RemoteInbound::RelayForgotDevice { .. } => {
+                        // Direct pairings keep working; only their pushes are
+                        // gone until the phone re-pairs (which re-registers this
+                        // Mac). Said once, when the client gives up on the relay.
+                        ui.message(crate::remote::client::RELAY_FORGOT_DEVICE_MESSAGE);
                     }
                     RemoteInbound::PairingRejected { .. } => {
                         // The relay no longer recognizes our pairing; the client
@@ -848,6 +882,18 @@ impl<'a> AppHost<'a> {
                 b.tick(&views, now_ms, &mut |out| {
                     let _ = remote_out_tx.send(out);
                 });
+            }
+            // Pushes the bridge decided this tick (remote-control-fglt), sealed
+            // for the pairing: over the relay socket when it can carry them,
+            // otherwise a signed HTTPS POST on the shared runtime. Never blocks.
+            let pushes = b.take_push_notifies();
+            if let Some(setup) = self.remote_setup.as_ref() {
+                let now_unix_ms = (env.clock.now_unix_secs() as i64).saturating_mul(1_000);
+                for push in pushes {
+                    setup.push.dispatch(push, now_unix_ms, &mut |out| {
+                        let _ = remote_out_tx.send(out);
+                    });
+                }
             }
             // Inbound phone commands queued by the bridge: idempotency-check,
             // translate, execute on this (main) thread through the existing
@@ -1779,6 +1825,17 @@ impl<'a> AppHost<'a> {
             web_running: handle.is_some(),
             web_viewers: handle.map_or(0, |h| h.viewer_count()),
             phone_paired: self.ui.remote_paired,
+            phone_transport: self
+                .remote_bridge
+                .as_ref()
+                .and_then(RemoteBridge::active_is_direct)
+                .map(|direct| if direct { "direct" } else { "relay" }),
+            direct_listening: self
+                .remote_setup
+                .as_ref()
+                .and_then(|s| s.direct.as_ref())
+                .and_then(|d| d.endpoint())
+                .map(|e| format!("{}:{}", e.host, e.port)),
             input_holder: self.ui.input_holder.clone(),
         }
     }

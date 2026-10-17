@@ -43,7 +43,7 @@ import CryptoKit
     }
 
     private func verifySignature(_ frame: Wire.RelayFrame, identityPublicKeyB64: String, nonceB64: String) -> Bool {
-        guard case let .authResponse(_, signature, _) = frame,
+        guard case let .authResponse(_, signature, _, _) = frame,
               let pub = Data(base64Encoded: identityPublicKeyB64),
               let sig = Data(base64Encoded: signature),
               let nonce = Data(base64Encoded: nonceB64),
@@ -78,9 +78,13 @@ import CryptoKit
         let nonce = TransportFixtures.nonceB64()
         await handshake(channel, client: client, nonceB64: nonce)
 
-        // resume + request_snapshot were sent after auth_ok.
+        // resume + request_snapshot were sent after auth_ok. Wait for BOTH: the
+        // envelope follows the resume asynchronously, so on a slow runner
+        // waiting for the resume alone races the request_snapshot.
         _ = await waitUntil {
-            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+            let frames = await channel.sentFrames()
+            return frames.contains { if case .resume = $0 { return true }; return false }
+                && frames.contains { if case .envelope = $0 { return true }; return false }
         }
         let sent = await channel.sentFrames()
 
@@ -580,9 +584,12 @@ import CryptoKit
         await client.start()
         await handshake(channel, client: client, nonceB64: TransportFixtures.nonceB64())
 
-        // Post-auth resume + request_snapshot went out once.
+        // Post-auth resume + request_snapshot went out once (wait for both; the
+        // envelope follows the resume asynchronously).
         _ = await waitUntil {
-            await channel.sentFrames().contains { if case .resume = $0 { return true }; return false }
+            let frames = await channel.sentFrames()
+            return frames.contains { if case .resume = $0 { return true }; return false }
+                && frames.contains { if case .envelope = $0 { return true }; return false }
         }
         func resumeCount() async -> Int {
             await channel.sentFrames().filter { if case .resume = $0 { return true }; return false }.count

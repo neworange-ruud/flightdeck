@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use flightdeck_remote_protocol::{DeviceId, PairingId};
+use flightdeck_remote_protocol::{DeviceId, DirectEndpoint, PairingId};
 
 /// A successfully redeemed claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub struct RedeemedClaim {
     pub pairing_id: PairingId,
     /// The desktop device that offered the pairing (the phone's peer).
     pub desktop_device: DeviceId,
+    /// The desktop's direct-link address from its `pairing_offer` (spec §5.2,
+    /// v4), handed to the phone in its `pairing_claimed`. `None` for a
+    /// relay-mode pairing.
+    pub direct_endpoint: Option<DirectEndpoint>,
 }
 
 /// Why a `pairing_claim` was rejected. Both map to `pairing_claim_rejected` on
@@ -36,6 +40,7 @@ struct Entry {
     pairing_id: PairingId,
     desktop_device: DeviceId,
     expires_at_ms: i64,
+    direct_endpoint: Option<DirectEndpoint>,
 }
 
 /// One claim-table row as a flat, public value, for round-tripping the table
@@ -55,6 +60,8 @@ pub struct ClaimRecord {
     pub desktop_device: DeviceId,
     /// Absolute wall-clock expiry in unix milliseconds.
     pub expires_at_ms: i64,
+    /// The offer's direct-link address, if any (spec §5.2, v4).
+    pub direct_endpoint: Option<DirectEndpoint>,
 }
 
 /// A table of live claim tokens. Not thread-safe on its own; the store wraps it
@@ -79,7 +86,13 @@ impl ClaimTable {
     pub fn from_records(records: impl IntoIterator<Item = ClaimRecord>) -> Self {
         let mut table = Self::new();
         for r in records {
-            table.issue(r.token, r.pairing_id, r.desktop_device, r.expires_at_ms);
+            table.issue(
+                r.token,
+                r.pairing_id,
+                r.desktop_device,
+                r.expires_at_ms,
+                r.direct_endpoint,
+            );
         }
         table
     }
@@ -93,17 +106,21 @@ impl ClaimTable {
             pairing_id: e.pairing_id.clone(),
             desktop_device: e.desktop_device.clone(),
             expires_at_ms: e.expires_at_ms,
+            direct_endpoint: e.direct_endpoint.clone(),
         })
     }
 
     /// Register a freshly-minted token. Overwrites any prior entry for the same
     /// token string (tokens are random, so collisions are not expected).
+    /// `direct_endpoint` is the offer's direct-link address (spec §5.2, v4),
+    /// carried until redemption so the phone's `pairing_claimed` can echo it.
     pub fn issue(
         &mut self,
         token: impl Into<String>,
         pairing_id: PairingId,
         desktop_device: DeviceId,
         expires_at_ms: i64,
+        direct_endpoint: Option<DirectEndpoint>,
     ) {
         self.entries.insert(
             token.into(),
@@ -111,6 +128,7 @@ impl ClaimTable {
                 pairing_id,
                 desktop_device,
                 expires_at_ms,
+                direct_endpoint,
             },
         );
     }
@@ -126,6 +144,7 @@ impl ClaimTable {
         Ok(RedeemedClaim {
             pairing_id: entry.pairing_id,
             desktop_device: entry.desktop_device,
+            direct_endpoint: entry.direct_endpoint,
         })
     }
 
@@ -196,6 +215,7 @@ mod tests {
             PairingId::new("pair_1"),
             DeviceId::new("dev_mac"),
             expires_at_ms,
+            None,
         );
         t
     }
@@ -209,6 +229,37 @@ mod tests {
         // Single-use: a second attempt fails as unknown.
         assert_eq!(t.redeem("4729-Xk9Qa2Lm", 5_000), Err(ClaimError::Unknown));
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn direct_endpoint_survives_issue_records_and_redeem() {
+        // Spec §5.2 (v4): the offer's direct endpoint rides with the claim until
+        // the phone redeems it, including through a durable store's round trip.
+        let endpoint = DirectEndpoint {
+            host: "ruuds-mbp.tail1234.ts.net".into(),
+            port: 47800,
+        };
+        let mut t = ClaimTable::new();
+        t.issue(
+            "1234",
+            PairingId::new("pair_d"),
+            DeviceId::new("dev_mac"),
+            10_000,
+            Some(endpoint.clone()),
+        );
+        let mut restored = ClaimTable::from_records(t.records().collect::<Vec<_>>());
+        let claim = restored.redeem("1234", 5_000).expect("redeem");
+        assert_eq!(claim.direct_endpoint, Some(endpoint));
+
+        // A relay-mode offer carries none.
+        let mut plain = table_with_token(10_000);
+        assert_eq!(
+            plain
+                .redeem("4729-Xk9Qa2Lm", 5_000)
+                .unwrap()
+                .direct_endpoint,
+            None
+        );
     }
 
     #[test]
@@ -277,9 +328,9 @@ mod tests {
     #[test]
     fn sweep_expired_evicts_only_past_ttl_and_reports_count() {
         let mut t = ClaimTable::new();
-        t.issue("a", PairingId::new("p1"), DeviceId::new("d1"), 10_000);
-        t.issue("b", PairingId::new("p2"), DeviceId::new("d2"), 20_000);
-        t.issue("c", PairingId::new("p3"), DeviceId::new("d3"), 30_000);
+        t.issue("a", PairingId::new("p1"), DeviceId::new("d1"), 10_000, None);
+        t.issue("b", PairingId::new("p2"), DeviceId::new("d2"), 20_000, None);
+        t.issue("c", PairingId::new("p3"), DeviceId::new("d3"), 30_000, None);
 
         // At now=15_000, only "a" (TTL 10_000) has elapsed.
         assert_eq!(t.live_len(15_000), 2);

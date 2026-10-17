@@ -1,6 +1,6 @@
 //
 //  PairingRecord.swift
-//  FlightDeckRemote
+//  FlightDeckRemote + FlightDeckNotificationService
 //
 //  The persisted state of an established pairing (REMOTE_PROTOCOL §5.2/§6):
 //  everything the transport needs to reconnect, re-derive the E2E channel, and
@@ -26,6 +26,24 @@
 //
 
 import Foundation
+
+/// How a pairing carries its data plane (REMOTE_PROTOCOL §5.2 / §5.10).
+enum PairingTransportMode: String, Equatable, Sendable {
+    /// Envelopes route through the relay — every pairing made before v4, and
+    /// any pairing whose desktop offered no direct endpoint.
+    case relay
+    /// Envelopes go straight to the Mac over Tailscale (`ws://host:port`);
+    /// the relay is still used for push-token registration and revoke.
+    case direct
+
+    /// Short user-facing label for the pairing/settings detail.
+    var displayName: String {
+        switch self {
+        case .relay: return "Relay"
+        case .direct: return "Direct (Tailscale)"
+        }
+    }
+}
 
 /// The persisted state for one phone ↔ Mac pairing.
 struct PairingRecord: Codable, Equatable, Sendable {
@@ -53,6 +71,20 @@ struct PairingRecord: Codable, Equatable, Sendable {
     var lastReceivedSeq: UInt64
     /// When this pairing was established.
     var pairedAt: Date
+    /// Where the Mac serves the direct link over Tailscale (v4, §5.10), copied
+    /// from the phone-bound `pairing_claimed.direct_endpoint`. `nil` for a
+    /// relay-mode pairing — including every record written before this field
+    /// existed (synthesized `Decodable` reads a missing optional as `nil`), so
+    /// old pairings keep working exactly as before. Re-pairing is the only way
+    /// to switch modes or change the endpoint (§5.2).
+    var directEndpoint: DirectEndpoint?
+
+    /// The pairing's transport, derived from `directEndpoint`: direct exactly
+    /// when the claim carried an endpoint. Derived rather than stored so the
+    /// mode can never disagree with the endpoint it implies.
+    var transportMode: PairingTransportMode {
+        directEndpoint == nil ? .relay : .direct
+    }
 
     init(
         pairingId: String,
@@ -62,7 +94,8 @@ struct PairingRecord: Codable, Equatable, Sendable {
         relayURL: String,
         lastSentSeq: UInt64 = 0,
         lastReceivedSeq: UInt64 = 0,
-        pairedAt: Date = Date()
+        pairedAt: Date = Date(),
+        directEndpoint: DirectEndpoint? = nil
     ) {
         self.pairingId = pairingId
         self.peerDeviceId = peerDeviceId
@@ -72,6 +105,7 @@ struct PairingRecord: Codable, Equatable, Sendable {
         self.lastSentSeq = lastSentSeq
         self.lastReceivedSeq = lastReceivedSeq
         self.pairedAt = pairedAt
+        self.directEndpoint = directEndpoint
     }
 
     /// The decoded E2E bootstrap salt bytes.
@@ -97,11 +131,11 @@ enum PairingRecordError: Error, Equatable {
 /// first stored record. New code should prefer the keyed API.
 final class PairingRecordStore {
     /// Keychain service shared with the identity keys.
-    static let service = DeviceIdentity.service
+    static let service = SharedContainer.keychainService
     /// Account prefix for the keyed per-pairing items:
     /// `"pairing-record-v1.<pairingId>"`. The trailing dot keeps these items
     /// disjoint from the legacy account and from other services' items.
-    static let accountPrefix = "pairing-record-v1."
+    static let accountPrefix = SharedContainer.pairingRecordAccountPrefix
     /// Legacy account for the single pre-multi-pairing record. Migrated into the
     /// keyed store on first read after upgrade, then removed.
     static let legacyAccount = "pairing-record-v1"
@@ -139,6 +173,18 @@ final class PairingRecordStore {
     /// The record for `pairingId`, or `nil` if no such pairing is stored.
     func load(pairingId: String) throws -> PairingRecord? {
         try migrateLegacyRecordIfNeeded()
+        guard let blob = try store.get(account: Self.account(for: pairingId)) else {
+            return nil
+        }
+        return try decode(blob)
+    }
+
+    /// Read-only lookup of `pairingId`'s record for the Notification Service
+    /// Extension (remote-control-bza0). Unlike `load(pairingId:)` it never runs
+    /// the legacy migration: the extension must not write the app's Keychain
+    /// (and a legacy, pre-multi-pairing item would not be in the shared group
+    /// anyway — the app migrates it on its next launch).
+    func peek(pairingId: String) throws -> PairingRecord? {
         guard let blob = try store.get(account: Self.account(for: pairingId)) else {
             return nil
         }

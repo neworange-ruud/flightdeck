@@ -48,6 +48,11 @@ extension Wire {
         /// recoverable: the endpoint re-syncs its stream (restart from seq 1)
         /// instead of tearing the link down (remote-control-bbf).
         case seqViolation = "seq_violation"
+        /// v4 (spec §5.9): a push-only relay refused a data-plane frame
+        /// (`envelope`, `resume`, `ack`). Advisory — the connection stays open
+        /// for push-token registration, revoke and presence; the endpoint must
+        /// stop sending data-plane frames to this relay.
+        case relayModePushOnly = "relay_mode_push_only"
         case internalError = "internal"
         /// A code this build does not recognize — a newer relay sent a code added
         /// after this app shipped. Decoding maps unknown wire values here so an
@@ -60,7 +65,55 @@ extension Wire {
         }
     }
 
+    /// Which mode a relay runs in (v4, spec §5.9), announced in
+    /// `hello_ok.relay_mode`. A pre-v4 relay omits the field: treat absent as
+    /// `.full`. Decoding is lenient — a mode added after this app shipped maps
+    /// to `.unknown` instead of failing the whole `hello_ok` (which would make
+    /// the relay unreachable); the transport treats `.unknown` like `.full`.
+    enum RelayMode: String, Codable, Hashable, Sendable {
+        /// Today's routing relay: carries envelopes for relay-mode pairings.
+        case full
+        /// Authenticates devices and sends pushes only; refuses `envelope`,
+        /// `resume` and `ack` with `error { relay_mode_push_only }`.
+        case pushOnly = "push_only"
+        /// A mode this build does not recognize.
+        case unknown
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = RelayMode(rawValue: raw) ?? .unknown
+        }
+    }
+
     // MARK: - Structs
+
+    /// Where the phone can reach a Mac directly over Tailscale (v4, spec
+    /// §5.10). Mirrors Rust `relay::DirectEndpoint`. Defined in
+    /// `Shared/DirectEndpoint.swift` — it is persisted on `PairingRecord`,
+    /// which the Notification Service Extension compiles without any `Wire`
+    /// types — and aliased here so the wire layer reads naturally.
+    typealias DirectEndpoint = FlightDeckRemote.DirectEndpoint
+
+    /// The body of a `push_notify` frame (v4, spec §5.5.1): desktop → relay
+    /// only. The phone never sends or expects one; it is mirrored so a stray
+    /// frame decodes (and the golden fixture round-trips) instead of failing
+    /// the session. Flattened next to the `type` tag on the wire.
+    struct PushNotifyBody: Codable, Hashable, Sendable {
+        var pairingId: PairingId
+        var eventId: EventId
+        var pushClass: PushClass
+        /// Base64 (standard, padded) 12-byte AEAD nonce.
+        var nonce: String
+        /// Base64 (standard, padded) sealed `PushPayload` (spec §7.2).
+        var ciphertext: String
+
+        private enum CodingKeys: String, CodingKey {
+            case nonce, ciphertext
+            case pairingId = "pairing_id"
+            case eventId = "event_id"
+            case pushClass = "class"
+        }
+    }
 
     /// Non-secret client build metadata, sent in `hello` for diagnostics.
     struct ClientInfo: Codable, Hashable, Sendable {
@@ -127,21 +180,28 @@ extension Wire {
         case hello(protocolVersion: UInt16, role: Role, deviceId: DeviceId,
                    client: ClientInfo, relayPassword: String?)
         /// relay -> endpoint. Accepts the connection at a negotiated version.
+        ///
+        /// `relayMode` (v4, §5.9) is omitted by pre-v4 relays and by the Mac on
+        /// the direct link (§5.10); absent means `.full`.
         case helloOk(protocolVersion: UInt16, serverTimeMs: Int64,
-                     connectionId: String)
+                     connectionId: String, relayMode: RelayMode? = nil)
         /// relay -> endpoint. Version outside supported range; socket closes.
         case versionIncompatible(yourVersion: UInt16, minSupported: UInt16,
                                  maxSupported: UInt16)
         /// relay -> endpoint. Challenge nonce to sign with the identity key.
         case authChallenge(nonce: String, serverTimeMs: Int64)
         /// endpoint -> relay. Signature over the nonce + pairings to activate.
+        /// `machineName` is desktop-only (§5.1/§5.7); the phone sends `nil`.
         case authResponse(deviceId: DeviceId, signature: String,
-                          pairingIds: [PairingId])
+                          pairingIds: [PairingId], machineName: String? = nil)
         /// relay -> endpoint. Authentication succeeded; pairings are active.
         case authOk(pairingIds: [PairingId])
         /// endpoint (desktop) -> relay. Mint a claim token for pairing.
+        /// Never sent by the phone; mirrored for fixture conformance.
         case pairingOffer(deviceId: DeviceId, devicePublicKey: String,
-                          keyAgreementPublicKey: String, role: Role)
+                          keyAgreementPublicKey: String, role: Role,
+                          claimTokenHint: String? = nil,
+                          directEndpoint: DirectEndpoint? = nil)
         /// relay -> endpoint (desktop). Pairing provisioned; token to display.
         case pairingOfferOk(pairingId: PairingId, claimToken: String,
                             expiresAtMs: Int64)
@@ -150,8 +210,15 @@ extension Wire {
                           devicePublicKey: String,
                           keyAgreementPublicKey: String, role: Role)
         /// relay -> endpoint. Pairing bootstrap succeeded.
+        ///
+        /// v4 (§5.2): the PHONE-bound copy carries `directEndpoint` when the
+        /// desktop offered one (the pairing is then in direct mode); the
+        /// DESKTOP-bound copy carries `peerDevicePublicKey` (the phone's
+        /// identity key). Each is omitted from the wire when `nil`.
         case pairingClaimed(pairingId: PairingId, peerDeviceId: DeviceId?,
-                            peerKeyAgreementPublicKey: String?)
+                            peerKeyAgreementPublicKey: String?,
+                            directEndpoint: DirectEndpoint? = nil,
+                            peerDevicePublicKey: String? = nil)
         /// relay -> endpoint. The peer connected or disconnected.
         case peerPresence(pairingId: PairingId, peer: Role,
                           state: PresenceState, atMs: Int64)
@@ -195,8 +262,10 @@ extension Wire {
         /// §5.8). The phone removes its local record eagerly on send, so this is
         /// treated as a non-fatal advisory rather than a gate on removal.
         case pairingRevoked(pairingId: PairingId)
-        /// relay -> endpoint. A relay-plane error.
-        /// A relay-plane error. `expectedSeq` is present only when the relay is
+        /// desktop -> relay (v4, §5.5.1). Encrypted push request. The phone
+        /// never sends it; decoding one is harmless (the transport ignores it).
+        case pushNotify(PushNotifyBody)
+        /// relay -> endpoint. A relay-plane error. `expectedSeq` is present only when the relay is
         /// telling the SENDER its outbound `seq` ran ahead and naming the value
         /// it will accept next; absent when the advisory concerns this side's
         /// stale inbound cursor (remote-control-zv3).
@@ -210,6 +279,10 @@ extension Wire {
             case type, role, client, nonce, signature, peer, state, cursor
             case token, environment, code, message, reason
             case relayPassword = "relay_password"
+            case relayMode = "relay_mode"
+            case claimTokenHint = "claim_token_hint"
+            case directEndpoint = "direct_endpoint"
+            case peerDevicePublicKey = "peer_device_public_key"
             case machineName = "machine_name"
             case protocolVersion = "protocol_version"
             case deviceId = "device_id"
@@ -247,7 +320,8 @@ extension Wire {
                 self = .helloOk(
                     protocolVersion: try c.decode(UInt16.self, forKey: .protocolVersion),
                     serverTimeMs: try c.decode(Int64.self, forKey: .serverTimeMs),
-                    connectionId: try c.decode(String.self, forKey: .connectionId))
+                    connectionId: try c.decode(String.self, forKey: .connectionId),
+                    relayMode: try c.decodeIfPresent(RelayMode.self, forKey: .relayMode))
             case "version_incompatible":
                 self = .versionIncompatible(
                     yourVersion: try c.decode(UInt16.self, forKey: .yourVersion),
@@ -261,7 +335,8 @@ extension Wire {
                 self = .authResponse(
                     deviceId: try c.decode(DeviceId.self, forKey: .deviceId),
                     signature: try c.decode(String.self, forKey: .signature),
-                    pairingIds: try c.decode([PairingId].self, forKey: .pairingIds))
+                    pairingIds: try c.decode([PairingId].self, forKey: .pairingIds),
+                    machineName: try c.decodeIfPresent(String.self, forKey: .machineName))
             case "auth_ok":
                 self = .authOk(
                     pairingIds: try c.decode([PairingId].self, forKey: .pairingIds))
@@ -270,7 +345,9 @@ extension Wire {
                     deviceId: try c.decode(DeviceId.self, forKey: .deviceId),
                     devicePublicKey: try c.decode(String.self, forKey: .devicePublicKey),
                     keyAgreementPublicKey: try c.decode(String.self, forKey: .keyAgreementPublicKey),
-                    role: try c.decode(Role.self, forKey: .role))
+                    role: try c.decode(Role.self, forKey: .role),
+                    claimTokenHint: try c.decodeIfPresent(String.self, forKey: .claimTokenHint),
+                    directEndpoint: try c.decodeIfPresent(DirectEndpoint.self, forKey: .directEndpoint))
             case "pairing_offer_ok":
                 self = .pairingOfferOk(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId),
@@ -288,7 +365,10 @@ extension Wire {
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId),
                     peerDeviceId: try c.decodeIfPresent(DeviceId.self, forKey: .peerDeviceId),
                     peerKeyAgreementPublicKey: try c.decodeIfPresent(
-                        String.self, forKey: .peerKeyAgreementPublicKey))
+                        String.self, forKey: .peerKeyAgreementPublicKey),
+                    directEndpoint: try c.decodeIfPresent(DirectEndpoint.self, forKey: .directEndpoint),
+                    peerDevicePublicKey: try c.decodeIfPresent(
+                        String.self, forKey: .peerDevicePublicKey))
             case "peer_presence":
                 self = .peerPresence(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId),
@@ -333,6 +413,8 @@ extension Wire {
             case "pairing_revoked":
                 self = .pairingRevoked(
                     pairingId: try c.decode(PairingId.self, forKey: .pairingId))
+            case "push_notify":
+                self = .pushNotify(try PushNotifyBody(from: decoder)) // flattened
             case "error":
                 self = .error(
                     code: try c.decode(RelayErrorCode.self, forKey: .code),
@@ -362,11 +444,13 @@ extension Wire {
                 // present-but-empty value, so absence — not "" — is the
                 // no-password signal an unconfigured relay accepts.
                 try c.encodeIfPresent(relayPassword, forKey: .relayPassword)
-            case let .helloOk(protocolVersion, serverTimeMs, connectionId):
+            case let .helloOk(protocolVersion, serverTimeMs, connectionId, relayMode):
                 try c.encode("hello_ok", forKey: .type)
                 try c.encode(protocolVersion, forKey: .protocolVersion)
                 try c.encode(serverTimeMs, forKey: .serverTimeMs)
                 try c.encode(connectionId, forKey: .connectionId)
+                // Omitted when absent (Rust `skip_serializing_if`).
+                try c.encodeIfPresent(relayMode, forKey: .relayMode)
             case let .versionIncompatible(yourVersion, minSupported, maxSupported):
                 try c.encode("version_incompatible", forKey: .type)
                 try c.encode(yourVersion, forKey: .yourVersion)
@@ -376,20 +460,27 @@ extension Wire {
                 try c.encode("auth_challenge", forKey: .type)
                 try c.encode(nonce, forKey: .nonce)
                 try c.encode(serverTimeMs, forKey: .serverTimeMs)
-            case let .authResponse(deviceId, signature, pairingIds):
+            case let .authResponse(deviceId, signature, pairingIds, machineName):
                 try c.encode("auth_response", forKey: .type)
                 try c.encode(deviceId, forKey: .deviceId)
                 try c.encode(signature, forKey: .signature)
                 try c.encode(pairingIds, forKey: .pairingIds)
+                // Desktop-only; omitted when nil so the phone's frame stays
+                // byte-identical to what it sent before this field existed
+                // (the relay and the Mac both default it — Rust `serde(default)`).
+                try c.encodeIfPresent(machineName, forKey: .machineName)
             case let .authOk(pairingIds):
                 try c.encode("auth_ok", forKey: .type)
                 try c.encode(pairingIds, forKey: .pairingIds)
-            case let .pairingOffer(deviceId, devicePublicKey, keyAgreementPublicKey, role):
+            case let .pairingOffer(deviceId, devicePublicKey, keyAgreementPublicKey, role,
+                                   claimTokenHint, directEndpoint):
                 try c.encode("pairing_offer", forKey: .type)
                 try c.encode(deviceId, forKey: .deviceId)
                 try c.encode(devicePublicKey, forKey: .devicePublicKey)
                 try c.encode(keyAgreementPublicKey, forKey: .keyAgreementPublicKey)
                 try c.encode(role, forKey: .role)
+                try c.encode(claimTokenHint, forKey: .claimTokenHint) // explicit null
+                try c.encodeIfPresent(directEndpoint, forKey: .directEndpoint)
             case let .pairingOfferOk(pairingId, claimToken, expiresAtMs):
                 try c.encode("pairing_offer_ok", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
@@ -403,12 +494,16 @@ extension Wire {
                 try c.encode(devicePublicKey, forKey: .devicePublicKey)
                 try c.encode(keyAgreementPublicKey, forKey: .keyAgreementPublicKey)
                 try c.encode(role, forKey: .role)
-            case let .pairingClaimed(pairingId, peerDeviceId, peerKeyAgreementPublicKey):
+            case let .pairingClaimed(pairingId, peerDeviceId, peerKeyAgreementPublicKey,
+                                     directEndpoint, peerDevicePublicKey):
                 try c.encode("pairing_claimed", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
                 try c.encode(peerDeviceId, forKey: .peerDeviceId) // explicit null
                 try c.encode(peerKeyAgreementPublicKey,
                              forKey: .peerKeyAgreementPublicKey) // explicit null
+                // v4 fields: omitted when absent (Rust `skip_serializing_if`).
+                try c.encodeIfPresent(directEndpoint, forKey: .directEndpoint)
+                try c.encodeIfPresent(peerDevicePublicKey, forKey: .peerDevicePublicKey)
             case let .peerPresence(pairingId, peer, state, atMs):
                 try c.encode("peer_presence", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
@@ -454,6 +549,9 @@ extension Wire {
             case let .pairingRevoked(pairingId):
                 try c.encode("pairing_revoked", forKey: .type)
                 try c.encode(pairingId, forKey: .pairingId)
+            case let .pushNotify(body):
+                try c.encode("push_notify", forKey: .type)
+                try body.encode(to: encoder) // flattened
             case let .error(code, message, pairingId, expectedSeq):
                 try c.encode("error", forKey: .type)
                 try c.encode(code, forKey: .code)
@@ -467,6 +565,23 @@ extension Wire {
                 try c.encode(reason, forKey: .reason) // explicit null
             }
         }
+    }
+
+    // MARK: - Direct-link auth message (§5.10)
+
+    /// Domain prefix of the direct-link auth signature (Rust
+    /// `DIRECT_AUTH_DOMAIN`).
+    static let directAuthDomain = Data("flightdeck-remote-direct-v1:".utf8)
+
+    /// The exact bytes the phone signs to authenticate on the direct link
+    /// (Rust `direct_auth_message`): `"flightdeck-remote-direct-v1:" ‖ nonce`,
+    /// where `nonce` is the DECODED `auth_challenge.nonce`. The prefix makes a
+    /// direct-link signature useless as a relay `auth_response` (which signs
+    /// the bare nonce, §5.1) and vice versa.
+    static func directAuthMessage(nonce: Data) -> Data {
+        var message = directAuthDomain
+        message.append(nonce)
+        return message
     }
 
     // MARK: - Machine name sanitization (§5.7)

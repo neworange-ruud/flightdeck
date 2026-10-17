@@ -583,12 +583,7 @@ pub fn remote_actions_view(status: &RemoteStatus, emit: Emit, cx: &App) -> impl 
         ))
     };
 
-    let phone_state = if status.phone_paired {
-        "paired"
-    } else {
-        "not paired"
-    }
-    .to_string();
+    let phone_state = phone_state_label(status);
     let phone_button = if status.phone_paired {
         run(
             "remote-phone-unpair",
@@ -609,6 +604,9 @@ pub fn remote_actions_view(status: &RemoteStatus, emit: Emit, cx: &App) -> impl 
         .gap_3()
         .child(row("Web interface", web_state, web_buttons))
         .child(row("Phone", phone_state, h_flex().child(phone_button)));
+    if let Some(addr) = &status.direct_listening {
+        body = body.child(row("Direct link", format!("listening on {addr}"), h_flex()));
+    }
     if status.web_running {
         let holder = match &status.input_holder {
             Some(who) => format!("held by {who}"),
@@ -626,6 +624,16 @@ pub fn remote_actions_view(status: &RemoteStatus, emit: Emit, cx: &App) -> impl 
         ));
     }
     card("remote-overlay", "Remote access", px(460.), &p, &emit).child(body)
+}
+
+/// The Phone row's state: paired or not, and — once a phone feed is active —
+/// whether it runs over the direct link or the relay (REMOTE_PROTOCOL §5.10).
+fn phone_state_label(status: &RemoteStatus) -> String {
+    match (status.phone_paired, status.phone_transport) {
+        (false, _) => "not paired".to_string(),
+        (true, Some(transport)) => format!("paired · {transport}"),
+        (true, None) => "paired".to_string(),
+    }
 }
 
 fn viewers_label(n: usize) -> String {
@@ -657,7 +665,10 @@ pub fn remote_indicator_items(status: &RemoteStatus) -> Vec<IndicatorItem> {
     }
     if status.phone_paired {
         items.push(IndicatorItem {
-            text: "phone paired".to_string(),
+            text: match status.phone_transport {
+                Some(transport) => format!("phone paired · {transport}"),
+                None => "phone paired".to_string(),
+            },
             attention: false,
         });
     }
@@ -927,6 +938,7 @@ mod tests {
             web_viewers: viewers,
             phone_paired: phone,
             input_holder: holder.map(str::to_string),
+            ..RemoteStatus::default()
         }
     }
 
@@ -1011,5 +1023,31 @@ mod tests {
         assert!(items[2].attention && !items[0].attention);
         let one = remote_indicator_items(&status(true, 1, false, None));
         assert_eq!(one[0].text, "web · 1 viewer");
+    }
+
+    /// Once a phone feed is active the Phone row and the indicator say how it
+    /// travels: over this machine's direct link or through the relay.
+    #[test]
+    fn the_phone_transport_is_named_once_known() {
+        let mut s = status(false, 0, true, None);
+        assert_eq!(phone_state_label(&s), "paired");
+        s.phone_transport = Some("direct");
+        assert_eq!(phone_state_label(&s), "paired · direct");
+        assert_eq!(remote_indicator_items(&s)[0].text, "phone paired · direct");
+        s.phone_transport = Some("relay");
+        assert_eq!(phone_state_label(&s), "paired · relay");
+        s.phone_paired = false;
+        assert_eq!(phone_state_label(&s), "not paired");
+    }
+
+    #[gpui::test]
+    fn the_direct_link_row_shows_where_it_listens(cx: &mut TestAppContext) {
+        let mut s = status(false, 0, true, None);
+        s.direct_listening = Some("ruuds-mbp.tail1234.ts.net:47800".to_string());
+        let (emit, _events) = recorder();
+        let cx = mount(cx, move |_, cx| {
+            remote_actions_view(&s, emit.clone(), cx).into_any_element()
+        });
+        assert!(cx.debug_bounds("remote-phone-unpair").is_some());
     }
 }

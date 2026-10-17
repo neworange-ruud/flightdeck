@@ -4,6 +4,7 @@
 # source of truth.
 *.xcodeproj
 FlightDeckRemote/Info.plist
+FlightDeckNotificationService/Info.plist
 
 # Xcode user state
 xcuserdata/

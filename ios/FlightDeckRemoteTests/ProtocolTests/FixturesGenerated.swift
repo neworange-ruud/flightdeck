@@ -12,25 +12,6 @@
 //    desktop_to_phone -> Wire.DesktopToPhone
 //    phone_to_desktop -> Wire.PhoneCommand
 //
-//  remote-control-b8d.9/.10/.11 note: the `machine_name` (b8d.9),
-//  `unregister_push_token` (b8d.10), and `revoke`/`pairing_revoked` (b8d.11)
-//  entries below were hand-spliced in (rather than running the full sync script)
-//  as their owning iOS issues landed, to avoid pulling in unrelated fields that
-//  the same upstream commit (7f0cd86) also touched (e.g. a
-//  `pairing_offer.claim_token_hint` the `Wire.RelayFrame` mirror doesn't decode
-//  yet). Re-run `ios/scripts/sync-fixtures.sh` for a full resync when that
-//  field is adopted.
-//
-//  remote-control-zag note: `desktop_to_phone/transcript` was likewise
-//  hand-spliced (protocol v2 multi-option prompt model: PromptKind,
-//  per-option `index`, `allow_free_text`, a second Question-kind
-//  permission_prompt item) rather than a full resync, for the same reason.
-//
-//  remote-control-dc9 note: the `desktop_to_phone/transcript` fixture's base64
-//  was re-spliced again for protocol v3's `multi_select` field on both
-//  permission_prompt items (still avoiding a full resync so the unadopted
-//  `pairing_offer.claim_token_hint` stays out).
-//
 
 import Foundation
 
@@ -64,7 +45,7 @@ enum ProtocolFixtures {
         ProtocolFixture(
             category: "relay",
             name: "auth_response",
-            base64: "ewogICJ0eXBlIjogImF1dGhfcmVzcG9uc2UiLAogICJkZXZpY2VfaWQiOiAiZGV2XzlmM2ExYyIsCiAgInNpZ25hdHVyZSI6ICJNRVVDSVFEZjhrMmIxczBWZDlwUTB4WmEyYzNkNGU1ZjZnN2g4aTlqMGsxbDJtM240bzVwNnE9PSIsCiAgInBhaXJpbmdfaWRzIjogWwogICAgInBhaXJfcnV1ZF9tYnAiCiAgXQp9Cg=="),
+            base64: "ewogICJ0eXBlIjogImF1dGhfcmVzcG9uc2UiLAogICJkZXZpY2VfaWQiOiAiZGV2XzlmM2ExYyIsCiAgInNpZ25hdHVyZSI6ICJNRVVDSVFEZjhrMmIxczBWZDlwUTB4WmEyYzNkNGU1ZjZnN2g4aTlqMGsxbDJtM240bzVwNnE9PSIsCiAgInBhaXJpbmdfaWRzIjogWwogICAgInBhaXJfcnV1ZF9tYnAiCiAgXSwKICAibWFjaGluZV9uYW1lIjogIlJ1dWQncyBNYWNCb29rIFBybyIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "bye",
@@ -79,12 +60,20 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogImVycm9yIiwKICAiY29kZSI6ICJwZWVyX3VuYXZhaWxhYmxlIiwKICAibWVzc2FnZSI6ICJkZXNrdG9wIGlzIG5vdCBjdXJyZW50bHkgY29ubmVjdGVkOyBmcmFtZXMgd2lsbCBiZSBxdWV1ZWQiLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiCn0K"),
         ProtocolFixture(
             category: "relay",
+            name: "error_relay_mode_push_only",
+            base64: "ewogICJ0eXBlIjogImVycm9yIiwKICAiY29kZSI6ICJyZWxheV9tb2RlX3B1c2hfb25seSIsCiAgIm1lc3NhZ2UiOiAidGhpcyByZWxheSBydW5zIGluIHB1c2hfb25seSBtb2RlIGFuZCBkb2VzIG5vdCBjYXJyeSBlbnZlbG9wZXMiLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiCn0K"),
+        ProtocolFixture(
+            category: "relay",
             name: "hello",
             base64: "ewogICJ0eXBlIjogImhlbGxvIiwKICAicHJvdG9jb2xfdmVyc2lvbiI6IDEsCiAgInJvbGUiOiAicGhvbmUiLAogICJkZXZpY2VfaWQiOiAiZGV2XzlmM2ExYyIsCiAgImNsaWVudCI6IHsKICAgICJhcHBfdmVyc2lvbiI6ICIxLjAuMCIsCiAgICAicGxhdGZvcm0iOiAiaW9zIiwKICAgICJvc192ZXJzaW9uIjogIjE4LjIiCiAgfQp9Cg=="),
         ProtocolFixture(
             category: "relay",
             name: "hello_ok",
             base64: "ewogICJ0eXBlIjogImhlbGxvX29rIiwKICAicHJvdG9jb2xfdmVyc2lvbiI6IDEsCiAgInNlcnZlcl90aW1lX21zIjogMTc1MjQxMjgwMDAwMCwKICAiY29ubmVjdGlvbl9pZCI6ICJjb25uXzAxSFpYOFEiCn0K"),
+        ProtocolFixture(
+            category: "relay",
+            name: "hello_ok_push_only",
+            base64: "ewogICJ0eXBlIjogImhlbGxvX29rIiwKICAicHJvdG9jb2xfdmVyc2lvbiI6IDQsCiAgInNlcnZlcl90aW1lX21zIjogMTc1MjQxMjgwMDAwMCwKICAiY29ubmVjdGlvbl9pZCI6ICJjb25uXzAxSFpYOFEiLAogICJyZWxheV9tb2RlIjogInB1c2hfb25seSIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "machine_name",
@@ -99,12 +88,32 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl9tYWNfN2IyMSIsCiAgInBlZXJfa2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iCn0K"),
         ProtocolFixture(
             category: "relay",
+            name: "pairing_claimed_direct",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl9tYWNfN2IyMSIsCiAgInBlZXJfa2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iLAogICJkaXJlY3RfZW5kcG9pbnQiOiB7CiAgICAiaG9zdCI6ICJydXVkcy1tYnAudGFpbDEyMzQudHMubmV0IiwKICAgICJwb3J0IjogNDc4MDAKICB9Cn0K"),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_claimed_to_desktop",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl85ZjNhMWMiLAogICJwZWVyX2tleV9hZ3JlZW1lbnRfcHVibGljX2tleSI6ICJCRXhhbXBsZVBob25lS2V5QWdyZWVtZW50U2VjMVB1YktleUJhc2U2NFdvdWxkNjVCeXRlc0dnMkhoNEpqNktrOExsME1tMk5uNFBwNlFxOFJyMFNzMlR0NFV1NnY9PSIsCiAgInBlZXJfZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVQaG9uZVNlY3VyZUVuY2xhdmVJZGVudGl0eVNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNIaDNKajVLazdMbDlNbTFObjNQcDVRcTdScjlTczFUdDN3PT0iCn0K"),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_claimed_to_desktop_direct",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfY2xhaW1lZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgInBlZXJfZGV2aWNlX2lkIjogImRldl85ZjNhMWMiLAogICJwZWVyX2tleV9hZ3JlZW1lbnRfcHVibGljX2tleSI6ICJCRXhhbXBsZVBob25lS2V5QWdyZWVtZW50U2VjMVB1YktleUJhc2U2NFdvdWxkNjVCeXRlc0dnMkhoNEpqNktrOExsME1tMk5uNFBwNlFxOFJyMFNzMlR0NFV1NnY9PSIsCiAgImRpcmVjdF9lbmRwb2ludCI6IHsKICAgICJob3N0IjogInJ1dWRzLW1icC50YWlsMTIzNC50cy5uZXQiLAogICAgInBvcnQiOiA0NzgwMAogIH0sCiAgInBlZXJfZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVQaG9uZVNlY3VyZUVuY2xhdmVJZGVudGl0eVNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNIaDNKajVLazdMbDlNbTFObjNQcDVRcTdScjlTczFUdDN3PT0iCn0K"),
+        ProtocolFixture(
+            category: "relay",
             name: "pairing_offer",
-            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfb2ZmZXIiLAogICJkZXZpY2VfaWQiOiAiZGV2X21hY183YjIxIiwKICAiZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVEZXNrdG9wU2VjMVB1YmxpY0tleUJhc2U2NFdvdWxkQmU2NURlY29kZWRCeXRlc1EycFY4WWIzTno3V3QxUms0WGg2Wmc5TW0wQWE1QmIyQ2M0RGQ2RWU4Zj09IiwKICAia2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iLAogICJyb2xlIjogImRlc2t0b3AiCn0K"),
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfb2ZmZXIiLAogICJkZXZpY2VfaWQiOiAiZGV2X21hY183YjIxIiwKICAiZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVEZXNrdG9wU2VjMVB1YmxpY0tleUJhc2U2NFdvdWxkQmU2NURlY29kZWRCeXRlc1EycFY4WWIzTno3V3QxUms0WGg2Wmc5TW0wQWE1QmIyQ2M0RGQ2RWU4Zj09IiwKICAia2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iLAogICJyb2xlIjogImRlc2t0b3AiLAogICJjbGFpbV90b2tlbl9oaW50IjogIjQ3MjkiCn0K"),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_offer_direct",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfb2ZmZXIiLAogICJkZXZpY2VfaWQiOiAiZGV2X21hY183YjIxIiwKICAiZGV2aWNlX3B1YmxpY19rZXkiOiAiQkV4YW1wbGVEZXNrdG9wU2VjMVB1YmxpY0tleUJhc2U2NFdvdWxkQmU2NURlY29kZWRCeXRlc1EycFY4WWIzTno3V3QxUms0WGg2Wmc5TW0wQWE1QmIyQ2M0RGQ2RWU4Zj09IiwKICAia2V5X2FncmVlbWVudF9wdWJsaWNfa2V5IjogIkJFeGFtcGxlRGVza3RvcEtleUFncmVlbWVudFNlYzFQdWJLZXlCYXNlNjRXb3VsZDY1Qnl0ZXNUdDNVdTVWdjdXdzlYeDFZeTNaejVBYTdCYjlDYzFEZDNFZTVGZjdnPT0iLAogICJyb2xlIjogImRlc2t0b3AiLAogICJjbGFpbV90b2tlbl9oaW50IjogIjQ3MjkiLAogICJkaXJlY3RfZW5kcG9pbnQiOiB7CiAgICAiaG9zdCI6ICJydXVkcy1tYnAudGFpbDEyMzQudHMubmV0IiwKICAgICJwb3J0IjogNDc4MDAKICB9Cn0K"),
         ProtocolFixture(
             category: "relay",
             name: "pairing_offer_ok",
             base64: "ewogICJ0eXBlIjogInBhaXJpbmdfb2ZmZXJfb2siLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiLAogICJjbGFpbV90b2tlbiI6ICI0NzI5LVhrOVFhMkxtIiwKICAiZXhwaXJlc19hdF9tcyI6IDE3NTI0MTI5MjA1MDAKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "pairing_revoked",
+            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfcmV2b2tlZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "peer_presence",
@@ -119,6 +128,10 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInBvbmciLAogICJjbGllbnRfdGltZV9tcyI6IDE3NTI0MTI4MDMwMDAsCiAgInNlcnZlcl90aW1lX21zIjogMTc1MjQxMjgwMzA0MAp9Cg=="),
         ProtocolFixture(
             category: "relay",
+            name: "push_notify",
+            base64: "ewogICJ0eXBlIjogInB1c2hfbm90aWZ5IiwKICAicGFpcmluZ19pZCI6ICJwYWlyX3J1dWRfbWJwIiwKICAiZXZlbnRfaWQiOiAiNmY5YTFjMmUtM2I0ZC00ZTVmLThhN2ItMWMyZDNlNGY1YTZiIiwKICAiY2xhc3MiOiAibmVlZHNfaW5wdXQiLAogICJub25jZSI6ICJBQUVDQXdRRkJnY0lDUW9MIiwKICAiY2lwaGVydGV4dCI6ICJBUDVnMEgzQ0p5QUI4VmY4Yi9IOXBTdWRqdk8rcW9LYlUvalZnYzVYQWw0U2dqZzZyM1JoaWp2ajc5M0RQenI0RkM4THlMa2ZyNjhXa2F6MW82dTBya3RWSGVZQjlmYlZwZnMxS0hhQlBTNnRrQWx4S0loTVNiVytVNStoaEVTeGtnczVxdFc4bDRkSmR2blV3VHJMQVB2VUZORUdDcnhyVGY2MkhhMHdPWGdWakd6R0Vhc1kxUno5WENmcjg5SUh2TVVGSWRzSnIzUnBtblVITENaTmw1NW5BdzFiUC9RZ0NYWUNlekdQdFhXRGlkb3Y3dDBJbVFUSTc5d1VaVk43NzRGT0taRWZEVkVWenJtYmQrSnlYS3Y1VnExb2hGQ3Y0S3NQNFhHRkNQeXRPbTV6c08vQTNDQjlBY0tpVDJjZVVtdUlENFZPVngvVmlKNk9xVVBUb3BOVzJjT1hLYlJ6VUZvK1RiWitTOHFXY0lXMHl6MTJ0SDZuaHFmNk9pQ3lLZmxBOVNrcW82Y28xZ0lOWVowPSIKfQo="),
+        ProtocolFixture(
+            category: "relay",
             name: "push_token_ack",
             base64: "ewogICJ0eXBlIjogInB1c2hfdG9rZW5fYWNrIiwKICAicGFpcmluZ19pZCI6ICJwYWlyX3J1dWRfbWJwIgp9Cg=="),
         ProtocolFixture(
@@ -127,20 +140,16 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInJlZ2lzdGVyX3B1c2hfdG9rZW4iLAogICJwYWlyaW5nX2lkIjogInBhaXJfcnV1ZF9tYnAiLAogICJ0b2tlbiI6ICI3NDBmNDcwN2JlYmNmNzRmOWI3YzI1ZDQ4ZTMzNTg5NDVmNmFhMDFkYTVkZGIzODc0NjJjN2VhZjYxYmI3OGFkIiwKICAiZW52aXJvbm1lbnQiOiAicHJvZHVjdGlvbiIKfQo="),
         ProtocolFixture(
             category: "relay",
-            name: "unregister_push_token",
-            base64: "ewogICJ0eXBlIjogInVucmVnaXN0ZXJfcHVzaF90b2tlbiIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
-        ProtocolFixture(
-            category: "relay",
             name: "resume",
             base64: "ewogICJ0eXBlIjogInJlc3VtZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIsCiAgImZyb21fc2VxIjogNDEKfQo="),
         ProtocolFixture(
             category: "relay",
-            name: "pairing_revoked",
-            base64: "ewogICJ0eXBlIjogInBhaXJpbmdfcmV2b2tlZCIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
-        ProtocolFixture(
-            category: "relay",
             name: "revoke",
             base64: "ewogICJ0eXBlIjogInJldm9rZSIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
+        ProtocolFixture(
+            category: "relay",
+            name: "unregister_push_token",
+            base64: "ewogICJ0eXBlIjogInVucmVnaXN0ZXJfcHVzaF90b2tlbiIsCiAgInBhaXJpbmdfaWQiOiAicGFpcl9ydXVkX21icCIKfQo="),
         ProtocolFixture(
             category: "relay",
             name: "version_incompatible",
@@ -257,5 +266,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 51
+    static let expectedCount = 58
 }

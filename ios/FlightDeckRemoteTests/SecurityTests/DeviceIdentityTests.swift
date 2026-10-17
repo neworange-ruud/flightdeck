@@ -15,18 +15,24 @@
 import Testing
 import Foundation
 import CryptoKit
+import os
 @testable import FlightDeckRemote
 
 /// In-memory `KeychainStoring` for deterministic, entitlement-free tests.
 /// Injecting this exercises the exact production create/load/destroy code
 /// paths without weakening `KeychainStore` itself.
-final class InMemoryKeychainStore: KeychainStoring {
-    private var items: [String: Data] = [:]
+///
+/// Thread-safe, like the real Keychain: the multi-pairing tests run several
+/// `TransportClient` actors over ONE shared store, and their concurrent cursor
+/// writes raced an unguarded dictionary into a SIGSEGV
+/// (`Dictionary._Variant.setValue`).
+final class InMemoryKeychainStore: KeychainStoring, @unchecked Sendable {
+    private let items = OSAllocatedUnfairLock(initialState: [String: Data]())
 
-    func get(account: String) throws -> Data? { items[account] }
-    func set(_ data: Data, account: String) throws { items[account] = data }
-    func delete(account: String) throws { items[account] = nil }
-    func accounts() throws -> [String] { Array(items.keys) }
+    func get(account: String) throws -> Data? { items.withLock { $0[account] } }
+    func set(_ data: Data, account: String) throws { items.withLock { $0[account] = data } }
+    func delete(account: String) throws { items.withLock { $0[account] = nil } }
+    func accounts() throws -> [String] { items.withLock { Array($0.keys) } }
 }
 
 /// Test-only verification helper: verify a raw r‖s signature over `nonce`

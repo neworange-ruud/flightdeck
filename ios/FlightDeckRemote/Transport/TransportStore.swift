@@ -68,6 +68,15 @@ final class TransportStore {
     /// `PairedInstance.machineNameFromDesktop` via `PairingStore.setMachineName`
     /// (see `TransportCoordinator`'s machine-name write-back).
     private(set) var machineName: String?
+    /// Whether this relay-mode pairing's relay turned out to be push-only
+    /// (spec §5.9): it authenticates and pushes, but carries no envelopes, so
+    /// the pairing cannot be used until it is re-paired over Tailscale.
+    private(set) var relayIsPushOnly = false
+
+    /// How this pairing carries its data plane (relay vs direct over
+    /// Tailscale), fixed at construction from the pairing record — shown in
+    /// the pairing/settings detail.
+    let transportMode: PairingTransportMode
 
     /// The current full state, folded from `snapshot` + incremental deltas.
     private(set) var snapshot: Wire.StateSnapshot?
@@ -100,6 +109,14 @@ final class TransportStore {
     // MARK: - Dependencies
 
     private let client: TransportClient
+    /// A direct-mode pairing's relay control-plane client (`.relayControl`):
+    /// push-token registration and revoke stay on the relay while `client`
+    /// talks to the Mac directly (spec §5.10). `nil` for a relay-mode pairing,
+    /// whose single `client` carries both planes. Its lifecycle follows this
+    /// store's exactly (start/stop/reconnect), and it only ever emits
+    /// `pairingRevoked` / `machineName` (see `TransportClient.emit`), so it can
+    /// share the event bridge without disturbing the honest link state.
+    private let controlClient: TransportClient?
     /// Additive, optional: when set, persists a debounced last-known-state
     /// snapshot on every meaningful update (PRD §9.2 offline cache). `nil` in
     /// every existing/unit-test construction, so this never writes to disk
@@ -117,13 +134,22 @@ final class TransportStore {
 
     init(
         client: TransportClient,
+        controlClient: TransportClient? = nil,
+        transportMode: PairingTransportMode = .relay,
         cache: SnapshotCache? = nil,
         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
         self.client = client
+        self.controlClient = controlClient
+        self.transportMode = transportMode
         self.cache = cache
         self.now = now
     }
+
+    /// The client that talks to the relay for this pairing's control frames
+    /// (push tokens, revoke): the dedicated control client of a direct-mode
+    /// pairing, else the single relay client.
+    private var relayClient: TransportClient { controlClient ?? client }
 
     // MARK: - Lifecycle
 
@@ -150,6 +176,10 @@ final class TransportStore {
         }
         await client.setEventHandler(sink)
         await client.start()
+        if let controlClient {
+            await controlClient.setEventHandler(sink)
+            await controlClient.start()
+        }
     }
 
     /// Force an immediate reconnect (remote-control-0ef.21 "Retry now"): resets
@@ -157,11 +187,13 @@ final class TransportStore {
     /// reconnects now instead of waiting out the current attempt/backoff.
     func reconnectNow() async {
         await client.reconnectNow()
+        await controlClient?.reconnectNow()
     }
 
     /// Stop the transport and tear down the event bridge.
     func stop() async {
         await client.stop()
+        await controlClient?.stop()
         // Finish so the loop drains any already-buffered events before exiting;
         // cancel is a backstop.
         eventContinuation?.finish()
@@ -213,7 +245,8 @@ final class TransportStore {
     /// it and (re-)sends on each `auth_ok`. Not a sealed command — the token is
     /// opaque and travels on the relay plane (outside E2E).
     func registerPushToken(_ token: String, environment: Wire.ApnsEnvironment) {
-        Task { await client.registerPushToken(token, environment: environment) }
+        let relay = relayClient
+        Task { await relay.registerPushToken(token, environment: environment) }
     }
 
     /// Apply the APNs token AND this pairing's mute preference atomically
@@ -223,7 +256,26 @@ final class TransportStore {
     /// unmuting re-registers the held token. `token == nil` keeps the held
     /// token. Safe before the link is live (applied on the next `auth_ok`).
     func applyPush(token: (token: String, environment: Wire.ApnsEnvironment)?, muted: Bool) {
-        Task { await client.applyPush(token: token, muted: muted) }
+        let relay = relayClient
+        Task { await relay.applyPush(token: token, muted: muted) }
+    }
+
+    // MARK: - Unpair / revoke (spec §5.8 / §5.10)
+
+    /// Best-effort `revoke` of this pairing. Always sent to the relay — it owns
+    /// membership and the push token, so its revoke is the authoritative one —
+    /// and, for a direct-mode pairing, ALSO to the Mac over the direct link when
+    /// that is live, so a connected Mac drops the pairing at once (§5.10).
+    /// Returns whether any frame was sent (diagnostic only; local removal never
+    /// waits on the network).
+    @discardableResult
+    func revokePairing() async -> Bool {
+        let viaRelay = await relayClient.revokePairing()
+        var viaDirect = false
+        if controlClient != nil {
+            viaDirect = await client.revokePairing()
+        }
+        return viaRelay || viaDirect
     }
 
     // MARK: - Shell surface (additive)
@@ -280,6 +332,8 @@ final class TransportStore {
             // `PairedInstance` is the `PairingStore`'s job, and this store has no
             // reference to it. `TransportCoordinator` observes this and prunes.
             isRevoked = true
+        case .relayPushOnly:
+            relayIsPushOnly = true
         case let .delivery(commandId, state):
             commandHandles[commandId]?.delivery = state
         case let .message(message):

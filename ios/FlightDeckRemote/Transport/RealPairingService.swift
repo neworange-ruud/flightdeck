@@ -15,9 +15,17 @@
 //    → pairing_claim { claim_token, device_id, device_public_key,
 //                      key_agreement_public_key, role: phone }
 //    ← pairing_claimed { pairing_id, peer_device_id,
-//                        peer_key_agreement_public_key }   (or error)
+//                        peer_key_agreement_public_key,
+//                        direct_endpoint? }                (or error)
 //    → auth_response { device_id, signature(nonce), pairing_ids: [pairing_id] }
 //    ← auth_ok
+//
+//  Direct mode (v4, §5.2/§5.10): when the desktop offered its Tailscale direct
+//  link, the relay copies the endpoint into `pairing_claimed.direct_endpoint`
+//  and the stored `PairingRecord` is in direct mode — the transport then talks
+//  to the Mac directly for the data plane. Nothing changes in the QR / code
+//  payload: the endpoint arrives from the relay rendezvous, and pairing itself
+//  always runs over the relay (§5.9 records why).
 //
 //  The phone MUST send its *software* key-agreement public key (KeyAgreementKeys)
 //  in `pairing_claim`, distinct from the Secure-Enclave signing identity
@@ -172,12 +180,24 @@ struct RealPairingService: PairingServicing {
             throw PairingError.unknown("The Mac didn't complete the secure handshake.")
         }
 
+        // Direct mode (§5.2/§5.10): the desktop has committed this pairing's
+        // data plane to its direct link, so an endpoint the phone cannot dial
+        // would strand it. Refuse it honestly instead of silently falling back
+        // to the relay, which the desktop will never feed for this pairing.
+        if let endpoint = claimed.directEndpoint {
+            let host = endpoint.host.trimmingCharacters(in: .whitespaces)
+            guard !host.isEmpty, endpoint.port != 0, endpoint.wsURL != nil else {
+                throw PairingError.unknown("The Mac offered a direct address this phone can't use.")
+            }
+        }
+
         let record = PairingRecord(
             pairingId: claimed.pairingId.rawValue,
             peerDeviceId: claimed.peerDeviceId?.rawValue,
             peerKeyAgreementPublicKeyB64: peerKA,
             saltB64: params.salt.base64EncodedString(),
-            relayURL: params.relayURL.absoluteString
+            relayURL: params.relayURL.absoluteString,
+            directEndpoint: claimed.directEndpoint
         )
         try? recordStore.save(record)
 
@@ -212,6 +232,9 @@ struct RealPairingService: PairingServicing {
         let pairingId: Wire.PairingId
         let peerDeviceId: Wire.DeviceId?
         let peerKeyAgreementPublicKey: String?
+        /// v4 (§5.2): present when the desktop offered its direct link — the
+        /// pairing is then in direct mode.
+        let directEndpoint: Wire.DirectEndpoint?
     }
 
     /// Receive frames until `predicate` matches, mapping fatal frames to typed
@@ -239,8 +262,9 @@ struct RealPairingService: PairingServicing {
     private func expectClaimed(_ channel: any WebSocketChannel, input: PairingInput) async throws -> Claimed {
         while true {
             let frame = try await receive(channel)
-            if case let .pairingClaimed(pairingId, peerDeviceId, peerKA) = frame {
-                return Claimed(pairingId: pairingId, peerDeviceId: peerDeviceId, peerKeyAgreementPublicKey: peerKA)
+            if case let .pairingClaimed(pairingId, peerDeviceId, peerKA, directEndpoint, _) = frame {
+                return Claimed(pairingId: pairingId, peerDeviceId: peerDeviceId,
+                               peerKeyAgreementPublicKey: peerKA, directEndpoint: directEndpoint)
             }
             try mapFatal(frame, input: input)
         }

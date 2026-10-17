@@ -75,6 +75,7 @@ FlightDeck Remote (phone pairing). See [FlightDeck Remote](/remote).
 | --- | --- | --- |
 | `enabled` | `false` | Master switch for phone pairing |
 | `relay_url` | `wss://relay.flightdeckai.app/ws` | Relay WebSocket URL (empty disables) |
+| `push_done_debounce_secs` | `5` | Seconds an agent must stay idle after a turn before your phone gets a "done" push. Going back to work inside the window cancels it, so mid-turn pauses don't notify. `0` pushes immediately; at most `3600`. Needs-input and error pushes are never delayed |
 
 <Callout type="warning">
   The default `relay_url` (`relay.flightdeckai.app`) is **restricted and not

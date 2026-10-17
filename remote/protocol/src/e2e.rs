@@ -8,11 +8,15 @@
 //! * [`DesktopToPhone`] — feeds pushed from the Mac to the phone.
 //! * [`PhoneCommand`] — commands issued by the phone; every one carries a
 //!   client-generated [`CommandId`] and is acknowledged by [`CommandAck`].
+//!
+//! Plus one plaintext that does **not** ride in an envelope: [`PushPayload`],
+//! sealed under the pairing's push key and carried by a push notification
+//! (spec §7.2) for the phone's Notification Service Extension to open.
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::{AgentStatus, AgentType, GitIndicators, GitStatusDetail, RollupDot};
-use crate::ids::{CommandId, EventId, ItemId, ProjectId, PromptId, SessionId, ShellId};
+use crate::common::{AgentStatus, AgentType, GitIndicators, GitStatusDetail, PushClass, RollupDot};
+use crate::ids::{CommandId, EventId, ItemId, PairingId, ProjectId, PromptId, SessionId, ShellId};
 
 // ===========================================================================
 // Shared value types
@@ -353,6 +357,82 @@ pub struct AgentEvent {
     pub occurred_at_ms: i64,
     /// Short title, e.g. `add-tests finished its turn`.
     pub title: String,
+}
+
+// ===========================================================================
+// Push payload (sealed for the Notification Service Extension, spec §7.2)
+// ===========================================================================
+
+/// Most bytes [`PushPayload::title`] may hold (UTF-8), ellipsis included. The
+/// desktop enforces it with [`truncate_push_text`].
+pub const MAX_PUSH_TITLE_BYTES: usize = 120;
+/// Most bytes [`PushPayload::body`] may hold (UTF-8), ellipsis included. The
+/// desktop enforces it with [`truncate_push_text`].
+pub const MAX_PUSH_BODY_BYTES: usize = 1000;
+/// Most bytes the serialized [`PushPayload`] JSON may hold before sealing. With
+/// the field caps above a payload fits comfortably; a desktop that still
+/// exceeds it (e.g. a huge project name) must shrink `body` further rather than
+/// send it.
+pub const MAX_PUSH_PLAINTEXT_BYTES: usize = 2048;
+
+/// The ellipsis [`truncate_push_text`] appends (U+2026, 3 bytes in UTF-8).
+pub const PUSH_TRUNCATION_MARK: &str = "\u{2026}";
+
+/// The plaintext of a push (spec §7.2): what the phone shows once its
+/// Notification Service Extension opens the sealed payload. Serialized to UTF-8
+/// JSON, sealed with ChaCha20-Poly1305 under the pairing's push key, and carried
+/// as [`crate::relay::PushNotifyBody::ciphertext`]. The relay never sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushPayload {
+    /// The event this push announces — the same id as the push frame's
+    /// `event_id` (and the `AgentEvent.event_id` the desktop also delivers over
+    /// the data plane, so the phone can dedupe the two).
+    pub event_id: EventId,
+    /// The event kind; equals the push frame's plaintext `class`.
+    pub class: PushClass,
+    /// Alert title, e.g. `fd-api needs input`. At most
+    /// [`MAX_PUSH_TITLE_BYTES`].
+    pub title: String,
+    /// Alert body: the question preview, error message or turn summary; may be
+    /// empty. At most [`MAX_PUSH_BODY_BYTES`].
+    pub body: String,
+    /// Where a tap should land.
+    pub deep_link: DeepLink,
+    /// Display-only project name, if the desktop has one.
+    pub project_name: Option<String>,
+    /// Wall-clock time (unix ms) the event occurred.
+    pub occurred_at_ms: i64,
+}
+
+/// The AEAD additional data for a sealed [`PushPayload`] (spec §7.2): the UTF-8
+/// of `"push:" ‖ pairing_id ‖ ":" ‖ event_id`. Binds the ciphertext to the push
+/// frame's plaintext routing fields, so the relay cannot replay one event's
+/// payload under another event or pairing.
+pub fn push_aad(pairing_id: &PairingId, event_id: &EventId) -> String {
+    format!("push:{pairing_id}:{event_id}")
+}
+
+/// Bound `text` to at most `max_bytes` UTF-8 bytes for a push field (spec §7.2).
+/// Text that already fits is returned unchanged. Otherwise it is cut on a
+/// `char` boundary and [`PUSH_TRUNCATION_MARK`] (`…`) appended, the mark
+/// counting toward `max_bytes`. If `max_bytes` cannot even hold the mark, the
+/// result is the longest prefix that fits, with no mark.
+pub fn truncate_push_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let (budget, mark) = match max_bytes.checked_sub(PUSH_TRUNCATION_MARK.len()) {
+        Some(budget) => (budget, PUSH_TRUNCATION_MARK),
+        None => (max_bytes, ""),
+    };
+    let mut cut = budget;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + mark.len());
+    out.push_str(&text[..cut]);
+    out.push_str(mark);
+    out
 }
 
 // ===========================================================================

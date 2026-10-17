@@ -437,6 +437,18 @@ impl PhoneDriver {
         self.conn = conn;
     }
 
+    /// Register an APNs push token for the pairing (spec §5.5), as the iOS app
+    /// does after pairing, so the relay has somewhere to send this pairing's
+    /// pushes. Fire-and-forget: the relay's `push_token_ack` is skipped by the
+    /// feed readers like any other non-envelope frame.
+    pub fn register_push_token(&mut self, token: &str) {
+        self.conn.send(&RelayFrame::RegisterPushToken {
+            pairing_id: self.pairing_id.clone(),
+            token: token.to_string(),
+            environment: flightdeck_remote_protocol::ApnsEnvironment::Sandbox,
+        });
+    }
+
     /// Seal and send a fully-formed [`PhoneCommand`]. The command's own
     /// `command_id` / `issued_at_ms` are used verbatim; the envelope's `seq`
     /// and `sent_at_ms` are assigned here (and bound into the AEAD AAD).
@@ -525,6 +537,8 @@ impl PhoneDriver {
                 // The desktop announces its machine name on connect (spec §5.7);
                 // it is relay-plane metadata, not an application message — skip it.
                 RelayFrame::MachineName { .. } => {}
+                // The answer to `register_push_token` (spec §5.5): relay-plane.
+                RelayFrame::PushTokenAck { .. } => {}
                 // A `seq_violation` WITHOUT `expected_seq` is the receiver-side
                 // advisory: our inbound cursor is stale, so drop it and re-resume
                 // exactly as `TransportClient.handleSeqViolation` does. Panicking
@@ -738,6 +752,7 @@ mod tests {
             key_agreement_public_key: public_key_b64(&desktop_key),
             role: Role::Desktop,
             claim_token_hint: Some(CLAIM_TOKEN.to_string()),
+            direct_endpoint: None,
         });
         let (pairing_id, issued_token) = match desktop.recv_expect(d_deadline, "pairing_offer_ok") {
             RelayFrame::PairingOfferOk {

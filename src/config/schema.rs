@@ -169,6 +169,7 @@ pub fn validate(config: &Config) -> Result<()> {
 
     validate_containers(&config.containers)?;
     validate_web(&config.web)?;
+    validate_remote(&config.remote)?;
 
     Ok(())
 }
@@ -231,6 +232,33 @@ fn validate_web(web: &crate::contracts::WebConfig) -> Result<()> {
         return Err(FlightDeckError::Config(format!(
             "web.replay_bytes {} exceeds the {}-byte sanity limit per terminal",
             web.replay_bytes, MAX_REPLAY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the `[remote]` section. Like `[web]` it is checked unconditionally
+/// (cheap, and a typo is better caught before the user turns Remote on):
+///
+/// - `push_done_debounce_secs` above
+///   [`crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS`] is rejected as a likely
+///   milliseconds-for-seconds typo that would silently swallow every done push.
+/// - `direct_port == 0` is rejected (spec §5.10): it would ask the OS for a
+///   different port every launch, silently breaking every direct pairing (each
+///   stores `host:port` on the phone).
+fn validate_remote(remote: &crate::contracts::RemoteConfig) -> Result<()> {
+    if remote.direct_port == 0 {
+        return Err(FlightDeckError::Config(
+            "remote.direct_port must not be 0 (direct pairings store a stable port on the phone)"
+                .to_string(),
+        ));
+    }
+    let max = crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS;
+    if remote.push_done_debounce_secs > max {
+        return Err(FlightDeckError::Config(format!(
+            "remote.push_done_debounce_secs {} exceeds the {max}-second limit \
+             (the value is in seconds, not milliseconds)",
+            remote.push_done_debounce_secs
         )));
     }
     Ok(())
@@ -387,6 +415,39 @@ mod tests {
         assert!(err.to_string().contains("ui.agent_tab_position"));
     }
 
+    // --- [remote] direct-link validation (REMOTE_PROTOCOL §5.10) ---
+
+    #[test]
+    fn direct_link_is_off_by_default_on_a_stable_port() {
+        let cfg = default_config("proj", "main");
+        assert!(!cfg.remote.direct_enabled, "the direct link is opt-in");
+        assert_eq!(
+            cfg.remote.direct_port,
+            crate::contracts::DEFAULT_DIRECT_PORT
+        );
+        assert!(cfg.remote.direct_host.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_direct_port() {
+        let mut cfg = default_config("proj", "main");
+        cfg.remote.direct_port = 0;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("remote.direct_port"), "{err}");
+    }
+
+    /// A partial `[remote]` table (an old config, or one that only sets
+    /// `enabled`) back-fills every direct-link key field by field.
+    #[test]
+    fn a_partial_remote_table_backfills_the_direct_keys() {
+        let cfg: crate::contracts::RemoteConfig =
+            toml::from_str("enabled = true\nrelay_url = \"wss://x/ws\"\n").unwrap();
+        assert!(cfg.enabled);
+        assert!(!cfg.direct_enabled);
+        assert_eq!(cfg.direct_port, crate::contracts::DEFAULT_DIRECT_PORT);
+        assert_eq!(cfg.direct_host, "");
+    }
+
     // --- [containers] validation (SPECS §31) ---
 
     #[test]
@@ -443,6 +504,26 @@ mod tests {
         assert_eq!(cfg.web.port, 7420);
         assert_eq!(cfg.web.bind, "127.0.0.1");
         assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    #[test]
+    fn validate_accepts_default_and_max_push_done_debounce() {
+        let mut cfg = default_config("p", "main");
+        assert_eq!(cfg.remote.push_done_debounce_secs, 5);
+        assert!(validate(&cfg).is_ok());
+        cfg.remote.push_done_debounce_secs = 0;
+        assert!(validate(&cfg).is_ok(), "0 = push done immediately");
+        cfg.remote.push_done_debounce_secs = crate::contracts::MAX_PUSH_DONE_DEBOUNCE_SECS;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_push_done_debounce_over_the_limit() {
+        let mut cfg = default_config("p", "main");
+        // 5000 reads like milliseconds typed into a seconds field.
+        cfg.remote.push_done_debounce_secs = 5_000;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("push_done_debounce_secs"), "{err}");
     }
 
     #[test]

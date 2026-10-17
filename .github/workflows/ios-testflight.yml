@@ -11,6 +11,11 @@ name: TestFlight
 #                                     Distribution certificate + private key
 #   APPLE_DISTRIBUTION_CERT_PASSWORD  the .p12 export password
 #   APPLE_APP_STORE_PROFILE           base64 of the App Store .mobileprovision
+#   APPLE_APP_STORE_PROFILE_NSE       base64 of the Notification Service
+#                                     Extension's App Store .mobileprovision
+#                                     ("FlightDeck Remote Notifications App
+#                                     Store", bundle id
+#                                     agency.neworange.flightdeck.remote.notification-service)
 #
 # and three that also drive the upload:
 #
@@ -74,6 +79,18 @@ jobs:
       - name: Install XcodeGen
         # The .xcodeproj is generated, not committed (see ios/README.md).
         run: brew install xcodegen
+
+      - name: Ensure the Metal Toolchain
+        # SwiftTerm ships Metal shaders, and Xcode 26+ no longer bundles the
+        # Metal compiler ("missing Metal Toolchain"). Download it only when this
+        # runner's Xcode reports it uninstalled; older Xcodes, which bundle it
+        # and do not know -showComponent, skip this.
+        run: |
+          if xcodebuild -showComponent MetalToolchain 2>/dev/null | grep -q "Status: uninstalled"; then
+            xcodebuild -downloadComponent MetalToolchain
+          else
+            echo "Metal Toolchain present or bundled; nothing to do."
+          fi
 
       - name: Import the Apple Distribution certificate
         env:
@@ -149,6 +166,21 @@ jobs:
           # profile's own UUID; it only needs a path.
           echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/appstore.mobileprovision"
           echo "FD_PROFILE_PATH=$RUNNER_TEMP/appstore.mobileprovision" >> "$GITHUB_ENV"
+
+      - name: Write the Notification Service Extension's provisioning profile
+        # The embedded extension (remote-control-bza0) is a separate bundle id
+        # and is signed manually against its own App Store profile; without it
+        # the archive cannot sign the .appex.
+        env:
+          PROFILE: ${{ secrets.APPLE_APP_STORE_PROFILE_NSE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROFILE" ]; then
+            echo "::error::APPLE_APP_STORE_PROFILE_NSE is not set — see this workflow's header."
+            exit 1
+          fi
+          echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/appstore-nse.mobileprovision"
+          echo "FD_NSE_PROFILE_PATH=$RUNNER_TEMP/appstore-nse.mobileprovision" >> "$GITHUB_ENV"
 
       - name: Archive and upload to TestFlight
         env:

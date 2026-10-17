@@ -1155,3 +1155,93 @@ fn a_desktop_ahead_of_the_relays_watermark_realigns_instead_of_wedging() {
 
     drop(h);
 }
+
+/// The desktop's push decision reaches the real relay over the live relay
+/// WebSocket (spec §5.5.1) without disturbing the session: an agent that stops
+/// to wait for input makes the desktop seal a `push_notify`, the relay (APNs
+/// unconfigured, as in every test run) accepts it from the authenticated
+/// desktop and logs its content-free outcome line `apns_not_configured` with
+/// `via=ws`, and the desktop never had to reconnect to get it there.
+///
+/// Observed through the relay's own push log line — the least invasive probe:
+/// no test hook in either binary, and it is exactly the line operators read.
+#[test]
+fn a_desktop_push_reaches_the_relay_over_the_live_socket() {
+    let mut h = Harness::boot_with(RelayHandle::spawn_logged());
+    // Like the iOS app after pairing: give the relay a token for this pairing,
+    // so the push is handed to the (unconfigured) APNs sender rather than
+    // dropped as `no_token`.
+    h.phone.register_push_token("e2e-device-token");
+
+    let project_id = only_project_id(&request_snapshot(&mut h.phone, ACK_TIMEOUT));
+    const SESSION: &str = "remote-push";
+    let new_agent = h.phone.command(CommandBody::NewAgent {
+        project_id,
+        agent_type: AgentType::ClaudeCode,
+        name: SESSION.to_string(),
+        base_branch: "main".to_string(),
+        first_task: String::new(),
+    });
+    let ack = await_ack(&mut h.phone, &new_agent, ACK_TIMEOUT);
+    assert_eq!(ack.outcome, CommandOutcome::Accepted, "{:?}", ack.message);
+    let status = h.worktree(SESSION).join(".flightdeck").join("agent-status");
+    wait_for_file_contains(&status, "working", EFFECT_TIMEOUT);
+    let session = wait_for_session(
+        &mut h.phone,
+        SESSION,
+        EFFECT_TIMEOUT,
+        |s| matches!(s.status, AgentStatus::Working | AgentStatus::Idle),
+        "push session present",
+    );
+
+    // The desktop suppresses events (and so pushes) for its first few seconds
+    // (`NOTIFY_STARTUP_GRACE_MS`, 4 s, SPECS §24), and this harness reaches
+    // here faster than that. Let the window pass so the edge below counts.
+    sleep(Duration::from_secs(5));
+
+    // The stub's sentinel makes it stop and wait for input: a needs-input push.
+    let reply = h.phone.command(CommandBody::Reply {
+        session_id: session.session_id.clone(),
+        text: "__WAIT__".to_string(),
+    });
+    let ack = await_ack(&mut h.phone, &reply, ACK_TIMEOUT);
+    assert_eq!(ack.outcome, CommandOutcome::Applied, "{:?}", ack.message);
+    wait_for_file_contains(&status, "waiting", EFFECT_TIMEOUT);
+
+    let deadline = Instant::now() + EFFECT_TIMEOUT;
+    let pushed = loop {
+        let log = h.relay.log();
+        if let Some(line) = log
+            .lines()
+            .find(|l| l.contains("apns_not_configured") && l.contains("\"via\":\"ws\""))
+        {
+            break line.to_string();
+        }
+        if Instant::now() >= deadline {
+            panic!("the relay never logged the desktop's push; relay log:\n{log}");
+        }
+        sleep(POLL);
+    };
+    assert!(
+        pushed.contains("needs_input"),
+        "the push is the needs-input decision: {pushed}"
+    );
+
+    // No reconnect was needed: one desktop hello for the whole run, and the
+    // relay refused nothing.
+    let log = h.relay.log();
+    let desktop_hellos = log
+        .lines()
+        .filter(|l| l.contains("hello accepted") && l.contains("Desktop"))
+        .count();
+    assert_eq!(
+        desktop_hellos, 1,
+        "the desktop reconnected; relay log:\n{log}"
+    );
+    assert!(
+        !log.contains("push refused"),
+        "the relay refused a push; relay log:\n{log}"
+    );
+
+    drop(h);
+}

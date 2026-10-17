@@ -5,13 +5,19 @@
 //! needs to authenticate endpoints and route ciphertext: version negotiation,
 //! device authentication, pairing bootstrap, presence, queued delivery with
 //! per-pairing sequence numbers, acks, latency ping/pong, push-token registration,
-//! and errors. The relay never sees application content — that travels inside the
-//! opaque [`EncryptedEnvelope`] and is defined in [`crate::e2e`].
+//! desktop-requested encrypted pushes, and errors. The relay never sees
+//! application content — that travels inside the opaque [`EncryptedEnvelope`]
+//! (or, for a push, the sealed [`PushNotifyBody::ciphertext`]) and is defined in
+//! [`crate::e2e`].
+//!
+//! The same frame set is also spoken on the **direct link** (spec §5.10): a
+//! phone in a direct-mode pairing connects straight to the Mac, which plays the
+//! relay's role for that pairing's data plane.
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::Role;
-use crate::ids::{DeviceId, PairingId};
+use crate::common::{PushClass, Role};
+use crate::ids::{DeviceId, EventId, PairingId};
 
 /// Presence of the peer endpoint for a pairing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,8 +84,237 @@ pub enum RelayErrorCode {
     /// never told to come back and both directions wedged permanently
     /// (remote-control-zv3).
     SeqViolation,
+    /// The relay runs in [`RelayMode::PushOnly`] and does not carry the data
+    /// plane: `envelope`, `resume` and `ack` are refused with this code (spec
+    /// §5.9). Not fatal — the connection stays open for the control frames a
+    /// push-only relay serves. Wire value: `relay_mode_push_only`.
+    RelayModePushOnly,
     /// An unexpected relay-side failure.
     Internal,
+}
+
+/// Which planes a relay serves (spec §5.9), announced in
+/// [`RelayFrame::HelloOk::relay_mode`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMode {
+    /// The routing relay: control plane **and** the data plane (queued
+    /// envelopes, seq/ack/resume). The default, and what a relay that omits
+    /// `relay_mode` (pre-v4) is. Wire value: `full`.
+    #[default]
+    Full,
+    /// Control plane only: hello/auth, pairing bootstrap, machine name, revoke,
+    /// push-token registration, ping, presence and `push_notify` (WS + HTTPS).
+    /// `envelope`/`resume`/`ack` are refused with
+    /// [`RelayErrorCode::RelayModePushOnly`]. Wire value: `push_only`.
+    PushOnly,
+}
+
+impl RelayMode {
+    /// The `snake_case` wire spelling — identical to the serde form and to the
+    /// relay's `RELAY_MODE` config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayMode::Full => "full",
+            RelayMode::PushOnly => "push_only",
+        }
+    }
+}
+
+impl std::fmt::Display for RelayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RelayMode {
+    type Err = String;
+
+    /// Parses the wire spelling (`full` | `push_only`), e.g. the relay's
+    /// `RELAY_MODE` environment variable. Anything else is an error naming the
+    /// accepted values.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(RelayMode::Full),
+            "push_only" => Ok(RelayMode::PushOnly),
+            other => Err(format!(
+                "unknown relay mode {other:?} (expected \"full\" or \"push_only\")"
+            )),
+        }
+    }
+}
+
+/// Path of the WebSocket endpoint the desktop serves for the direct link
+/// (spec §5.10): `ws://<host>:<port>/remote/v1`.
+pub const DIRECT_LINK_PATH: &str = "/remote/v1";
+
+/// Domain-separation prefix for the direct-link auth signature (spec §5.10).
+/// See [`direct_auth_message`].
+pub const DIRECT_AUTH_DOMAIN: &[u8] = b"flightdeck-remote-direct-v1:";
+
+/// Where a phone reaches the Mac directly (spec §5.2, §5.10). Carried in
+/// [`RelayFrame::PairingOffer::direct_endpoint`] and copied by the relay into the
+/// phone-bound [`RelayFrame::PairingClaimed::direct_endpoint`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DirectEndpoint {
+    /// The Mac's Tailscale MagicDNS name (e.g. `ruuds-mbp.tail1234.ts.net`) or
+    /// Tailscale address (e.g. `100.101.102.103`).
+    pub host: String,
+    /// TCP port the desktop's direct-link WebSocket listens on.
+    pub port: u16,
+}
+
+impl DirectEndpoint {
+    /// The WebSocket URL a phone dials: `ws://<host>:<port>/remote/v1`. An IPv6
+    /// literal host (it contains `:`) is bracketed, per RFC 3986.
+    pub fn ws_url(&self) -> String {
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("ws://[{}]:{}{DIRECT_LINK_PATH}", self.host, self.port)
+        } else {
+            format!("ws://{}:{}{DIRECT_LINK_PATH}", self.host, self.port)
+        }
+    }
+}
+
+/// The exact bytes a phone signs to authenticate on the direct link (spec
+/// §5.10): `b"flightdeck-remote-direct-v1:" ‖ nonce`, where `nonce` is the
+/// **decoded** `auth_challenge.nonce` bytes. Signed with the phone's identity key
+/// (ECDSA P-256 / SHA-256, raw `r ‖ s`), verified by the Mac against the
+/// `peer_device_public_key` it stored at pairing time.
+///
+/// The domain prefix makes a direct-link signature useless as a relay
+/// `auth_response` (which signs the bare nonce, §5.1) and vice versa, so a Mac
+/// that ran a malicious challenge could not replay the phone's answer to the
+/// relay.
+pub fn direct_auth_message(nonce: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(DIRECT_AUTH_DOMAIN.len() + nonce.len());
+    message.extend_from_slice(DIRECT_AUTH_DOMAIN);
+    message.extend_from_slice(nonce);
+    message
+}
+
+/// Largest base64 `ciphertext` a push may carry, in characters (spec §7.2). The
+/// relay rejects a larger `push_notify` with `error { code: bad_frame }` (WS) or
+/// HTTP 413 (HTTPS). It keeps the APNs request under Apple's 4 KiB payload cap.
+pub const MAX_PUSH_CIPHERTEXT_B64_LEN: usize = 3000;
+
+/// Path of the relay's HTTPS push endpoint (spec §5.5).
+pub const PUSH_HTTP_PATH: &str = "/v1/push";
+
+/// Derive the HTTPS push endpoint from the relay's WebSocket URL (spec §5.5):
+/// `wss://host[:port]/anything` → `https://host[:port]/v1/push`, and
+/// `ws://…` → `http://…`. The relay URL's path, query and fragment are dropped;
+/// the authority (host and any port) is kept verbatim. Returns `None` for any
+/// other scheme or an empty authority.
+pub fn push_endpoint_url(relay_ws_url: &str) -> Option<String> {
+    let (http_scheme, rest) = if let Some(rest) = relay_ws_url.strip_prefix("wss://") {
+        ("https", rest)
+    } else {
+        ("http", relay_ws_url.strip_prefix("ws://")?)
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{http_scheme}://{authority}{PUSH_HTTP_PATH}"))
+}
+
+/// HTTP header carrying the optional shared relay password on the HTTPS push
+/// endpoint — the HTTPS twin of [`RelayFrame::Hello::relay_password`].
+pub const RELAY_PASSWORD_HEADER: &str = "x-flightdeck-relay-password";
+
+/// Largest allowed `|relay_now - timestamp_ms|` for an HTTPS [`PushRequest`],
+/// in milliseconds (5 minutes). Bounds replay of a captured request.
+pub const PUSH_REQUEST_MAX_SKEW_MS: i64 = 300_000;
+
+/// Domain-separation label that opens every HTTPS push signing message. See
+/// [`push_request_signing_message`].
+pub const PUSH_SIGNING_DOMAIN: &str = "flightdeck-remote-push-v1";
+
+/// The five fields of a desktop-requested push (spec §5.5). Flattened next to
+/// `type` in [`RelayFrame::PushNotify`] and nested under `push` in the HTTPS
+/// [`PushRequest`] body — one struct so the WS and HTTPS paths cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushNotifyBody {
+    /// The pairing whose phone should be alerted. The requesting desktop must be
+    /// a member.
+    pub pairing_id: PairingId,
+    /// The event this push announces. Used as the APNs collapse id, so a retried
+    /// push for the same event replaces rather than duplicates the alert, and
+    /// bound into the payload AAD (spec §7.2).
+    pub event_id: EventId,
+    /// The only plaintext hint: picks the APNs interruption level and generic
+    /// alert text.
+    pub class: PushClass,
+    /// Base64 (standard, padded) 12-byte AEAD nonce.
+    pub nonce: String,
+    /// Base64 (standard, padded) ChaCha20-Poly1305 output (tag appended) of a
+    /// serialized [`crate::e2e::PushPayload`], sealed under the pairing's push
+    /// key (spec §7.2). At most [`MAX_PUSH_CIPHERTEXT_B64_LEN`] characters. The
+    /// relay copies it into the APNs payload verbatim and never opens it.
+    pub ciphertext: String,
+}
+
+/// The JSON body of `POST /v1/push` (spec §5.5): a desktop asking the relay to
+/// send a push without (or regardless of) a live WebSocket. Authenticated by
+/// [`Self::signature`] over [`push_request_signing_message`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    /// The requesting desktop device. Must be registered, role `desktop`, and a
+    /// member of `push.pairing_id`.
+    pub device_id: DeviceId,
+    /// Desktop wall-clock time (unix ms) at signing. The relay rejects a request
+    /// outside ±[`PUSH_REQUEST_MAX_SKEW_MS`] of its own clock.
+    pub timestamp_ms: i64,
+    /// The push itself — the same fields as [`RelayFrame::PushNotify`].
+    pub push: PushNotifyBody,
+    /// Base64 (standard, padded) ECDSA P-256 / SHA-256 signature, raw `r ‖ s`
+    /// (64 bytes), by the device identity key over the UTF-8 bytes of
+    /// [`Self::signing_message`].
+    pub signature: String,
+}
+
+impl PushRequest {
+    /// The canonical message [`Self::signature`] covers. Shorthand for
+    /// [`push_request_signing_message`] over this request's fields.
+    pub fn signing_message(&self) -> String {
+        push_request_signing_message(&self.device_id, self.timestamp_ms, &self.push)
+    }
+}
+
+/// The canonical string an HTTPS push request signs (spec §5.5) — the single
+/// implementation the desktop (signer) and the relay (verifier) share:
+///
+/// ```text
+/// flightdeck-remote-push-v1\n{device_id}\n{timestamp_ms}\n{pairing_id}\n{event_id}\n{class}\n{nonce}\n{ciphertext}
+/// ```
+///
+/// `\n`-joined, no trailing newline; `timestamp_ms` is base-10, `class` is the
+/// `snake_case` wire value. None of the fields can contain `\n` (ids are
+/// relay/desktop-minted tokens; `nonce`/`ciphertext` are base64), so the join is
+/// unambiguous. Sign/verify the UTF-8 bytes of the returned string.
+pub fn push_request_signing_message(
+    device_id: &DeviceId,
+    timestamp_ms: i64,
+    push: &PushNotifyBody,
+) -> String {
+    format!(
+        "{PUSH_SIGNING_DOMAIN}\n{device_id}\n{timestamp_ms}\n{}\n{}\n{}\n{}\n{}",
+        push.pairing_id,
+        push.event_id,
+        push.class.as_str(),
+        push.nonce,
+        push.ciphertext,
+    )
+}
+
+/// The JSON body of every non-2xx response from `POST /v1/push` (spec §5.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushErrorBody {
+    /// Machine-readable code — the same vocabulary as [`RelayFrame::Error`].
+    pub code: RelayErrorCode,
+    /// Human-readable detail for logs/support. Never contains push content.
+    pub message: String,
 }
 
 /// Non-secret client build metadata, sent in `hello` for diagnostics. Opaque to
@@ -160,6 +395,13 @@ pub enum RelayFrame {
         server_time_ms: i64,
         /// Opaque per-connection id for logging/support.
         connection_id: String,
+        /// **v4, optional.** Which planes this relay serves (spec §5.9). Absent
+        /// (`None`) from a pre-v4 relay, which is [`RelayMode::Full`]. The Mac's
+        /// direct-link server (spec §5.10) also sends `None` — it is not a relay
+        /// and carries the full data plane for its own pairings. Omitted from the
+        /// wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_mode: Option<RelayMode>,
     },
 
     /// relay -> endpoint. The client's version is outside the supported range;
@@ -257,6 +499,14 @@ pub enum RelayFrame {
         /// to a short TTL + single use + a per-connection claim rate limit; the
         /// E2E channel's confidentiality never rests on this token (spec §7.1).
         claim_token_hint: Option<String>,
+        /// **v4, optional.** Where the phone can reach this Mac directly over
+        /// Tailscale (spec §5.10). When `Some`, the relay copies it verbatim into
+        /// the **phone-bound** [`Self::PairingClaimed::direct_endpoint`], and the
+        /// pairing is in **direct mode** on both ends. `None` (and every pre-v4
+        /// desktop) makes a relay-mode pairing. The relay never dials it and
+        /// never uses it for routing. Omitted from the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct_endpoint: Option<DirectEndpoint>,
     },
 
     /// relay -> endpoint (desktop). A pairing was provisioned; `claim_token` is
@@ -298,6 +548,16 @@ pub enum RelayFrame {
     },
 
     /// relay -> endpoint. Pairing bootstrap succeeded; here is the assigned id.
+    ///
+    /// Sent to **both** sides of a fresh pairing, and the two copies carry
+    /// different peer material:
+    ///
+    /// | field | phone-bound copy (answer to `pairing_claim`) | desktop-bound copy (notification) |
+    /// |---|---|---|
+    /// | `peer_device_id` | the desktop's id | the phone's id |
+    /// | `peer_key_agreement_public_key` | the desktop's KA key | the phone's KA key |
+    /// | `direct_endpoint` | copied from the offer, if any | always `None` |
+    /// | `peer_device_public_key` | always `None` | the phone's identity key |
     PairingClaimed {
         /// The pairing id now shared by both devices.
         pairing_id: PairingId,
@@ -310,6 +570,23 @@ pub enum RelayFrame {
         /// key into the static-static ECDH of spec §7.1. `Option` to match
         /// `peer_device_id`'s shape (the relay may not yet hold the peer's key).
         peer_key_agreement_public_key: Option<String>,
+        /// **v4, optional, phone-bound copy only.** The desktop's
+        /// [`DirectEndpoint`], copied by the relay from the pairing's
+        /// [`Self::PairingOffer::direct_endpoint`]. `Some` puts the pairing in
+        /// **direct mode** (spec §5.10): the phone carries the whole data plane
+        /// over the direct link and uses the relay only for push-token
+        /// registration, revoke and pushes. The relay never sets it on the
+        /// desktop-bound copy. Omitted from the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direct_endpoint: Option<DirectEndpoint>,
+        /// **v4, optional, desktop-bound copy only.** The phone's **identity**
+        /// public key (the `device_public_key` from its `pairing_claim`; base64
+        /// standard-padded X9.63 uncompressed SEC1, 65 bytes), so the Mac can
+        /// verify the phone's direct-link auth signature itself (spec §5.10). The
+        /// relay never sets it on the phone-bound copy. Omitted from the wire when
+        /// `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_device_public_key: Option<String>,
     },
 
     /// relay -> endpoint. The peer for a pairing connected or disconnected.
@@ -446,6 +723,20 @@ pub enum RelayFrame {
         /// Pairing whose push token should be removed.
         pairing_id: PairingId,
     },
+
+    /// desktop -> relay (**v4**). Ask the relay to send one visible APNs alert
+    /// to the paired phone (spec §5.5). `type` is `push_notify`; the
+    /// [`PushNotifyBody`] fields are flattened alongside it, exactly like
+    /// [`Self::Envelope`].
+    ///
+    /// The desktop alone decides when a push is warranted (needs input, error,
+    /// done); the relay sends no pushes of its own. Accepted only from an
+    /// authenticated desktop that is a member of `pairing_id` (else
+    /// `error { code: unknown_pairing }`; from a phone, `bad_frame`).
+    /// Fire-and-forget: there is no success reply; failures surface as `error`
+    /// frames. A pairing with no registered push token is a silent no-op. Served
+    /// in both relay modes, and over HTTPS as [`PushRequest`].
+    PushNotify(PushNotifyBody),
 
     /// relay -> endpoint. A relay-plane error. Fatal-ness is implied by the code.
     Error {

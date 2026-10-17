@@ -17,5 +17,43 @@
 	-->
 	<key>aps-environment</key>
 	<string>production</string>
+	<!--
+	  Sharing with the Notification Service Extension (remote-control-bza0).
+
+	  keychain-access-groups: the FIRST entry is the app's own application
+	  identifier, which is exactly the default group items were written to
+	  before this entitlement existed, so every existing item (identity key,
+	  relay password) stays where it is and is still found. The second entry is
+	  the group the extension can read: KeychainStore writes ONLY the
+	  key-agreement key and the pairing records there
+	  (SharedContainer.accessGroup), and the app moves existing copies of those
+	  into it at launch (SharedStorageMigration) so nobody has to re-pair.
+	  Keychain groups need no developer-portal registration (profiles carry
+	  the TEAMID.* wildcard).
+
+	  application-groups: the shared UserDefaults suite for the notification
+	  preferences the extension applies. The App Group MUST be registered for
+	  team 7NKCS4AZS9, enabled on this App ID and the extension's, and present
+	  in the signing profiles — see ios/README.md.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)agency.neworange.flightdeck.remote</string>
+		<string>$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.agency.neworange.flightdeck.remote</string>
+	</array>
+	<!--
+	  Time Sensitive Notifications (remote-control-bza0): lets a *needs input*
+	  notification (interruption level time-sensitive — set by the relay's APNs
+	  payload and by the Notification Service Extension) break through Focus and
+	  the scheduled summary. Without it iOS silently presents those as `active`.
+	  The capability must be enabled on the App ID and present in the signing
+	  profile (regenerate the manual App Store profile) — see ios/README.md.
+	-->
+	<key>com.apple.developer.usernotifications.time-sensitive</key>
+	<true/>
 </dict>
 </plist>

@@ -73,6 +73,20 @@ pub struct Pairing {
     /// reconstructed at startup instead of the passthrough sealer.
     #[serde(default)]
     pub established: bool,
+    /// The phone's **identity** public key, base64 (standard, padded) X9.63 —
+    /// delivered in the desktop-bound `pairing_claimed.peer_device_public_key`
+    /// (spec §5.2, v4). The direct link (spec §5.10) verifies the phone's
+    /// `auth_response` signature against it, so the Mac authenticates the phone
+    /// itself with no relay in the loop. `None` for pairings claimed through a
+    /// pre-v4 relay and for every record written before the direct link existed.
+    #[serde(default)]
+    pub peer_device_public_key: Option<String>,
+    /// Which data plane carries this pairing's envelopes (spec §5.2 "Direct
+    /// endpoint & direct mode"). Absent in every record written before the
+    /// direct link existed, which therefore loads as [`PairingTransport::Relay`]
+    /// — exactly how those pairings behave. Switching means re-pairing.
+    #[serde(default)]
+    pub transport: PairingTransport,
 }
 
 impl Pairing {
@@ -87,6 +101,8 @@ impl Pairing {
             peer_key_agreement_public_key: None,
             claim_token: None,
             established: false,
+            peer_device_public_key: None,
+            transport: PairingTransport::Relay,
         }
     }
 
@@ -98,6 +114,26 @@ impl Pairing {
             && self.peer_key_agreement_public_key.is_some()
             && self.claim_token.is_some()
     }
+
+    /// Whether this pairing's data plane is the direct link (spec §5.10).
+    pub fn is_direct(&self) -> bool {
+        self.transport == PairingTransport::Direct
+    }
+}
+
+/// The data plane a pairing's envelopes travel on (spec §5.2, §5.10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingTransport {
+    /// Envelopes, resume and acks go through the relay (§6) — every pairing made
+    /// before v4, and every pairing whose offer carried no `direct_endpoint`.
+    #[default]
+    Relay,
+    /// The phone connects to this Mac's direct-link WebSocket over Tailscale and
+    /// the Mac's own outbox replaces the relay's queue. The relay is still used
+    /// for push-token registration, revoke and `push_notify`, never for this
+    /// pairing's envelopes.
+    Direct,
 }
 
 /// The whole persisted remote state.
@@ -145,6 +181,12 @@ impl RemoteState {
     /// All pairing ids this device wants to activate on a connection.
     pub fn pairing_ids(&self) -> Vec<String> {
         self.pairings.iter().map(|p| p.pairing_id.clone()).collect()
+    }
+
+    /// Whether `pairing_id` is a direct-mode pairing (spec §5.10). Unknown ids
+    /// are not.
+    pub fn is_direct(&self, pairing_id: &str) -> bool {
+        self.pairing(pairing_id).is_some_and(Pairing::is_direct)
     }
 }
 
@@ -219,6 +261,8 @@ mod tests {
                 peer_key_agreement_public_key: Some("BPeerKaKey".to_string()),
                 claim_token: Some("4729".to_string()),
                 established: true,
+                peer_device_public_key: Some("BPhoneIdKey".to_string()),
+                transport: PairingTransport::Direct,
             }],
         };
         save_remote_state(&fs, path, &state).expect("save");
@@ -265,5 +309,43 @@ mod tests {
         assert_eq!(loaded.device_private_key, "KEY");
         assert!(loaded.pairings.is_empty());
         assert_eq!(loaded.relay_url, None);
+    }
+
+    /// A pairing record written before the direct link existed carries neither
+    /// `transport` nor `peer_device_public_key`; it must load as a relay-mode
+    /// pairing with no phone identity key — exactly how it behaves (spec §5.2:
+    /// pre-v4 pairings are relay mode, re-pair to switch).
+    #[test]
+    fn a_pre_direct_pairing_record_loads_as_relay_mode() {
+        let fs = FakeFs::new().with_file(
+            "/home/user/.flightdeck/remote.json",
+            r#"{"version":1,"device_private_key":"KEY","pairings":[
+                {"pairing_id":"pair_old","peer_device_id":"dev","last_sent_seq":9,
+                 "peer_key_agreement_public_key":"BKa","claim_token":"1234","established":true}]}"#,
+        );
+        let path = Path::new("/home/user/.flightdeck/remote.json");
+        let loaded = load_remote_state(&fs, path).expect("load");
+        let p = loaded.pairing("pair_old").expect("pairing");
+        assert_eq!(p.transport, PairingTransport::Relay);
+        assert!(!p.is_direct());
+        assert_eq!(p.peer_device_public_key, None);
+        assert_eq!(p.last_sent_seq, 9);
+        assert!(!loaded.is_direct("pair_old"));
+    }
+
+    /// The transport is persisted in snake_case.
+    #[test]
+    fn transport_is_persisted() {
+        let fs = FakeFs::new();
+        let path = Path::new("/home/user/.flightdeck/remote.json");
+        let mut state = RemoteState::default();
+        let mut p = Pairing::new("pair_d");
+        p.transport = PairingTransport::Direct;
+        state.pairings.push(p);
+        save_remote_state(&fs, path, &state).expect("save");
+        let raw = fs.file_contents(path).expect("written");
+        assert!(raw.contains(r#""transport": "direct""#), "{raw}");
+        let loaded = load_remote_state(&fs, path).expect("load");
+        assert!(loaded.is_direct("pair_d"));
     }
 }

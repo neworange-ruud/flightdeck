@@ -84,6 +84,9 @@ enum TransportStoreFactory {
             keyAgreement: loadKeyAgreement(),
             recordStore: recordStore,
             connectorFactory: { URLSessionWebSocketConnection() },
+            // Direct-mode pairings (remote-control-gz0d) dial the Mac over
+            // Tailscale on a fail-fast session; relay traffic is unchanged.
+            directConnectorFactory: { DirectConnection() },
             cacheFactory: { pairingId in
                 isUITestLaunch
                     ? nil

@@ -275,6 +275,10 @@ impl SenderQueue {
     /// `SeqViolation` advisory the enqueue path already uses: the receiver
     /// zeroes its cursor for this pairing and asks its peer for a fresh
     /// snapshot (restarting the peer's stream), so no new wire frame is needed.
+    ///
+    /// **`from_seq == 0` never resyncs.** It is the receiver's recovery resume
+    /// after that advisory; the shed seqs are given up and the retained tail is
+    /// replayed (spec §6.3).
     pub fn resume(&self, from_seq: u64) -> ResumeOutcome {
         // The receiver's cursor sits ABOVE everything this stream has ever
         // accepted. That means the sender restarted its stream under the
@@ -303,7 +307,12 @@ impl SenderQueue {
             // a plain `ack`-pruned resume (`from_seq` below an acked front) would
             // be misread as a gap.
             let overflow_gap = front.seq > self.ack_cursor + 1;
-            if overflow_gap && from_seq + 1 < front.seq {
+            // `from_seq == 0` is exempt: it is the recovery resume a receiver
+            // sends after the resync advisory (it dropped its cursor), so the
+            // dropped seqs are given up and it replays the retained tail.
+            // Answering it with another resync is a livelock
+            // (remote-control-uj2t).
+            if overflow_gap && from_seq > 0 && from_seq + 1 < front.seq {
                 return ResumeOutcome::Resync;
             }
         }
@@ -660,8 +669,15 @@ mod tests {
             q.replay(0).iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
-        // A fresh receiver (from_seq 0) needs seq 1, which is gone → resync.
-        assert_eq!(q.resume(0), ResumeOutcome::Resync);
+        // from_seq 0 is the recovery resume a receiver sends AFTER a
+        // seq_violation (remote-control-uj2t): it holds nothing, so it replays
+        // what is retained instead of being told to resync again (a loop).
+        match q.resume(0) {
+            ResumeOutcome::Replay(v) => {
+                assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+            }
+            ResumeOutcome::Resync => panic!("resume(0) must replay the retained tail"),
+        }
         // A receiver that last saw seq 1 needs seq 2, also gone → resync.
         assert_eq!(q.resume(1), ResumeOutcome::Resync);
         // A receiver that last saw seq 2 needs seq 3, which is the front → clean.
@@ -736,8 +752,9 @@ mod tests {
             live.buffered().cloned().collect(),
             3,
         );
-        assert_eq!(restored.resume(0), ResumeOutcome::Resync);
         assert_eq!(restored.resume(1), ResumeOutcome::Resync);
+        // from_seq 0 is the post-advisory recovery: replay, never resync again.
+        assert_eq!(replayed_seqs(restored.resume(0)), vec![3, 4, 5]);
         match restored.resume(2) {
             ResumeOutcome::Replay(v) => {
                 assert_eq!(v.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5])

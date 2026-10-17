@@ -1,0 +1,65 @@
+{
+  "cases": [
+    {
+      "aad": "push:pair_ruud_mbp:6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "ciphertext_b64": "AP5g0H3CJyAB8Vf8b/H9pSudjvO+qoKbU/jVgc5XAl4Sgjg6r3Rhijvj793DPzr4FC8LyLkfr68Wkaz1o6u0rktVHeYB9fbVpfs1KHaBPS6tkAlxKIhMSbW+U5+hhESxkgs5qtW8l4dJdvnUwTrLAPvUFNEGCrxrTf62Ha0wOXgVjGzGEasY1Rz9XCfr89IHvMUFIdsJr3RpmnUHLCZNl55nAw1bP/QgCXYCezGPtXWDidov7t0ImQTI79wUZVN774FOKZEfDVEVzrmbd+JyXKv5Vq1ohFCv4KsP4XGFCPytOm5zsO/A3CB9AcKiT2ceUmuID4VOVx/ViJ6OqUPTopNW2cOXKbRzUFo+TbZ+S8qWcIW0yz12tH6nhqf6OiCyKflA9Skqo6co1gINYZ0=",
+      "claim_token": "4729",
+      "class": "needs_input",
+      "derived": {
+        "push_key_hex": "175d75062821fca6034886df54b7ff75e6dbcc06ceafd6e891942f7d59cd0fa3"
+      },
+      "event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b",
+      "info": "flightdeck-remote-e2e-v1:pair_ruud_mbp:push",
+      "name": "needs_input_code_pairing",
+      "nonce_b64": "AAECAwQFBgcICQoL",
+      "pairing_id": "pair_ruud_mbp",
+      "plaintext_utf8": "{\"event_id\":\"6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b\",\"class\":\"needs_input\",\"title\":\"fd-api needs input\",\"body\":\"Allow `cargo test --locked`?\",\"deep_link\":{\"project_id\":\"proj_fd_api\",\"session_id\":\"sess_fix_login\",\"item_id\":\"item_q1\"},\"project_name\":\"fd-api\",\"occurred_at_ms\":1752412800000}",
+      "role_input": {
+        "desktop_private_scalar_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "desktop_public_x963_b64": "BFFcPW6545a5BNP+yn9U/c0MwemXvzddylFa0KbDtANfRTa+OlDzGPv5pUdZAqIhUCvvDVfgjFOyzApW8X2fk1Q=",
+        "phone_private_scalar_hex": "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201",
+        "phone_public_x963_b64": "BCHhhNUWLYpNWffZn6gZ+E8LaxYjOewYWcePdzYuN8KP+Sia2/4/KkYuEEPNZhpWvH3tZaRUscnj+IvEfi0ei/E="
+      },
+      "salt_b64": "NDcyOQ==",
+      "tamper": {
+        "expect": "reject",
+        "tampered_aad": "push:pair_ruud_mbp:6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6c",
+        "tampered_event_id": "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6c"
+      }
+    },
+    {
+      "aad": "push:pair_qr_000001:0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2e",
+      "ciphertext_b64": "pfrz43It/ApySjUgFrc9SX4XZo/lxOFlKGunQXzR4E5Sf3T6jO7KEQgLmqqv3b01vMnkYGLkUTGgouBR61ecL2KULfZoVPkTuFkOO9SL/mLm3KLyC/q7/6qmSk9mZcS0JVNNdJai1/NbjvF39OldxJvgmMmZ/R7lOj/9n5WpZtrM1qFve7GdkqCbuXl0rQjRzg5yqZ5UcIF/eNRNft2X8v4H+QOGlHOxD6aG8gBtoN6h/Yz3qOqiVpB4QmjD+i2D845ef2AX1+YCJM2n1yNzCFA/0FWRklvxdSs8/9/koDqrOFdj0zQu24N1tSTpDbkzAJsxgGAISPxZd1c9ZRHALGBlpV26VUJZ4vgGcVdDYNKU8Q==",
+      "claim_token": "claim-482913-abcdef",
+      "class": "done",
+      "derived": {
+        "push_key_hex": "2face81794234cde7f2461d6e4859d78889279dc4e489caba7bfc27d04078cc6"
+      },
+      "event_id": "0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2e",
+      "info": "flightdeck-remote-e2e-v1:pair_qr_000001:push",
+      "name": "done_utf8_null_optionals",
+      "nonce_b64": "CwoJCAcGBQQDAgEA",
+      "pairing_id": "pair_qr_000001",
+      "plaintext_utf8": "{\"event_id\":\"0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2e\",\"class\":\"done\",\"title\":\"café-ui is done — 3 files changed\",\"body\":\"\",\"deep_link\":{\"project_id\":\"proj_cafe_ui\",\"session_id\":\"sess_polish\",\"item_id\":null},\"project_name\":null,\"occurred_at_ms\":1752412900000}",
+      "role_input": {
+        "desktop_private_scalar_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "desktop_public_x963_b64": "BFFcPW6545a5BNP+yn9U/c0MwemXvzddylFa0KbDtANfRTa+OlDzGPv5pUdZAqIhUCvvDVfgjFOyzApW8X2fk1Q=",
+        "phone_private_scalar_hex": "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201",
+        "phone_public_x963_b64": "BCHhhNUWLYpNWffZn6gZ+E8LaxYjOewYWcePdzYuN8KP+Sia2/4/KkYuEEPNZhpWvH3tZaRUscnj+IvEfi0ei/E="
+      },
+      "salt_b64": "Y2xhaW0tNDgyOTEzLWFiY2RlZg==",
+      "tamper": {
+        "expect": "reject",
+        "tampered_aad": "push:pair_qr_000001:0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2f",
+        "tampered_event_id": "0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2f"
+      }
+    }
+  ],
+  "scheme": {
+    "aad": "utf8(\"push:\" + pairing_id + \":\" + event_id)",
+    "aead": "ChaCha20-Poly1305, 12-byte nonce, ciphertext includes the 16-byte tag",
+    "ikm": "P-256 static-static ECDH shared secret x-coordinate (big-endian, 32 bytes) of the pairing's KA keys",
+    "kdf": "HKDF-SHA256(ikm, salt = utf8(claim_token)); info = \"flightdeck-remote-e2e-v1:\" + pairing_id + \":push\"",
+    "plaintext": "utf8 JSON of PushPayload"
+  }
+}

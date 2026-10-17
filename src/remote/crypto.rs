@@ -43,9 +43,18 @@
 //!    header as AAD means the relay cannot alter routing/ordering/attribution
 //!    without the receiver's `open` failing.
 //!
+//! 5. **Push key (spec §7.2).** A third, *direction-independent* key is expanded
+//!    from the same HKDF with `info = "flightdeck-remote-e2e-v1:" ‖ pairing_id ‖
+//!    ":push"`. The desktop seals a [`PushPayload`] under it
+//!    ([`E2eChannel::seal_push_payload`]) and the phone's Notification Service
+//!    Extension opens it from the stored pairing record alone — no envelope `seq`
+//!    is involved, so the AAD is `"push:" ‖ pairing_id ‖ ":" ‖ event_id`
+//!    ([`flightdeck_remote_protocol::e2e::push_aad`]).
+//!
 //! The construction is byte-compatible with the CryptoKit implementation on iOS
 //! (`E2EChannel.swift`); the checked-in cross-language vectors
-//! (`remote/protocol/tests/fixtures/e2e_crypto/vectors.json`) are the contract.
+//! (`remote/protocol/tests/fixtures/e2e_crypto/vectors.json`, and
+//! `push_vectors.json` for the push key) are the contract.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -58,7 +67,8 @@ use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
 use crate::contracts::{FlightDeckError, Result};
-use flightdeck_remote_protocol::Role;
+use flightdeck_remote_protocol::e2e::{push_aad, MAX_PUSH_PLAINTEXT_BYTES};
+use flightdeck_remote_protocol::{EventId, PairingId, PushNotifyBody, PushPayload, Role};
 
 /// Length of a derived AEAD key (ChaCha20-Poly1305 key).
 pub const KEY_LEN: usize = 32;
@@ -71,8 +81,8 @@ const INFO_PREFIX: &str = "flightdeck-remote-e2e-v1";
 
 /// A derived, ready-to-use end-to-end channel for one pairing on one endpoint.
 ///
-/// Holds the two directional keys plus this endpoint's [`Role`] (which selects the
-/// send key). Construct it with [`E2eChannel::derive`]; then [`E2eChannel::seal`]
+/// Holds the two directional keys, the direction-independent push key, plus this
+/// endpoint's [`Role`] (which selects the send key). Construct it with [`E2eChannel::derive`]; then [`E2eChannel::seal`]
 /// outgoing payloads and [`E2eChannel::open`] incoming ones. The private key
 /// material is consumed at derive time and never stored here.
 pub struct E2eChannel {
@@ -84,6 +94,9 @@ pub struct E2eChannel {
     d2p_key: [u8; KEY_LEN],
     /// Phone→desktop key.
     p2d_key: [u8; KEY_LEN],
+    /// Push-payload key (spec §7.2) — the same on both endpoints, whichever
+    /// role seals.
+    push_key: [u8; KEY_LEN],
 }
 
 impl std::fmt::Debug for E2eChannel {
@@ -104,7 +117,7 @@ impl E2eChannel {
     /// endpoint's `role`.
     ///
     /// Both endpoints, feeding in their own private key + the peer's public key,
-    /// arrive at the identical `d2p`/`p2d` key pair.
+    /// arrive at the identical `d2p`/`p2d` key pair and the identical push key.
     pub fn derive(
         identity_private_scalar: &[u8],
         peer_public_key_x963: &[u8],
@@ -124,13 +137,20 @@ impl E2eChannel {
         let hk = Hkdf::<Sha256>::new(Some(salt), ikm.as_slice());
         let d2p_key = expand_key(&hk, pairing_id, "d2p")?;
         let p2d_key = expand_key(&hk, pairing_id, "p2d")?;
+        let push_key = expand_key(&hk, pairing_id, "push")?;
 
         Ok(Self {
             role,
             pairing_id: pairing_id.to_string(),
             d2p_key,
             p2d_key,
+            push_key,
         })
+    }
+
+    /// The pairing this channel was derived for (bound into every AAD).
+    pub fn pairing_id(&self) -> &str {
+        &self.pairing_id
     }
 
     /// Seal an outgoing plaintext payload. Uses this endpoint's send key (chosen by
@@ -162,17 +182,7 @@ impl E2eChannel {
         // The sender of an outgoing message is always this endpoint's role.
         let key = self.key_for_sender(self.role);
         let aad = header_aad(&self.pairing_id, seq, self.role, sent_at_ms);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(nonce),
-                Payload {
-                    msg: plaintext_json,
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|_| FlightDeckError::State("e2e: seal failed".to_string()))?;
-        Ok((STANDARD.encode(nonce), STANDARD.encode(ciphertext)))
+        aead_seal(&key, nonce, plaintext_json, aad.as_bytes())
     }
 
     /// Open an incoming envelope. `sender` is the envelope's `sender` field (the
@@ -188,35 +198,100 @@ impl E2eChannel {
         nonce_b64: &str,
         ciphertext_b64: &str,
     ) -> Result<Vec<u8>> {
-        let nonce = STANDARD
-            .decode(nonce_b64)
-            .map_err(|e| FlightDeckError::State(format!("e2e: nonce not base64: {e}")))?;
-        if nonce.len() != NONCE_LEN {
-            return Err(FlightDeckError::State(format!(
-                "e2e: nonce must be {NONCE_LEN} bytes, got {}",
-                nonce.len()
-            )));
-        }
-        let ciphertext = STANDARD
-            .decode(ciphertext_b64)
-            .map_err(|e| FlightDeckError::State(format!("e2e: ciphertext not base64: {e}")))?;
-
         let key = self.key_for_sender(sender);
         let aad = header_aad(&self.pairing_id, seq, sender, sent_at_ms);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &ciphertext,
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|_| {
-                FlightDeckError::State(
-                    "e2e: open failed (wrong key, tampered, or bad header)".to_string(),
-                )
-            })
+        aead_open(
+            &key,
+            nonce_b64,
+            ciphertext_b64,
+            aad.as_bytes(),
+            "e2e: open failed (wrong key, tampered, or bad header)",
+        )
+    }
+
+    /// Serialize and seal a [`PushPayload`] for a `push_notify` frame (spec §7.2)
+    /// under the push key with a fresh random nonce, returning the ready-to-send
+    /// [`PushNotifyBody`] (`pairing_id`, `event_id` and `class` copied from the
+    /// payload). Fails if the serialized payload exceeds
+    /// [`MAX_PUSH_PLAINTEXT_BYTES`] — bound `title`/`body` first with
+    /// [`flightdeck_remote_protocol::e2e::truncate_push_text`].
+    pub fn seal_push_payload(&self, payload: &PushPayload) -> Result<PushNotifyBody> {
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        self.seal_push_payload_with_nonce(payload, &nonce)
+    }
+
+    /// [`Self::seal_push_payload`] with a caller-supplied nonce. **Test/vector
+    /// hook only** — production code must use the random-nonce form.
+    pub fn seal_push_payload_with_nonce(
+        &self,
+        payload: &PushPayload,
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<PushNotifyBody> {
+        let plaintext = serde_json::to_vec(payload)
+            .map_err(|e| FlightDeckError::State(format!("e2e: push payload: {e}")))?;
+        if plaintext.len() > MAX_PUSH_PLAINTEXT_BYTES {
+            return Err(FlightDeckError::State(format!(
+                "e2e: push payload is {} bytes, over the {MAX_PUSH_PLAINTEXT_BYTES}-byte cap",
+                plaintext.len()
+            )));
+        }
+        let (nonce, ciphertext) =
+            self.seal_push_with_nonce(&plaintext, &payload.event_id, nonce)?;
+        Ok(PushNotifyBody {
+            pairing_id: PairingId::new(self.pairing_id.clone()),
+            event_id: payload.event_id.clone(),
+            class: payload.class,
+            nonce,
+            ciphertext,
+        })
+    }
+
+    /// Seal raw push plaintext (the UTF-8 JSON of a [`PushPayload`]) under the
+    /// push key with a fresh random nonce. Returns `(nonce_b64, ciphertext_b64)`;
+    /// `ciphertext` has the 16-byte tag appended. Prefer
+    /// [`Self::seal_push_payload`], which also enforces the size cap.
+    pub fn seal_push(&self, plaintext_json: &[u8], event_id: &EventId) -> Result<(String, String)> {
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        self.seal_push_with_nonce(plaintext_json, event_id, &nonce)
+    }
+
+    /// [`Self::seal_push`] with a caller-supplied nonce. **Test/vector hook
+    /// only** — production code must use a fresh random nonce per push.
+    pub fn seal_push_with_nonce(
+        &self,
+        plaintext_json: &[u8],
+        event_id: &EventId,
+        nonce: &[u8; NONCE_LEN],
+    ) -> Result<(String, String)> {
+        let aad = self.push_aad(event_id);
+        aead_seal(&self.push_key, nonce, plaintext_json, aad.as_bytes())
+    }
+
+    /// Open a sealed push payload (spec §7.2). Fails if the key is wrong, the
+    /// ciphertext was tampered with, or `event_id` (or this channel's
+    /// `pairing_id`) is not the one it was sealed for. The phone's Notification
+    /// Service Extension does the same; the desktop uses this in tests.
+    pub fn open_push(
+        &self,
+        event_id: &EventId,
+        nonce_b64: &str,
+        ciphertext_b64: &str,
+    ) -> Result<Vec<u8>> {
+        let aad = self.push_aad(event_id);
+        aead_open(
+            &self.push_key,
+            nonce_b64,
+            ciphertext_b64,
+            aad.as_bytes(),
+            "e2e: push open failed (wrong key, tampered, or wrong event)",
+        )
+    }
+
+    /// The push AAD for this channel's pairing (spec §7.2).
+    fn push_aad(&self, event_id: &EventId) -> String {
+        push_aad(&PairingId::new(self.pairing_id.clone()), event_id)
     }
 
     /// The directional key a given sender's messages are encrypted under.
@@ -228,9 +303,58 @@ impl E2eChannel {
     }
 }
 
-/// HKDF-Expand one directional key. `direction` is `"d2p"` or `"p2d"`.
-fn expand_key(hk: &Hkdf<Sha256>, pairing_id: &str, direction: &str) -> Result<[u8; KEY_LEN]> {
-    let info = format!("{INFO_PREFIX}:{pairing_id}:{direction}");
+/// ChaCha20-Poly1305 seal; returns `(nonce_b64, ciphertext_b64)` with the tag
+/// appended to the ciphertext (spec §7.1 step 4).
+fn aead_seal(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    msg: &[u8],
+    aad: &[u8],
+) -> Result<(String, String)> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(nonce), Payload { msg, aad })
+        .map_err(|_| FlightDeckError::State("e2e: seal failed".to_string()))?;
+    Ok((STANDARD.encode(nonce), STANDARD.encode(ciphertext)))
+}
+
+/// ChaCha20-Poly1305 open of base64 `nonce`/`ciphertext`. Malformed base64 or a
+/// wrong-length nonce get their own error; an authentication failure reports
+/// `auth_failure`.
+fn aead_open(
+    key: &[u8; KEY_LEN],
+    nonce_b64: &str,
+    ciphertext_b64: &str,
+    aad: &[u8],
+    auth_failure: &str,
+) -> Result<Vec<u8>> {
+    let nonce = STANDARD
+        .decode(nonce_b64)
+        .map_err(|e| FlightDeckError::State(format!("e2e: nonce not base64: {e}")))?;
+    if nonce.len() != NONCE_LEN {
+        return Err(FlightDeckError::State(format!(
+            "e2e: nonce must be {NONCE_LEN} bytes, got {}",
+            nonce.len()
+        )));
+    }
+    let ciphertext = STANDARD
+        .decode(ciphertext_b64)
+        .map_err(|e| FlightDeckError::State(format!("e2e: ciphertext not base64: {e}")))?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| FlightDeckError::State(auth_failure.to_string()))
+}
+
+/// HKDF-Expand one key. `label` is `"d2p"`, `"p2d"` or `"push"`.
+fn expand_key(hk: &Hkdf<Sha256>, pairing_id: &str, label: &str) -> Result<[u8; KEY_LEN]> {
+    let info = format!("{INFO_PREFIX}:{pairing_id}:{label}");
     let mut key = [0u8; KEY_LEN];
     hk.expand(info.as_bytes(), &mut key)
         .map_err(|e| FlightDeckError::State(format!("e2e: hkdf expand failed: {e}")))?;
@@ -511,6 +635,235 @@ mod tests {
         } else {
             std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixtures");
             std::fs::write(&path, &serialized).expect("write vectors");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Push payload sealing (spec §7.2).
+    // ---------------------------------------------------------------------
+
+    use flightdeck_remote_protocol::e2e::{truncate_push_text, MAX_PUSH_BODY_BYTES};
+    use flightdeck_remote_protocol::{DeepLink, ItemId, ProjectId, PushClass, SessionId};
+
+    fn sample_payload(event_id: &str) -> PushPayload {
+        PushPayload {
+            event_id: EventId::new(event_id),
+            class: PushClass::NeedsInput,
+            title: "fd-api needs input".into(),
+            body: "Allow `cargo test --locked`?".into(),
+            deep_link: DeepLink {
+                project_id: ProjectId::new("proj_fd_api"),
+                session_id: SessionId::new("sess_fix_login"),
+                item_id: Some(ItemId::new("item_q1")),
+            },
+            project_name: Some("fd-api".into()),
+            occurred_at_ms: 1_752_412_800_000,
+        }
+    }
+
+    #[test]
+    fn push_key_is_shared_and_distinct_from_directional_keys() {
+        let (desktop, phone) = channels_for("pair_x", b"4729");
+        assert_eq!(desktop.push_key, phone.push_key);
+        assert_ne!(desktop.push_key, desktop.d2p_key);
+        assert_ne!(desktop.push_key, desktop.p2d_key);
+    }
+
+    #[test]
+    fn push_payload_round_trips_desktop_to_phone() {
+        let (desktop, phone) = channels_for("pair_x", b"4729");
+        let payload = sample_payload("evt_1");
+        let body = desktop.seal_push_payload(&payload).expect("seal push");
+        assert_eq!(body.pairing_id.as_str(), "pair_x");
+        assert_eq!(body.event_id, payload.event_id);
+        assert_eq!(body.class, PushClass::NeedsInput);
+        assert!(
+            body.ciphertext.len() <= flightdeck_remote_protocol::relay::MAX_PUSH_CIPHERTEXT_B64_LEN
+        );
+        let opened = phone
+            .open_push(&body.event_id, &body.nonce, &body.ciphertext)
+            .expect("open push");
+        let parsed: PushPayload = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn push_with_wrong_event_or_pairing_is_rejected() {
+        let (desktop, phone) = channels_for("pair_x", b"4729");
+        let body = desktop.seal_push_payload(&sample_payload("evt_1")).unwrap();
+        // The relay relabelling the push as another event breaks the AAD.
+        assert!(phone
+            .open_push(&EventId::new("evt_2"), &body.nonce, &body.ciphertext)
+            .is_err());
+        // A channel for another pairing (different key and AAD) cannot open it.
+        let (_, other_phone) = channels_for("pair_y", b"4729");
+        assert!(other_phone
+            .open_push(&body.event_id, &body.nonce, &body.ciphertext)
+            .is_err());
+        // An envelope key cannot open a push and vice versa.
+        assert!(phone
+            .open(1, Role::Desktop, 1, &body.nonce, &body.ciphertext)
+            .is_err());
+    }
+
+    #[test]
+    fn oversized_push_payload_is_refused() {
+        let (desktop, _) = channels_for("pair_x", b"4729");
+        let mut payload = sample_payload("evt_big");
+        payload.body = "x".repeat(MAX_PUSH_PLAINTEXT_BYTES);
+        assert!(desktop.seal_push_payload(&payload).is_err());
+        // Bounded with the shared helper, the worst-case payload fits.
+        payload.body = truncate_push_text(&payload.body, MAX_PUSH_BODY_BYTES);
+        payload.title = "t".repeat(120);
+        payload.project_name = Some("p".repeat(200));
+        let body = desktop
+            .seal_push_payload(&payload)
+            .expect("bounded payload fits");
+        assert!(
+            body.ciphertext.len() <= flightdeck_remote_protocol::relay::MAX_PUSH_CIPHERTEXT_B64_LEN
+        );
+    }
+
+    /// Absolute path to the checked-in cross-language push vectors.
+    fn push_vectors_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("remote/protocol/tests/fixtures/e2e_crypto/push_vectors.json")
+    }
+
+    /// One push vector case: the derived push key, a fixed-nonce seal of
+    /// `payload`, and a tampered-AAD case the other platform must reject.
+    fn build_push_case(
+        name: &str,
+        pairing_id: &str,
+        claim_token: &str,
+        payload: &PushPayload,
+        nonce: [u8; NONCE_LEN],
+        tampered_event_id: &str,
+    ) -> serde_json::Value {
+        let (desktop, phone) = channels_for(pairing_id, claim_token.as_bytes());
+        let plaintext = serde_json::to_string(payload).expect("serialize payload");
+        let body = desktop
+            .seal_push_payload_with_nonce(payload, &nonce)
+            .expect("seal push");
+        // Keep the generator honest: the phone opens it, and only under the
+        // honest event id.
+        assert_eq!(
+            phone
+                .open_push(&payload.event_id, &body.nonce, &body.ciphertext)
+                .unwrap(),
+            plaintext.as_bytes()
+        );
+        let tampered = EventId::new(tampered_event_id);
+        assert!(phone
+            .open_push(&tampered, &body.nonce, &body.ciphertext)
+            .is_err());
+
+        json!({
+            "name": name,
+            "pairing_id": pairing_id,
+            "role_input": {
+                "desktop_private_scalar_hex": hex(&DESKTOP_SCALAR),
+                "phone_private_scalar_hex": hex(&PHONE_SCALAR),
+                "desktop_public_x963_b64": STANDARD.encode(public_x963(&DESKTOP_SCALAR)),
+                "phone_public_x963_b64": STANDARD.encode(public_x963(&PHONE_SCALAR)),
+            },
+            "claim_token": claim_token,
+            "salt_b64": STANDARD.encode(claim_token.as_bytes()),
+            "info": format!("{INFO_PREFIX}:{pairing_id}:push"),
+            "derived": {
+                "push_key_hex": hex(&desktop.push_key),
+            },
+            "event_id": payload.event_id.as_str(),
+            "class": payload.class.as_str(),
+            "aad": push_aad(&PairingId::new(pairing_id), &payload.event_id),
+            "plaintext_utf8": plaintext,
+            "nonce_b64": body.nonce,
+            "ciphertext_b64": body.ciphertext,
+            // The other platform must confirm the same ciphertext fails to open
+            // when the AAD names a different event.
+            "tamper": {
+                "tampered_event_id": tampered_event_id,
+                "tampered_aad": push_aad(&PairingId::new(pairing_id), &tampered),
+                "expect": "reject"
+            }
+        })
+    }
+
+    /// Generate the cross-language push vectors and lock them, exactly like
+    /// [`generate_and_lock_cross_language_vectors`]: write on first run, assert
+    /// byte equality thereafter.
+    #[test]
+    fn generate_and_lock_push_vectors() {
+        let needs_input = PushPayload {
+            event_id: EventId::new("6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"),
+            class: PushClass::NeedsInput,
+            title: "fd-api needs input".into(),
+            body: "Allow `cargo test --locked`?".into(),
+            deep_link: DeepLink {
+                project_id: ProjectId::new("proj_fd_api"),
+                session_id: SessionId::new("sess_fix_login"),
+                item_id: Some(ItemId::new("item_q1")),
+            },
+            project_name: Some("fd-api".into()),
+            occurred_at_ms: 1_752_412_800_000,
+        };
+        // Non-ASCII text, an empty body and null optionals exercise the UTF-8
+        // and `null` handling on the other platform.
+        let done = PushPayload {
+            event_id: EventId::new("0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2e"),
+            class: PushClass::Done,
+            title: "caf\u{e9}-ui is done \u{2014} 3 files changed".into(),
+            body: String::new(),
+            deep_link: DeepLink {
+                project_id: ProjectId::new("proj_cafe_ui"),
+                session_id: SessionId::new("sess_polish"),
+                item_id: None,
+            },
+            project_name: None,
+            occurred_at_ms: 1_752_412_900_000,
+        };
+
+        let vectors = json!({
+            "scheme": {
+                "ikm": "P-256 static-static ECDH shared secret x-coordinate (big-endian, 32 bytes) of the pairing's KA keys",
+                "kdf": "HKDF-SHA256(ikm, salt = utf8(claim_token)); info = \"flightdeck-remote-e2e-v1:\" + pairing_id + \":push\"",
+                "aead": "ChaCha20-Poly1305, 12-byte nonce, ciphertext includes the 16-byte tag",
+                "aad": "utf8(\"push:\" + pairing_id + \":\" + event_id)",
+                "plaintext": "utf8 JSON of PushPayload"
+            },
+            "cases": [
+                build_push_case(
+                    "needs_input_code_pairing",
+                    "pair_ruud_mbp",
+                    "4729",
+                    &needs_input,
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                    "6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6c",
+                ),
+                build_push_case(
+                    "done_utf8_null_optionals",
+                    "pair_qr_000001",
+                    "claim-482913-abcdef",
+                    &done,
+                    [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+                    "0b7e4d1a-9c2f-4a6b-b1d3-5e8f7a9c0d2f",
+                ),
+            ]
+        });
+
+        let mut serialized = serde_json::to_string_pretty(&vectors).expect("serialize vectors");
+        serialized.push('\n');
+
+        let path = push_vectors_path();
+        if path.exists() {
+            let on_disk = std::fs::read_to_string(&path).expect("read push vectors");
+            assert_eq!(
+                on_disk, serialized,
+                "e2e_crypto/push_vectors.json is out of date. Delete it and re-run this test to regenerate."
+            );
+        } else {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir fixtures");
+            std::fs::write(&path, &serialized).expect("write push vectors");
         }
     }
 }

@@ -251,6 +251,47 @@ fn a_relay_refusal_fails_the_attempt_with_a_config_hint() {
 }
 
 #[test]
+fn a_relay_reason_ending_its_sentence_gets_no_double_period() {
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_handshake_failed("the relay refused the connection: unknown device.", false);
+    match s.phase() {
+        PairingPhase::Failed { message } => {
+            assert!(!message.contains(".."), "{message}");
+            assert!(message.starts_with("the relay refused the connection: unknown device. Check"));
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_pairing_refusal_is_shown_verbatim_without_config_advice() {
+    let refusal = "This relay is push-only, so pairing needs the direct link.";
+    // While the code is requested …
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_refused(refusal);
+    assert_eq!(
+        s.phase(),
+        &PairingPhase::Failed {
+            message: refusal.to_string()
+        }
+    );
+    // … and while it is on screen (a refused claim lands then).
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_offered(PairingId::new("pair_a"), "4729".to_string(), 9_999);
+    s.on_refused(refusal);
+    assert!(matches!(s.phase(), PairingPhase::Failed { message } if message == refusal));
+    // Never a finished pairing.
+    let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
+    s.on_offered(PairingId::new("pair_b"), "4729".to_string(), 9_999);
+    s.on_claimed(
+        PairingId::new("pair_b"),
+        Some(STANDARD.encode(public_x963(&PHONE_SCALAR))),
+    );
+    s.on_refused(refusal);
+    assert!(matches!(s.phase(), PairingPhase::Established { .. }));
+}
+
+#[test]
 fn a_retryable_failure_keeps_offering_but_explains_the_wait() {
     let mut s = PairingSession::begin_with_hint("ws://relay/ws", "4729");
     s.on_handshake_failed("cannot reach the relay: tcp connect failed", true);

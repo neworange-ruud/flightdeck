@@ -47,7 +47,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use flightdeck_remote_protocol::{ApnsEnvironment, DeviceId, EncryptedEnvelope, PairingId, Role};
+use flightdeck_remote_protocol::{
+    ApnsEnvironment, DeviceId, DirectEndpoint, EncryptedEnvelope, PairingId, Role,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::claims::{ClaimError, ClaimRecord, ClaimTable, RedeemedClaim};
@@ -69,10 +71,11 @@ CREATE TABLE IF NOT EXISTS pairings (
     machine_name TEXT
 );
 CREATE TABLE IF NOT EXISTS claims (
-    token         TEXT PRIMARY KEY,
-    pairing_id    TEXT NOT NULL,
-    desktop       TEXT NOT NULL,
-    expires_at_ms INTEGER NOT NULL
+    token           TEXT PRIMARY KEY,
+    pairing_id      TEXT NOT NULL,
+    desktop         TEXT NOT NULL,
+    expires_at_ms   INTEGER NOT NULL,
+    direct_endpoint TEXT
 );
 CREATE TABLE IF NOT EXISTS queue_streams (
     pairing_id TEXT NOT NULL,
@@ -228,7 +231,8 @@ fn save_queue(conn: &Connection, pairing: &PairingId, sender: Role, q: &SenderQu
 /// Read one claim row as a [`ClaimRecord`], if present.
 fn load_claim(conn: &Connection, token: &str) -> Option<ClaimRecord> {
     conn.query_row(
-        "SELECT token, pairing_id, desktop, expires_at_ms FROM claims WHERE token = ?1",
+        "SELECT token, pairing_id, desktop, expires_at_ms, direct_endpoint
+         FROM claims WHERE token = ?1",
         params![token],
         claim_record_from_row,
     )
@@ -239,7 +243,7 @@ fn load_claim(conn: &Connection, token: &str) -> Option<ClaimRecord> {
 /// Read every claim row as [`ClaimRecord`]s (for a full-table sweep).
 fn load_all_claims(conn: &Connection) -> Vec<ClaimRecord> {
     let mut stmt = conn
-        .prepare("SELECT token, pairing_id, desktop, expires_at_ms FROM claims")
+        .prepare("SELECT token, pairing_id, desktop, expires_at_ms, direct_endpoint FROM claims")
         .expect(DB_ERR);
     let rows = stmt.query_map([], claim_record_from_row).expect(DB_ERR);
     rows.map(|r| r.expect(DB_ERR)).collect()
@@ -252,7 +256,45 @@ fn claim_record_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord>
         pairing_id: PairingId::new(r.get::<_, String>(1)?),
         desktop_device: DeviceId::new(r.get::<_, String>(2)?),
         expires_at_ms: r.get(3)?,
+        direct_endpoint: decode_direct_endpoint(r.get::<_, Option<String>>(4)?),
     })
+}
+
+/// Serialize a claim's [`DirectEndpoint`] for the `claims.direct_endpoint`
+/// column: its wire JSON (`{"host":…,"port":…}`), or SQL `NULL` for none.
+fn encode_direct_endpoint(endpoint: Option<&DirectEndpoint>) -> Option<String> {
+    endpoint.map(|e| serde_json::to_string(e).expect("DirectEndpoint serializes"))
+}
+
+/// Parse a stored `claims.direct_endpoint`. `NULL` — and, defensively, a value
+/// that no longer parses — is "no endpoint" (a relay-mode pairing), never a
+/// failure: the worst case is a phone that pairs in relay mode.
+fn decode_direct_endpoint(stored: Option<String>) -> Option<DirectEndpoint> {
+    stored.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Bring a database created by an older relay up to the current [`SCHEMA`].
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so each column
+/// added after the first release is added here, idempotently, by checking
+/// `PRAGMA table_info` first.
+///
+/// - v4 (remote-control-l9xe): `claims.direct_endpoint` — the offer's
+///   direct-link address, nullable JSON (spec §5.2).
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = |table: &str, column: &str| -> rusqlite::Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        for name in names {
+            if name? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_column("claims", "direct_endpoint")? {
+        conn.execute("ALTER TABLE claims ADD COLUMN direct_endpoint TEXT", [])?;
+    }
+    Ok(())
 }
 
 /// File-backed [`RelayStore`]. See the module docs for the rationale and the
@@ -288,6 +330,7 @@ impl SqliteStore {
         // pairing is on the share before the call returns.
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             queue_max_per_pairing: queue_max_per_pairing.max(1),
@@ -497,16 +540,24 @@ impl RelayStore for SqliteStore {
         pairing: PairingId,
         desktop: DeviceId,
         expires_at_ms: i64,
+        direct_endpoint: Option<DirectEndpoint>,
     ) {
         self.lock()
             .execute(
-                "INSERT INTO claims (token, pairing_id, desktop, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO claims (token, pairing_id, desktop, expires_at_ms, direct_endpoint)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(token) DO UPDATE SET
                     pairing_id = excluded.pairing_id,
                     desktop = excluded.desktop,
-                    expires_at_ms = excluded.expires_at_ms",
-                params![token, pairing.as_str(), desktop.as_str(), expires_at_ms],
+                    expires_at_ms = excluded.expires_at_ms,
+                    direct_endpoint = excluded.direct_endpoint",
+                params![
+                    token,
+                    pairing.as_str(),
+                    desktop.as_str(),
+                    expires_at_ms,
+                    encode_direct_endpoint(direct_endpoint.as_ref())
+                ],
             )
             .expect(DB_ERR);
     }
@@ -550,8 +601,9 @@ impl RelayStore for SqliteStore {
             {
                 let mut stmt = tx
                     .prepare(
-                        "INSERT INTO claims (token, pairing_id, desktop, expires_at_ms)
-                         VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO claims
+                            (token, pairing_id, desktop, expires_at_ms, direct_endpoint)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
                     )
                     .expect(DB_ERR);
                 for r in table.records() {
@@ -559,7 +611,8 @@ impl RelayStore for SqliteStore {
                         r.token,
                         r.pairing_id.as_str(),
                         r.desktop_device.as_str(),
-                        r.expires_at_ms
+                        r.expires_at_ms,
+                        encode_direct_endpoint(r.direct_endpoint.as_ref())
                     ])
                     .expect(DB_ERR);
                 }
@@ -723,12 +776,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_direct_endpoint_survives_reopen() {
+        // Spec §5.2 (v4): the offer's direct endpoint is persisted with the
+        // pending claim, so a relay restart between offer and claim still hands
+        // the phone the Mac's address.
+        let tmp = tempdir();
+        let endpoint = DirectEndpoint {
+            host: "ruuds-mbp.tail1234.ts.net".into(),
+            port: 47800,
+        };
+        {
+            let s = store(&tmp);
+            s.issue_claim(
+                "direct".into(),
+                PairingId::new("pair_d"),
+                DeviceId::new("dev_mac"),
+                10_000,
+                Some(endpoint.clone()),
+            )
+            .await;
+            s.issue_claim(
+                "plain".into(),
+                PairingId::new("pair_r"),
+                DeviceId::new("dev_mac"),
+                10_000,
+                None,
+            )
+            .await;
+            // A sweep rewrites the survivors; the endpoint must survive that too.
+            assert_eq!(s.sweep_expired_claims(5_000).await, 0);
+        }
+        let s = store(&tmp);
+        let direct = s.redeem_claim("direct", 5_000).await.expect("redeem");
+        assert_eq!(direct.direct_endpoint, Some(endpoint));
+        let plain = s.redeem_claim("plain", 5_000).await.expect("redeem");
+        assert_eq!(plain.direct_endpoint, None);
+    }
+
+    #[tokio::test]
+    async fn pre_v4_database_is_migrated_in_place() {
+        // A database written by an older relay has no `claims.direct_endpoint`
+        // column; opening it must add the column and keep the existing rows.
+        let tmp = tempdir();
+        let path = tmp.join("relay.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE claims (
+                    token         TEXT PRIMARY KEY,
+                    pairing_id    TEXT NOT NULL,
+                    desktop       TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO claims VALUES ('old', 'pair_old', 'dev_mac', 10000);",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path, 1000).expect("open + migrate");
+        let claim = s.redeem_claim("old", 5_000).await.expect("old row kept");
+        assert_eq!(claim.pairing_id, PairingId::new("pair_old"));
+        assert_eq!(claim.direct_endpoint, None);
+        // Reopening an already-migrated database is a no-op.
+        drop(s);
+        SqliteStore::open(&path, 1000).expect("idempotent migration");
+    }
+
+    #[tokio::test]
     async fn claim_ttl_and_single_use() {
         let tmp = tempdir();
         let s = store(&tmp);
         let pairing = PairingId::new("pair_1");
         let desktop = DeviceId::new("dev_mac");
-        s.issue_claim("tok".into(), pairing.clone(), desktop.clone(), 10_000)
+        s.issue_claim("tok".into(), pairing.clone(), desktop.clone(), 10_000, None)
             .await;
         assert!(!s.claim_token_is_free("tok", 5_000).await);
         // Redeems once at/under expiry.
@@ -749,6 +868,7 @@ mod tests {
             PairingId::new("pair_1"),
             DeviceId::new("dev_mac"),
             10_000,
+            None,
         )
         .await;
         assert_eq!(
@@ -789,12 +909,16 @@ mod tests {
             s.enqueue(env(&pairing, Role::Desktop, 4)).await,
             Ok(AppendOutcome::Accepted { overflow: true })
         );
-        // The oldest (seq 1) was shed, so a resume from 0 asks for a lost seq and
-        // must RESYNC rather than replay a hole (remote-control-0ef.7). Resuming
-        // from seq 2 (the front's predecessor) replays the retained tail cleanly.
+        // The oldest (seq 1) was shed. A resume from 0 is the post-advisory
+        // recovery and replays the retained tail (remote-control-uj2t); the
+        // resync applies to 0 < from_seq with a lost seq in between
+        // (remote-control-0ef.7), covered by the deeper-overflow test below.
         assert_eq!(
-            s.resume(&pairing, Role::Desktop, 0).await,
-            ResumeOutcome::Resync
+            replayed(s.resume(&pairing, Role::Desktop, 0).await)
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
         );
         let seqs: Vec<u64> = replayed(s.resume(&pairing, Role::Desktop, 1).await)
             .iter()
@@ -855,12 +979,16 @@ mod tests {
         // A fresh receiver (needs seq 1) and one that last saw seq 1 (needs seq 2)
         // both ask for shed seqs → resync.
         assert_eq!(
-            s.resume(&pairing, Role::Desktop, 0).await,
-            ResumeOutcome::Resync
-        );
-        assert_eq!(
             s.resume(&pairing, Role::Desktop, 1).await,
             ResumeOutcome::Resync
+        );
+        // from_seq 0 recovers by replaying the retained tail (remote-control-uj2t).
+        assert_eq!(
+            replayed(s.resume(&pairing, Role::Desktop, 0).await)
+                .iter()
+                .map(|e| e.seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
         );
         // An unknown queue is a clean, empty replay (no stream row).
         assert_eq!(
@@ -961,6 +1089,7 @@ mod tests {
             PairingId::new("p1"),
             DeviceId::new("d1"),
             10_000,
+            None,
         )
         .await;
         s.issue_claim(
@@ -968,6 +1097,7 @@ mod tests {
             PairingId::new("p2"),
             DeviceId::new("d2"),
             5_000,
+            None,
         )
         .await;
 

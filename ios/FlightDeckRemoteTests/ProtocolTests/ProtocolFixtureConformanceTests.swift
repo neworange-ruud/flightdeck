@@ -33,10 +33,19 @@ struct ProtocolFixtureConformanceTests {
 
     @Test func fixtureInventoryIsComplete() {
         #expect(ProtocolFixtures.all.count == ProtocolFixtures.expectedCount)
-        // 23 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
+        // 31 relay + 10 desktop_to_phone + 17 phone_to_desktop golden files
         // (relay gained machine_name, unregister_push_token, revoke,
-        // pairing_revoked as their owning iOS issues landed).
-        #expect(ProtocolFixtures.all.count >= 48)
+        // pairing_revoked as their owning iOS issues landed, then the seven v4
+        // frames: push_notify, hello_ok_push_only, pairing_offer_direct,
+        // pairing_claimed_direct, pairing_claimed_to_desktop,
+        // pairing_claimed_to_desktop_direct, error_relay_mode_push_only).
+        #expect(ProtocolFixtures.all.count >= 58)
+        for v4 in ["push_notify", "hello_ok_push_only", "pairing_offer_direct",
+                   "pairing_claimed_direct", "pairing_claimed_to_desktop",
+                   "pairing_claimed_to_desktop_direct", "error_relay_mode_push_only"] {
+            #expect(ProtocolFixtures.all.contains { $0.category == "relay" && $0.name == v4 },
+                    "v4 fixture relay/\(v4) is not embedded — rerun ios/scripts/sync-fixtures.sh")
+        }
         for category in ["relay", "desktop_to_phone", "phone_to_desktop"] {
             #expect(ProtocolFixtures.all.contains { $0.category == category },
                     "no fixtures embedded for category \(category)")
@@ -471,6 +480,100 @@ struct ProtocolFixtureConformanceTests {
         }
         #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
         #expect(machineName == "Ruud's MacBook Pro")
+    }
+
+    // MARK: - Protocol v4: relay modes, direct link, push_notify
+
+    @Test func protocolVersionIsFour() {
+        #expect(Wire.protocolVersion == 4)
+        #expect(Wire.maxSupportedVersion == 4)
+        #expect(Wire.minSupportedVersion == 1)
+    }
+
+    @Test func helloOkCarriesRelayModeOnlyWhenPresent() throws {
+        let pushOnly = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "hello_ok_push_only"))
+        guard case let .helloOk(version, _, _, mode) = pushOnly else {
+            Issue.record("expected .helloOk"); return
+        }
+        #expect(version == 4)
+        #expect(mode == .pushOnly)
+        // A pre-v4 relay omits the field → nil (treated as full).
+        let legacy = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "hello_ok"))
+        guard case let .helloOk(_, _, _, legacyMode) = legacy else { return }
+        #expect(legacyMode == nil)
+        // An unknown future mode must not fail the hello_ok.
+        let future = Data(#"{"type":"hello_ok","protocol_version":5,"server_time_ms":1,"connection_id":"c","relay_mode":"mesh"}"#.utf8)
+        guard case let .helloOk(_, _, _, futureMode) = try JSONDecoder().decode(Wire.RelayFrame.self, from: future) else { return }
+        #expect(futureMode == .unknown)
+    }
+
+    @Test func phoneBoundPairingClaimedCarriesTheDirectEndpoint() throws {
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "pairing_claimed_direct"))
+        guard case let .pairingClaimed(pairingId, peerDeviceId, _, endpoint, peerDevicePublicKey) = frame else {
+            Issue.record("expected .pairingClaimed"); return
+        }
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+        #expect(peerDeviceId == Wire.DeviceId("dev_mac_7b21"))
+        #expect(endpoint == Wire.DirectEndpoint(host: "ruuds-mbp.tail1234.ts.net", port: 47800))
+        #expect(endpoint?.wsURLString == "ws://ruuds-mbp.tail1234.ts.net:47800/remote/v1")
+        #expect(peerDevicePublicKey == nil)
+        // The v2-shaped claim has neither v4 field (relay mode).
+        let legacy = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "pairing_claimed"))
+        guard case let .pairingClaimed(_, _, _, legacyEndpoint, legacyKey) = legacy else { return }
+        #expect(legacyEndpoint == nil)
+        #expect(legacyKey == nil)
+    }
+
+    @Test func desktopBoundPairingClaimedCarriesThePhoneIdentityKey() throws {
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "pairing_claimed_to_desktop"))
+        guard case let .pairingClaimed(_, _, _, endpoint, peerDevicePublicKey) = frame else {
+            Issue.record("expected .pairingClaimed"); return
+        }
+        #expect(endpoint == nil)
+        #expect(peerDevicePublicKey?.hasPrefix("BExamplePhoneSecureEnclave") == true)
+    }
+
+    @Test func pairingOfferDirectCarriesHintAndEndpoint() throws {
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "pairing_offer_direct"))
+        guard case let .pairingOffer(_, _, _, role, hint, endpoint) = frame else {
+            Issue.record("expected .pairingOffer"); return
+        }
+        #expect(role == .desktop)
+        #expect(hint == "4729")
+        #expect(endpoint?.port == 47800)
+    }
+
+    @Test func pushNotifyFrameDecodesWithoutBreakingTheStream() throws {
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "push_notify"))
+        guard case let .pushNotify(body) = frame else {
+            Issue.record("expected .pushNotify"); return
+        }
+        #expect(body.pairingId == Wire.PairingId("pair_ruud_mbp"))
+        #expect(body.eventId == Wire.EventId("6f9a1c2e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"))
+        #expect(body.pushClass == .needsInput)
+        #expect(body.nonce == "AAECAwQFBgcICQoL")
+        #expect(!body.ciphertext.isEmpty)
+    }
+
+    @Test func relayModePushOnlyErrorCodeDecodes() throws {
+        let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: fixture("relay", "error_relay_mode_push_only"))
+        guard case let .error(code, _, pairingId, expectedSeq) = frame else {
+            Issue.record("expected .error"); return
+        }
+        #expect(code == .relayModePushOnly)
+        #expect(pairingId == Wire.PairingId("pair_ruud_mbp"))
+        #expect(expectedSeq == nil)
+    }
+
+    /// The phone's own `auth_response` stays byte-compatible: no
+    /// `machine_name` key (desktop-only), so older relays and the Mac's direct
+    /// link see exactly what they always did.
+    @Test func phoneAuthResponseOmitsMachineName() throws {
+        let frame = Wire.RelayFrame.authResponse(deviceId: Wire.DeviceId("dev"), signature: "sig",
+                                                 pairingIds: [Wire.PairingId("p")])
+        let json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(frame)) as? [String: Any])
+        #expect(json["machine_name"] == nil)
+        #expect(json.count == 4)
     }
 
     // MARK: - Machine-name sanitization (§5.7, remote-control-b8d.9)

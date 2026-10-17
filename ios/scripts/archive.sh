@@ -58,6 +58,10 @@ BUNDLE_ID="agency.neworange.flightdeck.remote"
 # Create or rotate it from the App Store Connect API (see ios/README.md
 # "Credentials"); its name is the contract between that profile and this script.
 PROFILE_NAME="FlightDeck Remote App Store"
+# The embedded Notification Service Extension (remote-control-bza0) is its own
+# bundle id and needs its own App Store profile, managed the same way.
+NSE_BUNDLE_ID="agency.neworange.flightdeck.remote.notification-service"
+NSE_PROFILE_NAME="FlightDeck Remote Notifications App Store"
 SIGN_IDENTITY="Apple Distribution"
 
 UPLOAD=false
@@ -78,25 +82,36 @@ echo "==> Generating Xcode project (xcodegen)"
 # archive step silently falls back to the *development* identity and only blows
 # up later at export. Pinning the identity and the profile removes that whole
 # class of failure: the same inputs sign the same way on any machine.
-if [ -n "${FD_PROFILE_PATH:-}" ]; then
-  FD_PROFILE_PATH="${FD_PROFILE_PATH/#\~\//$HOME/}"
-  if [ ! -f "$FD_PROFILE_PATH" ]; then
-    echo "FD_PROFILE_PATH is set but no profile is there: $FD_PROFILE_PATH" >&2
+install_profile() {
+  local var_name="$1"
+  local path="$2"
+  path="${path/#\~\//$HOME/}"
+  if [ ! -f "$path" ]; then
+    echo "$var_name is set but no profile is there: $path" >&2
     exit 1
   fi
   # Xcode 26 reads managed profiles from UserData, not the older
   # ~/Library/MobileDevice/Provisioning Profiles (which is root-owned on some
   # machines and unwritable). Install by UUID, which is how xcodebuild indexes.
-  PROFILE_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
-  mkdir -p "$PROFILE_DIR"
-  PROFILE_UUID="$(security cms -D -i "$FD_PROFILE_PATH" 2>/dev/null \
-    | plutil -extract UUID raw - -o -)"
-  if [ -z "$PROFILE_UUID" ]; then
-    echo "Could not read a UUID out of $FD_PROFILE_PATH" >&2
+  local profile_dir="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+  mkdir -p "$profile_dir"
+  local uuid
+  uuid="$(security cms -D -i "$path" 2>/dev/null | plutil -extract UUID raw - -o -)"
+  if [ -z "$uuid" ]; then
+    echo "Could not read a UUID out of $path" >&2
     exit 1
   fi
-  cp "$FD_PROFILE_PATH" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
-  echo "==> Installed provisioning profile $PROFILE_UUID"
+  cp "$path" "$profile_dir/$uuid.mobileprovision"
+  echo "==> Installed provisioning profile $uuid ($var_name)"
+}
+
+# The app's profile, and the Notification Service Extension's (both must carry
+# the App Group group.agency.neworange.flightdeck.remote).
+if [ -n "${FD_PROFILE_PATH:-}" ]; then
+  install_profile FD_PROFILE_PATH "$FD_PROFILE_PATH"
+fi
+if [ -n "${FD_NSE_PROFILE_PATH:-}" ]; then
+  install_profile FD_NSE_PROFILE_PATH "$FD_NSE_PROFILE_PATH"
 fi
 
 # NOTE: the manual-signing build settings themselves live in project.yml on the
@@ -168,6 +183,8 @@ cat > "$EXPORT_OPTIONS" <<PLIST
 	<dict>
 		<key>$BUNDLE_ID</key>
 		<string>$PROFILE_NAME</string>
+		<key>$NSE_BUNDLE_ID</key>
+		<string>$NSE_PROFILE_NAME</string>
 	</dict>
 </dict>
 </plist>

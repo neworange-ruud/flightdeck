@@ -7,15 +7,20 @@
 //! `dead_code`-tolerant.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use flightdeck_relay::{
-    app, build,
+    apns::{ApnsConfig, ApnsPushService, ApnsRequest, ApnsSendError, ApnsTransport},
+    app, build, build_with_state,
     config::{Config, LogFormat},
+    AppState,
 };
 use flightdeck_remote_protocol::{
-    ApnsEnvironment, ClientInfo, DeviceId, PairingId, RelayFrame, Role, PROTOCOL_VERSION,
+    push_request_signing_message, ApnsEnvironment, ClientInfo, DeviceId, DirectEndpoint, PairingId,
+    PushNotifyBody, PushRequest, RelayFrame, Role, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
@@ -111,6 +116,139 @@ pub async fn spawn_app_with_password(password: &str) -> String {
     format!("http://{addr}")
 }
 
+/// A fake APNs transport: records every request the relay's real
+/// [`ApnsPushService`] builds and answers each with the next scripted outcome
+/// (`Ok` once the script runs out). Lets an integration test assert on the
+/// exact APNs requests without any network or Apple secret.
+#[derive(Default)]
+pub struct FakeApns {
+    sent: Mutex<Vec<ApnsRequest>>,
+    script: Mutex<VecDeque<Result<(), ApnsSendError>>>,
+}
+
+#[async_trait]
+impl ApnsTransport for FakeApns {
+    async fn send(&self, request: ApnsRequest) -> Result<(), ApnsSendError> {
+        self.sent.lock().unwrap().push(request);
+        self.script.lock().unwrap().pop_front().unwrap_or(Ok(()))
+    }
+}
+
+impl FakeApns {
+    /// Queue outcomes for the next sends, front first.
+    pub fn script(&self, outcomes: Vec<Result<(), ApnsSendError>>) {
+        self.script.lock().unwrap().extend(outcomes);
+    }
+
+    /// Every request recorded so far.
+    pub fn sent(&self) -> Vec<ApnsRequest> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// Wait (bounded, 5 s) until at least `n` requests were recorded — pushes
+    /// are sent on a detached task — and return them all.
+    pub async fn wait_for(&self, n: usize) -> Vec<ApnsRequest> {
+        for _ in 0..500 {
+            if self.sent.lock().unwrap().len() >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let sent = self.sent();
+        assert!(
+            sent.len() >= n,
+            "expected {n} APNs request(s), got {sent:?}"
+        );
+        sent
+    }
+
+    /// Assert no request arrives within `ms` (beyond `already` seen).
+    pub async fn expect_no_more(&self, already: usize, ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        let sent = self.sent();
+        assert_eq!(sent.len(), already, "unexpected APNs request(s): {sent:?}");
+    }
+}
+
+/// A throwaway APNs config with a freshly generated ES256 key, so the real
+/// JWT + request construction runs in tests without any Apple secret.
+pub fn test_apns_config() -> ApnsConfig {
+    use p256::pkcs8::EncodePrivateKey as _;
+    let secret = p256::SecretKey::random(&mut OsRng);
+    ApnsConfig {
+        team_id: "TEAM123456".into(),
+        key_id: "KEY7890AB".into(),
+        topic: "agency.neworange.flightdeck.remote".into(),
+        auth_key_pem: secret
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string(),
+        default_environment: ApnsEnvironment::Production,
+    }
+}
+
+/// Spawn the real relay with its push service swapped for the live
+/// [`ApnsPushService`] over a [`FakeApns`] transport (zero retry backoff, the
+/// store wired as the dead-token purge hook, exactly as in production).
+/// Returns the base URL and the fake to assert on.
+pub async fn spawn_app_with_fake_apns(mutate: impl FnOnce(&mut Config)) -> (String, Arc<FakeApns>) {
+    let (base, fake, _state) = spawn_app_with_fake_apns_state(mutate).await;
+    (base, fake)
+}
+
+/// Like [`spawn_app_with_fake_apns`], but also returns the mounted
+/// [`AppState`] so a test can seed the store directly (e.g. register a device
+/// on a password-gated relay the WebSocket helper cannot pass).
+pub async fn spawn_app_with_fake_apns_state(
+    mutate: impl FnOnce(&mut Config),
+) -> (String, Arc<FakeApns>, AppState) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    let mut config = Config::new(addr.port(), LogFormat::Pretty, "test-sha");
+    mutate(&mut config);
+    let mut state = AppState::new(config);
+    let fake = Arc::new(FakeApns::default());
+    state.push = Arc::new(
+        ApnsPushService::new(test_apns_config(), fake.clone())
+            .with_retry(3, Duration::ZERO)
+            .with_purge(state.store.clone()),
+    );
+    let (router, _shutdown) = build_with_state(state.clone());
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    (format!("http://{addr}"), fake, state)
+}
+
+/// Sign an HTTPS push request (spec §5.5.3) with `key`.
+pub fn sign_push_request(
+    key: &SigningKey,
+    device_id: &DeviceId,
+    timestamp_ms: i64,
+    push: PushNotifyBody,
+) -> PushRequest {
+    let message = push_request_signing_message(device_id, timestamp_ms, &push);
+    let sig: Signature = key.sign(message.as_bytes());
+    PushRequest {
+        device_id: device_id.clone(),
+        timestamp_ms,
+        push,
+        signature: b64(&sig.to_bytes()),
+    }
+}
+
+/// Current wall-clock time in unix milliseconds.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Low-level `hello` probe for the relay-password gate: open a raw WebSocket,
 /// send a single `hello` carrying `relay_password`, and return the **first**
 /// frame the relay sends back. Used by the password tests to assert acceptance
@@ -194,6 +332,18 @@ impl TestClient {
         device_id: &str,
         signing_key: SigningKey,
     ) -> Self {
+        Self::connect_at(base_url, role, device_id, signing_key, PROTOCOL_VERSION).await
+    }
+
+    /// [`Self::connect_with_key`] advertising `version` in `hello` (e.g. an
+    /// older v3 phone build). Asserts the relay answers at that version.
+    pub async fn connect_at(
+        base_url: &str,
+        role: Role,
+        device_id: &str,
+        signing_key: SigningKey,
+        version: u16,
+    ) -> Self {
         let ws_url = format!("{}/ws", base_url.replacen("http://", "ws://", 1));
         let (ws, resp) = connect_async(ws_url).await.expect("ws handshake");
         assert_eq!(resp.status(), 101, "expected protocol switch");
@@ -218,7 +368,7 @@ impl TestClient {
 
         client
             .send(RelayFrame::Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: version,
                 role,
                 device_id: DeviceId::new(device_id),
                 client: ClientInfo {
@@ -234,7 +384,7 @@ impl TestClient {
             RelayFrame::HelloOk {
                 protocol_version, ..
             } => {
-                assert_eq!(protocol_version, PROTOCOL_VERSION)
+                assert_eq!(protocol_version, version)
             }
             other => panic!("expected hello_ok, got {other:?}"),
         }
@@ -392,12 +542,28 @@ impl TestClient {
     /// Returns `(pairing_id, claim_token)` — the token the relay actually
     /// issued, which equals the hint when it was honored.
     pub async fn offer_pairing_hint(&mut self, hint: Option<&str>) -> (PairingId, String) {
+        self.offer_pairing_full(hint, None).await
+    }
+
+    /// Desktop bootstrap for a direct-mode pairing (spec §5.2, v4): the offer
+    /// carries `direct_endpoint`.
+    pub async fn offer_pairing_direct(&mut self, endpoint: DirectEndpoint) -> (PairingId, String) {
+        self.offer_pairing_full(None, Some(endpoint)).await
+    }
+
+    /// Desktop bootstrap with every optional offer field.
+    pub async fn offer_pairing_full(
+        &mut self,
+        hint: Option<&str>,
+        direct_endpoint: Option<DirectEndpoint>,
+    ) -> (PairingId, String) {
         self.send(RelayFrame::PairingOffer {
             device_id: self.device_id.clone(),
             device_public_key: self.public_key_b64.clone(),
             key_agreement_public_key: self.key_agreement_public_key_b64.clone(),
             role: self.role,
             claim_token_hint: hint.map(str::to_string),
+            direct_endpoint,
         })
         .await;
         match self.recv().await {
@@ -418,6 +584,19 @@ impl TestClient {
     /// Phone bootstrap: redeem `token`, returning both the joined `pairing_id`
     /// and the peer (desktop) key-agreement public key the relay hands back.
     pub async fn claim_pairing_full(&mut self, token: &str) -> (PairingId, Option<String>) {
+        match self.claim_pairing_frame(token).await {
+            RelayFrame::PairingClaimed {
+                pairing_id,
+                peer_key_agreement_public_key,
+                ..
+            } => (pairing_id, peer_key_agreement_public_key),
+            other => panic!("expected pairing_claimed, got {other:?}"),
+        }
+    }
+
+    /// Phone bootstrap: redeem `token` and return the relay's whole answer
+    /// (normally `pairing_claimed`), for tests asserting on every field.
+    pub async fn claim_pairing_frame(&mut self, token: &str) -> RelayFrame {
         self.send(RelayFrame::PairingClaim {
             claim_token: token.to_string(),
             device_id: self.device_id.clone(),
@@ -426,14 +605,18 @@ impl TestClient {
             role: self.role,
         })
         .await;
-        match self.recv().await {
-            RelayFrame::PairingClaimed {
-                pairing_id,
-                peer_key_agreement_public_key,
-                ..
-            } => (pairing_id, peer_key_agreement_public_key),
-            other => panic!("expected pairing_claimed, got {other:?}"),
-        }
+        self.recv().await
+    }
+
+    /// Send a desktop `push_notify` (spec §5.5.1).
+    pub async fn push_notify(&mut self, push: PushNotifyBody) {
+        self.send(RelayFrame::PushNotify(push)).await;
+    }
+
+    /// Build a signed HTTPS push request (spec §5.5.3) from this device's
+    /// identity key, timestamped `timestamp_ms`.
+    pub fn signed_push_request(&self, timestamp_ms: i64, push: PushNotifyBody) -> PushRequest {
+        sign_push_request(&self.signing_key, &self.device_id, timestamp_ms, push)
     }
 
     /// Sign the challenge and authenticate, activating `pairing_ids`. Returns

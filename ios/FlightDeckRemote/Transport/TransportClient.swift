@@ -30,6 +30,20 @@
 //  is fully UI-agnostic and driven by an injected `WebSocketConnecting`, so
 //  unit tests run it against a scripted mock socket.
 //
+//  Relay vs direct (v4, remote-control-gz0d): the same state machine drives
+//  both the relay and the Mac's direct link over Tailscale (§5.10), because
+//  the Mac speaks the relay's frame set in the relay's role. Each session
+//  resolves a `TransportLink` from the pairing record and `TransportPlane`
+//  (DirectConnection.swift): it picks the URL, the auth signature (bare nonce
+//  vs domain-separated) and which frames may ride the link. Everything else —
+//  E2E, seq, ack, resume, dedup, recovery, backoff — is one code path.
+//
+//  Push-only relays (v4, §5.9): a relay announcing `relay_mode: push_only` (or
+//  refusing a data frame with `relay_mode_push_only`) carries no envelopes.
+//  On a data-plane relay link the session then stays up for push-token
+//  registration/revoke, but sends no resume/envelope/ack, reports the data
+//  plane as disconnected, and fails commands honestly — no reconnect loop.
+//
 
 import Foundation
 import os
@@ -86,6 +100,10 @@ actor TransportClient {
     /// record, so N clients sharing one `PairingRecordStore` never rewrite each
     /// other's watermarks.
     private let targetPairingId: String?
+    /// Which half of the pairing's traffic this client carries (data plane, or
+    /// relay control for a direct-mode pairing). The concrete link is resolved
+    /// per session from the record — see `TransportLink.resolve`.
+    private let plane: TransportPlane
     private let connector: any WebSocketConnecting
     private let clientInfo: Wire.ClientInfo
     /// Source of the OPTIONAL shared relay password (remote-control-uq7),
@@ -120,6 +138,20 @@ actor TransportClient {
     private var phase: Phase = .idle
     private var sessionAuthed = false
     private var peerConnected: Bool?
+
+    /// The link the current (or last) session drives, resolved from the record
+    /// at session start. `.relay` until the first session resolves it.
+    private var link: TransportLink = .relay
+    /// Set when the relay this data-plane session talks to carries no
+    /// envelopes: it announced `relay_mode: push_only` in `hello_ok`, or
+    /// refused a data frame with `relay_mode_push_only` (§5.9). Per session — a
+    /// relay may change mode across restarts.
+    private var relayRefusesDataPlane = false
+
+    /// Whether this session may carry envelopes / resume / acks right now.
+    private var dataPlaneUsable: Bool {
+        link.carriesDataPlane && !relayRefusesDataPlane
+    }
 
     /// The latest APNs push token to register for this pairing (spec §5.5).
     /// Held so it can be (re)sent the moment the session reaches `auth_ok` —
@@ -166,6 +198,7 @@ actor TransportClient {
         keyAgreement: KeyAgreementKeys,
         recordStore: PairingRecordStore,
         pairingId: String? = nil,
+        plane: TransportPlane = .data,
         connector: any WebSocketConnecting,
         clientInfo: Wire.ClientInfo? = nil,
         relayPassword: @escaping @Sendable () -> String? = { RelayPasswordStore().load() },
@@ -177,6 +210,7 @@ actor TransportClient {
         self.keyAgreement = keyAgreement
         self.recordStore = recordStore
         self.targetPairingId = pairingId
+        self.plane = plane
         self.connector = connector
         self.clientInfo = clientInfo ?? Wire.ClientInfo(
             appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
@@ -236,8 +270,19 @@ actor TransportClient {
         setLink(.disconnected)
     }
 
-    /// The current link state (test/inspection convenience).
+    /// The current link state (test/inspection convenience). For a
+    /// `.relayControl` client this is tracked but never emitted.
     func currentLinkState() -> RemoteLinkState { linkState }
+
+    /// The link the current (or last) session resolved (test/inspection).
+    func currentLink() -> TransportLink { link }
+
+    /// Whether the relay this data-plane session reached refuses envelopes
+    /// (push-only, §5.9) — test/inspection convenience.
+    func relayIsPushOnly() -> Bool { relayRefusesDataPlane }
+
+    /// Which plane this client carries.
+    nonisolated var transportPlane: TransportPlane { plane }
 
     /// The pairing this client is bound to, when instantiated per-`PairedInstance`
     /// by the coordinator (`nil` for the transitional single-pairing wiring).
@@ -272,6 +317,11 @@ actor TransportClient {
     /// processes a revoke and notifies the desktop on its next connect
     /// regardless of whether the desktop is online right now. Returns whether a
     /// frame was actually sent (diagnostic only).
+    ///
+    /// Works on every link: on the relay (relay mode, or the `.relayControl`
+    /// client of a direct pairing) it is the authoritative revoke; on the
+    /// direct link it is the courtesy copy §5.10 allows, so a connected Mac
+    /// drops the pairing immediately.
     @discardableResult
     func revokePairing() async -> Bool {
         guard phase == .live, let ch = channel, let record else { return false }
@@ -386,7 +436,10 @@ actor TransportClient {
     /// supervisor can reset backoff after a genuinely-good session dropped).
     private func runSession() async -> Bool {
         guard let record else { return false }
-        guard let url = URL(string: record.relayURL) else { return false }
+        // Relay vs direct is decided here, from the record, every session.
+        link = TransportLink.resolve(plane: plane, record: record)
+        relayRefusesDataPlane = false
+        guard let url = link.url(for: record) else { return false }
 
         let ch: any WebSocketChannel
         do {
@@ -422,14 +475,16 @@ actor TransportClient {
 
         // hello. Present the shared relay password (remote-control-uq7) if one
         // is stored — re-read every connect so a change is picked up; nil omits
-        // the `relay_password` key so an unconfigured relay is unaffected.
+        // the `relay_password` key so an unconfigured relay is unaffected. Never
+        // sent to the Mac on the direct link (it ignores it, §5.10, and it is a
+        // relay secret).
         do {
             try await ch.send(.hello(
                 protocolVersion: Wire.protocolVersion,
                 role: .phone,
                 deviceId: Wire.DeviceId(identity.deviceId),
                 client: clientInfo,
-                relayPassword: relayPassword()
+                relayPassword: link.isRelay ? relayPassword() : nil
             ))
         } catch {
             await ch.close()
@@ -483,8 +538,15 @@ actor TransportClient {
     /// Handle one inbound frame. Returns `false` to end the session (reconnect).
     private func handle(_ frame: Wire.RelayFrame, on ch: any WebSocketChannel) async -> Bool {
         switch frame {
-        case .helloOk:
+        case let .helloOk(_, _, _, relayMode):
             if phase == .awaitingHelloOk { phase = .awaitingChallenge }
+            // A push-only relay carries no envelopes (§5.9). Only meaningful
+            // for a relay-mode pairing's data plane: the control-plane client
+            // of a direct pairing never sends data frames anyway, and the Mac
+            // omits the field on the direct link.
+            if relayMode == .pushOnly, link == .relay {
+                markRelayRefusesDataPlane()
+            }
             return true
 
         case .versionIncompatible:
@@ -494,7 +556,9 @@ actor TransportClient {
             guard phase == .awaitingChallenge else { return true }
             let signature: String
             do {
-                signature = try identity.signBase64(nonceBase64: nonce)
+                // Bare nonce for the relay (§5.1); domain-separated
+                // `"flightdeck-remote-direct-v1:" ‖ nonce` for the Mac (§5.10).
+                signature = try link.signChallenge(nonce, with: identity)
             } catch {
                 return false
             }
@@ -516,12 +580,19 @@ actor TransportClient {
             sessionAuthed = true
             phase = .live
             latencyMs = 0
-            setLink(.connected(latencyMs: 0))
-            transportDiag.notice("FDDIAG connection LIVE (auth_ok) pairing=\(self.record?.pairingId ?? "nil", privacy: .public)")
+            // A push-only relay authenticates fine but carries no data: keep
+            // the data plane reported as down so the UI stays honest.
+            if dataPlaneUsable { setLink(.connected(latencyMs: 0)) }
+            transportDiag.notice("FDDIAG connection LIVE (auth_ok) pairing=\(self.record?.pairingId ?? "nil", privacy: .public) link=\(String(describing: self.link), privacy: .public)")
             await onAuthenticated(ch)
             return true
 
         case let .peerPresence(_, peer, state, _):
+            // Presence on a link that carries no data for this pairing (the
+            // control-plane relay of a direct pairing, or a push-only relay)
+            // says nothing about whether a command could be delivered — the
+            // data plane's own link owns that. Ignore it.
+            guard dataPlaneUsable else { return true }
             let connected = state == .connected
             if peer == .desktop {
                 let wasConnected = peerConnected
@@ -553,12 +624,23 @@ actor TransportClient {
             return true
 
         case let .envelope(env):
+            // Only a data-plane link consumes (and acks) envelopes; a control-
+            // plane relay link must never advance this pairing's cursors.
+            guard dataPlaneUsable else { return true }
             await handleEnvelope(env, on: ch)
             return true
 
         case let .pong(clientTimeMs, _):
             latencyMs = max(0, Int(now() - clientTimeMs))
-            setLink(.connected(latencyMs: latencyMs))
+            if dataPlaneUsable { setLink(.connected(latencyMs: latencyMs)) }
+            return true
+
+        case let .error(code, _, _, _) where code == .relayModePushOnly:
+            // A push-only relay refused a data frame (§5.9). Advisory: the
+            // connection stays useful for push tokens and revoke, so keep it,
+            // but stop all data-plane traffic on it. On any other link this is
+            // unexpected and simply ignored.
+            if link == .relay { markRelayRefusesDataPlane() }
             return true
 
         case let .error(code, _, pairingId, expectedSeq):
@@ -570,7 +652,9 @@ actor TransportClient {
             // Conflating them is what left a runaway sender with no way back:
             // only the inbound half was implemented, so the outbound stream
             // stayed wedged and every command died silently.
-            if code == .seqViolation {
+            // Cursor recovery is a data-plane concern; a control-plane link
+            // must never touch the cursors the data-plane client owns.
+            if code == .seqViolation, dataPlaneUsable {
                 if let next = expectedSeq {
                     await handleSeqRealign(pairingId, nextSeq: next, on: ch)
                 } else {
@@ -603,10 +687,31 @@ actor TransportClient {
         case .ack, .resume, .ping, .hello, .authResponse,
              .pairingOffer, .pairingOfferOk, .pairingClaim, .pairingClaimed,
              .registerPushToken, .unregisterPushToken, .pushTokenAck,
-             .revoke:
+             .revoke, .pushNotify:
             return true
         }
     }
+
+    /// The relay this data-plane session reached is push-only (§5.9): stop all
+    /// data-plane traffic on it without ending the session (which would only
+    /// reconnect into the same refusal), fail in-flight commands honestly, and
+    /// report the data plane as down.
+    private func markRelayRefusesDataPlane() {
+        guard !relayRefusesDataPlane else { return }
+        relayRefusesDataPlane = true
+        transportDiag.notice("FDDIAG relay is push_only — no data plane for relay-mode pairing=\(self.record?.pairingId ?? "nil", privacy: .public)")
+        for (commandId, p) in pending {
+            p.timeout.cancel()
+            fail(commandId, Self.pushOnlyReason)
+        }
+        pending.removeAll()
+        setLink(.disconnected)
+        emit(.relayPushOnly)
+    }
+
+    /// Delivery-honesty reason for a command refused because the relay is
+    /// push-only.
+    static let pushOnlyReason = "relay is push-only — re-pair over Tailscale"
 
     /// After `auth_ok`: resume from the persisted inbound cursor, request a
     /// fresh snapshot so the UI has current state immediately, then re-register
@@ -627,7 +732,10 @@ actor TransportClient {
     /// `peerConnected == false`), so re-issuing it on the peer's return is what
     /// refreshes an otherwise-stale UI.
     private func requestResumeAndSnapshot(on ch: any WebSocketChannel) async {
-        guard let record else { return }
+        // Never on a link without a data plane: the control-plane relay of a
+        // direct pairing (§5.10) or a push-only relay (§5.9, which would answer
+        // `relay_mode_push_only`).
+        guard dataPlaneUsable, let record else { return }
         try? await ch.send(.resume(
             pairingId: Wire.PairingId(record.pairingId),
             fromSeq: record.lastReceivedSeq
@@ -652,7 +760,10 @@ actor TransportClient {
     /// Plain relay-plane frames (opaque token, outside E2E); a send failure is
     /// swallowed — it will be retried on the next `auth_ok`.
     private func reconcilePushToken(on ch: any WebSocketChannel) async {
-        guard let record else { return }
+        // Push tokens live on the relay only — the Mac answers
+        // `register_push_token` with a fatal `bad_frame` (§5.10). A direct
+        // pairing registers through its `.relayControl` client instead.
+        guard link.carriesRelayControl, let record else { return }
         let pairingId = Wire.PairingId(record.pairingId)
         if pushMuted {
             if registeredToken != nil {
@@ -755,6 +866,11 @@ actor TransportClient {
             if track { fail(commandId, "not connected") }
             return
         }
+        // Never put an envelope on a link that cannot carry it (§5.9/§5.10).
+        guard dataPlaneUsable else {
+            if track { fail(commandId, relayRefusesDataPlane ? Self.pushOnlyReason : "not connected") }
+            return
+        }
         // Never send blind when the desktop is known-absent (§5.3).
         if peerConnected == false {
             if track { fail(commandId, "peer unavailable") }
@@ -847,6 +963,16 @@ actor TransportClient {
     }
 
     private func emit(_ event: TransportEvent) {
+        // A control-plane client shares its pairing's store with the data-
+        // plane client, so it may only surface what is genuinely the relay's
+        // to say — never link state, presence, messages or delivery, which
+        // belong to the data plane's honest connection UI.
+        if plane == .relayControl {
+            switch event {
+            case .pairingRevoked, .machineName: break
+            case .link, .message, .delivery, .presence, .relayPushOnly: return
+            }
+        }
         eventHandler?(event)
     }
 
@@ -855,7 +981,7 @@ actor TransportClient {
         case .authFailed, .unsupportedVersion, .notAuthenticated, .badFrame, .internalError:
             return true
         case .unknownPairing, .pairingClaimRejected, .peerUnavailable, .rateLimited,
-             .seqViolation, .unknown:
+             .seqViolation, .relayModePushOnly, .unknown:
             // `seqViolation` is handled by re-syncing (see `handleSeqViolation`);
             // `unknown` is a forward-compat advisory we don't understand — never
             // tear the link down for either.

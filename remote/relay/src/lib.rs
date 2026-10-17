@@ -10,8 +10,22 @@
 //! ([`claims`]), zero-knowledge envelope routing by pairing id ([`router`]),
 //! and a server-side pending-event queue with gapless sequencing, resume, and
 //! cumulative-ack pruning ([`queue`]). Durable state sits behind the
-//! [`store::RelayStore`] seam (in-memory for v1). The per-connection state
+//! [`store::RelayStore`] seam (in-memory or sqlite). The per-connection state
 //! machine lives in [`session`].
+//!
+//! Pushes are desktop-requested only (protocol v4): `push_notify` on the
+//! WebSocket or `POST /v1/push` ([`handlers::push_http`]) both go through
+//! [`push::accept_push`], which hands one encrypted alert to [`apns`]. Queued
+//! envelopes never trigger a push.
+//!
+//! **Relay modes** (spec §5.9, [`config::Config::relay_mode`], `RELAY_MODE`).
+//! `full` (the default) is all of the above. `push_only` keeps the control
+//! plane — auth, pairing bootstrap, machine name, revoke, push-token
+//! registration, presence and push — and refuses the data plane (`envelope`,
+//! `resume`, `ack`) with `relay_mode_push_only`, for deployments whose pairings
+//! all talk to the Mac directly (spec §5.10). In push-only mode the session
+//! never calls the store's queue methods, so no sender queue, seq high-water
+//! mark or queued envelope is ever created.
 
 pub mod apns;
 pub mod auth;
@@ -19,6 +33,7 @@ pub mod claims;
 pub mod config;
 pub mod handlers;
 pub mod ids;
+pub mod push;
 pub mod queue;
 pub mod router;
 pub mod session;
@@ -28,12 +43,18 @@ pub mod telemetry;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::{routing::get, Router};
+use flightdeck_remote_protocol::RelayMode;
+
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use tokio::sync::watch;
 use tower_http::trace::TraceLayer;
 
 use apns::{NoopPushService, PushService};
 use config::{Config, StoreBackend};
+use push::PushRateLimiter;
 use router::Registry;
 use store::{InMemoryStore, RelayStore, SqliteStore};
 
@@ -57,11 +78,14 @@ pub struct AppState {
     pub store: Arc<dyn RelayStore>,
     /// The live, ephemeral connection routing table.
     pub registry: Arc<Registry>,
-    /// Wakes an offline phone via APNs when an event is queued for it
-    /// (spec §5.5/§11). Behind a seam so it is a no-op when APNs is not
-    /// configured, the live sender under the `apns-live` feature, or a
-    /// recording double under test.
+    /// Delivers the encrypted alerts desktops request with `push_notify` /
+    /// `POST /v1/push` (spec §5.5, [`push`]). Behind a seam so it is a no-op
+    /// when APNs is not configured, the live sender under the `apns-live`
+    /// feature, or a recording double under test.
     pub push: Arc<dyn PushService>,
+    /// Per-desktop push budget shared by the WebSocket and HTTPS push paths
+    /// ([`Config::push_rate_limit_per_minute`]).
+    pub push_limiter: Arc<PushRateLimiter>,
     /// Broadcasts the shutdown notice to every live `/ws` connection's writer
     /// task (see [`handlers::writer_task`]). Flips `false` -> `true` exactly
     /// once, when [`shutdown_signal`] observes SIGTERM/Ctrl-C; each writer task
@@ -75,6 +99,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The relay's configured mode ([`Config::relay_mode`]), as announced in
+    /// `hello_ok.relay_mode` and reported on `/version`.
+    pub fn relay_mode(&self) -> RelayMode {
+        self.config.relay_mode
+    }
+
+    /// Whether this relay refuses the data plane ([`RelayMode::PushOnly`]).
+    pub fn is_push_only(&self) -> bool {
+        self.relay_mode() == RelayMode::PushOnly
+    }
+
     /// Build application state from `config`, wiring up the default in-memory
     /// store, an empty connection registry, and a push service derived from the
     /// config (the live APNs sender when both configured and built with the
@@ -86,11 +121,13 @@ impl AppState {
         let store = build_store(&config);
         let push = default_push_service(&config, store.clone());
         let (shutdown_tx, _rx) = watch::channel(false);
+        let push_limiter = Arc::new(push_limiter(&config));
         Self {
             config: Arc::new(config),
             store,
             registry: Arc::new(Registry::new()),
             push,
+            push_limiter,
             shutdown_tx: Arc::new(shutdown_tx),
         }
     }
@@ -101,14 +138,22 @@ impl AppState {
     pub fn with_push(config: Config, push: Arc<dyn PushService>) -> Self {
         let store = build_store(&config);
         let (shutdown_tx, _rx) = watch::channel(false);
+        let push_limiter = Arc::new(push_limiter(&config));
         Self {
             config: Arc::new(config),
             store,
             registry: Arc::new(Registry::new()),
             push,
+            push_limiter,
             shutdown_tx: Arc::new(shutdown_tx),
         }
     }
+}
+
+/// The push rate limiter for a config: [`Config::push_rate_limit_per_minute`]
+/// accepted pushes per device per minute.
+fn push_limiter(config: &Config) -> PushRateLimiter {
+    PushRateLimiter::new(config.push_rate_limit_per_minute, Duration::from_secs(60))
 }
 
 /// Construct the durable store selected by [`Config::store`]. The in-memory
@@ -178,7 +223,14 @@ pub fn app(config: Config) -> Router {
 /// router's connections subscribed to (a fresh `app(config)` call would build
 /// its own `AppState` — and thus its own, unreachable, shutdown sender).
 pub fn build(config: Config) -> (Router, Arc<watch::Sender<bool>>) {
-    let state = AppState::new(config);
+    build_with_state(AppState::new(config))
+}
+
+/// Like [`build`], but over an already-assembled [`AppState`] — so an
+/// integration test can mount the real router with, e.g., an
+/// [`apns::ApnsPushService`] over a fake transport (and the store wired as its
+/// token-purge hook) in place of the config-derived push service.
+pub fn build_with_state(state: AppState) -> (Router, Arc<watch::Sender<bool>>) {
     let shutdown_tx = state.shutdown_tx.clone();
     // Evict expired claim tokens on a periodic sweep (remote-control-0ef.16).
     // Both entry points route through here — `app` (tests) and `main`
@@ -190,6 +242,10 @@ pub fn build(config: Config) -> (Router, Arc<watch::Sender<bool>>) {
         .route("/readyz", get(handlers::readyz))
         .route("/version", get(handlers::version))
         .route("/ws", get(handlers::ws_handler))
+        .route(
+            flightdeck_remote_protocol::relay::PUSH_HTTP_PATH,
+            post(handlers::push_http),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -287,6 +343,7 @@ mod tests {
                 PairingId::new("p"),
                 DeviceId::new("d"),
                 past,
+                None,
             )
             .await;
         assert_eq!(store.claim_entry_count(), 1, "token is physically present");

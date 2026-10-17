@@ -1,0 +1,11 @@
+{
+  "type": "pairing_claimed",
+  "pairing_id": "pair_ruud_mbp",
+  "peer_device_id": "dev_9f3a1c",
+  "peer_key_agreement_public_key": "BExamplePhoneKeyAgreementSec1PubKeyBase64Would65BytesGg2Hh4Jj6Kk8Ll0Mm2Nn4Pp6Qq8Rr0Ss2Tt4Uu6v==",
+  "direct_endpoint": {
+    "host": "ruuds-mbp.tail1234.ts.net",
+    "port": 47800
+  },
+  "peer_device_public_key": "BExamplePhoneSecureEnclaveIdentitySec1PubKeyBase64Would65BytesHh3Jj5Kk7Ll9Mm1Nn3Pp5Qq7Rr9Ss1Tt3w=="
+}

@@ -29,6 +29,25 @@
 	<key>keychain-access-groups</key>
 	<array>
 		<string>agency.neworange.flightdeck.remote</string>
+		<!--
+		  The group the Notification Service Extension reads (remote-control-bza0).
+		  KeychainStore writes the key-agreement key and pairing records here
+		  (SharedContainer.accessGroup). An ad-hoc simulator build has no
+		  $(AppIdentifierPrefix), so the app resolves the group to the team-
+		  prefixed fallback — listed here verbatim so the harness exercises the
+		  real shared-group write path instead of the default-group fallback.
+		-->
+		<string>7NKCS4AZS9.agency.neworange.flightdeck.remote.shared</string>
+	</array>
+	<!--
+	  The App Group backing the shared notification-settings suite. The
+	  simulator does not enforce it (the suite works without it); carried for
+	  parity with production. The harness never runs the extension itself —
+	  simulator pushes are out of scope — so its entitlements are not needed.
+	-->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.agency.neworange.flightdeck.remote</string>
 	</array>
 	<key>aps-environment</key>
 	<string>development</string>

@@ -15,6 +15,10 @@
 //!   with `src/web/server.rs` so the binary never starts a second one.
 //! * [`client`] — the connection task: connect → hello → auth → resume → pump,
 //!   with exponential backoff + jitter reconnect and periodic latency pings.
+//! * [`direct`] — the opt-in direct link: the same phone protocol served by this
+//!   Mac over Tailscale, with a Mac-held outbox, for direct-mode pairings
+//!   (spec §5.10). It splits the outbound channel by pairing in front of the
+//!   relay client, so relay-mode pairings are untouched.
 //!
 //! ## What this module does NOT do
 //!
@@ -38,11 +42,13 @@ pub mod client;
 pub mod commands;
 pub mod crypto;
 pub mod debuglog;
+pub mod direct;
 pub mod feed;
 pub mod identity;
 pub mod notifier;
 pub mod opencode;
 pub mod pairing;
+pub mod push;
 pub mod runtime;
 pub mod shell;
 pub mod state;
@@ -51,9 +57,10 @@ pub mod transcript;
 pub use bridge::{PeerLiveness, ProjectView, RemoteBridge};
 pub use client::{RemoteHandle, RemoteLinkState};
 pub use identity::DeviceIdentity;
-pub use state::{Pairing, RemoteState};
+pub use state::{Pairing, PairingTransport, RemoteState};
 
 use flightdeck_remote_protocol::relay::{EncryptedEnvelope, PresenceState};
+use flightdeck_remote_protocol::PushNotifyBody;
 use flightdeck_remote_protocol::{DeviceId, PairingId, Role};
 
 /// A message from the relay-client thread to the app (drained each tick).
@@ -214,6 +221,37 @@ pub enum RemoteInbound {
         /// Whether reconnecting could plausibly succeed (see above).
         retrying: bool,
     },
+    /// A pairing attempt was refused for a reason no relay URL or password can
+    /// fix (spec §5.9): a push-only relay with the direct link off or not yet
+    /// listening, or a phone too old to pair over the direct link. `reason` is
+    /// the complete user-facing sentence; the pairing overlay shows it verbatim
+    /// and fails the attempt, whether the code was still being requested or
+    /// already on screen. Distinct from [`Self::HandshakeFailed`], whose
+    /// refusals get configuration advice appended.
+    PairingRefused {
+        /// Complete, human-readable sentence, safe to show in the UI.
+        reason: String,
+    },
+    /// The relay kept rejecting this Mac's authentication and only direct-mode
+    /// pairings are left: it has lost its record of this device (a wiped
+    /// store). Those pairings keep working over the direct link, so the client
+    /// keeps them, but the relay can no longer route their pushes — until the
+    /// phone is re-paired, which also re-registers this Mac with the relay.
+    /// The client has stopped reconnecting; a Pair Phone request wakes it and
+    /// bootstraps offer-first (spec §5.2). The UI should say so once.
+    RelayForgotDevice {
+        /// The direct-mode pairings whose pushes are unavailable.
+        pairing_ids: Vec<PairingId>,
+    },
+    /// This pairing's data plane is the Mac's own direct link (spec §5.10):
+    /// its envelopes go to an outbox this process always holds, so — unlike a
+    /// relay-mode pairing — the bridge must not pause sealing for it while the
+    /// relay link is down. Emitted by [`direct::DirectLink`] at startup and when
+    /// a direct pairing is claimed.
+    DirectTransport {
+        /// The direct-mode pairing.
+        pairing_id: PairingId,
+    },
 }
 
 /// A message from the app to the relay-client thread.
@@ -265,5 +303,20 @@ pub enum RemoteOutbound {
     Unpair {
         /// The pairing to forget.
         pairing_id: PairingId,
+    },
+    /// Ask the relay to push the phone (spec §5.5.1): send a `push_notify`
+    /// frame on the live session. Queued by [`push::PushSender`] only while
+    /// [`push::PushLink`] reports an authenticated, recently-heard session at a
+    /// version that carries the frame. Pushes travel on their own channel
+    /// inside the client, so one is never held across sessions: whenever the
+    /// socket cannot be trusted with it at write time — no session, a version
+    /// below v4, older than [`push::PUSH_WS_MAX_QUEUE_AGE`], a socket silent for
+    /// [`push::PUSH_WS_MAX_SILENCE`], or a failed write — the client posts it
+    /// over HTTPS instead, under the same `event_id`.
+    PushNotify {
+        /// The sealed push.
+        push: PushNotifyBody,
+        /// When it was queued (monotonic), for the age bound.
+        queued_at: std::time::Instant,
     },
 }

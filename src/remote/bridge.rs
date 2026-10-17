@@ -7,7 +7,13 @@
 //! open project; the bridge:
 //!
 //! 1. detects per-session status edges (finish / needs-input / error) and emits
-//!    typed [`AgentEvent`]s, honouring a startup grace window;
+//!    typed [`AgentEvent`]s, honouring a startup grace window, and runs the push
+//!    decision on the same edges (needs-input/error now, done after an idle
+//!    debounce; see [`crate::remote::notifier`]), queueing each decided push as
+//!    a [`PushIntent`] (a needs-input push waits up to [`PROMPT_SETTLE_MS`] for
+//!    its question preview), sealed for the pairing by
+//!    [`RemoteBridge::take_push_notifies`] for the push sender
+//!    ([`crate::remote::push`]);
 //! 2. captures the pending-question preview when an agent stops for input;
 //! 3. builds the current [`StateSnapshot`] and diffs it against what the phone
 //!    last saw, sending a full snapshot on (re)connect / request / structural
@@ -30,8 +36,9 @@
 //! sync runs unconditionally, so a late-pairing phone still gets full history
 //! on that very tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -39,8 +46,13 @@ use base64::Engine;
 use crate::agents::setup::{status_backend, StatusBackend};
 use crate::app::state::AppState;
 use crate::contracts::AgentDef;
+use crate::remote::crypto::E2eChannel;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
-use crate::remote::notifier::{build_event, EventArming, EventClass, EventContext};
+use crate::remote::notifier::{
+    build_event, build_push_intent, new_event_id, EventArming, EventClass, EventContext,
+    PushDecider, PushFire, PushIntent, SettleEdge,
+};
+use crate::remote::push::seal_push;
 use crate::remote::shell::ShellManager;
 use crate::remote::transcript::{StructuredPrompt, TranscriptBuilder};
 use crate::remote::{RemoteInbound, RemoteOutbound};
@@ -48,8 +60,8 @@ use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
     AgentStatus, CommandAck, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId,
-    PermissionChoice, PermissionOption, PhoneCommand, ProjectId, PromptId, PromptKind, Role,
-    SessionId, StateSnapshot,
+    PermissionChoice, PermissionOption, PhoneCommand, ProjectId, PromptId, PromptKind, PushClass,
+    PushNotifyBody, Role, SessionId, StateSnapshot,
 };
 
 /// How long to wait for a racing Claude `AskUserQuestion` to be ingested from
@@ -101,6 +113,11 @@ const MAX_UNACKED_ENVELOPES: u64 = 500;
 /// converges on the very next envelope, so a healthy stream never spends more
 /// than one.
 const MAX_REALIGN_CREDITS: u32 = 3;
+
+/// Bound on decided-but-untaken pushes (see [`RemoteBridge::take_push_intents`]).
+/// The host drains them every tick, so this only matters if nothing does: the
+/// oldest are dropped first, since a stale "done" is the least useful push.
+const MAX_QUEUED_PUSH_INTENTS: usize = 64;
 
 /// Whether a phone peer is attached to the active pairing **and** still proving
 /// it by acknowledging what we send (remote-control-5qu).
@@ -182,6 +199,13 @@ pub struct ProjectView<'a> {
     pub cache: &'a GitStatusCache,
 }
 
+/// A remembered channel and how far its outbound stream got (see
+/// [`RemoteBridge::remember_channel`]).
+struct BookEntry {
+    channel: Arc<E2eChannel>,
+    out_seq: u64,
+}
+
 /// Owns all outbound-feed state for the desktop side of one relay link.
 pub struct RemoteBridge {
     feed: FeedState,
@@ -195,7 +219,32 @@ pub struct RemoteBridge {
     /// AskUserQuestion to be ingested from the JSONL before falling back to the
     /// binary allow/deny prompt (remote-control-qa1). Absent once resolved.
     needs_input_since: HashMap<SessionId, u64>,
-    event_seq: u64,
+    /// The push decision layered on the arming edges (remote-control-fglt).
+    push: PushDecider,
+    /// Pushes decided but not yet taken by the sender
+    /// ([`Self::take_push_intents`]), oldest first, bounded by
+    /// [`MAX_QUEUED_PUSH_INTENTS`].
+    push_intents: Vec<PushIntent>,
+    /// Needs-input pushes waiting for their question preview: Claude's binary
+    /// fallback is deferred up to [`PROMPT_SETTLE_MS`] while a racing
+    /// AskUserQuestion may still land (`needs_input_since`), and a push sent
+    /// at the edge would carry an empty body. Released, with whatever preview
+    /// exists, once that resolves or the settle window passes; dropped if the
+    /// session stops waiting first (answered at the desk) or disappears.
+    held_needs_input: HashMap<SessionId, (PushFire, u64)>,
+    /// The active pairing's E2E channel, for sealing pushes under its push key
+    /// (spec §7.2). Installed alongside the envelope sealer
+    /// ([`Self::install_push_channel`]); `None` until a channel is derived.
+    push_channel: Option<Arc<E2eChannel>>,
+    /// Every pairing's channel the host knows how to derive, with the outbound
+    /// high-water mark to resume it from ([`Self::remember_channel`]). When
+    /// the pairing this bridge feeds changes on `Paired` — the direct link
+    /// announces its pairings before the relay authenticates, so with several
+    /// pairings the fed one need not be the one installed at startup — the
+    /// sealer, opener and push channel follow it from here, so pairing B is
+    /// never sealed with A's keys (and B's pushes are not dropped for want of
+    /// a matching push channel).
+    channel_book: HashMap<PairingId, BookEntry>,
     pairing: Option<PairingId>,
     /// Whether the relay link is currently up (authenticated). While it is down
     /// the bridge PAUSES all seal/queue work: sealing StatusUpdate/Rollup/shell/
@@ -208,6 +257,11 @@ pub struct RemoteBridge {
     /// preserved: a reconnect re-arms `snapshot_needed` via `Paired`, so a single
     /// fresh snapshot — not a stale backlog — is sent when the link returns.
     link_up: bool,
+    /// Pairings whose data plane is the Mac's own direct link (spec §5.10,
+    /// [`RemoteInbound::DirectTransport`]). Their envelopes go to an outbox the
+    /// desktop always holds, never to the relay client's channel, so the
+    /// relay-outage pause above does not apply to them.
+    direct_pairings: std::collections::HashSet<PairingId>,
     /// Whether a phone peer is currently attached to the pairing. While no phone
     /// is attached the bridge does NOT seal+send the per-tick snapshot/status/
     /// rollup deltas — during the 2026-07-22 incident the desktop sealed and sent
@@ -307,9 +361,14 @@ impl RemoteBridge {
             previews: HashMap::new(),
             prev_status: HashMap::new(),
             needs_input_since: HashMap::new(),
-            event_seq: 0,
+            push: PushDecider::new(),
+            push_intents: Vec::new(),
+            held_needs_input: HashMap::new(),
+            push_channel: None,
+            channel_book: HashMap::new(),
             pairing: None,
             link_up: true,
+            direct_pairings: std::collections::HashSet::new(),
             peer_present: false,
             peer_acks_observed: false,
             peer_acked_seq: 0,
@@ -382,6 +441,10 @@ impl RemoteBridge {
         self.out_seq = 0;
         self.reset_ack_tracking();
         self.pairing = None;
+        // Nothing decided for the old peer may reach a new one.
+        self.push_intents.clear();
+        self.held_needs_input.clear();
+        self.push_channel = None;
         // Forget remote shells; their backing child terminals stay as ordinary
         // desktop shells (the phone is no longer trusted to drive them).
         self.shells.clear();
@@ -466,11 +529,22 @@ impl RemoteBridge {
                 // resume, or a repeat claim) must NOT rewind `out_seq`, so the
                 // phone's resumed cursor keeps matching (remote-control-bbf).
                 if self.pairing.is_some() && self.pairing.as_ref() != Some(&pairing_id) {
+                    // Remember how far the stream we are leaving got, so
+                    // coming back to it resumes rather than restarts.
+                    if let Some(old) = self.pairing.as_ref() {
+                        if let Some(entry) = self.channel_book.get_mut(old) {
+                            entry.out_seq = entry.out_seq.max(self.out_seq);
+                        }
+                    }
                     self.out_seq = 0;
                     // A different peer with its own ack cursor: everything the
                     // old one owed us is meaningless now.
                     self.reset_ack_tracking();
+                    // Pushes decided for the old peer are not the new one's.
+                    self.push_intents.clear();
+                    self.held_needs_input.clear();
                 }
+                self.follow_channel(&pairing_id);
                 self.pairing = Some(pairing_id);
                 self.snapshot_needed = true;
             }
@@ -535,6 +609,13 @@ impl RemoteBridge {
             // on anything other than `Link(Connected)`, and this arrives with no
             // `Link` transition of its own, so there is nothing to do here.
             RemoteInbound::HandshakeFailed { .. } => {}
+            // A refused pairing attempt never became a pairing, and a relay
+            // that forgot this Mac changes nothing about a direct pairing's
+            // data plane: both are UI notices only.
+            RemoteInbound::PairingRefused { .. } | RemoteInbound::RelayForgotDevice { .. } => {}
+            RemoteInbound::DirectTransport { pairing_id } => {
+                self.direct_pairings.insert(pairing_id);
+            }
             RemoteInbound::Envelope(env) => {
                 if self.pairing.is_none() {
                     self.pairing = Some(env.pairing_id.clone());
@@ -632,14 +713,23 @@ impl RemoteBridge {
             // The relay no longer knows our pairing; the client dropped it and
             // will re-offer. Forget it here too and revert to the passthrough
             // sealer so we stop sealing to a dead channel (remote-control-1jy).
-            RemoteInbound::PairingRejected { .. } => {
-                self.pairing = None;
-                self.reset_to_passthrough();
+            // Only the rejected pairings are forgotten: a direct-mode pairing the
+            // client kept (spec §5.10) must go on being fed.
+            RemoteInbound::PairingRejected { pairing_ids } => {
+                if self
+                    .pairing
+                    .as_ref()
+                    .is_none_or(|p| pairing_ids.contains(p))
+                {
+                    self.pairing = None;
+                    self.reset_to_passthrough();
+                }
             }
             // The phone unpaired this Mac (spec §10.2). If it was the pairing we
             // were feeding, forget it and revert to the passthrough sealer so we
             // stop sealing to a dead channel; a different pairing is unaffected.
             RemoteInbound::PairingRevoked { pairing_id } => {
+                self.direct_pairings.remove(&pairing_id);
                 if self.pairing.as_ref() == Some(&pairing_id) {
                     self.pairing = None;
                     self.reset_to_passthrough();
@@ -674,6 +764,14 @@ impl RemoteBridge {
     /// Whether a phone pairing is currently active.
     pub fn is_paired(&self) -> bool {
         self.pairing.is_some()
+    }
+
+    /// Whether the active pairing's data plane is the direct link
+    /// ([`RemoteInbound::DirectTransport`]); `None` with no active pairing.
+    pub fn active_is_direct(&self) -> Option<bool> {
+        self.pairing
+            .as_ref()
+            .map(|p| self.direct_pairings.contains(p))
     }
 
     /// Whether the attached phone is still earning its presence — see
@@ -833,6 +931,7 @@ impl RemoteBridge {
 
         // Pre-pass: per-session edge detection (events + needs-input preview).
         let mut events = Vec::new();
+        let mut live_sessions: HashSet<SessionId> = HashSet::new();
         for pv in projects {
             for tab in pv.state.tabs.iter() {
                 let sid = SessionId::new(&tab.meta.id);
@@ -970,15 +1069,72 @@ impl RemoteBridge {
 
                 // Event edge (arming always advances; grace only gates sending).
                 let arm = self.arming.entry(sid.clone()).or_default();
-                if let Some(class) = arm.observe(interpreted) {
-                    if now_ms >= self.grace_until_ms && self.pairing.is_some() {
-                        events.push(self.make_event(class, pv, tab, &sid, now_ms));
+                let edge = arm
+                    .observe(interpreted)
+                    .filter(|_| now_ms >= self.grace_until_ms)
+                    .map(|class| SettleEdge {
+                        class,
+                        event_id: new_event_id(),
+                    });
+                if let Some(edge) = &edge {
+                    if self.pairing.is_some() {
+                        let ev_id = edge.event_id.clone();
+                        events.push(self.make_event(edge.class, ev_id, pv, tab, &sid, now_ms));
                     }
                 }
+
+                // Push decision (remote-control-fglt): needs-input/error now, done
+                // once the session has stayed idle for the project's debounce.
+                // Decided whether or not the relay link is up (the push sender
+                // has its own HTTPS path); only kept when there is a pairing to
+                // push to.
+                let debounce_ms = pv
+                    .state
+                    .config
+                    .remote
+                    .push_done_debounce_secs
+                    .saturating_mul(1_000);
+                let fire = self
+                    .push
+                    .observe(&sid, interpreted, edge, now_ms, debounce_ms);
+                if let Some(fire) = fire {
+                    if self.pairing.is_some() {
+                        if fire.class == PushClass::NeedsInput
+                            && self.needs_input_since.contains_key(&sid)
+                        {
+                            // The preview is still being settled (see
+                            // `held_needs_input`); release it below once known.
+                            self.held_needs_input.insert(sid.clone(), (fire, now_ms));
+                        } else {
+                            let intent = self.make_push_intent(fire, pv, tab, &sid);
+                            self.queue_push_intent(intent);
+                        }
+                    }
+                }
+                if let Some((_, held_at)) = self.held_needs_input.get(&sid) {
+                    let held_at = *held_at;
+                    if !matches!(status, AgentStatus::NeedsInput) {
+                        // Answered (or otherwise moved on) before the preview
+                        // settled: the person is at the desk; no push.
+                        self.held_needs_input.remove(&sid);
+                    } else if !self.needs_input_since.contains_key(&sid)
+                        || now_ms.saturating_sub(held_at) >= PROMPT_SETTLE_MS
+                    {
+                        if let Some((fire, _)) = self.held_needs_input.remove(&sid) {
+                            let intent = self.make_push_intent(fire, pv, tab, &sid);
+                            self.queue_push_intent(intent);
+                        }
+                    }
+                }
+                live_sessions.insert(sid.clone());
 
                 self.prev_status.insert(sid.clone(), status);
             }
         }
+        // A session closed while its done push was pending must never push.
+        self.push.retain_sessions(|sid| live_sessions.contains(sid));
+        self.held_needs_input
+            .retain(|sid, _| live_sessions.contains(sid));
 
         // Nothing to transmit without a pairing (state kept for the next pair), or
         // while the relay link is down — pause seal/queue during an outage so we
@@ -986,7 +1142,13 @@ impl RemoteBridge {
         // not draining (unbounded growth + a reconnect flood), remote-control-0ef.10.
         // All per-session/transcript bookkeeping above still runs, so a reconnect
         // sends fresh, current state.
-        if self.pairing.is_none() || !self.link_up {
+        // A direct-mode pairing's outbox is local and always there (spec §5.10),
+        // so only a relay-mode pairing pauses with the relay link.
+        let direct = self
+            .pairing
+            .as_ref()
+            .is_some_and(|p| self.direct_pairings.contains(p));
+        if self.pairing.is_none() || !(self.link_up || direct) {
             return;
         }
 
@@ -1144,15 +1306,40 @@ impl RemoteBridge {
 
     /// Assemble a typed [`AgentEvent`] for a settled edge.
     fn make_event(
-        &mut self,
+        &self,
         class: EventClass,
+        event_id: EventId,
         pv: &ProjectView<'_>,
         tab: &crate::app::state::RuntimeTab,
         sid: &SessionId,
         now_ms: u64,
     ) -> flightdeck_remote_protocol::AgentEvent {
-        self.event_seq += 1;
-        let event_id = EventId::new(format!("ev:{}", self.event_seq));
+        build_event(class, self.event_context(event_id, pv, tab, sid, now_ms))
+    }
+
+    /// Assemble the [`PushIntent`] for a decided push. Mints a fresh id when
+    /// no feed event corresponds to it (see [`PushFire::event_id`]).
+    fn make_push_intent(
+        &self,
+        fire: PushFire,
+        pv: &ProjectView<'_>,
+        tab: &crate::app::state::RuntimeTab,
+        sid: &SessionId,
+    ) -> PushIntent {
+        let event_id = fire.event_id.unwrap_or_else(new_event_id);
+        let ctx = self.event_context(event_id, pv, tab, sid, fire.occurred_at_ms);
+        build_push_intent(fire.class, ctx, Some(pv.name.to_string()))
+    }
+
+    /// The per-session context shared by feed events and pushes.
+    fn event_context(
+        &self,
+        event_id: EventId,
+        pv: &ProjectView<'_>,
+        tab: &crate::app::state::RuntimeTab,
+        sid: &SessionId,
+        occurred_at_ms: u64,
+    ) -> EventContext {
         let deep_link = DeepLink {
             project_id: pv.id.clone(),
             session_id: sid.clone(),
@@ -1163,17 +1350,126 @@ impl RemoteBridge {
         let ready_to_push = ws
             .map(|s| s.changes.is_empty() && s.ahead > 0)
             .unwrap_or(false);
-        let ctx = EventContext {
+        EventContext {
             event_id,
             deep_link,
-            occurred_at_ms: now_ms as i64,
+            occurred_at_ms: occurred_at_ms as i64,
             session_name: tab.meta.name.clone(),
             preview: self.previews.get(sid).cloned().flatten(),
             files_changed,
             ready_to_push,
             error_message: None,
+        }
+    }
+
+    /// Queue a decided push for the sender, dropping the oldest past the bound.
+    fn queue_push_intent(&mut self, intent: PushIntent) {
+        if self.push_intents.len() >= MAX_QUEUED_PUSH_INTENTS {
+            self.push_intents.remove(0);
+        }
+        self.push_intents.push(intent);
+    }
+
+    /// Take every push decided since the last call, oldest first
+    /// (remote-control-fglt). This is the seam the push sender consumes: each
+    /// [`PushIntent`] is one notification to seal and send as `push_notify`.
+    /// Only produced while a pairing is active; decided regardless of whether
+    /// the relay link is up or a phone is attached (that is the point of a
+    /// push).
+    pub fn take_push_intents(&mut self) -> Vec<PushIntent> {
+        std::mem::take(&mut self.push_intents)
+    }
+
+    /// Record `channel` (for its own pairing) so the bridge can switch to it
+    /// when that pairing becomes the one it feeds, resuming the outbound
+    /// stream at `resume_from_seq` (the persisted or outbox high-water mark;
+    /// 0 for a fresh claim). Never lowers a remembered mark.
+    pub fn remember_channel(&mut self, channel: Arc<E2eChannel>, resume_from_seq: u64) {
+        let pairing_id = PairingId::new(channel.pairing_id());
+        let out_seq = self
+            .channel_book
+            .get(&pairing_id)
+            .map_or(resume_from_seq, |e| e.out_seq.max(resume_from_seq));
+        self.channel_book
+            .insert(pairing_id, BookEntry { channel, out_seq });
+    }
+
+    /// The pairing whose channel seals pushes right now, if any.
+    pub fn push_channel_pairing(&self) -> Option<&str> {
+        self.push_channel.as_deref().map(E2eChannel::pairing_id)
+    }
+
+    /// Make the installed channel the one for `pairing_id`, if it is not
+    /// already and the book has it (see [`Self::channel_book`]). Without a
+    /// book entry nothing changes, and the mismatch is logged: pushes are then
+    /// dropped by [`Self::take_push_notifies`]' channel check.
+    fn follow_channel(&mut self, pairing_id: &PairingId) {
+        if self.push_channel_pairing() == Some(pairing_id.as_str()) {
+            return;
+        }
+        let Some(entry) = self.channel_book.get(pairing_id) else {
+            if self.push_channel.is_some() {
+                crate::remote::debuglog::log(&format!(
+                    "bridge FEED pairing={} has no known channel (installed: {:?})",
+                    pairing_id.as_str(),
+                    self.push_channel_pairing()
+                ));
+            }
+            return;
         };
-        build_event(class, ctx)
+        let channel = Arc::clone(&entry.channel);
+        let resume = entry.out_seq;
+        // The installed channel belongs to another pairing, so the counter
+        // in hand is that stream's: bank it, and start this one from its own.
+        if let Some(current) = self.push_channel_pairing().map(PairingId::new) {
+            if let Some(banked) = self.channel_book.get_mut(&current) {
+                banked.out_seq = banked.out_seq.max(self.out_seq);
+            }
+        }
+        self.out_seq = 0;
+        let (seal, open) = crate::remote::pairing::channel_seal_open(&channel);
+        self.install_channel(seal, open, resume);
+        self.push_channel = Some(channel);
+        crate::remote::debuglog::log(&format!(
+            "bridge CHANNEL follows pairing={} resume_seq={resume}",
+            pairing_id.as_str()
+        ));
+    }
+
+    /// Install the active pairing's E2E channel for sealing pushes (spec §7.2).
+    /// The host hands over the same channel it builds the envelope sealer from
+    /// ([`crate::remote::pairing::build_e2e_channel`]).
+    pub fn install_push_channel(&mut self, channel: Arc<E2eChannel>) {
+        self.push_channel = Some(channel);
+    }
+
+    /// Take every push decided since the last call, each sealed for the active
+    /// pairing as a [`PushNotifyBody`] ready for
+    /// [`crate::remote::push::PushSender::dispatch`]. The body's `event_id` is
+    /// the feed event's, which the phone relies on to collapse the two. Pushes
+    /// with no channel for the active pairing (it was never derived) are
+    /// dropped with a log line; nothing is held for a later pairing.
+    pub fn take_push_notifies(&mut self) -> Vec<PushNotifyBody> {
+        let intents = self.take_push_intents();
+        let channel = match (&self.push_channel, &self.pairing) {
+            (Some(c), Some(p)) if c.pairing_id() == p.as_str() => Some(Arc::clone(c)),
+            _ => None,
+        };
+        let mut out = Vec::with_capacity(intents.len());
+        for intent in intents {
+            let sealed = channel
+                .as_deref()
+                .ok_or_else(|| "no channel for the active pairing".to_string())
+                .and_then(|c| seal_push(&intent, c).map_err(|e| e.to_string()));
+            match sealed {
+                Ok(body) => out.push(body),
+                Err(why) => crate::remote::debuglog::log(&format!(
+                    "push event={} class={} dropped: {why}",
+                    intent.event_id, intent.class
+                )),
+            }
+        }
+        out
     }
 
     /// Seal a message and enqueue it as an outbound envelope for the pairing.
