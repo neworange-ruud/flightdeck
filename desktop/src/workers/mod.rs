@@ -6,4 +6,8 @@
 //! [`flightdeck_desktop::workers::registry`], so the remote window and this
 //! module agree on one global without either depending on the other.
 
-// stub: filled by H1 (links.rs, view.rs)
+pub mod links;
+pub mod view;
+
+#[cfg(test)]
+mod tests;

@@ -19,6 +19,13 @@
 //! ([`flightdeck_desktop::instance`]): from a repository, the new instance
 //! would otherwise open the same project as this one.
 //!
+//! While a FlightDeck worker runs on this machine (`flightdeck worker start`)
+//! a *local* workspace refuses to open, as the TUI does: two hosts must not
+//! drive the same projects (`specs/WORKER_PRD.md` W22). The launcher says
+//! why; remote windows, including to that worker, are unaffected. The
+//! background links to saved workers ([`crate::workers::links`]) start in
+//! every mode.
+//!
 //! Quitting — closing the window, Cmd-Q on macOS, Ctrl-q (the table's Quit),
 //! a confirmed quit dialog, SIGTERM/SIGINT/SIGHUP — all end in `cx.quit()`,
 //! and GPUI's quit hook runs the TUI's teardown order before the process
@@ -31,6 +38,8 @@ use flightdeck::config::load::{global_config_path, load_config};
 use flightdeck::contracts::real::RealFs;
 use flightdeck::contracts::FileSystem;
 use flightdeck::host::AppHost;
+use flightdeck::worker::lock::{worker_running, LOCAL_HOST_REFUSAL};
+use flightdeck::worker::paths::WorkerPaths;
 use flightdeck_desktop::instance::LAUNCHER_FLAG;
 use gpui::{px, size, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_component::Root;
@@ -103,6 +112,7 @@ fn open_workspace(
     folder: &Path,
     isolated: bool,
 ) -> Result<AppHost<'static>, String> {
+    refuse_while_worker_runs(&RealFs, WorkerPaths::current().as_ref())?;
     let mut host = AppHost::open(services.env(), services.notifier(), folder, isolated)
         .map_err(|e| e.to_string())?;
     // The help overlay documents this app's own shortcuts too.
@@ -121,6 +131,20 @@ fn open_workspace(
     // Mission control's tiles answer the prompts waiting sessions show.
     host.track_prompts();
     Ok(host)
+}
+
+/// A local workspace does not open while a worker runs for this account
+/// (`paths`; `None` without a home directory): [`LOCAL_HOST_REFUSAL`].
+/// Probed on every OS — a worker only ever runs on Linux and macOS, and
+/// elsewhere its lock files simply do not exist.
+fn refuse_while_worker_runs(
+    fs: &dyn FileSystem,
+    paths: Option<&WorkerPaths>,
+) -> Result<(), String> {
+    match paths {
+        Some(paths) if worker_running(fs, paths) => Err(LOCAL_HOST_REFUSAL.to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// `[ui] use_f2_to_leave_terminal_focus` from the global config, for a launch
@@ -192,6 +216,9 @@ pub fn run(args: Vec<String>) {
     // isolated run is defined by its directory, so there it is the TUI's
     // error and a non-zero exit. `--launcher` opens nothing at all.
     let opened = (!launch.launcher).then(|| open_workspace(services, &cwd, launch.isolated));
+    // A running worker's refusal is worth saying in the launcher; "not inside
+    // a Git repository" from a Finder launch is not.
+    let mut refusal = None;
     let initial = match opened {
         None => None,
         Some(Ok(host)) => Some(host),
@@ -201,6 +228,7 @@ pub fn run(args: Vec<String>) {
         }
         Some(Err(e)) => {
             eprintln!("flightdeck-desktop: {e}; opening the project picker");
+            refusal = (e == LOCAL_HOST_REFUSAL).then_some(e);
             None
         }
     };
@@ -254,6 +282,10 @@ pub fn run(args: Vec<String>) {
             // platform-convention shortcuts (Cmd-Q, Cmd-, …) and the handlers
             // for the desktop's own menu items.
             crate::menus::install(cx, crate::commands::keymap(), isolated);
+            // Background links to the saved workers, before the window so
+            // the launcher's Workers section observes them from its first
+            // frame.
+            crate::workers::links::start(cx);
 
             // Teardown, once, whatever ended the app: the running host's, if
             // a project was ever opened.
@@ -276,8 +308,13 @@ pub fn run(args: Vec<String>) {
 
             let options = window_options(cx);
             let opened = cx.open_window(options, |window, cx| {
-                let root =
-                    cx.new(|cx| AppRoot::new(initial, opener, recent, Some(shutdown), true, cx));
+                let root = cx.new(|cx| {
+                    let mut root = AppRoot::new(initial, opener, recent, Some(shutdown), true, cx);
+                    if let Some(message) = refusal {
+                        root.report(message, cx);
+                    }
+                    root
+                });
                 cx.set_global(RootHandle(root.clone()));
                 // gpui-component's `Root` hosts its overlays (menus, tooltips)
                 // above our view; every window needs one at its top.
@@ -420,6 +457,30 @@ mod tests {
         assert!(!parse_args(args(&[])).unwrap().launcher);
         assert!(parse_args(args(&["--launcher", "--isolated"])).is_err());
         assert!(parse_args(args(&["-I", "--launcher"])).is_err());
+    }
+
+    #[test]
+    fn a_running_worker_refuses_a_local_workspace() {
+        use flightdeck::testing::FakeFs;
+        let fs = FakeFs::new();
+        let paths = WorkerPaths::from_home(Path::new("/home/u"));
+        assert_eq!(refuse_while_worker_runs(&fs, Some(&paths)), Ok(()));
+        assert_eq!(refuse_while_worker_runs(&fs, None), Ok(()), "no home");
+
+        // A supervisor (or a foreground `worker run`) holds its lock.
+        for lock in [&paths.supervisor_lock, &paths.run_lock] {
+            let held = fs.try_lock_exclusive(lock).unwrap().expect("free");
+            assert_eq!(
+                refuse_while_worker_runs(&fs, Some(&paths)),
+                Err(LOCAL_HOST_REFUSAL.to_string())
+            );
+            drop(held);
+            assert_eq!(
+                refuse_while_worker_runs(&fs, Some(&paths)),
+                Ok(()),
+                "a stopped worker's lock files refuse nothing"
+            );
+        }
     }
 
     #[test]
