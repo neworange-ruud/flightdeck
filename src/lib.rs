@@ -750,12 +750,14 @@ fn startup(
             if !created {
                 if let Ok(added) = crate::config::init::backfill_builtin_agents(services.fs, gp) {
                     if !added.is_empty() {
-                        eprintln!(
+                        // Best effort: a worker reaches this with its stderr a
+                        // pipe whose reader may be gone (`eprintln!` panics).
+                        best_effort_stderr_line(&format!(
                             "FlightDeck: added built-in agent{} {} to {}",
                             if added.len() == 1 { "" } else { "s" },
                             added.join(", "),
                             gp.display()
-                        );
+                        ));
                     }
                 }
             }
@@ -781,7 +783,7 @@ fn startup(
     if isolated.is_none() {
         let update = ensure_flightdeck_gitignore(services.fs, repo_root)?;
         if update.changed {
-            eprintln!(
+            best_effort_stderr_line(&format!(
                 "FlightDeck: added {} to .gitignore: {}",
                 if update.added.len() == 1 {
                     "entry"
@@ -789,7 +791,7 @@ fn startup(
                     "entries"
                 },
                 update.added.join(", ")
-            );
+            ));
         }
     }
 

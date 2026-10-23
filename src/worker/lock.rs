@@ -8,6 +8,7 @@
 //! window refuses to open: two hosts must not drive the same projects.
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::contracts::{FileLock, FileSystem, Result};
 use crate::worker::paths::WorkerPaths;
@@ -57,6 +58,37 @@ pub fn refuse_local_host() -> Result<()> {
 /// another process holds it (a second supervisor, a second `worker run`).
 pub fn acquire(fs: &dyn FileSystem, lock: &Path) -> Result<Option<FileLock>> {
     fs.try_lock_exclusive(lock)
+}
+
+/// How many times [`acquire_patiently`] tries before concluding the lock is
+/// held for good.
+pub const ACQUIRE_ATTEMPTS: u32 = 20;
+
+/// The pause between two of [`acquire_patiently`]'s attempts: with
+/// [`ACQUIRE_ATTEMPTS`], about half a second in all.
+pub const ACQUIRE_PAUSE: Duration = Duration::from_millis(25);
+
+/// [`acquire`] for a process starting up (`worker run`, the supervisor),
+/// which must not mistake a probe for another worker.
+///
+/// [`worker_running`] and `worker status` find out whether a lock is held by
+/// taking it for a moment. A worker starting in that moment would find its
+/// lock taken and exit as "already running" (73) — a `worker status` run by a
+/// script, or a TUI launched on the box, would stop it starting. A probe lets
+/// go at once, so `pause` is called between up to [`ACQUIRE_ATTEMPTS`] tries;
+/// `Ok(None)` only once every try found it held.
+pub fn acquire_patiently(
+    fs: &dyn FileSystem,
+    lock: &Path,
+    pause: &mut dyn FnMut(),
+) -> Result<Option<FileLock>> {
+    for _ in 1..ACQUIRE_ATTEMPTS {
+        if let Some(guard) = acquire(fs, lock)? {
+            return Ok(Some(guard));
+        }
+        pause();
+    }
+    acquire(fs, lock)
 }
 
 #[cfg(test)]
@@ -114,6 +146,36 @@ mod tests {
         assert!(acquire(&fs, &p.run_lock).unwrap().is_none());
         drop(first);
         assert!(acquire(&fs, &p.run_lock).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_patient_acquire_outwaits_a_probe() {
+        let fs = FakeFs::new();
+        let p = paths();
+        // A probe holds the lock when the worker first tries, and lets go
+        // during the pause.
+        let mut probe = acquire(&fs, &p.run_lock).unwrap();
+        assert!(probe.is_some());
+        let mut pauses = 0;
+        let guard = acquire_patiently(&fs, &p.run_lock, &mut || {
+            pauses += 1;
+            probe = None;
+        })
+        .unwrap();
+        assert!(guard.is_some(), "taken once the probe let go");
+        assert_eq!(pauses, 1);
+        assert!(probe.is_none());
+    }
+
+    #[test]
+    fn a_patient_acquire_gives_up_on_a_real_holder() {
+        let fs = FakeFs::new();
+        let p = paths();
+        let _held = acquire(&fs, &p.run_lock).unwrap().expect("free");
+        let mut pauses = 0;
+        let guard = acquire_patiently(&fs, &p.run_lock, &mut || pauses += 1).unwrap();
+        assert!(guard.is_none(), "another worker holds it");
+        assert_eq!(pauses, ACQUIRE_ATTEMPTS - 1, "every attempt was made");
     }
 
     #[test]

@@ -97,7 +97,11 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
     }
     let fs = RealFs;
     // Held for the whole run: dropped (and released) when this returns.
-    let _run_lock = match crate::worker::lock::acquire(&fs, &paths.run_lock) {
+    // Patiently: `worker status` and a TUI launch probe this lock by taking
+    // it for an instant, which must not read as another worker.
+    let _run_lock = match crate::worker::lock::acquire_patiently(&fs, &paths.run_lock, &mut || {
+        std::thread::sleep(crate::worker::lock::ACQUIRE_PAUSE)
+    }) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             log_line(

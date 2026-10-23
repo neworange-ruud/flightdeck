@@ -288,7 +288,12 @@ fn supervise_with(
         LOG_KEEP,
     )?));
     let mut sup = Supervisor::new(paths, exe.to_path_buf(), log);
-    let Some(_lock) = lock::acquire(&RealFs, &paths.supervisor_lock)? else {
+    // Patiently, as `worker run` takes its own: a probe of this lock (`worker
+    // status`, a TUI launch) is not another supervisor.
+    let Some(_lock) = lock::acquire_patiently(&RealFs, &paths.supervisor_lock, &mut || {
+        std::thread::sleep(lock::ACQUIRE_PAUSE)
+    })?
+    else {
         sup.say("error", "another supervisor is already running; exiting");
         return Ok(1);
     };
