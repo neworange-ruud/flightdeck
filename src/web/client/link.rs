@@ -35,9 +35,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::web::protocol::{
-    Ack, Attach, ClientInfo, ClientMsg, ConfigView, Delta, ErrorCode, GitStatusView, ImagePaste,
-    SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId,
-    WireError, PROTOCOL_VERSION,
+    Ack, Attach, ClientInfo, ClientMsg, CloneProgress, CloneResult, ConfigView, ConnectionKind,
+    Delta, DirListing, ErrorCode, GitStatusView, ImagePaste, ProjectScan, SeatRequest, ServerMsg,
+    ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId, WireError,
+    PROTOCOL_VERSION,
 };
 use crate::web::server::COOKIE_NAME;
 
@@ -74,6 +75,13 @@ pub struct LinkConfig {
     /// Sent as `User-Agent` and in `Attach.client`, so the controlled instance
     /// can tell this client from a browser and revoke it by name.
     pub user_agent: String,
+    /// A remote window, or a worker's status-only background link (v7). Sent
+    /// as `Attach.connection`; only ever `Background` towards a worker.
+    pub connection: ConnectionKind,
+    /// The longest reconnect delay, overriding the last entry of
+    /// [`RETRY_DELAYS_MS`] (v7: a background link backs off to a minute).
+    /// `None` keeps the browser's 8 s cap.
+    pub retry_cap_ms: Option<u64>,
 }
 
 /// The link's state, for the title and status bars.
@@ -110,6 +118,12 @@ pub enum LinkEnd {
     ServerStopped,
     /// The host speaks a different protocol version; one side must update.
     VersionMismatch(String),
+    /// Another window took this worker over (v7, PRD W17). `by` is its device
+    /// label. The token is still good: reconnecting takes the worker back.
+    TakenOver {
+        /// The device that took over.
+        by: String,
+    },
     /// This client closed the link.
     Stopped,
 }
@@ -129,6 +143,14 @@ pub enum LinkEvent {
     GitStatus(GitStatusView),
     Configuration(ConfigView),
     Error(WireError),
+    /// A worker's directory listing, in answer to `browse_dir` (v7).
+    DirListing(DirListing),
+    /// A worker's project scan, in answer to `scan_projects` (v7).
+    ProjectScan(ProjectScan),
+    /// A worker's clone progress (v7).
+    CloneProgress(CloneProgress),
+    /// How a worker's clone ended (v7).
+    CloneResult(CloneResult),
 }
 
 /// What the client asks the link task to send.
@@ -497,6 +519,7 @@ fn attach_frame(config: &LinkConfig, carry: &Carry, seat: SeatRequest) -> Client
             user_agent: Some(config.user_agent.clone()),
             label: Some(config.user_agent.clone()),
         }),
+        connection: config.connection,
     })
 }
 
@@ -627,6 +650,15 @@ async fn session(
                                 SessionEnd::Ended(LinkEnd::ServerStopped)
                             }
                         };
+                    }
+                    ServerMsg::DirListing(listing) => events.send(LinkEvent::DirListing(listing)),
+                    ServerMsg::ProjectScan(scan) => events.send(LinkEvent::ProjectScan(scan)),
+                    ServerMsg::CloneProgress(progress) => {
+                        events.send(LinkEvent::CloneProgress(progress))
+                    }
+                    ServerMsg::CloneResult(result) => events.send(LinkEvent::CloneResult(result)),
+                    ServerMsg::TakenOver { by } => {
+                        return SessionEnd::Ended(LinkEnd::TakenOver { by });
                     }
                     ServerMsg::Unrecognized => {}
                 }

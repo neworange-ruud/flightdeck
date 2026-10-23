@@ -68,7 +68,9 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use crate::contracts::domain::WebConfig;
 use crate::contracts::traits::Clock;
+use crate::contracts::PtySize;
 use crate::remote::debuglog;
+use crate::remote::direct::net::{AddressOrigin, AddressSource, TailscaleProbe};
 use crate::remote::runtime;
 use crate::web::arbiter::{Claim, InputArbiter, SharedInputLock, Writer};
 use crate::web::assets::{self, Lookup};
@@ -77,9 +79,10 @@ use crate::web::credentials::{
     RATE_LIMIT_LOCKOUT_MS,
 };
 use crate::web::protocol::{
-    check_version, Ack, AckOutcome, ActivityEvent, Attach, ClientMsg, Delta, DialogView, ErrorCode,
-    Geometry, ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason,
-    Snapshot, TermCursor, ViewerId, Viewport, WireError,
+    check_version, negotiated, Ack, AckOutcome, ActivityEvent, Attach, ClientMsg, ConnectionKind,
+    Delta, DialogView, ErrorCode, Geometry, Health, HostKind, HostMessage, ProjectView, Seat,
+    SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot, TermCursor, TerminalId,
+    ViewerId, Viewport, WireError, WorkerOp, WorkerShellView, WorkerStatusView,
 };
 
 // ===========================================================================
@@ -215,6 +218,31 @@ pub struct HostState {
     /// once per config save, and the browser picks the current one up on its
     /// next snapshot.
     pub sidebar_position: crate::contracts::AgentTabPosition,
+    /// What kind of FlightDeck publishes this state, stamped on every
+    /// snapshot as [`Snapshot::host_kind`] (v7). [`HostKind::Tui`] unless the
+    /// host says otherwise.
+    pub host_kind: HostKind,
+    /// The worker's own state (v7). `Some` only on a worker host; the server
+    /// turns it into each recipient's [`Snapshot::worker`].
+    pub worker: Option<WorkerHostState>,
+}
+
+/// The worker-only part of [`HostState`] (v7, `specs/WORKER_PRD.md`): what a
+/// [`crate::web::protocol::WorkerSnapshot`] is built from, minus the
+/// per-recipient [`crate::web::protocol::ConnectionsView`], which only the
+/// server knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerHostState {
+    /// `$HOME` on the worker.
+    pub home: String,
+    /// The worker shell, when one is running or has run.
+    pub shell: Option<WorkerShellView>,
+    /// The latest health sample.
+    pub health: Option<Health>,
+    /// Listen addresses, unread count, projects root.
+    pub status: WorkerStatusView,
+    /// The host messages nobody has seen yet, oldest first.
+    pub host_messages: Vec<HostMessage>,
 }
 
 impl Default for HostState {
@@ -241,6 +269,10 @@ impl Default for HostState {
             // told the user's `[ui]` either, and `left` is the default that
             // setting itself has.
             sidebar_position: crate::contracts::AgentTabPosition::default(),
+            // Every host before v7 was a TUI or a Desktop, and neither has a
+            // worker's state to publish.
+            host_kind: HostKind::Tui,
+            worker: None,
         }
     }
 }
@@ -275,6 +307,10 @@ pub enum WebOutbound {
     /// frame addressed to a moving target would land on whoever happened to be
     /// typing when it was built.
     Writers(ServerMsg),
+    /// To every **window** connection, and to no background link (v7). On a
+    /// TUI or Desktop host every viewer is a window, so this is
+    /// [`WebOutbound::All`] there.
+    Windows(ServerMsg),
 }
 
 /// Viewers → host. The TUI drains these non-blockingly each render tick, the
@@ -304,6 +340,12 @@ pub enum WebInbound {
         /// to zero on every reconnect and a browser replaying its held queue
         /// would have every keystroke typed twice.
         resume_viewer: Option<ViewerId>,
+        /// A window or a background link (v7, [`Attach::connection`]). A
+        /// background link is not replayed terminal bytes.
+        kind: ConnectionKind,
+        /// The version this viewer was answered at
+        /// ([`crate::web::protocol::negotiated`]).
+        protocol_version: u16,
     },
     /// A browser's socket closed.
     ViewerDetached {
@@ -358,6 +400,27 @@ pub enum WebInbound {
         viewer_id: ViewerId,
         /// What it can show.
         viewport: Viewport,
+    },
+    /// A window asked to size one terminal's PTY (v7, PRD W5). Only ever sent
+    /// by a **worker** host, and only for its window; everywhere else the
+    /// frame is dropped and D4 holds.
+    ResizeTerminal {
+        /// Who asked.
+        viewer_id: ViewerId,
+        /// The terminal to resize — an agent terminal or the worker shell.
+        terminal_id: TerminalId,
+        /// The requested grid.
+        size: PtySize,
+    },
+    /// A parsed [`crate::web::protocol::worker_command`] from a worker's
+    /// window (v7). The host applies it and sends the [`Ack`] for `seq`.
+    WorkerOp {
+        /// Who asked.
+        viewer_id: ViewerId,
+        /// The [`crate::web::protocol::Command::seq`] to ack.
+        seq: u64,
+        /// What they asked for.
+        op: WorkerOp,
     },
 }
 
@@ -442,6 +505,101 @@ pub enum BindExposure {
     /// `[web] bind` themselves, and the UI warns when the server actually
     /// starts.
     Routable,
+}
+
+/// How [`start_with`] runs a server: for which kind of host, on which
+/// addresses, and whether it serves the browser SPA (v7).
+#[derive(Clone, Debug)]
+pub struct ServerOptions {
+    /// What kind of FlightDeck this server belongs to. A worker gets the
+    /// worker seat model (one window, takeover, background links) and refuses
+    /// clients older than [`crate::web::protocol::WORKER_MIN_CLIENT_VERSION`].
+    pub host_kind: HostKind,
+    /// Where to listen.
+    pub listen: ListenPlan,
+    /// Whether the SPA's assets are served. A worker serves only the protocol
+    /// routes, and every other path is a 404.
+    pub serve_assets: bool,
+}
+
+/// Where a server listens (v7).
+#[derive(Clone)]
+pub enum ListenPlan {
+    /// `[web] bind:port`: today's single listener (TUI/Desktop). [`start`]
+    /// wraps this.
+    Configured {
+        /// The configured bind address, as `config.toml` spells it.
+        bind: String,
+        /// The configured port; `0` lets the OS choose.
+        port: u16,
+    },
+    /// Worker: only this machine's Tailscale addresses, re-read every `poll`
+    /// and rebound when they change (PRD W8, W27). Never loopback or the
+    /// unspecified address.
+    Tailscale {
+        /// The port every Tailscale address is bound on.
+        port: u16,
+        /// This machine's interface addresses.
+        source: Arc<dyn AddressSource>,
+        /// What Tailscale says about this node.
+        probe: Arc<dyn TailscaleProbe>,
+        /// How often the addresses are re-read.
+        poll: Duration,
+    },
+    /// Exactly these addresses (`127.0.0.1:0` allowed) — the seam tests and
+    /// debugging use.
+    Fixed(Vec<SocketAddr>),
+}
+
+impl std::fmt::Debug for ListenPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListenPlan::Configured { bind, port } => f
+                .debug_struct("Configured")
+                .field("bind", bind)
+                .field("port", port)
+                .finish(),
+            ListenPlan::Tailscale { port, poll, .. } => f
+                .debug_struct("Tailscale")
+                .field("port", port)
+                .field("poll", poll)
+                .finish_non_exhaustive(),
+            ListenPlan::Fixed(addrs) => f.debug_tuple("Fixed").field(addrs).finish(),
+        }
+    }
+}
+
+/// Where a server is listening right now, and why not when it is not (v7,
+/// PRD W27). What `flightdeck worker status` reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListenStatus {
+    /// Every address a listener is bound on.
+    pub bound: Vec<SocketAddr>,
+    /// The `host:port` a client should dial, when a name is known
+    /// (Tailscale's MagicDNS).
+    pub advertised: Option<String>,
+    /// Why nothing is bound, when nothing is.
+    pub reason: Option<String>,
+    /// Where the Tailscale addresses came from, on a Tailscale plan.
+    pub origin: Option<AddressOrigin>,
+}
+
+/// One attached connection, as `flightdeck worker status` and the worker's
+/// connection bookkeeping see it (v7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// The connection's viewer id.
+    pub viewer_id: ViewerId,
+    /// The credential it authenticated with.
+    pub token: TokenId,
+    /// A window or a background link.
+    pub kind: ConnectionKind,
+    /// Its chip label.
+    pub label: String,
+    /// The address the host observed on its socket.
+    pub address: IpAddr,
+    /// Host wall-clock (unix ms) it attached.
+    pub since_ms: i64,
 }
 
 // ===========================================================================
@@ -595,6 +753,52 @@ impl WebServerHandle {
         self.shared.registry().viewers.len()
     }
 
+    /// Where the server is listening, and why not when it is not (v7).
+    // stub: filled by A (the Tailscale plan reports its own status).
+    pub fn listen_status(&self) -> ListenStatus {
+        ListenStatus {
+            bound: vec![self.bound],
+            ..ListenStatus::default()
+        }
+    }
+
+    /// Every address a listener is bound on (v7). [`Self::bound_addr`] is the
+    /// first of them.
+    // stub: filled by A (one listener per Tailscale address).
+    pub fn bound_addrs(&self) -> Vec<SocketAddr> {
+        vec![self.bound]
+    }
+
+    /// How many **window** connections are attached (v7).
+    // stub: filled by A (connection kinds); every viewer is a window today.
+    pub fn window_count(&self) -> usize {
+        self.viewer_count()
+    }
+
+    /// How many **background links** are attached (v7).
+    // stub: filled by A (connection kinds).
+    pub fn background_count(&self) -> usize {
+        0
+    }
+
+    /// Every attached connection (v7).
+    // stub: filled by A (connection kinds); every viewer is a window today.
+    pub fn connections(&self) -> Vec<ConnectionInfo> {
+        self.shared
+            .registry()
+            .viewers
+            .iter()
+            .map(|viewer| ConnectionInfo {
+                viewer_id: viewer.id.clone(),
+                token: viewer.identity.token.clone(),
+                kind: ConnectionKind::Window,
+                label: viewer.identity.label(),
+                address: viewer.identity.address,
+                since_ms: viewer.since_ms,
+            })
+            .collect()
+    }
+
     /// Have every attached socket re-check its own credential, closing the ones
     /// whose credential has been withdrawn.
     ///
@@ -697,12 +901,62 @@ pub fn start(
     initial_state: HostState,
     inbound: std::sync::mpsc::Sender<WebInbound>,
 ) -> Result<WebServerHandle, StartError> {
+    start_with(
+        ServerOptions {
+            host_kind: HostKind::Tui,
+            listen: ListenPlan::Configured {
+                bind: config.bind.clone(),
+                port: config.port,
+            },
+            serve_assets: true,
+        },
+        config.replay_bytes,
+        credentials,
+        clock,
+        initial_state,
+        inbound,
+    )
+}
+
+/// Start the server on the shared runtime with explicit [`ServerOptions`]
+/// (v7): the worker's entry point, and what [`start`] wraps.
+///
+/// `replay_bytes` is `[web] replay_bytes`, the per-terminal ring capacity.
+// stub: filled by A. Today `Configured` and `Fixed` bind their first address
+// through the single-listener path below, `Tailscale` is refused, and
+// `host_kind`, `serve_assets` and `replay_bytes` change nothing yet.
+pub fn start_with(
+    options: ServerOptions,
+    replay_bytes: usize,
+    credentials: Arc<Mutex<CredentialStore>>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    initial_state: HostState,
+    inbound: std::sync::mpsc::Sender<WebInbound>,
+) -> Result<WebServerHandle, StartError> {
+    let _ = (options.host_kind, options.serve_assets, replay_bytes);
+    let address = match &options.listen {
+        ListenPlan::Configured { bind, port } => listen_address(bind, *port),
+        ListenPlan::Fixed(addrs) => match addrs.first() {
+            Some(addr) => addr.to_string(),
+            None => {
+                return Err(StartError::Bind {
+                    address: String::new(),
+                    reason: "no address to listen on".to_string(),
+                })
+            }
+        },
+        ListenPlan::Tailscale { port, .. } => {
+            return Err(StartError::Bind {
+                address: format!("tailscale:{port}"),
+                reason: "not implemented".to_string(),
+            })
+        }
+    };
+
     let Some(rt) = runtime::try_shared() else {
         debuglog::log("web START skipped — no async runtime");
         return Err(StartError::NoRuntime);
     };
-
-    let address = listen_address(&config.bind, config.port);
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownNotice>>(None);
     let (revocations_tx, revocations_rx) = watch::channel::<u64>(0);
     let (state_tx, state_rx) = watch::channel(Arc::new(initial_state));
@@ -927,7 +1181,9 @@ impl Shared {
     fn dispatch(&self, out: WebOutbound) {
         let mut registry = self.registry();
         match out {
-            WebOutbound::All(msg) => registry.send_all(&msg),
+            // Every viewer is a window until A gives background links their
+            // own kind.
+            WebOutbound::All(msg) | WebOutbound::Windows(msg) => registry.send_all(&msg),
             WebOutbound::Viewer { viewer_id, msg } => registry.send_to(&viewer_id, msg),
             WebOutbound::Writers(msg) => {
                 for id in registry.writers() {
@@ -938,12 +1194,21 @@ impl Shared {
     }
 
     /// Build the snapshot a viewer gets on attach.
-    fn snapshot_for(&self, viewer_id: &ViewerId, seat: Seat, last_input_seq: u64) -> Snapshot {
+    ///
+    /// `protocol_version` is the version this viewer was answered at
+    /// ([`negotiated`]), so a v6 client is told 6.
+    fn snapshot_for(
+        &self,
+        viewer_id: &ViewerId,
+        seat: Seat,
+        last_input_seq: u64,
+        protocol_version: u16,
+    ) -> Snapshot {
         let state = self.state_rx.borrow().clone();
         let holder = self.holder();
         let seats = self.registry().seat_rows(Some(viewer_id), holder.as_ref());
         Snapshot {
-            protocol_version: crate::web::protocol::PROTOCOL_VERSION,
+            protocol_version,
             host_version: state.host_version.clone(),
             server_time_ms: self.now_ms(),
             viewer_id: viewer_id.clone(),
@@ -972,6 +1237,10 @@ impl Shared {
             sidebar_position: state.sidebar_position,
             // Fixed for the life of the process, like `commands`.
             host_machine: Some(crate::web::protocol::HostMachine::current()),
+            host_kind: Some(state.host_kind),
+            // stub: filled by A (from `state.worker` plus this recipient's
+            // connections).
+            worker: None,
         }
     }
 
@@ -1105,6 +1374,9 @@ struct Viewer {
     identity: ViewerIdentity,
     seat: Seat,
     since_ms: i64,
+    /// The version this viewer was answered at ([`negotiated`]), so a later
+    /// `request_snapshot` is stamped the way its first snapshot was.
+    protocol_version: u16,
     tx: mpsc::Sender<ServerMsg>,
 }
 
@@ -1168,9 +1440,12 @@ impl SeatRegistry {
         id: ViewerId,
         identity: ViewerIdentity,
         since_ms: i64,
+        protocol_version: u16,
         tx: mpsc::Sender<ServerMsg>,
     ) {
-        if self.viewers.iter().any(|v| v.id == id) {
+        if let Some(viewer) = self.viewers.iter_mut().find(|v| v.id == id) {
+            // A re-attach on the same socket may speak another version.
+            viewer.protocol_version = protocol_version;
             return;
         }
         self.viewers.push(Viewer {
@@ -1178,8 +1453,22 @@ impl SeatRegistry {
             identity,
             seat: Seat::Observing,
             since_ms,
+            protocol_version,
             tx,
         });
+    }
+
+    /// The version this viewer was answered at; [`PROTOCOL_VERSION`] for one
+    /// that has gone.
+    ///
+    /// [`PROTOCOL_VERSION`]: crate::web::protocol::PROTOCOL_VERSION
+    fn protocol_version_of(&self, id: &ViewerId) -> u16 {
+        self.viewers
+            .iter()
+            .find(|v| &v.id == id)
+            .map_or(crate::web::protocol::PROTOCOL_VERSION, |v| {
+                v.protocol_version
+            })
     }
 
     fn remove(&mut self, id: &ViewerId) {
@@ -2183,6 +2472,9 @@ async fn handle_client_msg(
             handle_command(shared, viewer_id, command, sink).await;
             Flow::Continue
         }
+        // D4 holds on every host this build serves yet: dropped silently.
+        // stub: filled by A (a worker's window sizes its PTYs, PRD W5).
+        ClientMsg::ResizeTerminal(_) => Flow::Continue,
         ClientMsg::Unrecognized => {
             let _ = send_msg(
                 sink,
@@ -2323,10 +2615,20 @@ async fn handle_attach(
     let address = identity.address;
     let label = identity.label();
 
+    // A v6 client is answered at v6: its link compares the snapshot's version
+    // for equality, and nothing it is sent is newer than v6 (v7 frames come
+    // only from worker hosts, which refuse it).
+    let protocol_version = negotiated(attach.protocol_version);
     let now = shared.now_ms();
     let (seat, last_input_seq) = {
         let mut registry = shared.registry();
-        registry.register(viewer_id.clone(), identity.clone(), now, tx.clone());
+        registry.register(
+            viewer_id.clone(),
+            identity.clone(),
+            now,
+            protocol_version,
+            tx.clone(),
+        );
         let last_input_seq = match attach.resume_viewer.as_ref() {
             Some(previous) => registry.adopt_cursor(previous, viewer_id),
             None => registry.input_cursor(viewer_id),
@@ -2359,7 +2661,7 @@ async fn handle_attach(
     };
 
     *attached = true;
-    let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
+    let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq, protocol_version);
     if send_msg(sink, &ServerMsg::Snapshot(Box::new(snapshot)))
         .await
         .is_err()
@@ -2374,6 +2676,8 @@ async fn handle_attach(
         seat,
         cursors: attach.cursors,
         resume_viewer: attach.resume_viewer,
+        kind: attach.connection,
+        protocol_version,
     });
     // Any attach can change the seat map — a first attach adds a row, a
     // re-attach may have just moved the input lock. Both travel as this
@@ -2496,8 +2800,14 @@ async fn handle_command(
         // Answerable here, from the published state, for any seat: it is how a
         // viewer that believes it has drifted recovers.
         Route::Server if spec.name == names::REQUEST_SNAPSHOT => {
-            let last_input_seq = shared.registry().input_cursor(viewer_id);
-            let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq);
+            let (last_input_seq, protocol_version) = {
+                let registry = shared.registry();
+                (
+                    registry.input_cursor(viewer_id),
+                    registry.protocol_version_of(viewer_id),
+                )
+            };
+            let snapshot = shared.snapshot_for(viewer_id, seat, last_input_seq, protocol_version);
             let _ = send_msg(sink, &ServerMsg::Snapshot(Box::new(snapshot))).await;
             let _ = send_msg(sink, &applied(command.seq)).await;
         }

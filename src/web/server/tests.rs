@@ -50,6 +50,7 @@ fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>)
                 token: token(),
             },
             2_000 + index as i64,
+            crate::web::protocol::PROTOCOL_VERSION,
             tx,
         );
         receivers.push(rx);
@@ -435,6 +436,7 @@ fn a_viewer_that_cannot_keep_up_is_dropped_from_the_registry() {
             token: token(),
         },
         0,
+        crate::web::protocol::PROTOCOL_VERSION,
         tx,
     );
 
@@ -843,13 +845,19 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
             token: token(),
         },
         1_700_000_000_000,
+        crate::web::protocol::PROTOCOL_VERSION,
         tx,
     );
     shared
         .registry()
         .request_seat(&viewer("v0"), SeatRequest::Write);
 
-    let snapshot = shared.snapshot_for(&viewer("v0"), Seat::Writing, 12);
+    let snapshot = shared.snapshot_for(
+        &viewer("v0"),
+        Seat::Writing,
+        12,
+        crate::web::protocol::PROTOCOL_VERSION,
+    );
     assert_eq!(
         snapshot.protocol_version,
         crate::web::protocol::PROTOCOL_VERSION
@@ -882,7 +890,12 @@ fn publishing_state_changes_what_the_next_snapshot_says() {
         host_version: "1.2.3".to_string(),
         ..HostState::default()
     }));
-    let snapshot = shared.snapshot_for(&viewer("nobody"), Seat::Observing, 0);
+    let snapshot = shared.snapshot_for(
+        &viewer("nobody"),
+        Seat::Observing,
+        0,
+        crate::web::protocol::PROTOCOL_VERSION,
+    );
     assert_eq!(snapshot.host_version, "1.2.3");
 }
 

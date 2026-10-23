@@ -107,6 +107,8 @@ fn snapshot() -> Snapshot {
         update: None,
         sidebar_position: AgentTabPosition::default(),
         host_machine: None,
+        host_kind: None,
+        worker: None,
     }
 }
 

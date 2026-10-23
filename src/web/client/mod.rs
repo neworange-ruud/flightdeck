@@ -310,6 +310,11 @@ impl RemoteClient {
                 self.errors.push(error);
                 true
             }
+            // v7 project-picker answers. stub: filled by B.
+            LinkEvent::DirListing(_)
+            | LinkEvent::ProjectScan(_)
+            | LinkEvent::CloneProgress(_)
+            | LinkEvent::CloneResult(_) => false,
         }
     }
 

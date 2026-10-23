@@ -35,8 +35,8 @@ use flightdeck::web::activity::{apply_mark_read, ActivityStore, Transition};
 use flightdeck::web::credentials::CredentialStore;
 use flightdeck::web::interfaces::FakeInterfaceEnumerator;
 use flightdeck::web::protocol::{
-    AckOutcome, ActivityTier, Attach, ClientMsg, Command as WireCommand, Delta, ErrorCode, Input,
-    ProjectId, Seat, SeatRequest, ServerMsg, ShutdownReason, PROTOCOL_VERSION,
+    AckOutcome, ActivityTier, Attach, ClientMsg, Command as WireCommand, ConnectionKind, Delta,
+    ErrorCode, Input, ProjectId, Seat, SeatRequest, ServerMsg, ShutdownReason, PROTOCOL_VERSION,
 };
 use flightdeck::web::server::{
     self, BindExposure, HostState, ShutdownNotice, WebInbound, WebServerHandle, COOKIE_NAME,
@@ -349,6 +349,7 @@ async fn attach(ws: &mut Ws, seat: SeatRequest) -> ClientMsg {
         resume_viewer: None,
         viewport: None,
         client: None,
+        connection: ConnectionKind::Window,
     });
     send(ws, &msg).await;
     msg
@@ -1220,6 +1221,7 @@ fn an_unsupported_protocol_version_is_refused_with_the_numbers() {
                 resume_viewer: None,
                 viewport: None,
                 client: None,
+                connection: ConnectionKind::Window,
             }),
         )
         .await;
@@ -1238,6 +1240,53 @@ fn an_unsupported_protocol_version_is_refused_with_the_numbers() {
             next_frame(&mut ws).await.is_none(),
             "nothing this build can serve, so the socket closes"
         );
+    });
+}
+
+/// A v6 FlightDeck Desktop keeps driving a v7 TUI host
+/// (`remote-control-qlyd.9`): the attach is accepted and the snapshot — the
+/// first and any later `request_snapshot` — says 6, because the v6 link
+/// compares that number for equality.
+#[test]
+fn a_v6_client_is_served_and_answered_at_v6() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        send(
+            &mut ws,
+            &ClientMsg::Attach(Attach {
+                protocol_version: 6,
+                seat: SeatRequest::Write,
+                cursors: Vec::new(),
+                resume_viewer: None,
+                viewport: None,
+                client: None,
+                connection: ConnectionKind::Window,
+            }),
+        )
+        .await;
+        let snapshot = await_snapshot(&mut ws).await;
+        assert_eq!(snapshot.protocol_version, 6);
+        assert_eq!(
+            snapshot.host_kind,
+            Some(flightdeck::web::protocol::HostKind::Tui)
+        );
+        assert_eq!(snapshot.worker, None);
+
+        send(
+            &mut ws,
+            &ClientMsg::Command(WireCommand {
+                seq: 1,
+                name: flightdeck::web::protocol::command::REQUEST_SNAPSHOT.to_string(),
+                args: None,
+            }),
+        )
+        .await;
+        let again = await_snapshot(&mut ws).await;
+        assert_eq!(again.protocol_version, 6);
     });
 }
 
@@ -2390,6 +2439,7 @@ fn a_reconnecting_viewer_resumes_from_its_byte_cursor() {
                 resume_viewer: None,
                 viewport: None,
                 client: None,
+                connection: ConnectionKind::Window,
             }),
         )
         .await;
@@ -2442,6 +2492,7 @@ fn a_reconnecting_viewer_whose_cursor_aged_out_is_told_it_missed_output() {
                 resume_viewer: None,
                 viewport: None,
                 client: None,
+                connection: ConnectionKind::Window,
             }),
         )
         .await;
@@ -2732,6 +2783,7 @@ fn input_held_across_a_reconnect_arrives_in_order_exactly_once() {
                 resume_viewer: Some(previous_viewer.clone()),
                 viewport: None,
                 client: None,
+                connection: ConnectionKind::Window,
             }),
         )
         .await;

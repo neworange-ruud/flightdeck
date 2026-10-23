@@ -115,6 +115,8 @@ fn snapshot() -> Snapshot {
             user: Some("dev".to_string()),
             os: "linux".to_string(),
         }),
+        host_kind: None,
+        worker: None,
     }
 }
 

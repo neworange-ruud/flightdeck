@@ -86,6 +86,11 @@
 //! | [`Delta::DialogOpened`] + [`DialogOrigin`] | D13 — shared dialogs carry who opened them |
 //! | [`Command`] (name + free-form args) | D13/D8 — the M2 door: palette, dialogs, git commands |
 //! | [`SessionView::lifecycle_reporting`], [`StatusBucket::Unknown`] | turn 2 §5.1 "unknown stays unknown" |
+//! | [`HostKind`], [`Snapshot::host_kind`], [`WORKER_MIN_CLIENT_VERSION`], [`negotiated`] | `specs/WORKER_PRD.md` §5 — a Desktop must know it drives a worker, and a v6 Desktop must keep driving a v7 TUI host |
+//! | [`ConnectionKind`], [`Attach::connection`], [`ServerMsg::TakenOver`], [`Delta::Connections`] | PRD W10/W17/W19 — one window per worker, the new one takes over, plus background links that only watch |
+//! | [`WorkerSnapshot`], [`Delta::Health`], [`Delta::WorkerShell`], [`Delta::WorkerStatus`], [`Delta::HostMessage`], [`Delta::Notification`] | PRD W15/W18/W27/W29 — the worker's shell, status, health, messages and notifications |
+//! | [`worker_command`], [`WorkerOp`], [`DirListing`], [`ProjectScan`], [`CloneProgress`], [`CloneResult`] | PRD W9/W16 — the worker's project picker: browse, scan, open, clone |
+//! | [`ResizeTerminal`] | PRD W5 — a worker has no pane of its own, so its one window sizes the PTYs |
 //!
 //! # Forward compatibility
 //!
@@ -194,10 +199,28 @@ mod tests;
 /// sends no target and keeps D3's shared selection; a native client (FlightDeck
 /// Desktop as a remote control) browses independently and always names one.
 ///
-/// It is deliberately the whole range — there is no older web protocol to
-/// interoperate with, because the browser SPA ships inside the same binary as
-/// the server (D9), and a stale tab is answered with "reload to update" rather
-/// than with a half-spoken older version.
+/// **v7 is the worker** (`remote-control-qlyd.9`, `specs/WORKER_PRD.md` §5):
+/// a headless `flightdeck worker` host that a FlightDeck Desktop drives over
+/// the tailnet. [`Delta`] grew six kinds (health, the worker shell, the
+/// worker's status, its connections, host messages and notifications),
+/// [`ServerMsg`] grew five (the project picker's [`DirListing`] and
+/// [`ProjectScan`], the clone's [`CloneProgress`] and [`CloneResult`], and
+/// [`ServerMsg::TakenOver`]), and [`ClientMsg`] grew [`ResizeTerminal`] — all
+/// closed-vocabulary growth, hence the bump. Every one of them is produced
+/// only by a worker host or in answer to a [`worker_command`], so a v6 peer
+/// never receives one; what v6 peers *do* see are additive `#[serde(default)]`
+/// fields ([`Attach::connection`], [`Snapshot::host_kind`],
+/// [`Snapshot::worker`], [`ConfigSaveRequest::project_id`]) under rule 4.
+///
+/// **v7 is also the first range.** Until v6 this constant was the whole range:
+/// the browser SPA ships inside the same binary as the server (D9), so a stale
+/// tab is answered with "reload to update" rather than with a half-spoken
+/// older version. A *native* client does not co-ship — a FlightDeck Desktop
+/// updates on its own schedule — so a v7 TUI or Desktop host still serves a
+/// v6 client ([`MIN_SUPPORTED_VERSION`]) and answers it at the version it
+/// asked for ([`negotiated`]). A worker host does not: it refuses anything
+/// older than [`WORKER_MIN_CLIENT_VERSION`], because a v6 client would drop
+/// every frame the worker exists to send.
 ///
 /// That co-shipping is exactly why the constant matters. The SPA is baked in, so
 /// `flightdeck update` on the host while a tab is open leaves that tab running
@@ -210,14 +233,32 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
-/// Oldest version this build can serve. Equal to [`PROTOCOL_VERSION`]: server
-/// and SPA ship in the same binary (D9), so there is no older peer to keep.
+/// Oldest version this build can serve. One below [`PROTOCOL_VERSION`]: the
+/// browser SPA co-ships with the server (D9), but a FlightDeck Desktop driving
+/// a TUI or Desktop host does not, and a v6 Desktop keeps working against a v7
+/// host. A worker host raises the floor to [`WORKER_MIN_CLIENT_VERSION`].
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 6;
+pub const MAX_SUPPORTED_VERSION: u16 = 7;
+
+/// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
+///
+/// Every frame a worker exists to send — its shell, health, picker answers,
+/// takeover — arrived in v7, so a v6 client attached to one would render a
+/// window that silently never shows any of it. Refused with
+/// [`ErrorCode::VersionMismatch`] instead, naming this as the floor.
+pub const WORKER_MIN_CLIENT_VERSION: u16 = 7;
+
+/// The version both sides speak with a peer that passed [`check_version`]:
+/// the lower of the two. The host stamps it on that viewer's
+/// [`Snapshot::protocol_version`], which is what lets a v6 client — whose link
+/// compares the snapshot's version for equality — attach to a v7 host.
+pub fn negotiated(peer: u16) -> u16 {
+    peer.min(PROTOCOL_VERSION)
+}
 
 // The version this build prefers must be inside the range it advertises, or
 // `check_version` would refuse the very version we send in every `Snapshot`.
@@ -242,10 +283,13 @@ pub struct VersionMismatch {
 
 /// Check a peer's advertised version against this build's range.
 ///
-/// Unlike the relay protocol's `negotiate_version`, this does **not** fall back
-/// to a lower shared version: server and client ship in the same binary (D9), so
-/// a difference is not a negotiation, it is a stale tab. Returning an error is
-/// the honest outcome — the fix is a reload, not a downgrade.
+/// Unlike the relay protocol's `negotiate_version`, this does **not** pick a
+/// lower shared version on its own: a peer inside the range is answered at the
+/// version it asked for ([`negotiated`]), and a peer outside it is refused. For
+/// the browser, whose SPA ships in the same binary as the server (D9), a
+/// refusal means a stale tab — the fix is a reload, not a downgrade. A native
+/// client that dialled too new may redial once at the refusal's
+/// `max_supported`.
 pub fn check_version(peer_version: u16) -> Result<u16, VersionMismatch> {
     if (MIN_SUPPORTED_VERSION..=MAX_SUPPORTED_VERSION).contains(&peer_version) {
         Ok(peer_version)
@@ -1498,6 +1542,12 @@ pub struct ConfigSaveRequest {
     /// so two edits to one field settle the way the user left them.
     #[serde(default)]
     pub changes: Vec<ConfigChange>,
+    /// The project whose file the `Project`-scope changes land in, and which
+    /// the answer resolves Project scope for (v7). `None` means the host's
+    /// active project, which is all a v6 peer can mean. A native client sends
+    /// it because it browses independently of the host's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
 }
 
 /// One staged edit: which scope, which field, and what to do to it.
@@ -1525,6 +1575,336 @@ pub enum ConfigScopeName {
     Global,
     /// `<repo>/.flightdeck/config.toml`.
     Project,
+}
+
+// ===========================================================================
+// FlightDeck Worker (v7, `remote-control-qlyd.9`, `specs/WORKER_PRD.md`)
+// ===========================================================================
+
+/// What kind of FlightDeck is serving this socket ([`Snapshot::host_kind`]).
+///
+/// A closed vocabulary (rule 3): a client branches on it — only a
+/// [`HostKind::Worker`] is sent [`ResizeTerminal`], worker commands or a
+/// [`ConnectionKind::Background`] attach — so a member it does not know would
+/// be a host it cannot drive correctly. Growing it is a version bump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    /// The terminal UI (`flightdeck`).
+    Tui,
+    /// The native desktop app hosting its own projects.
+    Desktop,
+    /// The headless `flightdeck worker` (PRD W1).
+    Worker,
+}
+
+/// Which kind of connection an [`Attach`] opens (PRD W10, W19).
+///
+/// A **window** is a remote window someone looks at and types into; a worker
+/// allows one at a time and the newest takes over (W17). A **background link**
+/// only watches: it never counts as attached, never takes over, never types,
+/// and receives status but no terminal bytes — it is how a Desktop raises
+/// notifications for a worker with no window open (W18).
+///
+/// `Window` is the default, which is what every v6 peer meant by attaching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionKind {
+    /// A remote window. What every attach before v7 was.
+    #[default]
+    Window,
+    /// A status-only background link.
+    Background,
+}
+
+/// The worker shell's [`TerminalId`] (PRD W15). Fixed rather than minted: there
+/// is exactly one per worker, it is not inside any project or session, and a
+/// client addresses its byte cursor and [`ResizeTerminal`] by this id.
+pub const WORKER_SHELL_TERMINAL_ID: &str = "worker:shell";
+
+/// Everything worker-specific a window paints from, on the
+/// [`Snapshot::worker`]. `Some` only from a [`HostKind::Worker`] host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    /// `$HOME` on the worker: the project picker's root and the boundary every
+    /// path it browses must stay inside (W16).
+    pub home: String,
+    /// The worker shell, when one is running or has run.
+    #[serde(default)]
+    pub shell: Option<WorkerShellView>,
+    /// The latest health sample, once one has been taken.
+    #[serde(default)]
+    pub health: Option<Health>,
+    /// Where the worker listens, its unread count and its projects root.
+    pub status: WorkerStatusView,
+    /// Who else is connected, as seen by **this recipient** (`same_device` is
+    /// relative to its own credential).
+    pub connections: ConnectionsView,
+    /// Host messages nobody has seen yet, oldest first. Always empty for a
+    /// background link, which is not somewhere a message is read.
+    #[serde(default)]
+    pub host_messages: Vec<HostMessage>,
+}
+
+/// The worker shell's terminal (PRD W15): a login shell in `$HOME`, streamed
+/// like any agent terminal and addressed by [`WORKER_SHELL_TERMINAL_ID`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerShellView {
+    /// Always [`WORKER_SHELL_TERMINAL_ID`]; carried so the shell is addressed
+    /// the way every other terminal is.
+    pub terminal_id: TerminalId,
+    /// The tab title.
+    pub title: String,
+    /// The shell's current grid.
+    pub geometry: Geometry,
+    /// Bytes the shell has produced so far, as [`TerminalView::byte_len`].
+    pub byte_len: u64,
+    /// The oldest offset the replay ring still holds, as
+    /// [`TerminalView::replay_from`].
+    pub replay_from: u64,
+    /// Whether the shell process is running.
+    pub alive: bool,
+    /// The shell's exit status, once it has exited normally.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+}
+
+/// One health sample of the worker's machine (PRD W29).
+///
+/// Every reading the platform cannot give is `None` rather than a guess
+/// (available memory on macOS, for one). Load is carried as an integer
+/// (`load × 100`) so the type keeps `Eq`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Health {
+    /// Host wall-clock (unix ms) the sample was taken.
+    pub sampled_at_ms: i64,
+    /// How long this worker process has been running.
+    pub uptime_secs: u64,
+    /// The worker's FlightDeck version.
+    pub version: String,
+    /// The one-minute load average × 100, when the platform reports one.
+    #[serde(default)]
+    pub load_avg_1m_centi: Option<u32>,
+    /// Logical CPUs, the scale `load_avg_1m_centi` is read against.
+    pub cpu_count: u32,
+    /// Physical memory, in bytes.
+    #[serde(default)]
+    pub mem_total_bytes: Option<u64>,
+    /// Memory available to new work, in bytes.
+    #[serde(default)]
+    pub mem_available_bytes: Option<u64>,
+    /// Free disk under `$HOME`, in bytes.
+    #[serde(default)]
+    pub disk_free_home_bytes: Option<u64>,
+    /// Free disk under the projects root, in bytes.
+    #[serde(default)]
+    pub disk_free_projects_root_bytes: Option<u64>,
+    /// Agents across every open project.
+    pub agents_total: u32,
+    /// Of those, the ones whose process is running.
+    pub agents_running: u32,
+}
+
+/// What `flightdeck worker status` says about the network and the box, for
+/// the window's worker panel (PRD W27, W29).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStatusView {
+    /// Every address the worker is listening on, as `ip:port` (`[v6]:port`).
+    #[serde(default)]
+    pub listening: Vec<String>,
+    /// The name a Desktop should dial (`box.tail1234.ts.net:7420`), when
+    /// Tailscale's MagicDNS gives one.
+    #[serde(default)]
+    pub advertised: Option<String>,
+    /// Why the worker is not listening, when it is not (W27).
+    #[serde(default)]
+    pub not_listening_reason: Option<String>,
+    /// Host messages not yet seen in any window.
+    #[serde(default)]
+    pub unread_messages: u32,
+    /// The resolved, absolute root the picker scans for repositories.
+    pub projects_root: String,
+}
+
+/// Who is connected to the worker, as seen by one recipient (PRD W10, W19).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionsView {
+    /// The one attached window, if any.
+    #[serde(default)]
+    pub window: Option<WindowInfo>,
+    /// How many background links are open. A count, not a list: they watch,
+    /// and nobody needs to tell them apart.
+    #[serde(default)]
+    pub background_links: u32,
+}
+
+/// The worker's one attached window ([`ConnectionsView::window`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    /// The window's device label, as [`ServerMsg::TakenOver`] names it.
+    pub label: String,
+    /// The address the host observed on the window's socket.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Host wall-clock (unix ms) the window attached.
+    pub since_ms: i64,
+    /// Whether the window holds the same credential as the recipient — the
+    /// recipient's own device.
+    #[serde(default)]
+    pub same_device: bool,
+}
+
+/// How loud a [`HostMessage`] is. Closed: the window colours by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageLevel {
+    /// Something worth knowing (an update is available).
+    Info,
+    /// Something that may need doing.
+    Warning,
+    /// Something failed (a clone).
+    Error,
+}
+
+/// A line the worker would have shown on its status bar if it had one
+/// (PRD W29): forwarded to the window, kept unread until one is open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMessage {
+    /// Monotonic per worker run, so a client can de-duplicate a replay.
+    pub id: u64,
+    /// Host wall-clock (unix ms) the message was raised.
+    pub at_ms: i64,
+    /// How loud it is.
+    pub level: MessageLevel,
+    /// The message, rendered verbatim.
+    pub text: String,
+}
+
+/// Which sound a [`NotificationView`] asks for. Closed: it maps onto the
+/// client's own notification sounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSoundView {
+    /// Silent.
+    None,
+    /// An agent finished.
+    Completion,
+    /// An agent needs input.
+    InputRequired,
+}
+
+/// A notification the worker raised for a status edge that would notify on a
+/// local host (PRD W18). The client only decides *where* to show it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationView {
+    /// Host wall-clock (unix ms) the notification was raised.
+    pub at_ms: i64,
+    /// The notification's title.
+    pub title: String,
+    /// The notification's body.
+    pub body: String,
+    /// The sound it asks for.
+    pub sound: NotificationSoundView,
+}
+
+/// One directory of the worker's filesystem, in answer to
+/// [`worker_command::BROWSE_DIR`] (PRD W9, W16). Sent to the window that asked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirListing {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The directory listed, absolute.
+    pub path: String,
+    /// Its parent, or `None` at `$HOME` — the picker goes no higher.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// `$HOME`, so the picker can render paths relative to it.
+    pub home: String,
+    /// The subdirectories, in the host's order.
+    pub entries: Vec<DirEntryView>,
+    /// True when the host stopped listing before the end.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// One subdirectory in a [`DirListing`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntryView {
+    /// The directory's name.
+    pub name: String,
+    /// The directory's absolute path.
+    pub path: String,
+    /// Whether it is a git repository, and so openable as a project.
+    #[serde(default)]
+    pub is_git_repo: bool,
+    /// Whether it is already open on the worker.
+    #[serde(default)]
+    pub is_open_project: bool,
+}
+
+/// The repositories under the worker's projects root, in answer to
+/// [`worker_command::SCAN_PROJECTS`] (PRD W9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectScan {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The root scanned, absolute.
+    pub root: String,
+    /// Whether the root exists at all — an empty scan of a missing root is a
+    /// different thing to say than an empty scan of an empty one.
+    pub root_exists: bool,
+    /// The repositories found.
+    pub repos: Vec<ScannedRepo>,
+    /// Why the scan was refused, when it was (the root is outside `$HOME`).
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+/// One repository in a [`ProjectScan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScannedRepo {
+    /// The repository's folder name.
+    pub name: String,
+    /// The repository's absolute path.
+    pub path: String,
+    /// Whether it is already open on the worker.
+    #[serde(default)]
+    pub is_open_project: bool,
+}
+
+/// A running clone's progress ([`worker_command::CLONE_PROJECT`], PRD W9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneProgress {
+    /// The clone this is about, as the host numbered it.
+    pub clone_id: u64,
+    /// The URL being cloned.
+    pub url: String,
+    /// What git says it is doing (`Receiving objects`).
+    pub phase: String,
+    /// How far through that phase, when git says.
+    #[serde(default)]
+    pub percent: Option<u8>,
+}
+
+/// How a clone ended. On success the repository is opened as a project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneResult {
+    /// The clone this is about.
+    pub clone_id: u64,
+    /// The URL that was cloned.
+    pub url: String,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// Where it landed, on success.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The project it was opened as, on success.
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// What went wrong, on failure — git's own words, for credential failures
+    /// especially (W13).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 // ===========================================================================
@@ -1671,6 +2051,13 @@ pub struct Snapshot {
     /// `None` from a host that predates it.
     #[serde(default)]
     pub host_machine: Option<HostMachine>,
+    /// What kind of FlightDeck this is (v7). `None` from a v6 host, which is a
+    /// TUI or a Desktop — never a worker, since a worker refuses v6.
+    #[serde(default)]
+    pub host_kind: Option<HostKind>,
+    /// The worker's own state (v7). `Some` only from a [`HostKind::Worker`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSnapshot>,
 }
 
 /// The host's account and operating system ([`Snapshot::host_machine`]).
@@ -1943,6 +2330,21 @@ pub enum Delta {
         #[serde(default)]
         you_were_preempted: bool,
     },
+    /// A fresh health sample (v7, worker hosts only).
+    Health(Health),
+    /// The worker shell's title, geometry or liveness changed (v7, worker
+    /// hosts only).
+    WorkerShell(WorkerShellView),
+    /// The worker's listen addresses, unread count or projects root changed
+    /// (v7, worker hosts only).
+    WorkerStatus(WorkerStatusView),
+    /// Somebody attached, detached or took over (v7, worker hosts only). Built
+    /// per recipient, like [`Delta::Seats`]: `same_device` is relative to it.
+    Connections(ConnectionsView),
+    /// A new host message (v7, worker hosts only; windows only).
+    HostMessage(HostMessage),
+    /// A notification the worker raised (v7, worker hosts only).
+    Notification(NotificationView),
     /// A change this build does not know. Ignored by the receiver; see the
     /// forward-compatibility policy in the module docs.
     #[serde(other)]
@@ -2278,6 +2680,24 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// One directory of the worker's filesystem, in answer to this window's
+    /// [`worker_command::BROWSE_DIR`] (v7). Beside the [`Ack`] for the same
+    /// `seq`, like [`ServerMsg::GitStatus`].
+    DirListing(DirListing),
+    /// The repositories under the projects root, in answer to this window's
+    /// [`worker_command::SCAN_PROJECTS`] (v7).
+    ProjectScan(ProjectScan),
+    /// A running clone's progress (v7), to the window.
+    CloneProgress(CloneProgress),
+    /// How a clone ended (v7), to the window.
+    CloneResult(CloneResult),
+    /// Another window attached to this worker and took it over (v7, PRD W17).
+    /// The socket closes right after this frame. The credential stays valid:
+    /// the recipient may reconnect, and then takes it back.
+    TakenOver {
+        /// The device label of the window that took over.
+        by: String,
+    },
     /// A frame this build does not know. Ignored; see the forward-compatibility
     /// policy in the module docs.
     #[serde(other)]
@@ -2313,6 +2733,11 @@ pub struct Attach {
     /// Advisory self-description for the seat chip.
     #[serde(default)]
     pub client: Option<ClientInfo>,
+    /// A window or a background link (v7). Absent — every v6 peer — means a
+    /// window. Only a worker host distinguishes the two; a client sends
+    /// `background` only to a host whose snapshot said [`HostKind::Worker`].
+    #[serde(default)]
+    pub connection: ConnectionKind,
 }
 
 /// Keystrokes for a terminal.
@@ -2375,6 +2800,23 @@ pub struct ImagePaste {
 pub struct Resize {
     /// Cells the browser can currently show.
     pub viewport: Viewport,
+}
+
+/// Size one terminal's PTY (v7, PRD W5) — **worker hosts only**.
+///
+/// The one relaxation of D4: a worker has no pane of its own, so the attached
+/// window's pane size is the only size there is. A TUI or Desktop host keeps D4
+/// unconditionally and drops this frame silently; a background link's is
+/// dropped too. A client sends it only to a [`HostKind::Worker`] host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeTerminal {
+    /// The terminal to resize — an agent terminal or
+    /// [`WORKER_SHELL_TERMINAL_ID`].
+    pub terminal_id: TerminalId,
+    /// Columns.
+    pub cols: u16,
+    /// Rows.
+    pub rows: u16,
 }
 
 /// Every command name the host answers. String constants rather than an enum so
@@ -2508,6 +2950,160 @@ pub mod command {
     pub const QUIT: &str = "quit";
 }
 
+/// Worker-only command names (v7, PRD W9, W15), sent as an ordinary
+/// [`Command`] to a [`HostKind::Worker`] host.
+///
+/// **Deliberately not in [`command`]**, and so not in
+/// [`super::commands`]' palette inventory: these are not palette rows. The
+/// project picker and the worker shell tab send them, and the palette-coverage
+/// tests rightly assume every [`command`] name is a row. Parsed with
+/// [`WorkerOp::parse`], which is the one place their arguments are read.
+pub mod worker_command {
+    /// List one directory under `$HOME`. Args `{path?: string, show_hidden?:
+    /// bool}`; no `path` lists `$HOME`. Answered with
+    /// [`super::ServerMsg::DirListing`].
+    pub const BROWSE_DIR: &str = "browse_dir";
+    /// Scan the projects root for repositories. No args. Answered with
+    /// [`super::ServerMsg::ProjectScan`].
+    pub const SCAN_PROJECTS: &str = "scan_projects";
+    /// Open a repository as a project. Args `{path: string}`.
+    pub const OPEN_PROJECT_PATH: &str = "open_project_path";
+    /// Clone a URL under the projects root and open it. Args `{url: string,
+    /// name?: string}`. Progress arrives as [`super::ServerMsg::CloneProgress`].
+    pub const CLONE_PROJECT: &str = "clone_project";
+    /// Restart the worker shell. No args.
+    pub const RESTART_WORKER_SHELL: &str = "restart_worker_shell";
+    /// Every worker command name.
+    pub const ALL: &[&str] = &[
+        BROWSE_DIR,
+        SCAN_PROJECTS,
+        OPEN_PROJECT_PATH,
+        CLONE_PROJECT,
+        RESTART_WORKER_SHELL,
+    ];
+}
+
+/// A parsed [`worker_command`]: the name and its arguments, checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerOp {
+    /// [`worker_command::BROWSE_DIR`].
+    BrowseDir {
+        /// The directory to list; `None` is `$HOME`.
+        path: Option<String>,
+        /// Whether to list dot-directories too.
+        show_hidden: bool,
+    },
+    /// [`worker_command::SCAN_PROJECTS`].
+    ScanProjects,
+    /// [`worker_command::OPEN_PROJECT_PATH`].
+    OpenProjectPath {
+        /// The repository to open.
+        path: String,
+    },
+    /// [`worker_command::CLONE_PROJECT`].
+    CloneProject {
+        /// What to clone.
+        url: String,
+        /// The folder name to clone into; `None` derives it from the URL.
+        name: Option<String>,
+    },
+    /// [`worker_command::RESTART_WORKER_SHELL`].
+    RestartWorkerShell,
+}
+
+impl WorkerOp {
+    /// Parse a [`Command`]'s name and args.
+    ///
+    /// `None` when `name` is not a worker command (the caller then tries the
+    /// palette inventory); `Some(Err(reason))` when it is one but its args are
+    /// malformed — a missing or empty required string, or a field of the wrong
+    /// type. Unknown extra keys are ignored (rule 4), and the commands that take
+    /// no args ignore whatever is sent.
+    pub fn parse(name: &str, args: Option<&serde_json::Value>) -> Option<Result<WorkerOp, String>> {
+        worker_command::ALL
+            .contains(&name)
+            .then(|| WorkerOp::parse_known(name, args))
+    }
+
+    fn parse_known(name: &str, args: Option<&serde_json::Value>) -> Result<WorkerOp, String> {
+        match name {
+            worker_command::BROWSE_DIR => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::BrowseDir {
+                    path: args.optional_str("path")?,
+                    show_hidden: args.optional_bool("show_hidden")?.unwrap_or(false),
+                })
+            }
+            worker_command::SCAN_PROJECTS => Ok(WorkerOp::ScanProjects),
+            worker_command::OPEN_PROJECT_PATH => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::OpenProjectPath {
+                    path: args.required_str("path")?,
+                })
+            }
+            worker_command::CLONE_PROJECT => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::CloneProject {
+                    url: args.required_str("url")?,
+                    name: args.optional_str("name")?,
+                })
+            }
+            worker_command::RESTART_WORKER_SHELL => Ok(WorkerOp::RestartWorkerShell),
+            _ => Err(format!("`{name}` is not a worker command")),
+        }
+    }
+}
+
+/// A worker command's `args`, read field by field with a reason on failure.
+struct WorkerArgs<'a> {
+    name: &'a str,
+    fields: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'a> WorkerArgs<'a> {
+    /// Absent and `null` args are an empty object; anything but an object is
+    /// refused.
+    fn new(name: &'a str, args: Option<&'a serde_json::Value>) -> Result<Self, String> {
+        match args {
+            None | Some(serde_json::Value::Null) => Ok(WorkerArgs { name, fields: None }),
+            Some(serde_json::Value::Object(map)) => Ok(WorkerArgs {
+                name,
+                fields: Some(map),
+            }),
+            Some(_) => Err(format!("`{name}` takes an object of arguments")),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&'a serde_json::Value> {
+        self.fields
+            .and_then(|map| map.get(key))
+            .filter(|value| !value.is_null())
+    }
+
+    fn optional_str(&self, key: &str) -> Result<Option<String>, String> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(format!("`{}`: `{key}` must be a string", self.name)),
+        }
+    }
+
+    fn required_str(&self, key: &str) -> Result<String, String> {
+        match self.optional_str(key)? {
+            Some(text) if !text.trim().is_empty() => Ok(text),
+            _ => Err(format!("`{}` needs a `{key}`", self.name)),
+        }
+    }
+
+    fn optional_bool(&self, key: &str) -> Result<Option<bool>, String> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::Bool(flag)) => Ok(Some(*flag)),
+            Some(_) => Err(format!("`{}`: `{key}` must be true or false", self.name)),
+        }
+    }
+}
+
 /// A named command with free-form arguments — **the M2 door** (D13).
 ///
 /// M1 implements only the handful in [`command`]; D8 puts the palette, the dialog
@@ -2558,6 +3154,8 @@ pub enum ClientMsg {
     Resize(Resize),
     /// A named command; the M2 door.
     Command(Command),
+    /// Size one terminal's PTY — worker hosts only (v7).
+    ResizeTerminal(ResizeTerminal),
     /// A frame this build does not know. Answered with
     /// [`ErrorCode::NotSupported`] where a reply is possible, otherwise ignored.
     #[serde(other)]

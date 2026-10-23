@@ -726,6 +726,11 @@ fn ended(p: &Palette, end: &LinkEnd, remote: &Entity<RemoteModel>) -> impl IntoE
             "The host runs a different FlightDeck version.",
             "Update one side so both speak the same web protocol.",
         ),
+        // stub: filled by H2 (the "taken over by …" panel with Reconnect).
+        LinkEnd::TakenOver { .. } => (
+            "Another window took this worker over.",
+            "Reconnect to take it back.",
+        ),
         LinkEnd::Stopped => ("Disconnected.", ""),
     };
     let pair_again = matches!(end, LinkEnd::Revoked | LinkEnd::Unauthorized).then(|| {

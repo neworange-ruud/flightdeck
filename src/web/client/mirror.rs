@@ -267,6 +267,13 @@ impl RemoteWorkspace {
                 self.preempted |= you_were_preempted;
                 changed
             }
+            // v7 worker state. stub: filled by B (the worker mirror).
+            Delta::Health(_)
+            | Delta::WorkerShell(_)
+            | Delta::WorkerStatus(_)
+            | Delta::Connections(_)
+            | Delta::HostMessage(_)
+            | Delta::Notification(_) => Applied::default(),
             Delta::Unrecognized => Applied::default(),
         };
         self.repair_selection();

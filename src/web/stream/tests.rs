@@ -718,6 +718,8 @@ fn an_attach_is_answered_with_targeted_resume_frames() {
             seat: Seat::Writing,
             cursors: Vec::new(),
             resume_viewer: None,
+            kind: crate::web::protocol::ConnectionKind::Window,
+            protocol_version: crate::web::protocol::PROTOCOL_VERSION,
         },
         &mut host,
     );
@@ -913,6 +915,8 @@ fn the_drain_carries_the_watermark_across_a_reconnect() {
             seat: Seat::Writing,
             cursors: Vec::new(),
             resume_viewer: Some(old.clone()),
+            kind: crate::web::protocol::ConnectionKind::Window,
+            protocol_version: crate::web::protocol::PROTOCOL_VERSION,
         },
         &mut host,
     );

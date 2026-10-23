@@ -57,8 +57,20 @@
  * `Change Project Default Base` added existing-branch attachment. A stale v4
  * tab only understands the old local boolean and would display the wrong form,
  * so it must reload rather than answer a target it did not render.
+ *
+ * **v6 is explicit command targets**: a palette command's `args` may name the
+ * session or terminal it acts on. This tab sends no target and keeps the
+ * shared selection; a native client always names one.
+ *
+ * **v7 is the FlightDeck Worker** (`remote-control-qlyd.9`): new delta and
+ * frame kinds a headless worker sends a FlightDeck Desktop. This tab never
+ * receives one — a worker serves no SPA and v7 frames come only from a worker
+ * — so the SPA handles none of them; it only declares the additive fields
+ * below. v7 is also the host's first range: a TUI host still serves v6, for a
+ * Desktop that has not updated yet, and answers each peer at the version it
+ * asked for.
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -487,6 +499,13 @@ export interface WireSnapshot {
    * the layout it has always drawn rather than a guess.
    */
   readonly sidebar_position?: "left" | "right" | null;
+  /**
+   * v7: what kind of FlightDeck this is. Absent from a v6 host. This tab only
+   * ever attaches to a TUI or Desktop host (a worker serves no SPA).
+   */
+  readonly host_kind?: "tui" | "desktop" | "worker" | null;
+  /** v7: a worker's own state. Only a worker sends it, so this tab never sees it. */
+  readonly worker?: unknown;
 }
 
 /** A newer release than the host is running (SPECS §30). */
@@ -541,6 +560,17 @@ export interface WireShutdown {
 }
 
 /**
+ * v7: another window took a worker over, and the socket closes after this.
+ * Declared for completeness — only a worker sends it, and a worker serves no
+ * SPA.
+ */
+export interface WireTakenOver {
+  readonly type: "taken_over";
+  /** The device label of the window that took over. */
+  readonly by: string;
+}
+
+/**
  * `delta` is tagged twice: `type: "delta"` then `change: …`.
  *
  * `change: "seats"` carries `seats: WireSeatInfo[]`, `you`, and a
@@ -560,6 +590,7 @@ export type ServerFrame =
   | WireAck
   | WireError
   | WireShutdown
+  | WireTakenOver
   | WireGitStatus
   | WireConfiguration
   | WireDeltaEnvelope
@@ -579,6 +610,11 @@ export interface WireAttach {
   readonly resume_viewer: string | null;
   readonly viewport: WireGeometry | null;
   readonly client: { readonly user_agent: string | null } | null;
+  /**
+   * v7: a remote window or a worker's background link. Absent means a window,
+   * which is what this tab always is.
+   */
+  readonly connection?: "window" | "background";
 }
 
 export interface WireInput {

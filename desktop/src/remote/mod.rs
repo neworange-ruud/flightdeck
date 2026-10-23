@@ -842,6 +842,8 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
             flightdeck::web::server::NATIVE_CLIENT_AGENT,
             env!("CARGO_PKG_VERSION"),
         ),
+        connection: flightdeck::web::protocol::ConnectionKind::Window,
+        retry_cap_ms: None,
     };
     let client = RemoteClient::connect(config);
     let label = remote.label.clone();
@@ -941,6 +943,7 @@ pub fn link_label(state: &LinkState) -> String {
             LinkEnd::HostQuit => "the host quit FlightDeck".to_string(),
             LinkEnd::ServerStopped => "the host stopped its web interface".to_string(),
             LinkEnd::VersionMismatch(why) => why.clone(),
+            LinkEnd::TakenOver { by } => format!("taken over by {by}"),
             LinkEnd::Stopped => "disconnected".to_string(),
         },
     }

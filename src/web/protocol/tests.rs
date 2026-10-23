@@ -220,6 +220,131 @@ fn snapshot() -> Snapshot {
             user: Some("ruud".to_string()),
             os: "linux".to_string(),
         }),
+        // A worker's snapshot, so the round trip carries every v7 field.
+        host_kind: Some(HostKind::Worker),
+        worker: Some(worker_snapshot()),
+    }
+}
+
+/// A worker's own state with every optional field populated (v7).
+fn worker_snapshot() -> WorkerSnapshot {
+    WorkerSnapshot {
+        home: "/home/u".into(),
+        shell: Some(worker_shell_view()),
+        health: Some(health()),
+        status: worker_status_view(),
+        connections: connections_view(),
+        host_messages: vec![host_message()],
+    }
+}
+
+fn worker_shell_view() -> WorkerShellView {
+    WorkerShellView {
+        terminal_id: TerminalId::new(WORKER_SHELL_TERMINAL_ID),
+        title: "Worker shell".into(),
+        geometry: geometry(),
+        byte_len: 4096,
+        replay_from: 1024,
+        alive: false,
+        exit_code: Some(0),
+    }
+}
+
+fn health() -> Health {
+    Health {
+        sampled_at_ms: 1_700_000_000_000,
+        uptime_secs: 3_600,
+        version: "1.27.0".into(),
+        load_avg_1m_centi: Some(125),
+        cpu_count: 8,
+        mem_total_bytes: Some(16 << 30),
+        mem_available_bytes: Some(4 << 30),
+        disk_free_home_bytes: Some(100 << 30),
+        disk_free_projects_root_bytes: Some(90 << 30),
+        agents_total: 3,
+        agents_running: 2,
+    }
+}
+
+fn worker_status_view() -> WorkerStatusView {
+    WorkerStatusView {
+        listening: vec!["100.64.1.2:7420".into(), "[fd7a:115c::1]:7420".into()],
+        advertised: Some("box.tail1234.ts.net:7420".into()),
+        not_listening_reason: Some("bind failed: 100.64.1.3:7420: in use".into()),
+        unread_messages: 1,
+        projects_root: "/home/u/code".into(),
+    }
+}
+
+fn connections_view() -> ConnectionsView {
+    ConnectionsView {
+        window: Some(WindowInfo {
+            label: "laptop".into(),
+            address: Some("100.64.1.9".into()),
+            since_ms: 1_699_999_000_000,
+            same_device: true,
+        }),
+        background_links: 2,
+    }
+}
+
+fn host_message() -> HostMessage {
+    HostMessage {
+        id: 4,
+        at_ms: 1_700_000_000_000,
+        level: MessageLevel::Warning,
+        text: "FlightDeck 1.28.0 is available".into(),
+    }
+}
+
+/// The v7 frames a worker answers its picker with, every optional field set.
+fn dir_listing() -> DirListing {
+    DirListing {
+        seq: 30,
+        path: "/home/u/code".into(),
+        parent: Some("/home/u".into()),
+        home: "/home/u".into(),
+        entries: vec![DirEntryView {
+            name: "flightdeck".into(),
+            path: "/home/u/code/flightdeck".into(),
+            is_git_repo: true,
+            is_open_project: true,
+        }],
+        truncated: true,
+    }
+}
+
+fn project_scan() -> ProjectScan {
+    ProjectScan {
+        seq: 31,
+        root: "/home/u/code".into(),
+        root_exists: true,
+        repos: vec![ScannedRepo {
+            name: "flightdeck".into(),
+            path: "/home/u/code/flightdeck".into(),
+            is_open_project: false,
+        }],
+        refusal: Some("outside your home directory".into()),
+    }
+}
+
+fn clone_progress() -> CloneProgress {
+    CloneProgress {
+        clone_id: 2,
+        url: "git@github.com:o/r.git".into(),
+        phase: "Receiving objects".into(),
+        percent: Some(42),
+    }
+}
+
+fn clone_result() -> CloneResult {
+    CloneResult {
+        clone_id: 2,
+        url: "git@github.com:o/r.git".into(),
+        ok: true,
+        path: Some("/home/u/code/r".into()),
+        project_id: Some(ProjectId::new("proj_2")),
+        error: Some("never both, but the shape allows it".into()),
     }
 }
 
@@ -287,6 +412,17 @@ fn all_deltas() -> Vec<Delta> {
             server_time_ms: 1_700_000_012_000,
             you_were_preempted: false,
         },
+        Delta::Health(health()),
+        Delta::WorkerShell(worker_shell_view()),
+        Delta::WorkerStatus(worker_status_view()),
+        Delta::Connections(connections_view()),
+        Delta::HostMessage(host_message()),
+        Delta::Notification(NotificationView {
+            at_ms: 1_700_000_000_000,
+            title: "fix-login needs you".into(),
+            body: "Waiting for input".into(),
+            sound: NotificationSoundView::InputRequired,
+        }),
     ]
 }
 
@@ -383,6 +519,13 @@ fn all_server_msgs() -> Vec<ServerMsg> {
             self_initiated: true,
             detail: Some("Ctrl-q from this browser".into()),
         },
+        ServerMsg::DirListing(dir_listing()),
+        ServerMsg::ProjectScan(project_scan()),
+        ServerMsg::CloneProgress(clone_progress()),
+        ServerMsg::CloneResult(clone_result()),
+        ServerMsg::TakenOver {
+            by: "laptop".into(),
+        },
     ];
     msgs.extend(all_deltas().into_iter().map(ServerMsg::Delta));
     msgs
@@ -407,6 +550,7 @@ fn all_client_msgs() -> Vec<ClientMsg> {
                 user_agent: Some("Chrome on macOS".into()),
                 label: None,
             }),
+            connection: ConnectionKind::Background,
         }),
         ClientMsg::Input(Input {
             seq: 18,
@@ -424,6 +568,11 @@ fn all_client_msgs() -> Vec<ClientMsg> {
             seq: 19,
             name: command::SELECT_SESSION.into(),
             args: Some(json!({ "session_id": "tab_2" })),
+        }),
+        ClientMsg::ResizeTerminal(ResizeTerminal {
+            terminal_id: TerminalId::new(WORKER_SHELL_TERMINAL_ID),
+            cols: 132,
+            rows: 40,
         }),
     ]
 }
@@ -494,7 +643,7 @@ fn ids_are_plain_json_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn protocol_version_is_five_and_the_whole_supported_range() {
+fn protocol_version_is_seven_and_still_serves_six() {
     // v2 was D14 as revised: `Seat` and `SeatRequest` are closed vocabularies
     // and both grew a member the peer must understand. **v3 was
     // `ServerMsg::GitStatus`** (`remote-control-ll5.8`) and **v4 is
@@ -516,9 +665,15 @@ fn protocol_version_is_five_and_the_whole_supported_range() {
     // **v6 is explicit command targets** (`remote-control-jija.1`): a palette
     // `Command`'s `args` were ignored and may now name the session or terminal
     // the command acts on — an existing field changing meaning.
-    assert_eq!(PROTOCOL_VERSION, 6);
+    //
+    // **v7 is the worker** (`remote-control-qlyd.9`): six delta kinds, five
+    // frame kinds and `ResizeTerminal`. And v7 is the first *range*: a native
+    // FlightDeck Desktop does not co-ship with its host, so a v6 Desktop keeps
+    // driving a v7 TUI host. Only a worker refuses it.
+    assert_eq!(PROTOCOL_VERSION, 7);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 6);
+    assert_eq!(MAX_SUPPORTED_VERSION, 7);
+    assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -534,10 +689,10 @@ fn protocol_version_is_five_and_the_whole_supported_range() {
 /// next person to add one has to read this comment to update it.
 #[test]
 fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
-    // `Configuration` arrived with v4. If you are adding a frame kind and this
-    // line still says 4, the answer is almost certainly a bump — see the module
-    // doc's forward-compatibility rule 1.
-    let newest_frame_kind_arrived_in = 4;
+    // `TakenOver` and the picker's frames arrived with v7. If you are adding a
+    // frame kind and this line still says 7, the answer is almost certainly a
+    // bump — see the module doc's forward-compatibility rule 1.
+    let newest_frame_kind_arrived_in = 7;
     assert!(
         PROTOCOL_VERSION >= newest_frame_kind_arrived_in,
         "a frame kind was added without bumping PROTOCOL_VERSION: a peer at the \
@@ -546,6 +701,12 @@ fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
 
     // And it really is a frame this build sends, so the pairing above is about
     // live code rather than a number kept in step with nothing.
+    let frame = ServerMsg::TakenOver {
+        by: "laptop".into(),
+    };
+    assert_eq!(serde_json::to_value(&frame).unwrap()["type"], "taken_over");
+    // The ones before it are still on the wire, so the pairing above is a
+    // moving pin rather than a replacement.
     let frame = ServerMsg::Configuration(config_view());
     assert_eq!(
         serde_json::to_value(&frame).unwrap()["type"],
@@ -562,6 +723,19 @@ fn matching_version_is_accepted() {
     assert_eq!(check_version(PROTOCOL_VERSION), Ok(PROTOCOL_VERSION));
 }
 
+/// A v6 FlightDeck Desktop attached to a v7 TUI host is answered at v6: its
+/// link compares the snapshot's version for equality, so the host must say 6.
+#[test]
+fn the_host_answers_each_peer_at_the_lower_of_the_two_versions() {
+    assert_eq!(check_version(6), Ok(6));
+    assert_eq!(check_version(7), Ok(7));
+    assert_eq!(negotiated(6), 6);
+    assert_eq!(negotiated(7), 7);
+    // A peer newer than this build never gets past `check_version`, but the
+    // arithmetic still never claims a version this build does not speak.
+    assert_eq!(negotiated(9), PROTOCOL_VERSION);
+}
+
 #[test]
 fn mismatched_version_is_representable_and_detectable() {
     // A stale tab left open across `flightdeck update`. **v3 is the case that
@@ -574,24 +748,24 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v6 host");
+    // refused both ways round. v7 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v7 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 6,
+            local: 7,
             peer: 5,
             min_supported: 6,
-            max_supported: 6,
+            max_supported: 7,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
     for older in 1..=4 {
         assert!(check_version(older).is_err());
     }
-    // Newer than our ceiling is equally a mismatch — there is no downgrade path,
-    // because server and SPA ship together.
-    assert!(check_version(7).is_err());
+    // Newer than our ceiling is equally a mismatch. A native client that
+    // dialled too new may redial at `max_supported`; a browser reloads.
+    assert!(check_version(8).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -599,7 +773,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 6);
+    assert_eq!(value["version"]["max_supported"], 7);
     assert_eq!(round_trip(&frame), frame);
 }
 
@@ -651,6 +825,7 @@ fn a_staged_edit_names_a_scope_a_key_and_either_a_value_or_a_clear() {
                 value: None,
             },
         ],
+        project_id: Some(ProjectId::new("proj_1")),
     };
     let frame = ClientMsg::Command(Command {
         seq: 7,
@@ -662,12 +837,17 @@ fn a_staged_edit_names_a_scope_a_key_and_either_a_value_or_a_clear() {
     assert_eq!(value["args"]["changes"][0]["scope"], "project");
     assert_eq!(value["args"]["changes"][0]["value"], false);
     assert!(value["args"]["changes"][1]["value"].is_null());
+    // v7: the project the Project-scope edits land in, for a native client
+    // that browses independently of the host's selection.
+    assert_eq!(value["args"]["project_id"], "proj_1");
     assert_eq!(round_trip(&frame), frame);
 
     // And a bare `open_configuration` is a read: absent args parse as no
-    // changes at all, never as "clear everything".
+    // changes at all, never as "clear everything" — and, from a v6 peer, as
+    // the host's active project.
     let read: ConfigSaveRequest = serde_json::from_value(json!({})).unwrap();
     assert!(read.changes.is_empty());
+    assert_eq!(read.project_id, None);
 }
 
 /// SPECS §21's two absences survive the wire as absences
@@ -835,6 +1015,7 @@ fn next_offset_is_the_cursor_the_viewer_sends_back() {
         resume_viewer: Some(ViewerId::new("view_0")),
         viewport: None,
         client: None,
+        connection: ConnectionKind::Window,
     };
     let value = serde_json::to_value(&attach).unwrap();
     assert_eq!(value["cursors"][0]["next_offset"], 140);
@@ -1770,4 +1951,296 @@ fn every_shutdown_reason_round_trips_through_its_wire_spelling() {
     ] {
         assert_eq!(ShutdownReason::from_str_lossy(reason.as_str()), reason);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 11. FlightDeck Worker (v7, `remote-control-qlyd.9`)
+// ---------------------------------------------------------------------------
+
+/// Every v7 kind travels under the tag the TypeScript mirror and the native
+/// client match on. Pinned as strings, because a renamed variant would
+/// otherwise round-trip happily on this side and be dropped on the other.
+#[test]
+fn every_v7_frame_and_delta_has_its_wire_tag() {
+    let deltas = [
+        (Delta::Health(health()), "health"),
+        (Delta::WorkerShell(worker_shell_view()), "worker_shell"),
+        (Delta::WorkerStatus(worker_status_view()), "worker_status"),
+        (Delta::Connections(connections_view()), "connections"),
+        (Delta::HostMessage(host_message()), "host_message"),
+        (
+            Delta::Notification(NotificationView {
+                at_ms: 1,
+                title: "t".into(),
+                body: "b".into(),
+                sound: NotificationSoundView::Completion,
+            }),
+            "notification",
+        ),
+    ];
+    for (delta, tag) in deltas {
+        let value = serde_json::to_value(ServerMsg::Delta(delta.clone())).unwrap();
+        assert_eq!(value["type"], "delta");
+        assert_eq!(value["change"], tag, "{value}");
+        assert_eq!(round_trip(&delta), delta);
+    }
+
+    let frames = [
+        (ServerMsg::DirListing(dir_listing()), "dir_listing"),
+        (ServerMsg::ProjectScan(project_scan()), "project_scan"),
+        (ServerMsg::CloneProgress(clone_progress()), "clone_progress"),
+        (ServerMsg::CloneResult(clone_result()), "clone_result"),
+        (
+            ServerMsg::TakenOver {
+                by: "laptop".into(),
+            },
+            "taken_over",
+        ),
+    ];
+    for (frame, tag) in frames {
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["type"], tag, "{value}");
+        assert_eq!(round_trip(&frame), frame);
+    }
+
+    let resize = ClientMsg::ResizeTerminal(ResizeTerminal {
+        terminal_id: TerminalId::new("tab_1:primary"),
+        cols: 100,
+        rows: 30,
+    });
+    assert_eq!(
+        serde_json::to_value(&resize).unwrap(),
+        json!({ "type": "resize_terminal", "terminal_id": "tab_1:primary", "cols": 100, "rows": 30 })
+    );
+}
+
+/// `TakenOver` is a struct variant inside an internally tagged enum: its one
+/// field sits beside the tag, like `Shutdown`'s.
+#[test]
+fn taken_over_names_the_device_beside_the_tag() {
+    let value = serde_json::to_value(ServerMsg::TakenOver {
+        by: "FlightDeck Desktop (studio)".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        value,
+        json!({ "type": "taken_over", "by": "FlightDeck Desktop (studio)" })
+    );
+    let parsed: ServerMsg = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        parsed,
+        ServerMsg::TakenOver {
+            by: "FlightDeck Desktop (studio)".into()
+        }
+    );
+}
+
+/// Every v6 peer attached as a window, and an attach that says nothing still
+/// does. `background` is spelled the way the TypeScript mirror spells it.
+#[test]
+fn an_attach_without_a_connection_kind_is_a_window() {
+    let parsed: ClientMsg = serde_json::from_value(json!({
+        "type": "attach",
+        "protocol_version": 6,
+        "seat": "write"
+    }))
+    .unwrap();
+    let ClientMsg::Attach(attach) = parsed else {
+        panic!("expected an attach");
+    };
+    assert_eq!(attach.connection, ConnectionKind::Window);
+    assert_eq!(ConnectionKind::default(), ConnectionKind::Window);
+
+    let background = Attach {
+        connection: ConnectionKind::Background,
+        ..attach
+    };
+    let value = serde_json::to_value(&background).unwrap();
+    assert_eq!(value["connection"], "background");
+    assert_eq!(round_trip(&background), background);
+}
+
+/// A v6 host's snapshot — no `host_kind`, no `worker` — still parses, and
+/// reads as "not a worker". That is what lets a v7 Desktop keep driving an
+/// older TUI.
+#[test]
+fn a_v6_snapshot_parses_and_is_not_a_worker() {
+    let mut value = serde_json::to_value(snapshot()).unwrap();
+    assert_eq!(value["host_kind"], "worker");
+    assert_eq!(value["worker"]["home"], "/home/u");
+    let obj = value.as_object_mut().unwrap();
+    obj.remove("host_kind");
+    obj.remove("worker");
+    obj.insert("protocol_version".into(), json!(6));
+
+    let parsed: Snapshot = serde_json::from_value(value).expect("a v6 snapshot parses");
+    assert_eq!(parsed.protocol_version, 6);
+    assert_eq!(parsed.host_kind, None);
+    assert_eq!(parsed.worker, None);
+}
+
+/// A TUI or Desktop host's snapshot carries no `worker` key at all, so what a
+/// v6 peer receives from a v7 TUI is its old frame plus one ignored tag.
+#[test]
+fn a_tui_snapshot_says_what_it_is_and_carries_no_worker_state() {
+    let snap = Snapshot {
+        host_kind: Some(HostKind::Tui),
+        worker: None,
+        ..snapshot()
+    };
+    let value = serde_json::to_value(&snap).unwrap();
+    assert_eq!(value["host_kind"], "tui");
+    assert!(value.get("worker").is_none(), "{value}");
+    assert_eq!(round_trip(&snap), snap);
+    for (kind, label) in [
+        (HostKind::Tui, "tui"),
+        (HostKind::Desktop, "desktop"),
+        (HostKind::Worker, "worker"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), label);
+    }
+}
+
+/// A worker snapshot with nothing optional set — a fresh worker, before the
+/// first health sample and with no shell yet — parses from its minimal form.
+#[test]
+fn a_minimal_worker_snapshot_parses() {
+    let parsed: WorkerSnapshot = serde_json::from_value(json!({
+        "home": "/home/u",
+        "status": { "projects_root": "/home/u/code" },
+        "connections": {}
+    }))
+    .unwrap();
+    assert_eq!(parsed.shell, None);
+    assert_eq!(parsed.health, None);
+    assert!(parsed.host_messages.is_empty());
+    assert!(parsed.status.listening.is_empty());
+    assert_eq!(parsed.connections, ConnectionsView::default());
+}
+
+#[test]
+fn every_worker_command_parses_into_its_op() {
+    let cases = [
+        (
+            worker_command::BROWSE_DIR,
+            Some(json!({ "path": "/home/u/code", "show_hidden": true })),
+            WorkerOp::BrowseDir {
+                path: Some("/home/u/code".into()),
+                show_hidden: true,
+            },
+        ),
+        (
+            worker_command::BROWSE_DIR,
+            None,
+            WorkerOp::BrowseDir {
+                path: None,
+                show_hidden: false,
+            },
+        ),
+        (worker_command::SCAN_PROJECTS, None, WorkerOp::ScanProjects),
+        (
+            worker_command::OPEN_PROJECT_PATH,
+            Some(json!({ "path": "/home/u/code/r" })),
+            WorkerOp::OpenProjectPath {
+                path: "/home/u/code/r".into(),
+            },
+        ),
+        (
+            worker_command::CLONE_PROJECT,
+            Some(json!({ "url": "git@github.com:o/r.git", "name": "r2", "extra": 1 })),
+            WorkerOp::CloneProject {
+                url: "git@github.com:o/r.git".into(),
+                name: Some("r2".into()),
+            },
+        ),
+        (
+            worker_command::CLONE_PROJECT,
+            Some(json!({ "url": "https://example.com/r.git", "name": null })),
+            WorkerOp::CloneProject {
+                url: "https://example.com/r.git".into(),
+                name: None,
+            },
+        ),
+        (
+            worker_command::RESTART_WORKER_SHELL,
+            Some(json!({ "ignored": true })),
+            WorkerOp::RestartWorkerShell,
+        ),
+    ];
+    for (name, args, expected) in cases {
+        assert_eq!(
+            WorkerOp::parse(name, args.as_ref()),
+            Some(Ok(expected)),
+            "{name} {args:?}"
+        );
+    }
+    // Every name in the table is one `parse` knows.
+    for name in worker_command::ALL {
+        assert!(WorkerOp::parse(name, None).is_some(), "{name}");
+    }
+}
+
+#[test]
+fn a_worker_command_with_bad_args_is_refused_with_a_reason() {
+    let bad = [
+        (worker_command::OPEN_PROJECT_PATH, None),
+        (
+            worker_command::OPEN_PROJECT_PATH,
+            Some(json!({ "path": "  " })),
+        ),
+        (
+            worker_command::OPEN_PROJECT_PATH,
+            Some(json!({ "path": 7 })),
+        ),
+        (worker_command::CLONE_PROJECT, Some(json!({}))),
+        (
+            worker_command::CLONE_PROJECT,
+            Some(json!({ "url": "u", "name": ["r"] })),
+        ),
+        (
+            worker_command::BROWSE_DIR,
+            Some(json!({ "show_hidden": "yes" })),
+        ),
+        (worker_command::BROWSE_DIR, Some(json!("/home/u"))),
+    ];
+    for (name, args) in bad {
+        match WorkerOp::parse(name, args.as_ref()) {
+            Some(Err(reason)) => assert!(reason.contains(name), "{reason}"),
+            other => panic!("{name} {args:?} should be refused, got {other:?}"),
+        }
+    }
+}
+
+/// Worker names are not palette rows: `parse` says "not mine" for every other
+/// name, and no worker name is in the palette inventory — the
+/// palette-coverage tests assume every `command::` name is a row.
+#[test]
+fn worker_commands_are_a_separate_table_from_the_palette() {
+    assert_eq!(WorkerOp::parse(command::SELECT_SESSION, None), None);
+    assert_eq!(WorkerOp::parse(command::OPEN_PROJECT, None), None);
+    assert_eq!(WorkerOp::parse("hologram", None), None);
+    for name in worker_command::ALL {
+        assert!(
+            crate::web::commands::lookup(name).is_none(),
+            "{name} must not be in the palette inventory"
+        );
+    }
+}
+
+/// The worker types keep `Eq`, which is why load travels as an integer.
+#[test]
+fn the_worker_types_are_eq() {
+    fn eq<T: Eq>() {}
+    eq::<WorkerSnapshot>();
+    eq::<Health>();
+    eq::<WorkerStatusView>();
+    eq::<ConnectionsView>();
+    eq::<HostMessage>();
+    eq::<NotificationView>();
+    eq::<DirListing>();
+    eq::<ProjectScan>();
+    eq::<CloneProgress>();
+    eq::<CloneResult>();
+    eq::<ResizeTerminal>();
+    eq::<WorkerOp>();
 }

@@ -27,8 +27,8 @@ use flightdeck::web::client::{
 };
 use flightdeck::web::credentials::CredentialStore;
 use flightdeck::web::protocol::{
-    command as names, Geometry, GitBar, ProjectView, SeatRequest, Selection, ServerMsg,
-    SessionPhase, SessionStatus, SessionView, ShutdownReason, StatusBucket, TerminalId,
+    command as names, ConnectionKind, Geometry, GitBar, ProjectView, SeatRequest, Selection,
+    ServerMsg, SessionPhase, SessionStatus, SessionView, ShutdownReason, StatusBucket, TerminalId,
     TerminalRole, TerminalView,
 };
 use flightdeck::web::server::{
@@ -362,6 +362,8 @@ fn connect(host: &Host, seat: SeatRequest) -> RemoteClient {
         token: paired(host),
         seat,
         user_agent: "FlightDeck Desktop/test".to_string(),
+        connection: ConnectionKind::Window,
+        retry_cap_ms: None,
     })
 }
 

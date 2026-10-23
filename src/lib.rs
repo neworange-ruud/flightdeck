@@ -2498,6 +2498,10 @@ fn build_web_host_state(
         // `UiConfig::agent_tab_side` the TUI's own layout reads — so the two
         // surfaces cannot end up mirroring on different rules.
         sidebar_position: active.state.config.ui.agent_tab_side(),
+        // v7: what kind of host this is, and a worker's own state. Neither the
+        // TUI nor the Desktop is a worker; the worker host sets both.
+        host_kind: wire::HostKind::Tui,
+        worker: None,
     }
 }
 
