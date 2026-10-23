@@ -1349,7 +1349,20 @@ struct Ui {
     /// never reused within a process and a stale answer cannot land on a new
     /// dialog by matching its id.
     dialog_seq: u64,
+    /// Whether [`Ui::message`] also keeps each sentence in
+    /// [`Ui::messages_out`]: set only by a worker host
+    /// ([`crate::host::AppHost::open_worker`]), which has no screen to show
+    /// a notification on and forwards them to its window instead (SPECS §33).
+    capture_messages: bool,
+    /// The status-line sentences since the worker host last drained them,
+    /// oldest first, at most [`MESSAGES_OUT_KEPT`]. Always empty unless
+    /// `capture_messages`: the TUI and the desktop never read it.
+    messages_out: std::collections::VecDeque<String>,
 }
+
+/// How many uncollected sentences [`Ui::messages_out`] holds; a worker host
+/// drains it every turn, so this only bounds a host that stopped turning.
+const MESSAGES_OUT_KEPT: usize = 100;
 
 /// What one dispatch produced, in the vocabulary a
 /// [`crate::web::protocol::Ack`] needs (see [`Ui::web_outcome`]).
@@ -1444,7 +1457,15 @@ impl Ui {
     }
 
     /// Show a notification message as a centered modal dialog (SPECS §22).
+    /// A worker host also collects it ([`Ui::capture_messages`]).
     fn message(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        if self.capture_messages {
+            if self.messages_out.len() >= MESSAGES_OUT_KEPT {
+                self.messages_out.pop_front();
+            }
+            self.messages_out.push_back(msg.clone());
+        }
         self.overlay = UiOverlay::Dialog(Dialog::notification(msg));
     }
 
@@ -1597,6 +1618,35 @@ struct WebSurface {
     /// The last state published, so `publish_state` is paired with the deltas
     /// that describe the difference rather than a server-side guess.
     published: crate::web::server::HostState,
+    /// What kind of host publishes, and what an empty (worker) workspace
+    /// answers with.
+    flavor: WebFlavor,
+}
+
+/// What [`build_web_host_state`] needs beyond the workspace: the kind of host
+/// it describes (v7 `Snapshot::host_kind`), and — for a worker, the one host
+/// whose workspace may be empty (design A9) — the global config and the PTY
+/// size to describe when there is no project to read them from.
+#[derive(Clone, Debug)]
+struct WebFlavor {
+    kind: crate::web::protocol::HostKind,
+    /// The effective global config, read where an empty workspace has no
+    /// active project's config (help, sidebar side). `None` for TUI and
+    /// Desktop hosts, which always have a project.
+    fallback_config: Option<Box<Config>>,
+    /// The grid an empty workspace reports (a worker's `default_cols` ×
+    /// `default_rows`).
+    fallback_size: PtySize,
+}
+
+impl Default for WebFlavor {
+    fn default() -> Self {
+        WebFlavor {
+            kind: crate::web::protocol::HostKind::Tui,
+            fallback_config: None,
+            fallback_size: PtySize::default(),
+        }
+    }
 }
 
 impl WebSurface {
@@ -1607,6 +1657,13 @@ impl WebSurface {
             // No `$HOME`: run without persistence rather than failing, the same
             // idiom as `remote.json`. The token then lasts one session.
             .unwrap_or_else(|| std::path::PathBuf::from("web.json"));
+        WebSurface::with_credentials(config, path)
+    }
+
+    /// [`WebSurface::new`] with the device tokens at `path`: a worker keeps
+    /// its own (`~/.flightdeck/worker/devices.json`, design A4), so a token
+    /// minted for a TUI's web interface never opens a worker.
+    fn with_credentials(config: &crate::contracts::domain::WebConfig, path: PathBuf) -> WebSurface {
         let store = crate::web::credentials::CredentialStore::open(
             Arc::new(RealFs),
             Arc::new(RealClock),
@@ -1625,11 +1682,38 @@ impl WebSurface {
             count_rx,
             handle: None,
             published: crate::web::server::HostState::default(),
+            flavor: WebFlavor::default(),
         }
     }
 
     fn running(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// Start a server on `options` (a worker's listen plan), on the shared
+    /// credential store, replay rings and inbound channel. Already running is
+    /// `Ok`. Unlike [`WebSurface::start`] the caller learns where it listens
+    /// from [`crate::web::server::WebServerHandle::listen_status`], which
+    /// changes over time for a Tailscale plan.
+    fn start_with(
+        &mut self,
+        options: crate::web::server::ServerOptions,
+        initial: crate::web::server::HostState,
+    ) -> std::result::Result<(), crate::web::server::StartError> {
+        if self.handle.is_some() {
+            return Ok(());
+        }
+        self.published = initial.clone();
+        let handle = crate::web::server::start_with(
+            options,
+            self.streams.capacity_bytes(),
+            Arc::clone(&self.credentials),
+            Arc::new(RealClock),
+            initial,
+            self.inbound_tx.clone(),
+        )?;
+        self.handle = Some(handle);
+        Ok(())
     }
 
     /// Start listening, returning the bound address and whether it is reachable
@@ -1784,14 +1868,26 @@ impl WebSurface {
 
     /// One chunk of raw PTY output, from `drain_pty_output`'s tee.
     fn tee(&mut self, tab_id: &str, child: Option<usize>, mint: u64, bytes: &[u8]) {
-        let Some(handle) = self.handle.as_ref() else {
+        if self.handle.is_none() {
             return;
-        };
+        }
         let terminal_id = match child {
             None => crate::web::stream::primary_terminal_id(tab_id),
             Some(_) => crate::web::stream::child_terminal_id(tab_id, mint),
         };
-        if let Some(frame) = self.streams.pty_output(&terminal_id, bytes) {
+        self.tee_terminal(&terminal_id, bytes);
+    }
+
+    /// One chunk of raw output from the terminal `terminal_id` names, into its
+    /// replay ring and out to every viewer: what [`WebSurface::tee`] does for
+    /// an agent's terminal, for one that is not an agent's (a worker's shell,
+    /// [`crate::web::protocol::WORKER_SHELL_TERMINAL_ID`]). Only while the
+    /// server runs.
+    fn tee_terminal(&mut self, terminal_id: &crate::web::protocol::TerminalId, bytes: &[u8]) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        if let Some(frame) = self.streams.pty_output(terminal_id, bytes) {
             handle.send(crate::web::server::WebOutbound::All(
                 crate::web::protocol::ServerMsg::TermBytes(frame),
             ));
@@ -1908,6 +2004,10 @@ struct WorkspaceTerminals<'a> {
     projects: &'a mut [Project],
     /// Where a pasted image is saved ([`crate::web::protocol::Input::image`]).
     fs: &'a dyn FileSystem,
+    /// A worker's login shell, which takes the keystrokes for
+    /// [`crate::web::protocol::WORKER_SHELL_TERMINAL_ID`]. `None` on every
+    /// other host.
+    worker_shell: Option<&'a mut crate::host::worker::shell::WorkerShell>,
 }
 
 impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
@@ -1916,6 +2016,11 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
         terminal_id: &crate::web::protocol::TerminalId,
         bytes: &[u8],
     ) -> crate::web::stream::Written {
+        if terminal_id.as_str() == crate::web::protocol::WORKER_SHELL_TERMINAL_ID {
+            if let Some(shell) = self.worker_shell.as_deref_mut() {
+                return shell.write(bytes);
+            }
+        }
         for project in self.projects.iter_mut() {
             for tab in project.state.tabs.iter_mut() {
                 let tab_id = tab.meta.id.clone();
@@ -2380,24 +2485,43 @@ fn apply_update_notice(workspace: &mut Workspace, latest: String) {
 /// by [`web_dialog_view`] and passed in rather than derived here — this function
 /// takes a `&Workspace` and a dialog lives on the [`Ui`], which is the layer
 /// above. Absent rather than guessed when none is open.
+///
+/// `flavor` names the kind of host this describes and, for a worker whose
+/// workspace is empty (design A9), what to describe instead of an active
+/// project: the global config for help and the sidebar side, and the default
+/// grid. A worker's own state ([`crate::web::server::HostState::worker`]) is
+/// the worker host's to add.
 fn build_web_host_state(
     workspace: &Workspace,
     streams: &crate::web::stream::TerminalStreams,
     activity: Vec<crate::web::protocol::ActivityEvent>,
     dialog: Option<crate::web::protocol::DialogView>,
     now_ms: u64,
+    flavor: &WebFlavor,
 ) -> crate::web::server::HostState {
     use crate::web::protocol as wire;
     use crate::web::stream as ws;
 
-    let active = workspace.active_project();
+    // `None` only for a worker that has no project yet.
+    let active = workspace.projects.get(workspace.active);
+    let fallback_config;
+    let active_config = match active {
+        Some(p) => &p.state.config,
+        None => match flavor.fallback_config.as_deref() {
+            Some(config) => config,
+            None => {
+                fallback_config = Config::default();
+                &fallback_config
+            }
+        },
+    };
     let mut projects = Vec::with_capacity(workspace.projects.len());
     let mut selection = wire::Selection {
-        split_view: active.state.split_view,
+        split_view: active.is_some_and(|p| p.state.split_view),
         ..wire::Selection::default()
     };
 
-    for project in workspace.projects.iter() {
+    for (project_index, project) in workspace.projects.iter().enumerate() {
         // The repository root, not the folder name: two open projects can be
         // called `web` and the browser keys everything by this id.
         let root = project.git.root().display().to_string();
@@ -2421,7 +2545,7 @@ fn build_web_host_state(
                 }
             }
 
-            if std::ptr::eq(project, active) && project.state.selected_tab == Some(index) {
+            if project_index == workspace.active && project.state.selected_tab == Some(index) {
                 selection.project_id = Some(project_id.clone());
                 selection.session_id = Some(tab.id());
                 selection.terminal_id = Some(match tab.session.selected_child() {
@@ -2486,7 +2610,7 @@ fn build_web_host_state(
         host_version: env!("CARGO_PKG_VERSION").to_string(),
         projects,
         selection,
-        geometry: ws::geometry_of(active.state.pty_size),
+        geometry: ws::geometry_of(active.map_or(flavor.fallback_size, |p| p.state.pty_size)),
         replay_capacity_bytes: streams.capacity_bytes() as u64,
         activity,
         dialog,
@@ -2496,8 +2620,8 @@ fn build_web_host_state(
         // when the server started, so a config save changes what the next
         // snapshot documents (`specs/WEB_INTERFACE.md` §6.5 R16).
         help: crate::tui::help::help_doc(
-            active.state.config.ui.use_f2_to_leave_terminal_focus,
-            active.state.isolated,
+            active_config.ui.use_f2_to_leave_terminal_focus,
+            active.is_some_and(|p| p.state.isolated),
         ),
         about: crate::tui::help::about_doc(),
         // SPECS §30's notice, read from the same field the desktop's own status
@@ -2507,19 +2631,19 @@ fn build_web_host_state(
         // when no check has reported a newer release, which includes every
         // reason there was no check at all; see `Snapshot::update` for why that
         // is not the same claim as "up to date".
-        update: active.state.update_available.as_ref().map(|latest| {
-            crate::web::protocol::UpdateNotice {
+        update: active
+            .and_then(|p| p.state.update_available.as_ref())
+            .map(|latest| crate::web::protocol::UpdateNotice {
                 latest_version: latest.clone(),
-            }
-        }),
+            }),
         // Artboard 1h position 4 (`specs/WEB_INTERFACE.md` §6.5 R24), read
         // from the active project's config through the same
         // `UiConfig::agent_tab_side` the TUI's own layout reads — so the two
         // surfaces cannot end up mirroring on different rules.
-        sidebar_position: active.state.config.ui.agent_tab_side(),
-        // v7: what kind of host this is, and a worker's own state. Neither the
-        // TUI nor the Desktop is a worker; the worker host sets both.
-        host_kind: wire::HostKind::Tui,
+        sidebar_position: active_config.ui.agent_tab_side(),
+        // v7: what kind of host this is. A worker's own state is added by the
+        // worker host, which alone has it.
+        host_kind: flavor.kind,
         worker: None,
     }
 }
@@ -2570,15 +2694,18 @@ fn web_host_state_now(
         activity,
         {
             // A dialog a targeted command opened is about its own project's tab.
+            // An empty (worker) workspace has no project to ask about.
             let project = ui
                 .prompt
                 .as_ref()
                 .and_then(|p| p.target.as_ref())
                 .and_then(|t| t.project(workspace))
-                .map_or_else(|| workspace.active_project(), |i| &workspace.projects[i]);
-            web_dialog_view(ui, &project.name, &project.state)
+                .or(Some(workspace.active))
+                .and_then(|i| workspace.projects.get(i));
+            project.and_then(|project| web_dialog_view(ui, &project.name, &project.state))
         },
         now_ms,
+        &web.flavor,
     )
 }
 
@@ -5258,7 +5385,11 @@ fn apply_host_event(
         // Project applies first (an isolated run opens nothing else), then the
         // folder browser's own open path.
         HostEvent::OpenProject(path) => {
-            if workspace.active_project().state.isolated {
+            let isolated = workspace
+                .projects
+                .get(workspace.active)
+                .is_some_and(|p| p.state.isolated);
+            if isolated {
                 ui.message(ISOLATED_REFUSAL);
             } else {
                 open_project_path(&path, workspace, env, ui);
@@ -5725,7 +5856,18 @@ fn apply_web_configuration(
             .map_err(|e| format!("`open_configuration` could not read its edits: {e}"))?,
     };
 
-    let mut cm = build_config_manager(workspace, env);
+    // v7: the project whose file Project scope means — the one the asking
+    // window shows, which need not be the host's active project. A v6 peer
+    // names none and means the active one.
+    let index = match &request.project_id {
+        None => workspace.active,
+        Some(id) => workspace
+            .projects
+            .iter()
+            .position(|p| p.git.root().display().to_string() == id.as_str())
+            .ok_or_else(|| format!("No open project is {id}. Nothing has been saved."))?,
+    };
+    let mut cm = build_config_manager(workspace, env, index)?;
     for ConfigChange { scope, key, value } in &request.changes {
         let scope = match scope {
             ConfigScopeName::Global => ConfigScope::Global,
@@ -6257,7 +6399,11 @@ fn open_project_path(target: &Path, workspace: &mut Workspace, env: &Env, ui: &m
                 // Seed the new project's PTY size from the active one and
                 // resume its recovered agents (never auto-relaunched beyond
                 // this explicit open), matching startup behaviour.
-                let sz = workspace.active_project().state.pty_size;
+                let sz = workspace
+                    .projects
+                    .get(workspace.active)
+                    .map(|p| p.state.pty_size)
+                    .unwrap_or_default();
                 {
                     let services = env.services(&proj.git);
                     proj.state.set_pty_size(sz);
@@ -7654,6 +7800,16 @@ fn run_web_command(
         );
     };
 
+    // A worker with no project yet (design A9): every route but the feed's
+    // read mark needs a project to act on, so it is refused before any of
+    // them can reach for one.
+    if workspace.projects.is_empty() && !matches!(spec.route, Route::ActivityRead) {
+        return ack(
+            AckOutcome::Rejected,
+            Some(crate::host::worker::NO_PROJECT_REFUSAL.to_string()),
+        );
+    }
+
     match &spec.route {
         // D11: read-marking is host state, so a second tab — or the same tab
         // tomorrow — backfills a feed that agrees about what has been seen.
@@ -8525,7 +8681,10 @@ fn locate_web_terminal(
 
 /// Build and open the configuration manager for the active project.
 fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
-    ui.config = Some(build_config_manager(workspace, env));
+    match build_config_manager(workspace, env, workspace.active) {
+        Ok(cm) => ui.config = Some(cm),
+        Err(reason) => ui.message(reason),
+    }
 }
 
 /// Build the configuration manager for the active project, reading the global
@@ -8541,13 +8700,28 @@ fn open_config_manager(workspace: &Workspace, env: &Env, ui: &mut Ui) {
 /// (`remote-control-1p22`, `specs/WEB_INTERFACE.md` §6.5 R22). The field list,
 /// the two files and the layer walk are therefore the same on both, by
 /// construction rather than by review.
-fn build_config_manager(workspace: &Workspace, env: &Env) -> ConfigManager {
+///
+/// `project` is the index of the project whose file Project scope edits: the
+/// active one for the desktop, the asking window's for a native client (v7).
+/// An empty (worker) workspace has none, and is refused.
+fn build_config_manager(
+    workspace: &Workspace,
+    env: &Env,
+    project: usize,
+) -> std::result::Result<ConfigManager, String> {
+    let Some(p) = workspace.projects.get(project) else {
+        return Err(if workspace.projects.is_empty() {
+            crate::host::worker::NO_PROJECT_REFUSAL.to_string()
+        } else {
+            "That project is no longer open.".to_string()
+        });
+    };
     let global_path = global_config_path();
     // An isolated run writes nothing to the user's config on its own (SPECS
     // §32): merely opening the manager to look must not create
     // `~/.flightdeck/config.toml`. `read_table` below tolerates a missing
     // file, so the manager still opens and shows the effective settings.
-    if !workspace.active_project().state.isolated {
+    if !p.state.isolated {
         if let Some(gp) = &global_path {
             let _ = ensure_global_config(env.fs, gp);
         }
@@ -8565,20 +8739,19 @@ fn build_config_manager(workspace: &Workspace, env: &Env) -> ConfigManager {
         }
     };
 
-    let p = workspace.active_project();
     let project_path = p.git.root().join(".flightdeck").join("config.toml");
     let global = global_path.as_deref().map(read_table).unwrap_or_default();
     let project = read_table(&project_path);
     let agent_keys: Vec<String> = p.state.config.agents.keys().cloned().collect();
 
-    ConfigManager::new(
+    Ok(ConfigManager::new(
         p.name.clone(),
         global_path,
         project_path,
         global,
         project,
         agent_keys,
-    )
+    ))
 }
 
 /// Handle a key while the configuration manager overlay is open (SPECS §8).
@@ -14963,6 +15136,7 @@ mod tests {
                 Vec::new(),
                 None,
                 0,
+                &WebFlavor::default(),
             )
         }
 
@@ -15107,6 +15281,7 @@ mod tests {
                 Vec::new(),
                 None,
                 0,
+                &WebFlavor::default(),
             )
         }
 
@@ -15603,6 +15778,7 @@ mod tests {
                 count_rx,
                 handle: None,
                 published: crate::web::server::HostState::default(),
+                flavor: WebFlavor::default(),
             }
         }
 
