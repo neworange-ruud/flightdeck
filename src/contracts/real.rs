@@ -108,6 +108,10 @@ impl FileSystem for RealFs {
         Ok(out)
     }
 
+    fn canonicalize(&self, p: &Path) -> Result<PathBuf> {
+        fs::canonicalize(p).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
+    }
+
     fn remove_dir_all(&self, p: &Path) -> Result<()> {
         remove_dir_all_resilient(p)
     }
