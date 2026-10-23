@@ -8,10 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **`flightdeck worker`: a headless FlightDeck for a remote machine.** Run FlightDeck with no screen on a spare Linux or macOS box and control it from FlightDeck Desktop over Tailscale. `flightdeck worker start`, `stop`, `restart`, `status` (`--json`), `pair`, `devices`, `revoke`, `logs` and `run` manage it; `pair` mints a one-time code for pairing a Desktop, and `revoke` takes a Desktop's access away. A supervisor restarts the worker if it crashes (and gives up after 5 crashes in 10 minutes), and the worker listens only on Tailscale addresses. From the Desktop you get a worker shell, and can open, scan and clone projects confined to the worker account's `$HOME`. The worker reports its health and host messages to the Desktop. Configure it with the global `[worker]` section (`port`, `projects_root`, `default_cols`, `default_rows`). Agent logins and git credentials stay on the worker. See the "Run a FlightDeck Worker" docs.
 
 ### Improvements
 
+- Web protocol v7, which workers require. v6 clients are still served by terminal UI hosts. Update the Desktop and the CLI together when you use a worker.
+- The terminal UI refuses to start while a worker serves the machine, and tells you to use the Desktop or run `flightdeck worker stop`.
 - Releases now publish a Linux arm64 (`aarch64-unknown-linux-gnu`) `flightdeck` binary, built natively on a GitHub arm runner, alongside the existing x86_64 Linux build.
 
 ### Bug fixes

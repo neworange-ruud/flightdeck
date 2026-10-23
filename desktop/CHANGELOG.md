@@ -14,11 +14,13 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Workers.** The launcher has a WORKERS section listing your saved FlightDeck Workers with live status (online, offline, not paired, access revoked, update needed), health, how many agents need you and a "version differs" badge. Desktop keeps status-only background links to them and raises OS notifications when an agent needs input, fails or finishes. Opening a worker gives a remote window with a Worker shell tab (and a Restart shell button), an "Open a project…" picker (scan the projects folder, browse the worker's home directory, or clone a git URL), host messages ("N messages while you were away"), a version-skew warning, and a "Taken over by …" panel with Reconnect when another Desktop takes the worker. Set up the worker with `flightdeck worker`; see the "Run a FlightDeck Worker" docs.
+- **Configuration manager in remote windows.** Open Configuration in the command palette of any remote window (a worker or a Desktop or terminal host) to edit the host's configuration.
 
 ### Improvements
 
-- None yet.
+- Web protocol v7, with automatic fallback to v6 hosts. Workers require v7, so update the Desktop and the CLI together.
+- A local Desktop window refuses to open while a worker runs on the machine; use the worker's remote window or run `flightdeck worker stop`.
 
 ### Bug fixes
 
