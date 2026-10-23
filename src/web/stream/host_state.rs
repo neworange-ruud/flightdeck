@@ -420,7 +420,57 @@ pub fn deltas(previous: &HostState, next: &HostState) -> Vec<Delta> {
         _ => {}
     }
 
+    if let Some(now) = &next.worker {
+        worker_deltas(previous.worker.as_ref(), now, &mut out);
+    }
+
     out
+}
+
+/// The deltas for a worker host's own state (v7).
+///
+/// Only what changed, and only what a [`Delta`] can describe:
+///
+/// * **The shell** when a field its tab renders moved — title, geometry,
+///   liveness, exit code. Its byte counters move on every tick it prints, and
+///   for the same reason as a terminal's (see [`deltas`]) they produce nothing.
+///   A shell that disappears from the state produces nothing either: there is
+///   no frame for "no shell", and the worker always has one once started.
+/// * **Health** whenever the sample differs, which is every sample, since
+///   `sampled_at_ms` moves.
+/// * **Status** whenever any of it differs.
+///
+/// Host messages are never diffed: they reach a window as
+/// [`Delta::HostMessage`] when the host drains them, and the snapshot carries
+/// the unread ones. A diff would deliver each one twice.
+fn worker_deltas(
+    previous: Option<&crate::web::server::WorkerHostState>,
+    now: &crate::web::server::WorkerHostState,
+    out: &mut Vec<Delta>,
+) {
+    if let Some(shell) = &now.shell {
+        let changed = match previous.and_then(|p| p.shell.as_ref()) {
+            None => true,
+            Some(was) => {
+                was.terminal_id != shell.terminal_id
+                    || was.title != shell.title
+                    || was.geometry != shell.geometry
+                    || was.alive != shell.alive
+                    || was.exit_code != shell.exit_code
+            }
+        };
+        if changed {
+            out.push(Delta::WorkerShell(shell.clone()));
+        }
+    }
+    if let Some(health) = &now.health {
+        if previous.and_then(|p| p.health.as_ref()) != Some(health) {
+            out.push(Delta::Health(health.clone()));
+        }
+    }
+    if previous.map(|p| &p.status) != Some(&now.status) {
+        out.push(Delta::WorkerStatus(now.status.clone()));
+    }
 }
 
 /// The deltas for one session that exists on both sides of the diff.

@@ -38,7 +38,7 @@ fn token() -> TokenId {
 /// leaves them), plus the channel receivers so nothing is dropped mid-test.
 #[allow(clippy::type_complexity)]
 fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>) {
-    let mut registry = SeatRegistry::new(1_000);
+    let mut registry = SeatRegistry::new(1_000, HostKind::Tui);
     let mut receivers = Vec::new();
     for index in 0..count {
         let (tx, rx) = mpsc::channel::<ServerMsg>(8);
@@ -51,6 +51,7 @@ fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>)
             },
             2_000 + index as i64,
             crate::web::protocol::PROTOCOL_VERSION,
+            ConnectionKind::Window,
             tx,
         );
         receivers.push(rx);
@@ -426,7 +427,7 @@ fn only_the_interrupted_writers_frame_says_it_was_deliberate() {
 /// host's heap; it comes back through the reconnect path (Q3).
 #[test]
 fn a_viewer_that_cannot_keep_up_is_dropped_from_the_registry() {
-    let mut registry = SeatRegistry::new(0);
+    let mut registry = SeatRegistry::new(0, HostKind::Tui);
     let (tx, _rx) = mpsc::channel::<ServerMsg>(1);
     registry.register(
         viewer("slow"),
@@ -437,6 +438,7 @@ fn a_viewer_that_cannot_keep_up_is_dropped_from_the_registry() {
         },
         0,
         crate::web::protocol::PROTOCOL_VERSION,
+        ConnectionKind::Window,
         tx,
     );
 
@@ -475,7 +477,7 @@ fn input_cursors_survive_a_reconnect_and_never_go_backwards() {
 
 #[test]
 fn remembered_input_cursors_are_bounded() {
-    let mut registry = SeatRegistry::new(0);
+    let mut registry = SeatRegistry::new(0, HostKind::Tui);
     for index in 0..(REMEMBERED_INPUT_CURSORS + 10) {
         registry.record_input(&viewer(&format!("v{index}")), index as u64 + 1);
     }
@@ -792,6 +794,10 @@ fn only_text_frames_carry_protocol_v1() {
 // ---------------------------------------------------------------------------
 
 fn test_shared() -> Arc<Shared> {
+    test_shared_for(HostKind::Tui)
+}
+
+fn test_shared_for(host_kind: HostKind) -> Arc<Shared> {
     use crate::testing::{FakeClock, FakeFs};
 
     let clock = Arc::new(FakeClock::default());
@@ -824,12 +830,14 @@ fn test_shared() -> Arc<Shared> {
         inbound: Mutex::new(inbound),
         state: state_tx,
         state_rx,
-        registry: Mutex::new(SeatRegistry::new(1_699_999_000_000)),
+        registry: Mutex::new(SeatRegistry::new(1_699_999_000_000, host_kind)),
         input_lock: InputArbiter::shared(),
         announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
         revocations: revocations_rx,
         drain: Arc::new(Drain::default()),
+        host_kind,
+        serve_assets: host_kind != HostKind::Worker,
     })
 }
 
@@ -846,6 +854,7 @@ fn a_snapshot_carries_the_published_state_plus_this_viewers_own_seat() {
         },
         1_700_000_000_000,
         crate::web::protocol::PROTOCOL_VERSION,
+        ConnectionKind::Window,
         tx,
     );
     shared
@@ -983,4 +992,581 @@ fn self_initiated_is_true_only_for_the_viewer_that_asked() {
     assert_eq!(notice.initiator.as_ref(), Some(&viewer("asker")));
     assert!(notice.initiator.as_ref() != Some(&viewer("bystander")));
     assert_eq!(ShutdownNotice::server_stopped().initiator, None);
+}
+
+// ---------------------------------------------------------------------------
+// Listening on Tailscale (v7, design §2.2)
+// ---------------------------------------------------------------------------
+
+/// A listener a test can watch being retired.
+struct FakeListener {
+    ip: IpAddr,
+    retired: Arc<Mutex<Vec<IpAddr>>>,
+}
+
+impl Retire for FakeListener {
+    fn retire(self) {
+        self.retired.lock().expect("not poisoned").push(self.ip);
+    }
+}
+
+/// A binder that records every address it is asked for and refuses the ones
+/// in `refuse`.
+struct FakeBinder {
+    asked: Vec<SocketAddr>,
+    refuse: Vec<IpAddr>,
+    retired: Arc<Mutex<Vec<IpAddr>>>,
+}
+
+impl FakeBinder {
+    fn new() -> Self {
+        FakeBinder {
+            asked: Vec::new(),
+            refuse: Vec::new(),
+            retired: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn bind(&mut self, addr: SocketAddr) -> std::io::Result<FakeListener> {
+        self.asked.push(addr);
+        if self.refuse.contains(&addr.ip()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "address in use",
+            ));
+        }
+        Ok(FakeListener {
+            ip: addr.ip(),
+            retired: Arc::clone(&self.retired),
+        })
+    }
+
+    fn reconcile(
+        &mut self,
+        current: &mut HashMap<IpAddr, FakeListener>,
+        wanted: &[IpAddr],
+    ) -> Vec<(IpAddr, String)> {
+        reconcile(current, wanted, 7420, &mut |addr| self.bind(addr))
+    }
+}
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().expect("test address parses")
+}
+
+/// PRD W8: whatever the address source and the probe say, a worker never
+/// listens on loopback or on every interface.
+#[test]
+fn reconcile_never_binds_loopback_or_the_unspecified_address() {
+    let mut binder = FakeBinder::new();
+    let mut current = HashMap::new();
+    let wanted = [
+        ip("127.0.0.1"),
+        ip("0.0.0.0"),
+        ip("::1"),
+        ip("::"),
+        ip("100.64.1.2"),
+    ];
+    let errors = binder.reconcile(&mut current, &wanted);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        binder.asked,
+        vec![SocketAddr::new(ip("100.64.1.2"), 7420)],
+        "only the Tailscale address is ever offered to the OS"
+    );
+    assert_eq!(
+        current.keys().copied().collect::<Vec<_>>(),
+        vec![ip("100.64.1.2")]
+    );
+}
+
+/// An address that went away is retired; one that appeared is bound; one that
+/// stayed is left alone (its connections stay up).
+#[test]
+fn reconcile_retires_what_went_away_and_binds_what_appeared() {
+    let mut binder = FakeBinder::new();
+    let mut current = HashMap::new();
+    binder.reconcile(&mut current, &[ip("100.64.1.2"), ip("100.64.1.3")]);
+    binder.asked.clear();
+
+    let errors = binder.reconcile(&mut current, &[ip("100.64.1.3"), ip("fd7a:115c:a1e0::1")]);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        binder.asked,
+        vec![SocketAddr::new(ip("fd7a:115c:a1e0::1"), 7420)],
+        "the address that stayed is not rebound"
+    );
+    assert_eq!(
+        *binder.retired.lock().expect("not poisoned"),
+        vec![ip("100.64.1.2")]
+    );
+    let mut now: Vec<IpAddr> = current.keys().copied().collect();
+    now.sort();
+    assert_eq!(now, vec![ip("100.64.1.3"), ip("fd7a:115c:a1e0::1")]);
+
+    // Nothing wanted any more: everything is retired.
+    binder.reconcile(&mut current, &[]);
+    assert!(current.is_empty());
+    assert_eq!(binder.retired.lock().expect("not poisoned").len(), 3);
+}
+
+/// A bind that fails is reported, and tried again on the next pass.
+#[test]
+fn a_failed_bind_is_reported_and_retried() {
+    let mut binder = FakeBinder::new();
+    binder.refuse = vec![ip("100.64.1.2")];
+    let mut current = HashMap::new();
+    let errors = binder.reconcile(&mut current, &[ip("100.64.1.2")]);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, ip("100.64.1.2"));
+    assert!(current.is_empty());
+
+    binder.refuse.clear();
+    let errors = binder.reconcile(&mut current, &[ip("100.64.1.2")]);
+    assert!(errors.is_empty());
+    assert_eq!(binder.asked.len(), 2, "the next pass tries again");
+    assert!(current.contains_key(&ip("100.64.1.2")));
+}
+
+#[test]
+fn nothing_to_bind_reads_as_no_tailscale_address() {
+    let status = tailscale_listen_status(
+        7420,
+        &[ip("127.0.0.1")],
+        &[],
+        &[],
+        Some("box.tail1234.ts.net"),
+        AddressOrigin::RangeFallback,
+    );
+    assert!(status.bound.is_empty());
+    assert_eq!(status.reason.as_deref(), Some("no Tailscale address"));
+    assert_eq!(status.advertised, None, "nothing bound, nothing to dial");
+    assert_eq!(status.origin, Some(AddressOrigin::RangeFallback));
+}
+
+#[test]
+fn every_bind_failing_reads_as_bind_failed_with_the_os_reason() {
+    let status = tailscale_listen_status(
+        7420,
+        &[ip("100.64.1.2")],
+        &[],
+        &[(ip("100.64.1.2"), "address in use".to_string())],
+        None,
+        AddressOrigin::TailscaleStatus,
+    );
+    assert_eq!(
+        status.reason.as_deref(),
+        Some("bind failed: 100.64.1.2:7420: address in use")
+    );
+}
+
+/// The advert prefers the MagicDNS name, falls back to the first IPv4, and
+/// brackets an IPv6 literal so `host:port` parses.
+#[test]
+fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
+    let named = tailscale_listen_status(
+        7420,
+        &[ip("100.64.1.2"), ip("fd7a:115c:a1e0::1")],
+        &[ip("fd7a:115c:a1e0::1"), ip("100.64.1.2")],
+        &[],
+        Some("box.tail1234.ts.net"),
+        AddressOrigin::TailscaleStatus,
+    );
+    assert_eq!(
+        named.advertised.as_deref(),
+        Some("box.tail1234.ts.net:7420")
+    );
+    assert_eq!(named.reason, None);
+    assert_eq!(
+        named.bound,
+        vec![
+            SocketAddr::new(ip("100.64.1.2"), 7420),
+            SocketAddr::new(ip("fd7a:115c:a1e0::1"), 7420),
+        ],
+        "IPv4 first"
+    );
+
+    let v6_only = tailscale_listen_status(
+        7420,
+        &[ip("fd7a:115c:a1e0::1")],
+        &[ip("fd7a:115c:a1e0::1")],
+        &[],
+        None,
+        AddressOrigin::TailscaleStatus,
+    );
+    assert_eq!(
+        v6_only.advertised.as_deref(),
+        Some("[fd7a:115c:a1e0::1]:7420")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Versions (v7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tui_host_serves_v6_and_v7_and_a_worker_only_v7() {
+    assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
+    assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
+    assert_eq!(accept_version(HostKind::Desktop, 6), Ok(6));
+    assert_eq!(accept_version(HostKind::Worker, 7), Ok(7));
+
+    for peer in [5, 6, 8] {
+        let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
+        assert_eq!(refused.peer, peer);
+        assert_eq!(refused.min_supported, 7, "the worker's own floor");
+        assert_eq!(refused.max_supported, MAX_SUPPORTED_VERSION);
+    }
+    let tui_refusal = accept_version(HostKind::Tui, 5).expect_err("refused");
+    assert_eq!(
+        tui_refusal.min_supported,
+        crate::web::protocol::MIN_SUPPORTED_VERSION
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Connection kinds and the worker's seat model (v7, design §2.5)
+// ---------------------------------------------------------------------------
+
+/// Register `id` on `registry` as `kind`, holding `token`.
+fn register_as(
+    registry: &mut SeatRegistry,
+    id: &str,
+    kind: ConnectionKind,
+    token: &TokenId,
+    label: &str,
+) -> mpsc::Receiver<ServerMsg> {
+    let (tx, rx) = mpsc::channel::<ServerMsg>(8);
+    registry.register(
+        viewer(id),
+        ViewerIdentity {
+            address: IpAddr::V4(Ipv4Addr::new(100, 64, 1, 9)),
+            user_agent_label: Some(label.to_string()),
+            token: token.clone(),
+        },
+        5_000,
+        crate::web::protocol::PROTOCOL_VERSION,
+        kind,
+        tx,
+    );
+    rx
+}
+
+fn drained(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<ServerMsg> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        out.push(msg);
+    }
+    out
+}
+
+/// A TUI or Desktop host has no background links: whatever a client says, it
+/// is a window there, so nothing about the multi-writer model can change.
+#[test]
+fn a_non_worker_host_records_every_connection_as_a_window() {
+    let mut registry = SeatRegistry::new(0, HostKind::Tui);
+    let _rx = register_as(
+        &mut registry,
+        "v0",
+        ConnectionKind::Background,
+        &token(),
+        "Chrome on macOS",
+    );
+    assert_eq!(
+        registry.kind_of(&viewer("v0")),
+        Some(ConnectionKind::Window)
+    );
+    assert_eq!(registry.count(ConnectionKind::Background), 0);
+}
+
+#[test]
+fn a_worker_has_no_desktop_row_and_no_rows_for_background_links() {
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let device = token();
+    let _w = register_as(&mut registry, "win", ConnectionKind::Window, &device, "A");
+    let _b = register_as(
+        &mut registry,
+        "bg",
+        ConnectionKind::Background,
+        &device,
+        "A",
+    );
+    registry.request_seat(&viewer("win"), SeatRequest::Write);
+
+    let rows = registry.seat_rows(None, None);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].viewer_id, Some(viewer("win")));
+    assert!(rows.iter().all(|r| r.label != DESKTOP_SEAT_LABEL));
+    assert_eq!(registry.count(ConnectionKind::Window), 1);
+    assert_eq!(registry.count(ConnectionKind::Background), 1);
+    assert!(
+        registry
+            .seat_frames(0, None, None)
+            .iter()
+            .all(|(id, _)| id == &viewer("win")),
+        "a background link is not seated, so it is not sent seat lists"
+    );
+}
+
+/// A new window displaces the old one with a `TakenOver` naming the new
+/// device; its own reconnect is removed silently; background links are never
+/// touched.
+#[test]
+fn a_new_window_takes_over_every_other_window_but_no_background_link() {
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let mut old = register_as(&mut registry, "old", ConnectionKind::Window, &token(), "A");
+    let mut stale = register_as(
+        &mut registry,
+        "stale",
+        ConnectionKind::Window,
+        &token(),
+        "B",
+    );
+    let mut bg = register_as(
+        &mut registry,
+        "bg",
+        ConnectionKind::Background,
+        &token(),
+        "C",
+    );
+    let _new = register_as(&mut registry, "new", ConnectionKind::Window, &token(), "D");
+
+    let displaced = registry.displace_windows(&viewer("new"), Some(&viewer("stale")), "laptop");
+    assert_eq!(displaced, vec![viewer("old"), viewer("stale")]);
+    assert!(matches!(
+        drained(&mut old).as_slice(),
+        [ServerMsg::TakenOver { by }] if by == "laptop"
+    ));
+    assert!(
+        drained(&mut stale).is_empty(),
+        "the window being resumed is replaced silently"
+    );
+    assert!(drained(&mut bg).is_empty());
+    assert_eq!(registry.ids_of(ConnectionKind::Window), vec![viewer("new")]);
+    assert_eq!(
+        registry.ids_of(ConnectionKind::Background),
+        vec![viewer("bg")]
+    );
+}
+
+#[test]
+fn a_background_link_is_never_sent_what_only_a_window_renders() {
+    use crate::web::protocol::{DirListing, HostMessage, MessageLevel, TermBytes};
+
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let mut bg = register_as(
+        &mut registry,
+        "bg",
+        ConnectionKind::Background,
+        &token(),
+        "A",
+    );
+    let mut win = register_as(&mut registry, "win", ConnectionKind::Window, &token(), "B");
+
+    let bytes = ServerMsg::TermBytes(TermBytes {
+        terminal_id: TerminalId::new("t"),
+        offset: 0,
+        data: Vec::new(),
+        truncated: false,
+    });
+    let message = ServerMsg::Delta(Delta::HostMessage(HostMessage {
+        id: 1,
+        at_ms: 0,
+        level: MessageLevel::Info,
+        text: "hi".to_string(),
+    }));
+    let status = ServerMsg::Delta(Delta::WorkerStatus(WorkerStatusView::default()));
+    registry.send_all(&bytes);
+    registry.send_all(&message);
+    registry.send_all(&status);
+    registry.send_to(
+        &viewer("bg"),
+        ServerMsg::DirListing(DirListing {
+            seq: 1,
+            path: "/home/ruud".to_string(),
+            parent: None,
+            home: "/home/ruud".to_string(),
+            entries: Vec::new(),
+            truncated: false,
+        }),
+    );
+
+    assert!(
+        matches!(
+            drained(&mut bg).as_slice(),
+            [ServerMsg::Delta(Delta::WorkerStatus(_))]
+        ),
+        "only the status got through"
+    );
+    assert_eq!(drained(&mut win).len(), 3, "the window gets everything");
+    assert!(
+        registry.viewer(&viewer("bg")).is_some(),
+        "filtered, not evicted"
+    );
+}
+
+#[test]
+fn the_background_filter_denies_the_window_only_frames_and_allows_the_rest() {
+    use crate::web::protocol::{CloneProgress, NotificationSoundView, NotificationView};
+
+    assert!(!background_may_receive(&ServerMsg::CloneProgress(
+        CloneProgress {
+            clone_id: 1,
+            url: String::new(),
+            phase: String::new(),
+            percent: None,
+        }
+    )));
+    assert!(background_may_receive(&ServerMsg::Delta(
+        Delta::Notification(NotificationView {
+            at_ms: 0,
+            title: "done".to_string(),
+            body: String::new(),
+            sound: NotificationSoundView::Completion,
+        })
+    )));
+    assert!(background_may_receive(&ServerMsg::Delta(
+        Delta::Connections(ConnectionsView::default())
+    )));
+    assert!(background_may_receive(&revoked_frame()));
+}
+
+/// `same_device` is relative to the recipient's own credential.
+#[test]
+fn the_connections_view_says_whether_the_window_is_the_recipients_device() {
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let mine = token();
+    let theirs = token();
+    let _w = register_as(
+        &mut registry,
+        "win",
+        ConnectionKind::Window,
+        &mine,
+        "FlightDeck Desktop/1.0.0 (studio)",
+    );
+    let _b1 = register_as(&mut registry, "b1", ConnectionKind::Background, &mine, "x");
+    let _b2 = register_as(
+        &mut registry,
+        "b2",
+        ConnectionKind::Background,
+        &theirs,
+        "y",
+    );
+
+    let for_me = registry.connections_view(Some(&mine));
+    let window = for_me.window.expect("a window");
+    assert!(window.same_device);
+    assert_eq!(window.label, "studio", "a Desktop is named by its host");
+    assert_eq!(window.address.as_deref(), Some("100.64.1.9"));
+    assert_eq!(for_me.background_links, 2);
+
+    let for_them = registry.connections_view(Some(&theirs));
+    assert!(!for_them.window.expect("a window").same_device);
+}
+
+#[test]
+fn a_device_label_is_a_desktops_hostname_or_else_the_chip_label() {
+    let identity = |agent: Option<&str>| ViewerIdentity {
+        address: IpAddr::V4(Ipv4Addr::new(100, 64, 1, 9)),
+        user_agent_label: agent.map(str::to_string),
+        token: token(),
+    };
+    assert_eq!(
+        identity(Some("FlightDeck Desktop/0.41.0 (ruuds-mbp)")).device_label(),
+        "ruuds-mbp"
+    );
+    assert_eq!(
+        identity(Some("FlightDeck Desktop")).device_label(),
+        "100.64.1.9 · FlightDeck Desktop"
+    );
+    assert_eq!(
+        identity(Some("Chrome on macOS")).device_label(),
+        "100.64.1.9 · Chrome on macOS"
+    );
+    assert_eq!(identity(None).device_label(), "100.64.1.9");
+}
+
+// ---------------------------------------------------------------------------
+// The worker's snapshot (v7)
+// ---------------------------------------------------------------------------
+
+fn worker_state() -> HostState {
+    use crate::web::protocol::{HostMessage, MessageLevel};
+    HostState {
+        host_kind: HostKind::Worker,
+        worker: Some(WorkerHostState {
+            home: "/home/ruud".to_string(),
+            shell: None,
+            health: None,
+            status: WorkerStatusView::default(),
+            host_messages: vec![HostMessage {
+                id: 1,
+                at_ms: 0,
+                level: MessageLevel::Info,
+                text: "unread".to_string(),
+            }],
+        }),
+        ..HostState::default()
+    }
+}
+
+#[test]
+fn a_worker_snapshot_is_made_for_its_recipient() {
+    let shared = test_shared_for(HostKind::Worker);
+    shared.state.send_replace(Arc::new(worker_state()));
+    let device = token();
+    let _w = register_as(
+        &mut shared.registry(),
+        "win",
+        ConnectionKind::Window,
+        &device,
+        "A",
+    );
+    let _b = register_as(
+        &mut shared.registry(),
+        "bg",
+        ConnectionKind::Background,
+        &token(),
+        "B",
+    );
+
+    let window = shared.snapshot_for(&viewer("win"), Seat::Writing, 0, 7);
+    assert_eq!(window.host_kind, Some(HostKind::Worker));
+    let worker = window.worker.expect("a worker snapshot");
+    assert_eq!(worker.home, "/home/ruud");
+    assert_eq!(worker.host_messages.len(), 1, "the window reads them");
+    assert!(worker.connections.window.expect("a window").same_device);
+    assert_eq!(worker.connections.background_links, 1);
+    let quit = window
+        .commands
+        .iter()
+        .find(|c| c.id == crate::web::protocol::command::QUIT)
+        .expect("quit is listed");
+    assert_eq!(
+        quit.refusal.as_deref(),
+        crate::web::commands::worker_refusal(crate::web::protocol::command::QUIT)
+    );
+    assert_eq!(window.seats.len(), 1, "no desktop row on a worker");
+
+    let background = shared.snapshot_for(&viewer("bg"), Seat::Observing, 0, 7);
+    let worker = background.worker.expect("a worker snapshot");
+    assert!(
+        worker.host_messages.is_empty(),
+        "a background link is not somewhere a message is read"
+    );
+    assert!(!worker.connections.window.expect("a window").same_device);
+}
+
+/// A TUI host never sends worker state, whatever was published, and keeps
+/// sending the inventory unchanged.
+#[test]
+fn a_tui_snapshot_carries_no_worker_state() {
+    let shared = test_shared();
+    let mut state = worker_state();
+    state.host_kind = HostKind::Tui;
+    shared.state.send_replace(Arc::new(state));
+    let snapshot = shared.snapshot_for(&viewer("nobody"), Seat::Observing, 0, 7);
+    assert_eq!(snapshot.worker, None);
+    assert_eq!(snapshot.host_kind, Some(HostKind::Tui));
+    assert_eq!(snapshot.commands, crate::web::commands::inventory());
 }
