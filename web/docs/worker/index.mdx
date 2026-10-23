@@ -19,7 +19,7 @@ or more powerful than your laptop, while you control them from the Desktop.
  worker machine (Linux / macOS)                  your machine
  ┌────────────────────────────────┐              ┌──────────────────────────┐
  │ flightdeck worker              │   Tailscale  │ FlightDeck Desktop       │
- │  projects, agents, git, shell  │◄────────────►│  Workers list            │
+ │  projects, agents, git, shell  │◄────────────►│  Workers section         │
  └────────────────────────────────┘              │  remote window           │
                                                  └──────────────────────────┘
 ```
@@ -72,28 +72,36 @@ Pairing needs a shell on the worker, so SSH in first.
    flightdeck worker pair
    ```
 
-   It prints the worker's address (its Tailscale MagicDNS name when it has one,
-   otherwise its `100.x` address, with the port) and a **one-time code**. The code
-   works once and expires after **120 seconds**.
+   ```text
+   Pairing code: 4821   (valid for 120 s, single use)
+   Address:      box.tail1234.ts.net:7420
+   ```
+
+   The address is the worker's Tailscale MagicDNS name when it has one, otherwise
+   its `100.x` address, with the port. The code works once and expires after
+   **120 seconds**; run `pair` again for a new one. `pair --json` prints the same
+   information for scripts.
 
 2. On your machine, open FlightDeck Desktop, choose **Connect to remote…** and
    enter the address and the code.
 
 The Desktop saves a token, so you only do this once per Desktop. Saved workers
-appear in the **Workers** list in the launcher. To pair another Desktop, run
+appear in the **WORKERS** section of the launcher. To pair another Desktop, run
 `flightdeck worker pair` again.
 
-If `pair` says the worker is not listening, see
-[No Tailscale address](#no-tailscale-address).
+If the worker isn't running, `pair` says so and tells you to run
+`flightdeck worker start`. If it prints a warning that the worker is not
+listening, see [No Tailscale address](#no-tailscale-address).
 
 ## Log in to your agents
 
 Each worker window has a **Worker shell** tab, first in the tab bar. It is a login
-shell on the worker, in the worker account's home directory. You don't need SSH
-for it.
+shell on the worker, in the worker account's home directory. A worker window has
+no SSH tab, so you don't need SSH for it. If the shell exits or hangs, choose
+**Restart shell**.
 
 Open it and log in to each agent CLI you plan to use, the same way you would on
-any machine: run `claude`, `codex`, `opencode` or `cursor-agent` and follow its
+any machine: run `claude`, `codex`, `opencode` or `cursor-agent` (the Cursor CLI) and follow its
 login flow. FlightDeck never stores, forwards or injects agent credentials. Agents
 run with the worker account's own environment and use whatever login they find
 there.
@@ -122,14 +130,16 @@ Desktop shows git's own error message.
 
 ## Open projects
 
-In a worker window, open a project in one of three ways:
+In a worker window, choose **Open a project…** (or Open Project from the command
+palette). The picker replaces the window body and has three parts:
 
-- **Open a folder.** Browse the worker's filesystem from its home directory and
-  open any git repository there.
-- **Pick a scanned project.** FlightDeck scans `projects_root` (default
-  `~/flightdeck`), two levels deep, for git repositories and lists them.
-- **Clone a git URL.** The worker clones into `projects_root/<name>`, shows
-  progress, and opens the project.
+- **PROJECTS IN `<projects_root>`.** FlightDeck scans `projects_root` (default
+  `~/flightdeck`), two levels deep, for git repositories and lists them. Choose
+  **Open** next to one.
+- **BROWSE.** Browse the worker's filesystem from its home directory and open any
+  git repository there.
+- **CLONE.** Enter a git URL and, optionally, a folder name. The worker clones
+  into `projects_root/<name>`, shows progress, and opens the project.
 
 Browsing, opening and cloning are limited to the worker account's home directory.
 Anything that resolves outside it, including through a symlink, is refused.
@@ -137,18 +147,37 @@ Anything that resolves outside it, including through a symlink, is refused.
 ## One window at a time
 
 A worker has one remote window at a time. If you open the worker from a second
-Desktop, the second one takes over. The first window shows who took over and
-offers **Reconnect**. Its pairing stays valid.
+Desktop, the second one takes over. The first window shows **Taken over by
+`<device>`** with a **Reconnect** button, which takes the worker back. Its
+pairing stays valid.
+
+If the worker is stopped, the window shows **The worker stopped.** and tells you
+to run `flightdeck worker start` on the machine, then **Reconnect**.
 
 When no window is open, each Desktop keeps a status-only background link to its
-saved workers. The **Workers** list shows whether each worker is online, how many
-agents need you, its version and its health, and the Desktop raises OS
-notifications when an agent needs input, fails or finishes. Background links
-carry no terminal output and can't send input, and they never cause a takeover.
+saved workers. Each row in the **WORKERS** section shows a status pill:
 
-Host messages (for example a refused merge or a failed clone) are shown in the
-open window. While nothing is attached, the worker keeps the last 100 and shows
-them on the next attach.
+| Pill | Meaning |
+| --- | --- |
+| **connecting…** | The Desktop is dialling the worker. |
+| **online** | Connected. The row shows the worker's health (for example `load 0.42 · 18 GB free · 3 agents`), how many agents need you, and its version. |
+| **offline** | Unreachable. The row shows when it was last seen, and the Desktop retries. |
+| **not paired** | This Desktop's token is gone. **Connect to remote…** pairs it again. |
+| **access revoked** | The worker revoked this Desktop. Pair again with a new code. |
+| **update needed** | The Desktop and the worker speak protocols too far apart. The row says which side to update. |
+
+A **version differs** badge means the worker runs a different FlightDeck version
+than the Desktop. Click a row to open that worker's window.
+
+The Desktop raises OS notifications for the worker's agents (needs input, error,
+done), the way a local FlightDeck would. They are not posted while a window to
+that worker is open, because that window notifies instead. When several Desktop
+processes run on one machine, only one posts them. Background links carry no
+terminal output and can't send input, and they never cause a takeover.
+
+Host messages (for example a refused merge or a failed clone) appear in the open
+window. While nothing is attached, the worker keeps the last 100. The next window
+shows them as **N messages while you were away**.
 
 ## Security
 
@@ -165,7 +194,8 @@ them on the next attach.
   means being logged in as that account.
 - **Tokens are per Desktop and revocable.** List them with
   `flightdeck worker devices`. Revoke one with `flightdeck worker revoke <device>`,
-  by id, label or a unique id prefix. Its live connections close at once.
+  by id, by label (case-insensitive) or by a unique id prefix. Its live
+  connections close at once, and it must pair again to reconnect.
 - **No credentials cross the wire.** Nothing leaves the WireGuard tunnel, so there
   is no TLS, and the worker never handles your agent or git logins.
 
@@ -174,8 +204,9 @@ flightdeck worker devices
 flightdeck worker revoke mbp
 ```
 
-`devices` shows each Desktop's label, when it paired, when it was last seen, and
-whether it is attached, a background link, or offline.
+`devices` prints a table with each Desktop's id, label, state (attached,
+background or offline; revoked ones are marked), when it paired, when it was last
+seen and its address. `devices --json` prints a bare array for scripts.
 
 Whether agents run in containers or worktree isolation follows your normal
 [configuration](/reference/configuration), with no worker-specific default.
@@ -221,15 +252,16 @@ resume command, as in the terminal UI. A turn that was in progress is lost.
 
 A small supervisor restarts the worker if it crashes, waiting longer after each
 crash (from 1 second up to 60). If the worker crashes 5 times within 10 minutes,
-the supervisor gives up. `flightdeck worker status` then shows why, and
-`flightdeck worker logs` shows the details. Fix the cause and run
+the supervisor gives up. `flightdeck worker status` then shows `Gave up:` with the
+reason (for example `5 crashes within 10 minutes`), and `flightdeck worker logs`
+shows the details. A run that lasts at least a minute resets the wait to 1 second. Fix the cause and run
 `flightdeck worker start`. The supervisor also gives up at once if the global
-config is invalid.
+config is invalid, or if another worker already runs for the account.
 
 ### No Tailscale address
 
 If the worker has no Tailscale address (Tailscale is down or logged out), it keeps
-running and your agents keep working. `status` reports **not listening: no
+running and your agents keep working. `status` reports **Not listening: no
 Tailscale address**. The worker checks every 5 seconds and starts listening as
 soon as an address appears, and rebinds if the address changes. Desktops
 reconnect on their own. Run `tailscale up` on the worker if it stays that way.
@@ -244,15 +276,19 @@ flightdeck worker restart
 ```
 
 The restart makes the worker and its supervisor run the new binary. Until then,
-`status` shows a different `version` for the running worker than for the CLI, and
-the Desktop warns about the mismatch. Updating from the Desktop is not available
+`status` shows the running worker's version with a note that the CLI differs,
+and the Desktop shows a **version differs** badge in the launcher and a banner in
+the worker window: "This worker runs FlightDeck `<worker>`; this app was built with
+`<app>`. Update it from the worker shell: `flightdeck update`, then
+`flightdeck worker restart`." Updating from the Desktop is not available
 in this version.
 
 ### The terminal UI on a worker machine
 
 While a worker runs, starting the terminal UI or a local Desktop window on that
-machine refuses and tells you to control it from the Desktop or run
-`flightdeck worker stop`. Desktop remote windows on that machine are not affected.
+machine refuses: "A FlightDeck worker is running on this machine and serving its
+projects. Control it from FlightDeck Desktop, or run `flightdeck worker stop`."
+Desktop remote windows on that machine are not affected.
 
 ## Configuration
 
@@ -279,3 +315,8 @@ An attached window resizes terminals to fit its panes, so the defaults only appl
 when nothing is attached. An invalid `[worker]` table stops the worker from
 starting. Run `flightdeck worker logs` to see the message. These settings aren't
 in the configuration manager, so edit the file and run `flightdeck worker restart`.
+
+To change other settings (agents, git, UI) for the worker's projects, open the
+configuration manager from the worker window: choose **Open Configuration** in the
+command palette. It edits the configuration on the worker, and it works in a
+remote window on any host, not only workers.
