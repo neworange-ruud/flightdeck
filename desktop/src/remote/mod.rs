@@ -30,14 +30,40 @@
 //! larger than this window, the element pans over it rather than clipping it
 //! (R17, see `crate::terminal::pan`). Its emulator never
 //! answers queries — the host's already did ([`Terminal::mirror`]).
+//!
+//! ## A worker host
+//!
+//! A FlightDeck worker (`specs/WORKER_PRD.md`) has no screen of its own, so
+//! this window is where its geometry, its projects and its words come from:
+//!
+//! - **Tabs.** The first tab is the worker's own shell ([`Tab::WorkerShell`],
+//!   mirrored like any terminal, typed into by its wire id), not this
+//!   machine's SSH shell ([`Tab::SshShell`]), which only other hosts get.
+//! - **Geometry (W5).** The pane size the terminal element measures is sent
+//!   for the terminal on screen whenever it differs from the last size sent
+//!   for it; the host resizes that PTY and its grid comes back at that size.
+//!   Other hosts keep D4: their grid is letterboxed or panned here.
+//! - **Projects.** Open Project is the project picker ([`projects`]): scan,
+//!   browse, clone.
+//! - **Host messages and notifications** ([`messages`]): a message is a
+//!   status-bar notice (an error also an overlay); the ones kept while no
+//!   window was attached come back together as one overlay; notifications
+//!   are posted on this machine, named after the window.
+//! - **Takeover.** A worker serves one window; another one attaching ends
+//!   this link with [`LinkEnd::TakenOver`], and Reconnect takes it back.
+//!
+//! The host's configuration manager ([`RemoteConfigEditor`]) is offered on
+//! every host kind that forwards it (design A1): staged here, drawn with the
+//! local manager's card, saved in one command.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 use flightdeck::app::commands::Selector;
 use flightdeck::app::keymap::encode_paste;
 use flightdeck::app::modes::InputMode;
-use flightdeck::contracts::{PtySize, TabId};
+use flightdeck::contracts::{Notification, NotificationSound, Notifier, PtySize, TabId};
 use flightdeck::host::{
     GitStatusView, HostEvent, MessageView, OverlayInput, OverlayKey, OverlayView,
 };
@@ -47,10 +73,14 @@ use flightdeck::tui::palette::FrontEndAction;
 use flightdeck::view::TerminalRef;
 use flightdeck::web::client::store::SavedRemote;
 use flightdeck::web::client::views::{self, DialogDraft, LocalAction, RemoteAction};
-use flightdeck::web::client::{user_agent, LinkConfig};
+use flightdeck::web::client::worker::OpenedProject;
+use flightdeck::web::client::{client_label, LinkConfig};
+use flightdeck::web::client::{CloneEvent, EditorEffect, ProjectPicker, RemoteConfigEditor};
 use flightdeck::web::client::{LinkEnd, LinkState, RemoteClient, RemoteWorkspace};
 use flightdeck::web::protocol::{
-    AckOutcome, ErrorCode, Geometry, ImagePaste, ProjectId, SeatRequest, TerminalId, TerminalRole,
+    command as names, AckOutcome, ErrorCode, Geometry, HostKind, ImagePaste, MessageLevel,
+    NotificationSoundView, NotificationView, ProjectId, SeatRequest, TerminalId, TerminalRole,
+    WORKER_SHELL_TERMINAL_ID,
 };
 use gpui::{App, AppContext, Context, Task};
 
@@ -58,6 +88,8 @@ use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
 
 pub mod connect;
+pub mod messages;
+pub mod projects;
 pub mod shell;
 pub mod window;
 
@@ -77,12 +109,41 @@ struct Mirror {
 #[derive(Debug, Clone, PartialEq)]
 enum Local {
     None,
-    Palette { filter: String, selected: usize },
+    Palette {
+        filter: String,
+        selected: usize,
+    },
     Message(String),
     Help,
     About,
     GitStatus(GitStatusView),
+    /// The host's configuration manager, staged here.
+    Config(Box<RemoteConfigEditor>),
 }
+
+/// Which tab of the window is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// The selected project: its sidebar, git strip and terminal.
+    Project,
+    /// This machine's `ssh` to the host ([`shell`]); hosts that are not
+    /// workers.
+    SshShell,
+    /// A worker's own shell, mirrored like the host's terminals.
+    WorkerShell,
+}
+
+/// Dials the host again for Reconnect: a new client on the window's own
+/// link configuration (a scripted one in tests).
+pub type Dialer = Rc<dyn Fn() -> RemoteClient>;
+
+/// Why a worker command could not be sent.
+const WORKER_NOT_SENT: &str = "Not connected to the worker — nothing was sent.";
+
+/// Why a host command is refused on the worker shell's tab.
+pub const WORKER_SHELL_COMMAND_REFUSAL: &str = "Switch to a project tab to run host commands: \
+                                                the worker shell is not one of the host's \
+                                                sessions.";
 
 /// The remote window's entity. See the module docs.
 pub struct RemoteModel {
@@ -114,10 +175,36 @@ pub struct RemoteModel {
     /// target), so a hand edit applies without reconnecting. None in a window
     /// that was not opened from the real file.
     remotes: connect::Store,
-    /// The SSH shell tab is on screen ([`shell`]) instead of a project. The
-    /// host's terminals are hidden then, so nothing typed or run here goes
-    /// to them.
-    shell: bool,
+    /// The tab on screen. On the SSH shell's ([`shell`]) the host's
+    /// terminals are hidden, so nothing typed or run here goes to them; on
+    /// the worker shell's, what is typed goes to the worker shell.
+    tab: Tab,
+    /// The host kind saved for this remote by an earlier attach, so a worker
+    /// window looks like one before this attach answers.
+    saved_kind: Option<HostKind>,
+    /// Dials again for Reconnect. None in a window that cannot (tests that
+    /// do not ask for it).
+    dialer: Option<Dialer>,
+    /// The size the terminal element last measured for the pane.
+    viewport: Option<PtySize>,
+    /// The size last sent to a worker for each terminal (W5), so a size is
+    /// sent once, not every frame.
+    sent_sizes: HashMap<TerminalId, PtySize>,
+    /// A worker's project picker, while it is open.
+    picker: Option<ProjectPicker>,
+    /// A project the worker opened for the picker, to look at once it is in
+    /// the workspace.
+    pending_open: Option<OpenedProject>,
+    /// The seq of the last `open_configuration` (a read or a save), whose ack
+    /// is the configuration manager's.
+    config_seq: Option<u64>,
+    /// The project the configuration manager was asked for.
+    config_project: Option<ProjectId>,
+    /// The next snapshot's host messages are a replay of the ones kept while
+    /// this window was away (set while the link is not live).
+    awaiting_replay: bool,
+    /// Where a worker's notifications are posted: this machine's notifier.
+    notifier: Rc<dyn Notifier>,
     /// What the program on screen copied with OSC 52 (Claude Code's own
     /// mouse selection does), for the turn to put on this machine's
     /// clipboard: the host's emulator cannot, its clipboard is not ours.
@@ -151,7 +238,17 @@ impl RemoteModel {
                 fs: std::rc::Rc::new(flightdeck::contracts::real::RealFs),
                 path: None,
             },
-            shell: false,
+            tab: Tab::Project,
+            saved_kind: None,
+            dialer: None,
+            viewport: None,
+            sent_sizes: HashMap::new(),
+            picker: None,
+            pending_open: None,
+            config_seq: None,
+            config_project: None,
+            awaiting_replay: true,
+            notifier: Rc::new(flightdeck::notify::SystemNotifier),
             copied: None,
             #[cfg(test)]
             dispatched: Vec::new(),
@@ -171,7 +268,22 @@ impl RemoteModel {
 
     /// Read per-remote settings from `remotes`.
     pub fn set_remotes(&mut self, remotes: connect::Store) {
+        self.saved_kind = remotes
+            .load()
+            .get(&self.address)
+            .and_then(|saved| saved.host_kind);
         self.remotes = remotes;
+    }
+
+    /// Dial with `dialer` when Reconnect is asked for.
+    pub fn set_dialer(&mut self, dialer: Dialer) {
+        self.dialer = Some(dialer);
+    }
+
+    /// Post a worker's notifications through `notifier` instead of the OS's.
+    #[cfg(test)]
+    pub fn set_notifier(&mut self, notifier: Rc<dyn Notifier>) {
+        self.notifier = notifier;
     }
 
     /// Use this text size for the remote terminals.
@@ -213,16 +325,178 @@ impl RemoteModel {
         self.notice.as_deref()
     }
 
+    /// The tab on screen.
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
     /// Whether the SSH shell tab is on screen.
     pub fn shell_active(&self) -> bool {
-        self.shell
+        self.tab == Tab::SshShell
+    }
+
+    /// Whether the worker shell's tab is on screen.
+    pub fn worker_shell_active(&self) -> bool {
+        self.tab == Tab::WorkerShell
+    }
+
+    /// Whether the host is a worker — or, before this attach has answered,
+    /// was one the last time.
+    pub fn is_worker(&self) -> bool {
+        let ws = self.workspace();
+        match ws.ready {
+            true => ws.is_worker(),
+            false => self.saved_kind == Some(HostKind::Worker),
+        }
     }
 
     /// Show the SSH shell tab (its tab's click). The window starts the shell
-    /// the first time.
+    /// the first time. A worker has none: it has its own shell.
     pub fn show_shell(&mut self) {
-        self.shell = true;
+        if self.is_worker() {
+            return self.show_worker_shell();
+        }
+        self.tab = Tab::SshShell;
         self.local = Local::None;
+    }
+
+    /// Show the worker shell's tab (its tab's click). Its keys are the
+    /// shell's: there is no APP mode on it.
+    pub fn show_worker_shell(&mut self) {
+        self.tab = Tab::WorkerShell;
+        self.mode = InputMode::Terminal;
+        self.local = Local::None;
+    }
+
+    /// The worker's shell, as the worker last described it.
+    pub fn worker_shell(&self) -> Option<&flightdeck::web::protocol::WorkerShellView> {
+        self.workspace().worker_shell()
+    }
+
+    /// Start the worker shell again after it exited (its Restart shell).
+    pub fn restart_worker_shell(&mut self) {
+        if self.client.restart_worker_shell().is_none() {
+            self.local = Local::Message(WORKER_NOT_SENT.to_string());
+        }
+    }
+
+    /// The version-skew banner's text, when the worker's FlightDeck is not
+    /// the core this app was built with.
+    pub fn skew_warning(&self) -> Option<String> {
+        let ws = self.workspace();
+        if !ws.is_worker() {
+            return None;
+        }
+        messages::skew_warning(&ws.host_version, flightdeck::VERSION)
+    }
+
+    /// The project picker, while it is open.
+    pub fn picker(&self) -> Option<&ProjectPicker> {
+        self.picker.as_ref()
+    }
+
+    /// Open the project picker (Open Project on a worker): scan the projects
+    /// root and list `$HOME`. Open already, it is refreshed.
+    pub fn open_picker(&mut self) {
+        let home = self
+            .workspace()
+            .worker
+            .as_ref()
+            .map(|w| w.home.clone())
+            .unwrap_or_default();
+        let mut picker = self
+            .picker
+            .take()
+            .unwrap_or_else(|| ProjectPicker::new(home));
+        let cwd = picker.cwd.clone();
+        picker.scan_sent(self.client.scan_projects());
+        picker.browse_sent(self.client.browse_dir(cwd.as_deref(), picker.show_hidden));
+        self.picker = Some(picker);
+        self.local = Local::None;
+    }
+
+    /// Close the project picker. A clone it started carries on; how it ended
+    /// is said in the status bar.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// List `path` in the picker (`None`: `$HOME`).
+    pub fn picker_browse(&mut self, path: Option<&str>) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let path = path.map(str::trim).filter(|p| !p.is_empty());
+        picker.browse_sent(self.client.browse_dir(path, picker.show_hidden));
+    }
+
+    /// Up one folder from the one the picker lists.
+    pub fn picker_up(&mut self) {
+        let parent = self.picker.as_ref().and_then(|p| p.parent.clone());
+        if let Some(parent) = parent {
+            self.picker_browse(Some(&parent));
+        }
+    }
+
+    /// List hidden folders too, or not, and list the same folder again.
+    pub fn picker_toggle_hidden(&mut self) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        picker.show_hidden = !picker.show_hidden;
+        let cwd = picker.cwd.clone();
+        self.picker_browse(cwd.as_deref());
+    }
+
+    /// Open the repository at `path` on the worker as a project.
+    pub fn picker_open(&mut self, path: &str) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        picker.open_sent(self.client.open_project_path(path), path);
+    }
+
+    /// Clone `url` (into `name`, if one is given) and open it.
+    pub fn picker_clone(&mut self, url: &str, name: &str) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let url = url.trim();
+        if url.is_empty() {
+            picker.error = Some("Type the URL of the repository to clone.".to_string());
+            return;
+        }
+        picker.clone_url = url.to_string();
+        picker.clone_name = name.trim().to_string();
+        let name = (!picker.clone_name.is_empty()).then_some(picker.clone_name.as_str());
+        let seq = self.client.clone_project(url, name);
+        picker.clone_sent(seq, url);
+    }
+
+    /// The pane size the terminal element measured. On a worker it is sent
+    /// for the terminal on screen on the next turn (W5); any other host owns
+    /// its geometry (D4) and is told nothing.
+    pub fn set_viewport(&mut self, size: PtySize) {
+        self.viewport = Some(size);
+    }
+
+    /// Dial the host again with this window's link configuration — on a
+    /// worker, taking it back from the window that took it over.
+    pub fn reconnect(&mut self) {
+        let Some(dialer) = self.dialer.clone() else {
+            return;
+        };
+        // The old link has ended; dropping it closes what is left of it.
+        self.client = dialer();
+        self.terminals.clear();
+        self.sent_sizes.clear();
+        self.local = Local::None;
+        self.draft = None;
+        self.notice = None;
+        self.picker = None;
+        self.pending_open = None;
+        self.config_seq = None;
+        self.awaiting_replay = true;
     }
 
     /// Where the SSH shell connects: the target saved for this remote by
@@ -264,16 +538,34 @@ impl RemoteModel {
         }
     }
 
-    /// The terminal on screen: this window's selected terminal.
+    /// The terminal on screen: this window's selected terminal, or the
+    /// worker shell on its tab.
     pub fn active_terminal(&self) -> Option<&Terminal> {
-        let id = &self.workspace().selected_terminal()?.terminal_id;
-        self.terminals.get(id).map(|m| &m.terminal)
+        let id = self.on_screen()?;
+        self.terminals.get(&id).map(|m| &m.terminal)
     }
 
     /// The terminal on screen, for view-local state (selection, scrollback).
     pub fn active_terminal_mut(&mut self) -> Option<&mut Terminal> {
-        let id = self.workspace().selected_terminal()?.terminal_id.clone();
+        let id = self.on_screen()?;
         self.terminals.get_mut(&id).map(|m| &mut m.terminal)
+    }
+
+    /// The wire id of the terminal on screen: none on the SSH shell's tab,
+    /// the worker shell on its own.
+    fn on_screen(&self) -> Option<TerminalId> {
+        match self.tab {
+            Tab::SshShell => None,
+            Tab::WorkerShell => Some(
+                self.worker_shell()
+                    .map(|shell| shell.terminal_id.clone())
+                    .unwrap_or_else(|| WORKER_SHELL_TERMINAL_ID.into()),
+            ),
+            Tab::Project => self
+                .workspace()
+                .selected_terminal()
+                .map(|t| t.terminal_id.clone()),
+        }
     }
 
     /// The overlay to draw: the host's shared dialog first (D13), else this
@@ -292,6 +584,7 @@ impl RemoteModel {
             Local::Help => ws.help.clone().map(OverlayView::Help),
             Local::About => ws.about.clone().map(OverlayView::About),
             Local::GitStatus(view) => Some(OverlayView::GitStatus(view.clone())),
+            Local::Config(editor) => Some(OverlayView::Config(editor.overlay())),
         }
     }
 
@@ -332,8 +625,121 @@ impl RemoteModel {
         let mut changed = self.client.pump();
         changed |= self.track_dialog();
         changed |= self.take_answers();
+        changed |= self.take_worker_news();
+        changed |= self.follow_host_kind();
+        changed |= self.select_opened();
         changed |= self.sync_terminals();
+        self.sync_geometry();
         changed
+    }
+
+    /// A worker's words since the last turn: its host messages (a notice,
+    /// an error also an overlay, a replay on attach one overlay of them all)
+    /// and its notifications, posted on this machine.
+    fn take_worker_news(&mut self) -> bool {
+        let live = self.client.state().is_live();
+        let attached = live && self.workspace().ready;
+        let replay = self.awaiting_replay && attached;
+        if attached {
+            self.awaiting_replay = false;
+        } else if !live {
+            self.awaiting_replay = true;
+        }
+        let mut changed = false;
+        let new = self.client.take_new_messages();
+        if replay && !new.is_empty() {
+            self.show_message(messages::away_text(&new));
+            changed = true;
+        } else {
+            for message in new {
+                self.notice = Some(messages::line(&message));
+                if message.level == MessageLevel::Error {
+                    self.show_message(message.text);
+                }
+                changed = true;
+            }
+        }
+        for notification in self.client.take_notifications() {
+            self.notifier.notify(&self.notification(notification));
+        }
+        changed
+    }
+
+    /// A message overlay, unless something the person is working in (the
+    /// palette, the configuration manager) is up: then the notice says it.
+    fn show_message(&mut self, text: String) {
+        if matches!(self.local, Local::Palette { .. } | Local::Config(_)) {
+            self.notice = Some(text.lines().next().unwrap_or_default().to_string());
+        } else {
+            self.local = Local::Message(text);
+        }
+    }
+
+    /// A worker's notification as this machine posts it: named after the
+    /// window, so two workers' agents are told apart.
+    fn notification(&self, view: NotificationView) -> Notification {
+        Notification {
+            title: format!("{}: {}", self.label, view.title),
+            body: view.body,
+            sound: match view.sound {
+                NotificationSoundView::None => NotificationSound::None,
+                NotificationSoundView::Completion => NotificationSound::Completion,
+                NotificationSoundView::InputRequired => NotificationSound::InputRequired,
+            },
+        }
+    }
+
+    /// The tabs follow what the host turned out to be: a worker has no SSH
+    /// shell tab, and anything else no worker shell.
+    fn follow_host_kind(&mut self) -> bool {
+        if !self.workspace().ready {
+            return false;
+        }
+        let worker = self.workspace().is_worker();
+        match self.tab {
+            Tab::SshShell if worker => self.tab = Tab::Project,
+            Tab::WorkerShell if !worker => self.tab = Tab::Project,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Look at the project the picker had the worker open, once it is in
+    /// the workspace.
+    fn select_opened(&mut self) -> bool {
+        let Some(opened) = &self.pending_open else {
+            return false;
+        };
+        let found = self
+            .workspace()
+            .projects
+            .iter()
+            .find(|p| opened.project_id.as_ref() == Some(&p.project_id) || p.root == opened.path)
+            .map(|p| p.project_id.clone());
+        let Some(id) = found else {
+            return false;
+        };
+        self.pending_open = None;
+        self.client.workspace_mut().select_project(&id);
+        self.tab = Tab::Project;
+        true
+    }
+
+    /// Send a worker the pane size for the terminal on screen, once per size
+    /// per terminal (W5). Nothing goes to any other host (D4).
+    fn sync_geometry(&mut self) {
+        if !self.client.is_worker() {
+            return;
+        }
+        let (Some(size), Some(id)) = (self.viewport, self.on_screen()) else {
+            return;
+        };
+        if !self.terminals.contains_key(&id) || self.sent_sizes.get(&id) == Some(&size) {
+            return;
+        }
+        if self.client.resize_terminal(&id, size) {
+            self.sent_sizes.insert(id, size);
+        }
     }
 
     /// Keep the draft on the host's open dialog: a new dialog starts a new
@@ -357,9 +763,18 @@ impl RemoteModel {
     /// What the host answered: refusals as a message (the TUI shows its own
     /// the same way), outcomes in the status bar, panels as overlays.
     fn take_answers(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.take_picker_answers();
+        changed |= self.take_configuration();
         for ack in self.client.take_results() {
             changed = true;
+            if self.picker.as_mut().is_some_and(|p| p.on_ack(&ack)) {
+                continue;
+            }
+            if self.config_seq.is_some() && self.config_seq == Some(ack.seq) {
+                self.config_seq = None;
+                self.config_answered(ack.outcome, ack.detail);
+                continue;
+            }
             match (ack.outcome, ack.detail) {
                 (AckOutcome::Rejected, Some(detail)) => self.local = Local::Message(detail),
                 (_, Some(detail)) => self.notice = Some(detail),
@@ -372,6 +787,14 @@ impl RemoteModel {
         }
         for error in self.client.take_errors() {
             changed = true;
+            if self.picker.as_mut().is_some_and(|p| p.on_error(&error)) {
+                continue;
+            }
+            if error.seq.is_some() && error.seq == self.config_seq {
+                self.config_seq = None;
+                self.config_answered(AckOutcome::Rejected, Some(error.message));
+                continue;
+            }
             match error.code {
                 ErrorCode::SeatHeld | ErrorCode::ReadOnly => self.notice = Some(error.message),
                 _ => self.local = Local::Message(error.message),
@@ -381,26 +804,123 @@ impl RemoteModel {
             self.local = Local::GitStatus(views::git_status(&view));
             changed = true;
         }
+        changed |= self.close_opened_picker();
         changed
+    }
+
+    /// Feed the project picker what the worker answered: a listing, a scan,
+    /// a clone's progress and end (its acks are fed with the others).
+    fn take_picker_answers(&mut self) -> bool {
+        let mut changed = false;
+        let listing = self.client.take_dir_listing();
+        let scan = self.client.take_project_scan();
+        let clones = self.client.take_clone_events();
+        if let Some(picker) = self.picker.as_mut() {
+            if let Some(listing) = listing {
+                changed |= picker.on_listing(listing);
+            }
+            if let Some(scan) = scan {
+                changed |= picker.on_scan(scan);
+            }
+            for event in clones {
+                changed |= picker.on_clone_event(event);
+            }
+        } else {
+            // A clone the closed picker started: its end is a notice. A
+            // failure is also the worker's own error message.
+            for event in clones {
+                if let CloneEvent::Result(result) = event {
+                    self.notice = Some(match (result.ok, result.path, result.error) {
+                        (true, Some(path), _) => format!("Cloned {} into {path}.", result.url),
+                        (true, None, _) => format!("Cloned {}.", result.url),
+                        (false, _, error) => error.unwrap_or_else(|| "The clone failed.".into()),
+                    });
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// When the worker opened a project for the picker (an open's ack, a
+    /// clone's result), close the picker and go to that project.
+    fn close_opened_picker(&mut self) -> bool {
+        let Some(opened) = self.picker.as_mut().and_then(|p| p.opened.take()) else {
+            return false;
+        };
+        let status = self.picker.as_ref().and_then(|p| p.status.clone());
+        self.notice = Some(status.unwrap_or_else(|| format!("Opened {}.", opened.path)));
+        self.picker = None;
+        self.pending_open = Some(opened);
+        true
+    }
+
+    /// The configuration manager the host sent: a first answer opens it, a
+    /// later one (after a save) is its new truth.
+    fn take_configuration(&mut self) -> bool {
+        let Some(view) = self.client.take_configuration() else {
+            return false;
+        };
+        match &mut self.local {
+            Local::Config(editor) => editor.on_view(view),
+            _ => {
+                let editor = RemoteConfigEditor::new(view, self.config_project.clone());
+                self.local = Local::Config(Box::new(editor));
+            }
+        }
+        true
+    }
+
+    /// The host's word on an `open_configuration`: a refusal is the
+    /// manager's status line (or a message when it is not open), anything
+    /// else the window's notice.
+    fn config_answered(&mut self, outcome: AckOutcome, detail: Option<String>) {
+        if outcome != AckOutcome::Rejected {
+            if detail.is_some() {
+                self.notice = detail;
+            }
+        } else if let Local::Config(editor) = &mut self.local {
+            editor.on_refused(detail.unwrap_or_else(|| "The host refused the change.".to_string()));
+        } else {
+            self.local =
+                Local::Message(detail.unwrap_or_else(|| {
+                    "The host did not open its configuration manager.".to_string()
+                }));
+        }
+    }
+
+    /// Ask the host for its configuration manager, resolved for the project
+    /// this window looks at.
+    fn open_configuration(&mut self) {
+        let project = self
+            .workspace()
+            .selected_project()
+            .map(|p| p.project_id.clone());
+        match self.client.open_configuration(project.as_ref()) {
+            Some(seq) => {
+                self.config_seq = Some(seq);
+                self.config_project = project;
+            }
+            None => {
+                self.local =
+                    Local::Message("Not connected to the host — nothing was sent.".to_string())
+            }
+        }
     }
 
     /// Mirror every terminal the host streams and parse what arrived.
     fn sync_terminals(&mut self) -> bool {
+        // A worker's shell is streamed like any terminal.
         let wanted: Vec<(TerminalId, TerminalRole, String, Geometry)> = self
             .workspace()
-            .terminals()
-            .map(|t| (t.terminal_id.clone(), t.role, t.title.clone(), t.geometry))
+            .streamed_terminals()
+            .into_iter()
+            .map(|t| (t.terminal_id, t.role, t.title, t.geometry))
             .collect();
         let mut changed = false;
         // Only the terminal on screen may copy: the user selected in it. The
         // SSH shell tab hides them all.
-        let on_screen = match self.shell {
-            true => None,
-            false => self
-                .workspace()
-                .selected_terminal()
-                .map(|t| t.terminal_id.clone()),
-        };
+        let on_screen = self.on_screen();
         self.terminals
             .retain(|id, _| wanted.iter().any(|(w, ..)| w == id));
         for (id, role, title, geometry) in wanted {
@@ -480,7 +1000,7 @@ impl RemoteModel {
 
     /// [`RemoteModel::dispatch`] without a GPUI context.
     pub fn apply(&mut self, event: HostEvent) {
-        if self.shell && Self::hidden_from_shell(&event) {
+        if self.tab == Tab::SshShell && Self::hidden_from_shell(&event) {
             return;
         }
         match event {
@@ -496,8 +1016,13 @@ impl RemoteModel {
                 ));
                 self.run(route);
             }
-            HostEvent::RunPaletteAction(action) => self.run(views::route_palette(&action)),
+            HostEvent::RunPaletteAction(action) => {
+                let route = views::route_palette_for(self.workspace(), &action);
+                self.run(route)
+            }
             HostEvent::SwitchProject(selector) => self.step_project(selector),
+            // The worker shell has no APP mode: its keys are all the shell's.
+            HostEvent::FocusApp if self.tab == Tab::WorkerShell => {}
             HostEvent::FocusApp => self.mode = InputMode::App,
             HostEvent::FocusTerminal => {
                 if self.active_terminal().is_some() {
@@ -513,7 +1038,8 @@ impl RemoteModel {
             HostEvent::OpenHelp => self.local = Local::Help,
             HostEvent::Overlay(input) => self.overlay_input(input),
             HostEvent::Quit => self.close_requested = true,
-            // The host owns geometry (D4); a viewer never resizes a PTY.
+            // The host owns geometry (D4); a worker's is the pane's, which
+            // the terminal element reports ([`RemoteModel::set_viewport`]).
             HostEvent::Resize(_) => {}
             HostEvent::OpenProject(_) => {
                 self.local = Local::Message(
@@ -543,11 +1069,7 @@ impl RemoteModel {
     /// Keystrokes for the terminal on screen. Typing returns to the live
     /// screen, as it does locally.
     fn type_bytes(&mut self, bytes: Vec<u8>) {
-        let Some(id) = self
-            .workspace()
-            .selected_terminal()
-            .map(|t| t.terminal_id.clone())
-        else {
+        let Some(id) = self.on_screen() else {
             return;
         };
         if let Some(mirror) = self.terminals.get_mut(&id) {
@@ -565,11 +1087,7 @@ impl RemoteModel {
         if self.mode != InputMode::Terminal {
             return;
         }
-        let Some(id) = self
-            .workspace()
-            .selected_terminal()
-            .map(|t| t.terminal_id.clone())
-        else {
+        let Some(id) = self.on_screen() else {
             return;
         };
         if let Err(reason) = check_pasted_image(&image) {
@@ -621,7 +1139,7 @@ impl RemoteModel {
             .get(index)
             .map(|p| p.project_id.clone());
         if let Some(id) = id {
-            self.shell = false;
+            self.tab = Tab::Project;
             self.client.workspace_mut().select_project(&id);
         }
     }
@@ -637,13 +1155,13 @@ impl RemoteModel {
     }
 
     fn run(&mut self, action: RemoteAction) {
-        // Stepping through sessions, terminals or projects from the shell tab
+        // Stepping through sessions, terminals or projects from a shell tab
         // first goes back to the project.
         if let RemoteAction::Local(
             LocalAction::Session(_) | LocalAction::Terminal(_) | LocalAction::Project(_),
         ) = action
         {
-            if std::mem::take(&mut self.shell) {
+            if self.leave_shell_tab() {
                 return;
             }
         }
@@ -657,14 +1175,18 @@ impl RemoteModel {
                 self.open_in_vscode()
             }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
-            // Placeholder until the worker window wires them (package H2).
-            RemoteAction::Local(LocalAction::Configuration | LocalAction::ProjectPicker) => {
-                self.local = Local::Message(
-                    "This window cannot open that yet: update FlightDeck Desktop.".to_string(),
-                )
-            }
+            RemoteAction::Local(LocalAction::Configuration) => self.open_configuration(),
+            RemoteAction::Local(LocalAction::ProjectPicker) => self.open_picker(),
             RemoteAction::Unavailable(why) => self.local = Local::Message(why.to_string()),
-            RemoteAction::Send { .. } if self.shell => {
+            // A worker's Open Project is its picker, however it is asked for.
+            RemoteAction::Send {
+                name: names::OPEN_PROJECT,
+                ..
+            } if self.client.is_worker() => self.open_picker(),
+            RemoteAction::Send { .. } if self.tab == Tab::WorkerShell => {
+                self.local = Local::Message(WORKER_SHELL_COMMAND_REFUSAL.to_string())
+            }
+            RemoteAction::Send { .. } if self.tab == Tab::SshShell => {
                 self.local = Local::Message(
                     "Switch to a project tab to run host commands: the SSH shell is not one of \
                      the host's sessions."
@@ -749,9 +1271,14 @@ impl RemoteModel {
         }
     }
 
+    /// Back to the project tab from a shell's. Whether it was on one.
+    fn leave_shell_tab(&mut self) -> bool {
+        std::mem::replace(&mut self.tab, Tab::Project) != Tab::Project
+    }
+
     fn step_project(&mut self, selector: Selector) {
-        // From the shell tab, back to the project it left.
-        if std::mem::take(&mut self.shell) {
+        // From a shell tab, back to the project it left.
+        if self.leave_shell_tab() {
             return;
         }
         let ids: Vec<ProjectId> = self
@@ -779,6 +1306,17 @@ impl RemoteModel {
             }
             return;
         }
+        if let Local::Config(editor) = &mut self.local {
+            match editor.input(input) {
+                EditorEffect::None => {}
+                EditorEffect::Close => self.local = Local::None,
+                EditorEffect::Send(request) => match self.client.save_configuration(&request) {
+                    Some(seq) => self.config_seq = Some(seq),
+                    None => editor.on_refused("Not connected to the host — nothing was saved."),
+                },
+            }
+            return;
+        }
         if let Local::Palette { filter, selected } = &self.local {
             let (mut filter, mut selected) = (filter.clone(), *selected);
             match input {
@@ -794,13 +1332,13 @@ impl RemoteModel {
                     let action = view.entries.get(view.selected).map(|r| r.action.clone());
                     self.local = Local::None;
                     if let Some(action) = action {
-                        self.run(views::route_palette(&action));
+                        self.run(views::route_palette_for(self.workspace(), &action));
                     }
                     return;
                 }
                 OverlayInput::PaletteRun(action) => {
                     self.local = Local::None;
-                    self.run(views::route_palette(&action));
+                    self.run(views::route_palette_for(self.workspace(), &action));
                     return;
                 }
                 OverlayInput::Cancel => {
@@ -844,14 +1382,16 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
         address: remote.address.clone(),
         token: remote.access_token(),
         seat,
-        user_agent: user_agent(
+        // A worker shows this machine's name in its device list and in
+        // "taken over by …" (design A11).
+        user_agent: client_label(
             flightdeck::web::server::NATIVE_CLIENT_AGENT,
             env!("CARGO_PKG_VERSION"),
         ),
         connection: flightdeck::web::protocol::ConnectionKind::Window,
         retry_cap_ms: None,
     };
-    let client = RemoteClient::connect(config);
+    let client = RemoteClient::connect(config.clone());
     let label = remote.label.clone();
     let address = remote.address.clone();
     // The host's projects' settings are the host's; text size is this app's.
@@ -865,6 +1405,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
         let mut model = RemoteModel::new(client, label.clone(), address.clone());
         model.set_font_size(font_size);
         model.set_remotes(connect::Store::real());
+        model.set_dialer(Rc::new(move || RemoteClient::connect(config.clone())));
         model.start_ticking(cx);
         model
     });
@@ -887,7 +1428,19 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
             ws.viewer_id.as_ref().map(|v| v.to_string()),
             Some(ws.host_version.clone()),
         );
+        // What the host is, so the launcher lists a worker under Workers.
+        if let Some(kind) = ws.host_kind {
+            saved.record_host_kind(&address, kind);
+        }
         store.save(&saved);
+    })
+    .detach();
+    // The Workers section's background link stays quiet while this window
+    // is open: the window notifies instead.
+    let window_address = remote.address.clone();
+    flightdeck_desktop::workers::registry::opened(&window_address, cx);
+    cx.observe_release(&model, move |_, cx| {
+        flightdeck_desktop::workers::registry::closed(&window_address, cx)
     })
     .detach();
     let mut options = crate::app::window_options(cx);

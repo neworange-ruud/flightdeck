@@ -168,7 +168,9 @@ impl ConnectView {
             exchange,
             open,
             done: false,
-            client_label: flightdeck::web::client::user_agent(
+            // `FlightDeck Desktop/<version> (<this machine>)`: a worker lists
+            // the device by its name (design A11).
+            client_label: flightdeck::web::client::client_label(
                 flightdeck::web::server::NATIVE_CLIENT_AGENT,
                 env!("CARGO_PKG_VERSION"),
             ),

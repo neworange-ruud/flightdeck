@@ -597,8 +597,12 @@ impl TerminalView {
             }
             TerminalSource::Host(host) => host.update(cx, |model, _| model.set_viewport(size)),
             // D4: the host owns PTY geometry; the grid is the host's size and
-            // the element letterboxes it.
-            TerminalSource::Remote(_) => {}
+            // the element letterboxes it. A worker has no screen, so the
+            // window's pane is its size (W5): the model sends it on its next
+            // turn, once per size.
+            TerminalSource::Remote(remote) => {
+                remote.update(cx, |model, _| model.set_viewport(size))
+            }
         }
     }
 
