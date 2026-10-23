@@ -1543,3 +1543,192 @@ Isolated mode is a per-run flag and never a configuration setting: a persisted
 setting that suppressed persistence would be a trap. See
 `specs/ISOLATED_MODE.md` for the design and `specs/ISOLATED_MODE_PLAN.md` for the
 implementation record.
+
+## 33. FlightDeck Worker
+
+`flightdeck worker` turns a Linux or macOS machine into a headless FlightDeck
+host that FlightDeck Desktop controls over Tailscale: agents run on the box,
+the Desktop opens a remote window onto them. Requirements are in
+`specs/WORKER_PRD.md`; this section is the contract.
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `flightdeck worker start` | Starts the supervisor in the background and returns once the worker answers on the control socket (or prints why it didn't, with the last log lines). Refuses if a worker is already running for this account. |
+| `flightdeck worker stop` | Stops the supervisor and the worker gracefully: agents are terminated as on a TUI quit and state is persisted, so the next `start` resumes them. "Not running" is not an error. |
+| `flightdeck worker restart` | Stop, then start. This is how `flightdeck update` takes effect; the supervisor is re-executed too, so both run the new binary. |
+| `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
+| `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port). |
+| `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. |
+| `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. |
+| `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
+| `flightdeck worker run` | The worker in the foreground, logging to stderr. What the supervisor runs; also for debugging. |
+
+`flightdeck worker` with no command (or `--help`) prints this table; an unknown
+command prints it and exits 2. Every worker command is dispatched before the
+top-level `--help`/`--version` handling. On Windows every worker command exits 2
+with "flightdeck worker is not supported on Windows (Linux and macOS only)."
+
+### Process model
+
+`start` spawns `flightdeck worker supervise` as a new process
+(`std::process::Command`, `setsid()` in `pre_exec`, stdin/stdout null, stderr
+appended to the log, working directory `$HOME`). The supervisor spawns
+`flightdeck worker run` the same way and logs its output. Neither ever forks a
+process that already runs a runtime. The supervisor has no tokio and no
+`AppHost`: it restarts a worker that exits abnormally with exponential backoff
+(1 s doubling to 60 s; a run longer than 60 s resets it) and gives up after 5
+crashes within 10 minutes, recording why in `supervisor.json`. A clean exit
+after `stop` is not restarted.
+
+The supervisor holds `supervisor.lock` and `worker run` holds `run.lock` for
+their whole lives. The OS releases an advisory lock when its holder exits, so
+"is a worker running?" is answered by the locks, never by a pid file a crash
+left behind.
+
+**Local host lock (W22).** While either lock is held, starting the TUI, or
+opening a *local* Desktop window, on that machine refuses with:
+
+> A FlightDeck worker is running on this machine and serving its projects.
+> Control it from FlightDeck Desktop, or run `flightdeck worker stop`.
+
+Desktop *remote* windows on the worker machine are unaffected. Checking does
+not create `~/.flightdeck/worker/` on a machine that never ran a worker.
+
+### Exit codes of `worker run`
+
+| Code | Meaning | Supervisor |
+| --- | --- | --- |
+| 0 | Stopped on request | Stops (a 0 while not stopping counts as a crash) |
+| 73 | Another worker holds `run.lock` | Gives up at once |
+| 78 | The global config is invalid | Gives up at once, with the message |
+| anything else | A crash (including a panic, 101, or a signal) | Restarts with backoff |
+
+### Files
+
+| Path | What |
+| --- | --- |
+| `~/.flightdeck/worker/` | The worker directory, mode 0700. |
+| `~/.flightdeck/worker/control.sock` | The control socket, mode 0600: one JSON request and one JSON answer per connection. Only the account can reach it, so minting a pairing code already requires a shell on the box. |
+| `~/.flightdeck/worker/supervisor.pid`, `worker.pid` | Informational pids (the locks are the truth). |
+| `~/.flightdeck/worker/supervisor.lock`, `run.lock` | The locks above. |
+| `~/.flightdeck/worker/supervisor.json` | The supervisor's last state (phase, restarts, last exit, give-up reason), written atomically. |
+| `~/.flightdeck/worker/restart.marker` | Left by `worker restart` for the next worker. |
+| `~/.flightdeck/worker/workspace.json` | The worker's open projects, separate from the TUI's `~/.flightdeck/workspace.json`. Each project's `state.json` stays in its repository, as for the TUI. |
+| `~/.flightdeck/worker/devices.json` | Paired Desktops' tokens, in the web interface's credential format but separate from `~/.flightdeck/web.json`: a browser token for a TUI's web interface never grants a worker shell. |
+| `~/.flightdeck/logs/worker.log` | The log, rotated at 10 MiB, 5 files kept (`worker.log`, `.1` … `.4`). The supervisor's own lines go to the same file. |
+
+### `[worker]` section
+
+Read from the **global** `~/.flightdeck/config.toml` only: a worker serves every
+project, so a project's `[worker]` table is ignored. Every field has its own
+default, so an absent or partial table keeps working.
+
+```toml
+[worker]
+port = 7420
+projects_root = "~/flightdeck"
+default_cols = 200
+default_rows = 50
+```
+
+- **`port`** (integer, default `7420`) — the TCP port served on each Tailscale
+  address. A configured `0` is rejected: paired Desktops store `host:port`.
+- **`projects_root`** (string, default `"~/flightdeck"`) — scanned two levels
+  deep for repositories to offer, and where clones land. `~` and `~/…` are
+  relative to `$HOME`, as is a relative path. Empty is rejected (`"~"` means
+  the home folder).
+- **`default_cols`** / **`default_rows`** (integers, default `200` / `50`) —
+  the PTY size of an agent started while no window has reported a size. An
+  attached window resizes PTYs to its panes. Columns must be 20–1000 and rows
+  4–500.
+
+An invalid `[worker]` table makes `worker run` exit 78. It is not in the
+configuration manager (numbers and a path, not toggles): edit the file.
+
+### Network and pairing
+
+The worker serves the web protocol's `/ws`, `/auth/exchange` and
+`/auth/session` (no browser assets) **only on the addresses Tailscale
+reports**, never on loopback, `0.0.0.0` or another network. With no Tailscale
+address it keeps running, reports "not listening: no Tailscale address", polls
+every 5 s and binds when one appears. Pairing uses the web interface's
+single-use bootstrap codes, minted by `worker pair` over the control socket.
+One remote window is attached at a time (a second takes over; the first's token
+stays valid); any number of status-only background links may be held.
+
+### `worker status --json` (schema 1)
+
+A stable shape for scripts. Field names and meanings do not change; additions
+are optional fields. Every timestamp is unix seconds; absent values are `null`,
+never missing.
+
+```json
+{
+  "schema": 1,
+  "state": "running",
+  "cli_version": "1.27.0",
+  "version": "1.27.0",
+  "pid": 4242,
+  "supervisor_pid": 4100,
+  "uptime_secs": 7380,
+  "listen": {
+    "listening": true,
+    "addresses": ["100.64.1.2:7420"],
+    "advertised": "box.tail1234.ts.net:7420",
+    "reason": null,
+    "origin": "magic_dns"
+  },
+  "devices": [{
+    "id": "tok1", "label": "mbp", "address": "100.64.1.9",
+    "paired_at": 1700000000, "last_seen": 1700000500,
+    "state": "attached", "revoked": false
+  }],
+  "attached": {"device_id": "tok1", "label": "mbp", "since": 1700000500},
+  "background_links": 1,
+  "projects": [{
+    "name": "app", "root": "/home/u/flightdeck/app",
+    "agents": [{"id": "t1", "name": "fix-login", "agent": "claude",
+                "status": "working", "running": true}]
+  }],
+  "unread_messages": 0,
+  "restarts": 1,
+  "last_exit": {"at": 1700000600, "code": 101, "signal": null,
+                "description": "exited with code 101 (panic)"},
+  "gave_up_reason": null
+}
+```
+
+- `state`: `running` (the worker answers on its control socket), `starting`
+  (a lock is held but nothing answers yet), `backoff` (crashed, a restart is
+  due), `stopped`, or `gave_up` (kept after the supervisor exits, so the reason
+  is not lost).
+- `cli_version` is the binary that printed the report; `version` the running
+  worker's. They differ after `flightdeck update` until `worker restart`.
+- `supervisor_pid` is reported only while the supervisor's lock is held.
+- `listen` is `null` unless running; when not listening, `listening` is false
+  and `reason` says why. `origin` says where `advertised` came from.
+- `devices[].state`: `attached` (has the window), `background` (a status-only
+  link), `offline`. `id` is what `worker revoke` takes.
+- `projects[].agents[].status` is the interpreted status label (`working`,
+  `needs_input`, …); `running` is whether its process is alive.
+- `restarts`, `last_exit` and `gave_up_reason` come from `supervisor.json` and
+  are reported even when stopped.
+
+### Security model
+
+- **Pairing a Desktop with a worker gives it the worker account's full power**:
+  a shell and the whole home directory.
+- The outer boundary is the tailnet: the worker listens nowhere else, so
+  Tailscale ACLs decide who can even reach the port.
+- Codes are minted only on demand, over a control socket only the account can
+  reach, so getting one already requires a shell on the box.
+- Tokens are long-lived, one per Desktop, listed by `worker devices` and
+  revoked by `worker revoke`, which closes live connections at once.
+- No credentials cross the wire, and no TLS is needed because nothing leaves
+  WireGuard. The worker never stores, forwards or injects agent or git
+  credentials: agents and git run with the account's own environment.
+- Opening, browsing and cloning are confined to `$HOME`: paths are
+  canonicalised and anything resolving outside it, through a symlink too, is
+  refused.

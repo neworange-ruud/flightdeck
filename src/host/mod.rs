@@ -65,6 +65,7 @@ use flightdeck_remote_protocol::ProjectId;
 
 pub mod overlay;
 pub mod vscode;
+pub mod worker;
 pub use overlay::{
     AgentChoice, ButtonRole, ConfigView, DialogButton, DialogKind, DialogRow, DialogView,
     GitStatusView, HostNotices, MessageView, NewAgentForm, NewAgentTarget, OverlayInput,

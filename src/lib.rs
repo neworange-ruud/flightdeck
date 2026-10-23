@@ -27,6 +27,11 @@ pub mod tui;
 pub mod update;
 pub mod view;
 pub mod web;
+pub mod worker;
+
+/// This build's FlightDeck version (`Cargo.toml`), as the CLI, a worker's
+/// status and the web protocol's `host_version` report it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // No-op stand-in when the real self-updater is not built: either the
 // `self-update` feature is off (a pure-Rust build with no C toolchain), or the
@@ -124,6 +129,14 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(50);
 /// real terminal. Teardown is guaranteed in all paths (SPECS §25): the terminal
 /// is restored and every tab's sessions are terminated before returning.
 pub fn run() -> Result<()> {
+    // `flightdeck worker …` is its own command family with its own `--help`
+    // and exit codes (SPECS §33), so it is dispatched before anything below
+    // can read its arguments.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("worker") {
+        std::process::exit(crate::worker::cli::main(&argv[2..]));
+    }
+
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
         println!("flightdeck {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -136,7 +149,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    let argv: Vec<String> = std::env::args().collect();
     let isolated = parse_isolated(&argv)?;
 
     // Subcommand dispatch. These configure status/notification
@@ -179,6 +191,9 @@ pub fn run() -> Result<()> {
     // project plus every project remembered from the previous session (SPECS
     // §10). A GPUI front-end opens it the same way.
     let notifier = SystemNotifier;
+    // A worker serving this account's projects owns them: a second, local
+    // host would drive the same agents (SPECS §33, W22).
+    crate::worker::lock::refuse_local_host()?;
     let mut host = AppHost::open(env, &notifier, &cwd, isolated)?;
     let repo_root = host
         .project_root(host.active_project_index())
@@ -941,6 +956,7 @@ const SUBCOMMANDS: &[&str] = &[
     "update",
     "image",
     "doctor",
+    "worker",
 ];
 
 /// Whether this invocation asked for an isolated run (SPECS §32).
@@ -987,6 +1003,9 @@ fn print_help() {
     println!();
     println!("MAINTENANCE:");
     println!("    update                 Update FlightDeck to the latest release");
+    println!();
+    println!("WORKER (Linux and macOS — a headless host for FlightDeck Desktop):");
+    println!("    worker <command>       Run `flightdeck worker` for its commands");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");
