@@ -17,6 +17,10 @@
 //! An `--isolated` run never lands here: it is defined by the directory it
 //! was started in, so a non-repository directory is the TUI's error.
 //!
+//! Above the recent projects the launcher lists the saved FlightDeck workers
+//! with their live status ([`crate::workers`]); a click opens one's remote
+//! window.
+//!
 //! ## Who owns what
 //!
 //! [`AppRoot`] owns the host model and the shell once running, and is
@@ -34,7 +38,7 @@ use flightdeck_desktop::keys::KeymapAction;
 use gpui::{
     div, px, App, AppContext, Context, Entity, FocusHandle, FontWeight, Global, InteractiveElement,
     IntoElement, ParentElement, PathPromptOptions, Render, StatefulInteractiveElement, Styled,
-    Task, Window,
+    Subscription, Task, Window,
 };
 use gpui_component::{h_flex, v_flex};
 
@@ -77,6 +81,8 @@ pub struct AppRoot {
     live: bool,
     focus: FocusHandle,
     _signal_poll: Option<Task<()>>,
+    /// Redraws the launcher's Workers section when a worker's link changes.
+    _workers: Option<Subscription>,
 }
 
 impl AppRoot {
@@ -100,7 +106,16 @@ impl AppRoot {
             live,
             focus: cx.focus_handle(),
             _signal_poll: None,
+            _workers: None,
         };
+        // The background links start before the window (`app::run`); a test
+        // without them has no Workers section.
+        if let Some(links) = cx
+            .try_global::<crate::workers::links::WorkerLinksHandle>()
+            .map(|h| h.0.clone())
+        {
+            root._workers = Some(cx.observe(&links, |_, _, cx| cx.notify()));
+        }
         if let Some(host) = initial {
             root.start(host, cx);
         } else {
@@ -324,6 +339,11 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
         .child("Connect to remote…")
         .on_click(|_, _, cx| crate::remote::connect::open_connect_window(None, cx));
 
+    // Saved workers, above the recent projects (`crate::workers`).
+    let rows = crate::workers::links::rows(cx);
+    let workers = (!rows.is_empty())
+        .then(|| crate::workers::view::section(&rows, &p, crate::workers::links::unix_now()));
+
     let recent = (!root.recent.is_empty()).then(|| {
         v_flex()
             .w_full()
@@ -389,6 +409,7 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
                 )
                 .child(h_flex().gap_3().child(open).child(connect))
                 .children(error)
+                .children(workers.map(|list| div().mt_4().w(px(420.)).child(list)))
                 .children(recent.map(|list| div().mt_4().w(px(420.)).child(list))),
         )
 }
