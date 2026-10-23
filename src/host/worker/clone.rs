@@ -315,5 +315,6 @@ impl CloneJobs {
     }
 }
 
-#[cfg(test)]
+// The worker is Linux and macOS only (W2); its tests use unix paths.
+#[cfg(all(test, unix))]
 mod tests;

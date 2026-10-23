@@ -288,5 +288,6 @@ pub fn is_git_repo(fs: &dyn FileSystem, dir: &Path) -> bool {
     fs.exists(&dir.join(".git"))
 }
 
-#[cfg(test)]
+// The worker is Linux and macOS only (W2); its tests use unix paths.
+#[cfg(all(test, unix))]
 mod tests;

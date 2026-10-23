@@ -59,7 +59,8 @@ pub mod notify;
 pub mod projects;
 pub mod shell;
 
-#[cfg(test)]
+// The worker is Linux and macOS only (W2); its tests use unix paths.
+#[cfg(all(test, unix))]
 mod tests;
 
 pub use notify::WorkerNotifier;
