@@ -1,5 +1,4 @@
 use super::*;
-use crate::contracts::RealFs;
 use crate::testing::FakeFs;
 
 const HOME: &str = "/home/u";
@@ -329,7 +328,7 @@ fn real_symlink_escape_is_refused_and_inside_link_allowed() {
     std::os::unix::fs::symlink("code/app", home.join("inside")).unwrap();
     std::os::unix::fs::symlink("../outside", home.join("relescape")).unwrap();
 
-    let fs = RealFs;
+    let fs = crate::contracts::RealFs;
     let c = Confinement::new(&fs, &home).unwrap();
     for req in ["escape", "escape/secret", "relescape", "..", "code/../.."] {
         assert!(
