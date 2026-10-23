@@ -49,6 +49,7 @@ use crate::persistence::workspace::{
 use crate::remote::commands::{CommandLedger, PendingFirstTask};
 use crate::remote::pairing::{build_e2e_channel, channel_seal_open, PairingSession};
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
+use crate::web::protocol::HostKind;
 use crate::{
     answer_prompt, apply_host_event, apply_update_notice, build_web_host_state,
     cleanup_isolated_run, drain_create_outcomes, drain_pty_output, drive_pairing_overlay,
@@ -192,6 +193,13 @@ pub struct AppHost<'a> {
     /// The front-end is the desktop app ([`AppHost::set_desktop_front_end`]):
     /// its help screen also documents the desktop-only platform shortcuts.
     desktop_front_end: bool,
+    /// What kind of host this is (v7 `Snapshot::host_kind`): the TUI's, the
+    /// desktop app's ([`AppHost::set_desktop_front_end`]) or a worker's
+    /// ([`AppHost::open_worker`]).
+    kind: HostKind,
+    /// A worker's extras (its shell, messages, health, clones…). `Some` only
+    /// for [`HostKind::Worker`]; see [`worker`].
+    worker: Option<Box<worker::WorkerExt>>,
     /// Where the workspace file lives, or `None` for an isolated run (which
     /// writes no workspace file at all).
     ws_path: Option<PathBuf>,
@@ -353,6 +361,8 @@ impl<'a> AppHost<'a> {
             ui: Ui::default(),
             isolated,
             desktop_front_end: false,
+            kind: HostKind::Tui,
+            worker: None,
             ws_path: None,
             workspace_ui: WorkspaceUi::default(),
             tick: 0,
@@ -415,6 +425,12 @@ impl<'a> AppHost<'a> {
     /// once-a-day update check, FlightDeck Remote (when enabled) and FlightDeck
     /// Web (when `[web] enabled`). Call once, right before the first turn.
     pub fn start(&mut self) {
+        // A worker brings up its own set (no FlightDeck Remote, ever; its own
+        // listeners): the run loop calls `start_worker`, and so does this.
+        if self.worker.is_some() {
+            self.start_worker();
+            return;
+        }
         let env = &self.env;
         let workspace = &mut self.workspace;
 
@@ -429,7 +445,10 @@ impl<'a> AppHost<'a> {
         // finding immediately and, when due, kick off a background check. Applied to
         // every project so whichever is active shows the hint.
         if let Some(update_tx) = self.update_tx.take() {
-            let check_enabled = update_check_enabled(&workspace.active_project().state);
+            let check_enabled = workspace
+                .projects
+                .get(workspace.active)
+                .is_some_and(|p| update_check_enabled(&p.state));
             if let Some(latest) =
                 crate::update::start_check(check_enabled, env.clock.now_unix_secs(), update_tx)
             {
@@ -533,8 +552,14 @@ impl<'a> AppHost<'a> {
                 .ok()
                 .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
         }
-        if self.workspace.active_project().state.config.web.enabled {
-            let config = self.workspace.active_project().state.config.web.clone();
+        let web_config = self
+            .workspace
+            .projects
+            .get(self.workspace.active)
+            .map(|p| &p.state.config.web)
+            .filter(|web| web.enabled)
+            .cloned();
+        if let Some(config) = web_config {
             // Deliberately no access overlay here. `[web] enabled` is a user who
             // asked for the server on every launch, not for a modal on every
             // launch; `Show Web Access` in the palette is how they reach the code.
@@ -762,6 +787,10 @@ impl<'a> AppHost<'a> {
         // --- Apply a completed background update check (SPECS §30). ---
         while let Ok(latest) = self.update_rx.try_recv() {
             changed = true;
+            // A worker has no status bar to badge: it tells its window, once.
+            if self.kind == HostKind::Worker {
+                ui.message(worker::update_message(&latest));
+            }
             apply_update_notice(workspace, latest);
         }
 
@@ -972,9 +1001,11 @@ impl<'a> AppHost<'a> {
             .is_none_or(|last| now_ms.saturating_sub(last) >= GIT_REFRESH_MIN_MS);
         if self.tick.is_multiple_of(GIT_REFRESH_EVERY) && refresh_due {
             self.last_git_refresh_ms = Some(now_ms);
-            let p = &mut workspace.projects[active];
-            if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
-                p.status_in_flight = true;
+            // An empty (worker) workspace has no active project to refresh.
+            if let Some(p) = workspace.projects.get_mut(active) {
+                if !p.status_in_flight && spawn_status_refresh(&p.state, &p.git, &p.status_tx) {
+                    p.status_in_flight = true;
+                }
             }
         }
         // --- And, while a remote client is attached, the others too: it may
@@ -998,7 +1029,11 @@ impl<'a> AppHost<'a> {
         }
         self.tick = self.tick.wrapping_add(1);
 
-        changed || status_fingerprint(workspace, now_ms) != before
+        let moved = status_fingerprint(workspace, now_ms) != before;
+        // A worker's own turn: its shell, notifications, messages, clones and
+        // health (see `worker`).
+        let worker_changed = self.worker.is_some() && self.pump_worker(now_ms);
+        changed || moved || worker_changed
     }
 
     /// Second phase of a turn, after the front-end has synced the active
@@ -1010,11 +1045,6 @@ impl<'a> AppHost<'a> {
     ///
     /// Returns `true` when a browser frame was handled this turn.
     pub fn publish(&mut self) -> bool {
-        let env = &self.env;
-        let workspace = &mut self.workspace;
-        let ui = &mut self.ui;
-        let web_surface = &mut self.web_surface;
-        let now_ms = self.now_ms;
         let mut changed = false;
 
         // --- FlightDeck Web: drain what the browsers said, then publish the
@@ -1025,90 +1055,48 @@ impl<'a> AppHost<'a> {
         //     published on this same tick rather than a tick later. And publish
         //     comes after the front-end's size sync, so the geometry the
         //     browser letterboxes is the grid the PTY actually has (D4). ---
-        if web_surface.running() {
+        if self.web_surface.running() {
             let inbound: Vec<crate::web::server::WebInbound> =
-                web_surface.inbound_rx.try_iter().collect();
+                self.web_surface.inbound_rx.try_iter().collect();
             for event in inbound {
                 changed = true;
-                // A `Command` frame is the browser's palette pressing Enter:
-                // `run_web_command` routes it into the same `run_palette_action`
-                // the desktop's own palette calls, and answers with the ack that
-                // dispatch earned. The server has already refused an unknown
-                // name, a read-only seat's frame (D14) and every command whose
-                // effect must not land for a browser (D16, including `quit`), so
-                // reaching here means a controller sent something runnable.
-                if let crate::web::server::WebInbound::Command {
-                    viewer_id,
-                    label,
-                    command,
-                } = &event
-                {
-                    // D13: a dialog this command opens is tagged with the seat
-                    // that asked, so the desktop can say `opened from browser ·
-                    // 192.168.2.20` about a modal nobody at this keyboard
-                    // requested.
-                    let origin = crate::web::protocol::DialogOrigin::Browser {
-                        viewer_id: Some(viewer_id.clone()),
-                        label: label.clone(),
-                    };
-                    let reply = crate::run_web_command(
-                        command,
-                        &origin,
-                        workspace,
-                        env,
-                        ui,
-                        &mut web_surface.activity,
-                    );
-                    if let Some(handle) = web_surface.handle.as_ref() {
-                        handle.send(crate::web::server::WebOutbound::Viewer {
-                            viewer_id: viewer_id.clone(),
-                            msg: crate::web::protocol::ServerMsg::Ack(reply.ack),
-                        });
-                        // SPECS §21's panel, to the viewer that asked and to no
-                        // other (§6.5 R16). After the ack, so a browser that
-                        // reads frames in order learns the command landed
-                        // before it is handed what the command produced.
-                        if let Some(view) = reply.git_status {
-                            handle.send(crate::web::server::WebOutbound::Viewer {
-                                viewer_id: viewer_id.clone(),
-                                msg: crate::web::protocol::ServerMsg::GitStatus(view),
-                            });
-                        }
-                        // SPECS §8's manager, likewise to the viewer that
-                        // asked and after the ack (§6.5 R22).
-                        if let Some(view) = reply.config {
-                            handle.send(crate::web::server::WebOutbound::Viewer {
-                                viewer_id: viewer_id.clone(),
-                                msg: crate::web::protocol::ServerMsg::Configuration(view),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                let mut host = WorkspaceTerminals {
-                    projects: &mut workspace.projects,
-                    fs: env.fs,
-                };
-                let out = web_surface.streams.apply_inbound(&event, &mut host);
-                if let Some(handle) = web_surface.handle.as_ref() {
+                let out = self.route_inbound(event);
+                if let Some(handle) = self.web_surface.handle.as_ref() {
                     for frame in out {
                         handle.send(frame);
                     }
                 }
             }
+        }
+        // A worker's own state, built every turn it publishes (its shell, its
+        // listeners, its health, the messages no window has seen).
+        let worker_state = self
+            .web_surface
+            .running()
+            .then(|| self.worker_host_state())
+            .flatten();
 
+        let env = &self.env;
+        let workspace = &mut self.workspace;
+        let ui = &mut self.ui;
+        let web_surface = &mut self.web_surface;
+        let now_ms = self.now_ms;
+
+        if web_surface.running() {
             let activity = web_surface.activity_events(env.clock);
-            let next = build_web_host_state(
+            let dialog = workspace
+                .projects
+                .get(workspace.active)
+                .and_then(|p| web_dialog_view(ui, &p.name, &p.state));
+            let mut next = build_web_host_state(
                 workspace,
                 &web_surface.streams,
                 activity,
-                web_dialog_view(
-                    ui,
-                    &workspace.active_project().name,
-                    &workspace.active_project().state,
-                ),
+                dialog,
                 now_ms,
+                &web_surface.flavor,
             );
+            next.worker = worker_state;
             let decided = std::mem::take(&mut ui.dialog_decisions);
             if next != web_surface.published {
                 // Publish, *then* the matching deltas: publishing changes what
@@ -1134,6 +1122,16 @@ impl<'a> AppHost<'a> {
         // life of the process — so the take above is paired with a clear here
         // rather than living inside the `running()` branch.
         ui.dialog_decisions.clear();
+
+        // A worker's network access is the worker's own (§2.4): nothing a
+        // window sends may start, stop or rebind it. Its routes refuse those
+        // commands already; this keeps a request that slipped through inert.
+        if self.kind == HostKind::Worker {
+            ui.pending_web_start = false;
+            ui.pending_web_stop = false;
+            ui.pending_web_rebind = None;
+            ui.pending_web_access_open = false;
+        }
 
         // --- Start / stop the web interface, when the palette asked (D10). ---
         if ui.pending_web_start {
@@ -1265,6 +1263,99 @@ impl<'a> AppHost<'a> {
         changed
     }
 
+    /// What one browser frame does to the host, and the frames that answer it,
+    /// in the order they must be sent. [`AppHost::publish`] sends them; a test
+    /// can feed a frame here with no server at all.
+    pub(crate) fn route_inbound(
+        &mut self,
+        event: crate::web::server::WebInbound,
+    ) -> Vec<crate::web::server::WebOutbound> {
+        use crate::web::server::{WebInbound, WebOutbound};
+        // A `Command` frame is the browser's palette pressing Enter:
+        // `run_web_command` routes it into the same `run_palette_action` the
+        // desktop's own palette calls, and answers with the ack that dispatch
+        // earned. The server has already refused an unknown name, a read-only
+        // seat's frame (D14) and every command whose effect must not land for
+        // a browser (D16, including `quit`), so reaching here means a
+        // controller sent something runnable.
+        if let WebInbound::Command {
+            viewer_id,
+            label,
+            command,
+        } = &event
+        {
+            let ack = |outcome, detail: String| WebOutbound::Viewer {
+                viewer_id: viewer_id.clone(),
+                msg: crate::web::protocol::ServerMsg::Ack(crate::web::protocol::Ack {
+                    seq: command.seq,
+                    outcome,
+                    detail: Some(detail),
+                }),
+            };
+            // §2.4: what a worker refuses, refused here too (defence in depth).
+            if self.kind == HostKind::Worker {
+                if let Some(reason) = worker::worker_refusal(&command.name) {
+                    return vec![ack(
+                        crate::web::protocol::AckOutcome::Rejected,
+                        reason.to_string(),
+                    )];
+                }
+            }
+            // D13: a dialog this command opens is tagged with the seat that
+            // asked, so the desktop can say `opened from browser ·
+            // 192.168.2.20` about a modal nobody at this keyboard requested.
+            let origin = crate::web::protocol::DialogOrigin::Browser {
+                viewer_id: Some(viewer_id.clone()),
+                label: label.clone(),
+            };
+            let reply = crate::run_web_command(
+                command,
+                &origin,
+                &mut self.workspace,
+                &self.env,
+                &mut self.ui,
+                &mut self.web_surface.activity,
+            );
+            let mut out = vec![WebOutbound::Viewer {
+                viewer_id: viewer_id.clone(),
+                msg: crate::web::protocol::ServerMsg::Ack(reply.ack),
+            }];
+            // SPECS §21's panel, to the viewer that asked and to no other
+            // (§6.5 R16). After the ack, so a browser that reads frames in
+            // order learns the command landed before it is handed what the
+            // command produced.
+            if let Some(view) = reply.git_status {
+                out.push(WebOutbound::Viewer {
+                    viewer_id: viewer_id.clone(),
+                    msg: crate::web::protocol::ServerMsg::GitStatus(view),
+                });
+            }
+            // SPECS §8's manager, likewise to the viewer that asked and after
+            // the ack (§6.5 R22).
+            if let Some(view) = reply.config {
+                out.push(WebOutbound::Viewer {
+                    viewer_id: viewer_id.clone(),
+                    msg: crate::web::protocol::ServerMsg::Configuration(view),
+                });
+            }
+            return out;
+        }
+        // A worker's own frames (attach kinds, `ResizeTerminal`, the picker's
+        // operations). Any other host ignores those two v7 frames below: the
+        // server never forwards them to a TUI or Desktop host anyway.
+        if self.worker.is_some() {
+            if let Some(out) = self.route_worker_inbound(&event) {
+                return out;
+            }
+        }
+        let mut host = WorkspaceTerminals {
+            projects: &mut self.workspace.projects,
+            fs: self.env.fs,
+            worker_shell: self.worker.as_mut().map(|w| &mut w.shell),
+        };
+        self.web_surface.streams.apply_inbound(&event, &mut host)
+    }
+
     /// Feed one front-end-neutral input. Hands off any worktree job the input
     /// queued before returning, so the caller need not call
     /// [`AppHost::after_input`] as well. Any handled input warrants a redraw.
@@ -1274,6 +1365,12 @@ impl<'a> AppHost<'a> {
     /// dialog does not show, a palette row it does not offer); the latter
     /// changes nothing.
     pub fn handle(&mut self, event: HostEvent) -> Result<()> {
+        // Every input acts on a project; a worker may have none yet.
+        if self.workspace.projects.is_empty() {
+            return Err(crate::contracts::FlightDeckError::Other(
+                worker::NO_PROJECT_REFUSAL.to_string(),
+            ));
+        }
         if let HostEvent::AnswerPrompt(reply) = &event {
             // Needs the bridge whose prompt ids the answer is checked
             // against, which `apply_host_event` does not see.
@@ -1485,17 +1582,19 @@ impl<'a> AppHost<'a> {
     #[cfg(any(test, feature = "testing"))]
     pub fn web_host_state(&self) -> crate::web::server::HostState {
         let workspace = &self.workspace;
-        build_web_host_state(
+        let mut state = build_web_host_state(
             workspace,
             &self.web_surface.streams,
             Vec::new(),
-            web_dialog_view(
-                &self.ui,
-                &workspace.active_project().name,
-                &workspace.active_project().state,
-            ),
+            workspace
+                .projects
+                .get(workspace.active)
+                .and_then(|p| web_dialog_view(&self.ui, &p.name, &p.state)),
             self.now_ms,
-        )
+            &self.web_surface.flavor,
+        );
+        state.worker = self.worker_host_state();
+        state
     }
 
     /// Whether the active project's terminal currently has input focus.
@@ -1530,6 +1629,8 @@ impl<'a> AppHost<'a> {
     /// The TUI and the browser never call this.
     pub fn set_desktop_front_end(&mut self) {
         self.desktop_front_end = true;
+        self.kind = HostKind::Desktop;
+        self.web_surface.flavor.kind = HostKind::Desktop;
         // The palette's front-end rows (Connect to Remote, New Window) are
         // the desktop's to perform; see `take_front_end_actions`.
         self.ui.front_end_actions = true;

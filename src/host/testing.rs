@@ -156,6 +156,57 @@ pub fn host_with_workspace_file<'a>(
     host
 }
 
+/// [`crate::host::worker::WorkerOptions`] over fakes, for a worker whose home
+/// is `home` on a fake filesystem: no health to read
+/// ([`crate::host::worker::health::FakeHealthProbe`]), clones that succeed at
+/// once ([`crate::host::worker::clone::FakeCloner`]), the default `[worker]`
+/// and global config, and a listen plan that binds nothing — so
+/// [`AppHost::start_worker`] stays off the network unless a test swaps in a
+/// loopback [`crate::web::server::ListenPlan::Fixed`] address.
+pub fn worker_options(home: &str) -> crate::host::worker::WorkerOptions {
+    let home = PathBuf::from(home);
+    crate::host::worker::WorkerOptions {
+        paths: crate::worker::paths::WorkerPaths::from_home(&home),
+        home,
+        config: crate::contracts::WorkerConfig::default(),
+        global_config: Config::default(),
+        listen: crate::web::server::ListenPlan::Fixed(Vec::new()),
+        health: Box::new(crate::host::worker::health::FakeHealthProbe {
+            cpu_count: 1,
+            ..Default::default()
+        }),
+        cloner: Arc::new(crate::host::worker::clone::FakeCloner {
+            lines: Vec::new(),
+            outcome: Ok(()),
+        }),
+    }
+}
+
+/// A worker host ([`AppHost::open_worker`]) over `projects` — which may be
+/// empty, as a fresh worker's is — with the first one active, nothing
+/// started, and its web surface's credential store on a fake filesystem.
+/// Its first turn skips the tick-0 git refresh, as [`host`]'s does.
+///
+/// Panics when `opts.home` cannot be confined, which is a test bug.
+pub fn worker_host<'a>(
+    env: Env<'a>,
+    notifier: &'a crate::host::worker::WorkerNotifier,
+    projects: Vec<TestProject>,
+    opts: crate::host::worker::WorkerOptions,
+) -> AppHost<'a> {
+    let workspace = Workspace {
+        projects: projects
+            .into_iter()
+            .map(|p| project(&p.name, p.root, p.state, p.git))
+            .collect(),
+        active: 0,
+    };
+    let mut host = AppHost::worker_from_parts(env, notifier, workspace, web_surface(), opts)
+        .expect("the worker's home confines");
+    host.tick = 1;
+    host
+}
+
 /// Record `status` as project `project`'s latest collected git status for tab
 /// `tab_id`, as the periodic refresh would.
 pub fn set_git_status(host: &mut AppHost, project: usize, tab_id: &str, status: WorktreeStatus) {
@@ -202,5 +253,6 @@ pub(crate) fn web_surface() -> WebSurface {
         count_rx,
         handle: None,
         published: crate::web::server::HostState::default(),
+        flavor: crate::WebFlavor::default(),
     }
 }
