@@ -845,7 +845,6 @@ fn a_tui_host_is_never_sent_a_resize_or_a_worker_command() {
 }
 
 #[test]
-#[ignore = "needs package A (worker server)"]
 fn a_background_link_watches_a_worker_without_its_bytes() {
     let mut host = Host::start_worker();
     let agent = host.tab("s1", "login");
@@ -921,7 +920,6 @@ fn a_background_link_watches_a_worker_without_its_bytes() {
 }
 
 #[test]
-#[ignore = "needs package A (worker server)"]
 fn a_second_window_takes_the_worker_over() {
     let mut host = Host::start_worker();
     host.tab("s1", "login");
@@ -956,7 +954,6 @@ fn a_second_window_takes_the_worker_over() {
 }
 
 #[test]
-#[ignore = "needs package A (worker server)"]
 fn a_window_sizes_the_workers_ptys() {
     let mut host = Host::start_worker();
     host.tab("s1", "login");
