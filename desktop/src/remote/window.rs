@@ -25,7 +25,11 @@
 //! The first tab, before the project tabs, is the SSH shell
 //! ([`super::shell`]): a terminal this window runs itself, drawn full width
 //! in place of the sidebar, git strip and mirrored terminal while it is on
-//! screen.
+//! screen. On a worker it is the worker's own shell instead, mirrored like
+//! the host's terminals and drawn the same way; a worker also gets its
+//! project picker ([`super::projects`]) in place of the body while it is
+//! open, a version-skew banner under the titlebar when its FlightDeck is
+//! not this app's, and Reconnect when another window took it over.
 
 use std::rc::Rc;
 
@@ -44,7 +48,8 @@ use gpui::{
 };
 use gpui_component::{h_flex, v_flex};
 
-use super::RemoteModel;
+use super::projects::ProjectPickerView;
+use super::{RemoteModel, Tab};
 use crate::commands::{
     intent_for, keycap, keymap, perform_remote_entry, perform_remote_id, Intent,
 };
@@ -77,6 +82,8 @@ pub struct RemoteWindow {
     shell_error: Option<String>,
     /// What the SSH shell runs on: the real PTY, a fake one in tests.
     shell_pty: Rc<dyn PtyBackend>,
+    /// A worker's project picker, while the model has it open.
+    picker: Option<Entity<ProjectPickerView>>,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -101,6 +108,7 @@ impl RemoteWindow {
             shell_target: String::new(),
             shell_error: None,
             shell_pty: Rc::new(PortablePtyBackend),
+            picker: None,
             #[cfg(target_os = "macos")]
             drag_pending: false,
         }
@@ -156,6 +164,26 @@ impl RemoteWindow {
         self.terminal.clone()
     }
 
+    /// The project picker's view, while it is open.
+    #[cfg(test)]
+    pub(crate) fn picker_view(&self) -> Option<Entity<ProjectPickerView>> {
+        self.picker.clone()
+    }
+
+    /// Build the picker's view when the model opened it, drop it when the
+    /// model closed it.
+    fn sync_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.remote.read(cx).picker().is_some();
+        match (open, &self.picker) {
+            (true, None) => {
+                let remote = self.remote.clone();
+                self.picker = Some(cx.new(|cx| ProjectPickerView::new(remote, window, cx)));
+            }
+            (false, Some(_)) => self.picker = None,
+            _ => {}
+        }
+    }
+
     fn on_keymap_action(&mut self, action: &KeymapAction, _: &mut Window, cx: &mut Context<Self>) {
         if self.remote.read(cx).overlay().is_some() {
             cx.propagate();
@@ -185,7 +213,9 @@ impl RemoteWindow {
         let model = self.remote.read(cx);
         let ws = model.workspace();
         let tabs = views::project_tabs(ws);
-        let shell_active = model.shell_active();
+        let tab = model.tab();
+        let on_project = tab == Tab::Project;
+        let worker = model.is_worker();
         let live = model.client().state().is_live();
         let link = model.link_label();
         let name = model.label().to_string();
@@ -198,7 +228,11 @@ impl RemoteWindow {
             .min_w_0()
             .overflow_x_scroll()
             .text_size(px(12.5))
-            .child(shell_tab(shell_active, p, &self.remote))
+            .child(if worker {
+                worker_shell_tab(tab == Tab::WorkerShell, p, &self.remote).into_any_element()
+            } else {
+                shell_tab(tab == Tab::SshShell, p, &self.remote).into_any_element()
+            })
             .children(tabs.iter().enumerate().map(|(i, tab)| {
                 let remote = remote.clone();
                 h_flex()
@@ -217,7 +251,7 @@ impl RemoteWindow {
                     ))
                     .child(div().max_w(px(160.)).truncate().child(tab.name.clone()))
                     .when_else(
-                        tab.active && !shell_active,
+                        tab.active && on_project,
                         |t| {
                             t.border_1()
                                 .border_color(p.border.hsla())
@@ -349,6 +383,13 @@ impl RemoteWindow {
                 "SSH",
                 "FocusTerminal",
             ),
+            // Nor has the worker shell.
+            _ if model.worker_shell_active() => (
+                p.pill_terminal_bg,
+                p.pill_terminal_ink,
+                "SHELL",
+                "FocusTerminal",
+            ),
             InputMode::Terminal => (
                 p.pill_terminal_bg,
                 p.pill_terminal_ink,
@@ -445,7 +486,7 @@ impl RemoteWindow {
             return self.shell_area(p, cx);
         }
         if let Some(end) = model.ended() {
-            return ended(p, end, &self.remote).into_any_element();
+            return ended(p, end, model, &self.remote).into_any_element();
         }
         if !ws.ready {
             return notice_card(
@@ -454,6 +495,24 @@ impl RemoteWindow {
                 &model.link_label(),
             )
             .into_any_element();
+        }
+        if model.worker_shell_active() {
+            return self.worker_shell_area(p, cx);
+        }
+        if model.is_worker() && ws.projects.is_empty() {
+            return v_flex()
+                .flex_1()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(notice_card(
+                    p,
+                    "This worker has no projects yet.",
+                    "Open a repository on it, or clone one.",
+                ))
+                .child(open_project_button(p, &self.remote))
+                .into_any_element();
         }
         if model.active_terminal().is_some() {
             return div()
@@ -472,6 +531,69 @@ impl RemoteWindow {
 }
 
 impl RemoteWindow {
+    /// The worker's shell, full width; with Restart shell once it exited.
+    fn worker_shell_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
+        let model = self.remote.read(cx);
+        let restart = || {
+            let remote = self.remote.clone();
+            div()
+                .id("remote-worker-shell-restart")
+                .debug_selector(|| "remote-worker-shell-restart".into())
+                .flex_none()
+                .px_3()
+                .py_1()
+                .rounded(px(6.))
+                .bg(p.button_primary_bg.hsla())
+                .text_color(p.button_primary_ink.hsla())
+                .cursor_pointer()
+                .text_size(px(12.))
+                .child("Restart shell")
+                .on_click(move |_, _, cx| {
+                    remote.update(cx, |model, cx| {
+                        model.restart_worker_shell();
+                        cx.notify();
+                    })
+                })
+        };
+        let Some(shell) = model.worker_shell() else {
+            return v_flex()
+                .flex_1()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(notice_card(p, "The worker shell is not running.", ""))
+                .child(restart())
+                .into_any_element();
+        };
+        let exited = (!shell.alive).then(|| {
+            let why = match shell.exit_code {
+                Some(code) => format!("The worker shell exited ({code})."),
+                None => "The worker shell exited.".to_string(),
+            };
+            h_flex()
+                .debug_selector(|| "remote-worker-shell-ended".into())
+                .flex_none()
+                .px(px(14.))
+                .py(px(8.))
+                .gap_3()
+                .border_t_1()
+                .border_color(p.hairline.hsla())
+                .bg(p.surface_window.hsla())
+                .text_size(px(12.))
+                .text_color(p.muted.hsla())
+                .child(div().flex_1().min_w_0().truncate().child(why))
+                .child(restart())
+        });
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .size_full()
+            .child(div().flex_1().min_h_0().child(self.terminal.clone()))
+            .children(exited)
+            .into_any_element()
+    }
+
     /// The SSH shell, full width; with Reconnect once it ended, or why it
     /// could not start.
     fn shell_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
@@ -538,6 +660,7 @@ impl Render for RemoteWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *Palette::global(cx);
         self.ensure_shell(cx);
+        self.sync_picker(window, cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
             window.remove_window();
@@ -547,6 +670,10 @@ impl Render for RemoteWindow {
         let mode = model.mode();
         let has_terminal = model.active_terminal().is_some();
         let shell_active = model.shell_active();
+        // Either shell's tab hides the project's sidebar and git strip.
+        let off_project = model.tab() != Tab::Project;
+        let skew = model.skew_warning();
+        let picker = self.picker.clone().filter(|_| model.ended().is_none());
         let data = SidebarData {
             rows: views::agent_rows(ws),
             focused_child: views::focused_child(ws),
@@ -563,7 +690,8 @@ impl Render for RemoteWindow {
             layer.set_context(context, cx);
             layer.set_view(overlay, window, cx);
         });
-        if !overlay_open {
+        // The picker's fields take the keyboard where they are clicked.
+        if !overlay_open && picker.is_none() {
             let shell_focus = self
                 .shell
                 .as_ref()
@@ -597,7 +725,7 @@ impl Render for RemoteWindow {
             .min_w_0()
             .h_full()
             .bg(p.surface_terminal.hsla())
-            .when(!shell_active, |main| {
+            .when(!off_project, |main| {
                 main.child(git_strip(&strip, &surface, &p))
             })
             .child(self.main_area(&p, cx));
@@ -613,14 +741,22 @@ impl Render for RemoteWindow {
             .text_color(p.ink.hsla())
             .font_family(crate::fonts::UI_FAMILY)
             .child(titlebar)
-            .child(
-                h_flex()
+            .children(skew.map(|text| skew_banner(&p, text)))
+            .child(match picker {
+                Some(picker) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(picker)
+                    .into_any_element(),
+                None => h_flex()
                     .flex_1()
                     .min_h_0()
                     .items_start()
-                    .when(!shell_active, |row| row.child(side))
-                    .child(main),
-            )
+                    .when(!off_project, |row| row.child(side))
+                    .child(main)
+                    .into_any_element(),
+            })
             .child(status)
             .child(self.layer.clone())
     }
@@ -666,6 +802,86 @@ fn shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> impl In
         })
 }
 
+/// A worker's own shell's tab, first in the row, where other hosts have the
+/// SSH shell's.
+fn worker_shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+    let remote = remote.clone();
+    h_flex()
+        .id("remote-worker-shell-tab")
+        .debug_selector(|| "remote-worker-shell-tab".into())
+        .flex_none()
+        .h(px(30.))
+        .px(px(10.))
+        .gap(px(8.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .child(icons::icon(
+            crate::assets::icon::TERMINAL,
+            px(13.),
+            if active { p.ink } else { p.muted },
+        ))
+        .child("Worker shell")
+        .when_else(
+            active,
+            |t| {
+                t.border_1()
+                    .border_color(p.border.hsla())
+                    .bg(p.surface_raised.hsla())
+                    .text_color(p.ink.hsla())
+                    .font_weight(FontWeight::MEDIUM)
+            },
+            |t| {
+                t.text_color(p.muted.hsla())
+                    .hover(|s| s.bg(p.surface_raised.hsla()))
+            },
+        )
+        .on_click(move |_, _, cx| {
+            remote.update(cx, |model, cx| {
+                model.show_worker_shell();
+                cx.notify();
+            })
+        })
+}
+
+/// A worker's Open Project, from its empty state.
+fn open_project_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+    let remote = remote.clone();
+    div()
+        .id("remote-open-project")
+        .debug_selector(|| "remote-open-project".into())
+        .flex_none()
+        .px_3()
+        .py_1()
+        .rounded(px(6.))
+        .bg(p.button_primary_bg.hsla())
+        .text_color(p.button_primary_ink.hsla())
+        .cursor_pointer()
+        .text_size(px(12.))
+        .child("Open a project…")
+        .on_click(move |_, _, cx| {
+            remote.update(cx, |model, cx| {
+                model.open_picker();
+                cx.notify();
+            })
+        })
+}
+
+/// The soft warning that the worker's FlightDeck is not this app's.
+fn skew_banner(p: &Palette, text: String) -> impl IntoElement {
+    div()
+        .debug_selector(|| "remote-version-skew".into())
+        .flex_shrink_0()
+        .w_full()
+        .px(px(14.))
+        .py(px(6.))
+        .border_b_1()
+        .border_color(p.status_attention.hsla())
+        .bg(p.surface_raised.hsla())
+        .text_size(px(12.))
+        .text_color(p.ink_2.hsla())
+        .child(text)
+}
+
 /// One clickable hint: its keycap and word.
 fn hint(p: &Palette, entry: &'static str, label: &'static str) -> impl IntoElement {
     h_flex()
@@ -703,9 +919,75 @@ fn notice_card(p: &Palette, title: &str, detail: &str) -> impl IntoElement {
         })
 }
 
-/// The link ended for good: say why, and offer to close the window.
-fn ended(p: &Palette, end: &LinkEnd, remote: &Entity<RemoteModel>) -> impl IntoElement {
-    let (title, detail) = match end {
+/// The link ended for good: say why, and offer to close the window — or to
+/// reconnect, where trying again can work.
+fn ended(
+    p: &Palette,
+    end: &LinkEnd,
+    model: &RemoteModel,
+    remote: &Entity<RemoteModel>,
+) -> impl IntoElement {
+    let worker = model.is_worker();
+    let taken_over;
+    let mismatch;
+    let (title, detail): (&str, &str) = match end {
+        LinkEnd::TakenOver { by } => {
+            taken_over = format!("Taken over by {by}");
+            (
+                taken_over.as_str(),
+                "A worker serves one window at a time. Reconnect to take it back.",
+            )
+        }
+        LinkEnd::HostQuit if worker => (
+            "The worker stopped.",
+            "Start it again on the box with `flightdeck worker start`, then reconnect.",
+        ),
+        LinkEnd::VersionMismatch(reason) if worker => {
+            mismatch = super::messages::mismatch_advice(
+                reason,
+                &model.workspace().host_version,
+                flightdeck::VERSION,
+            );
+            (
+                "The worker runs a different FlightDeck version.",
+                mismatch.as_str(),
+            )
+        }
+        _ => ended_words(end),
+    };
+    let can_reconnect = matches!(
+        end,
+        LinkEnd::TakenOver { .. }
+            | LinkEnd::HostQuit
+            | LinkEnd::ServerStopped
+            | LinkEnd::VersionMismatch(_)
+    );
+    let reconnect = can_reconnect.then(|| {
+        let remote = remote.clone();
+        div()
+            .id("remote-reconnect")
+            .debug_selector(|| "remote-reconnect".into())
+            .px_3()
+            .py_1()
+            .rounded(px(6.))
+            .bg(p.button_primary_bg.hsla())
+            .text_color(p.button_primary_ink.hsla())
+            .cursor_pointer()
+            .text_size(px(12.))
+            .child("Reconnect")
+            .on_click(move |_, _, cx| {
+                remote.update(cx, |model, cx| {
+                    model.reconnect();
+                    cx.notify();
+                })
+            })
+    });
+    ended_panel(p, end, title, detail, reconnect, remote)
+}
+
+/// What an ended link says on any host.
+fn ended_words(end: &LinkEnd) -> (&'static str, &'static str) {
+    match end {
         LinkEnd::Revoked => (
             "The host withdrew this app's access.",
             "Pair again with a new code from the host's web access overlay.",
@@ -726,13 +1008,24 @@ fn ended(p: &Palette, end: &LinkEnd, remote: &Entity<RemoteModel>) -> impl IntoE
             "The host runs a different FlightDeck version.",
             "Update one side so both speak the same web protocol.",
         ),
-        // stub: filled by H2 (the "taken over by …" panel with Reconnect).
         LinkEnd::TakenOver { .. } => (
             "Another window took this worker over.",
             "Reconnect to take it back.",
         ),
         LinkEnd::Stopped => ("Disconnected.", ""),
-    };
+    }
+}
+
+fn ended_panel(
+    p: &Palette,
+    end: &LinkEnd,
+    title: &str,
+    detail: &str,
+    reconnect: Option<impl IntoElement>,
+    remote: &Entity<RemoteModel>,
+) -> impl IntoElement {
+    let title = title.to_string();
+    let detail = detail.to_string();
     let pair_again = matches!(end, LinkEnd::Revoked | LinkEnd::Unauthorized).then(|| {
         let remote = remote.clone();
         div()
@@ -773,6 +1066,7 @@ fn ended(p: &Palette, end: &LinkEnd, remote: &Entity<RemoteModel>) -> impl IntoE
             )
         })
         .children(pair_again)
+        .children(reconnect)
         .child(
             div()
                 .id("remote-close-window")
