@@ -18,7 +18,10 @@
 use std::path::Path;
 
 #[cfg(unix)]
-use crate::config::{init::ensure_global_config, load::load_config};
+use crate::config::{
+    init::{backfill_builtin_agents, ensure_global_config},
+    load::load_config,
+};
 #[cfg(unix)]
 use crate::contracts::{Config, FileSystem, WorkerConfig};
 #[cfg(unix)]
@@ -170,8 +173,6 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
             crate::VERSION
         ),
     );
-    // integrate: add `listen,` to this literal once C adds
-    // `WorkerOptions.listen: ListenPlan`, then drop the `drop(listen)` below.
     let opts = WorkerOptions {
         paths: paths.clone(),
         home: paths.home.clone(),
@@ -179,9 +180,8 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
         global_config: config,
         health: Box::new(RealHealthProbe),
         cloner: std::sync::Arc::new(RealGitCloner),
+        listen,
     };
-    // integrate: remove once `listen` moves into `opts` above.
-    drop(listen);
     let mut host = match AppHost::open_worker(env, &notifier, opts) {
         Ok(host) => host,
         Err(e) => {
@@ -310,8 +310,24 @@ enum ConfigProblem {
 /// (SPECS §33): it serves every project, so no project's `[worker]` applies.
 fn load_global_config(fs: &dyn FileSystem, home: &Path) -> Result<Config, ConfigProblem> {
     let path = home.join(".flightdeck").join("config.toml");
-    ensure_global_config(fs, &path)
+    let created = ensure_global_config(fs, &path)
         .map_err(|e| ConfigProblem::Io(format!("could not write {}: {e}", path.display())))?;
+    // As the TUI does at startup: an existing file gains any built-in agent it
+    // lacks, so a hand-written or older global config still loads.
+    if !created {
+        if let Ok(added) = backfill_builtin_agents(fs, &path) {
+            if !added.is_empty() {
+                log_line(
+                    "info",
+                    &format!(
+                        "added built-in agent(s) {} to {}",
+                        added.join(", "),
+                        path.display()
+                    ),
+                );
+            }
+        }
+    }
     load_config(fs, &path).map_err(|e| match e {
         crate::contracts::FlightDeckError::Io(_) => {
             ConfigProblem::Io(format!("could not read {}: {e}", path.display()))
