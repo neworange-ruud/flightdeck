@@ -125,6 +125,21 @@ impl FakeFs {
     }
 }
 
+/// Queue `path`'s normal, `.` and `..` components ahead of `rest` (the root, if
+/// any, is the caller's business).
+fn push_components_front(rest: &mut VecDeque<String>, path: &Path) {
+    use std::path::Component;
+    let comps: Vec<_> = path.components().collect();
+    for c in comps.iter().rev() {
+        match c {
+            Component::RootDir | Component::Prefix(_) => {}
+            Component::CurDir => rest.push_front(".".to_string()),
+            Component::ParentDir => rest.push_front("..".to_string()),
+            Component::Normal(n) => rest.push_front(n.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 fn mark_parents(dirs: &mut HashSet<PathBuf>, path: &Path) {
     let mut cur = path.parent();
     while let Some(p) = cur {
@@ -235,8 +250,56 @@ impl FileSystem for FakeFs {
         for d in &st.dirs {
             collect(&mut out, d);
         }
+        for l in st.symlinks.keys() {
+            collect(&mut out, l);
+        }
         out.sort();
         Ok(out)
+    }
+
+    fn canonicalize(&self, p: &Path) -> Result<PathBuf> {
+        let missing = || FlightDeckError::Io(format!("no such file or directory: {}", p.display()));
+        if !p.is_absolute() {
+            return Err(missing());
+        }
+        let st = self.inner.lock().unwrap();
+        let mut cur = PathBuf::from("/");
+        let mut rest: VecDeque<String> = VecDeque::new();
+        push_components_front(&mut rest, p);
+        let mut hops = 0;
+        while let Some(name) = rest.pop_front() {
+            if name == "." {
+                continue;
+            }
+            if name == ".." {
+                cur.pop();
+                continue;
+            }
+            let next = cur.join(&name);
+            if let Some(target) = st.symlinks.get(&next) {
+                hops += 1;
+                if hops > 40 {
+                    return Err(FlightDeckError::Io(format!(
+                        "too many levels of symbolic links: {}",
+                        p.display()
+                    )));
+                }
+                if target.is_absolute() {
+                    cur = PathBuf::from("/");
+                }
+                push_components_front(&mut rest, target);
+                continue;
+            }
+            if st.files.contains_key(&next)
+                || st.blobs.contains_key(&next)
+                || st.dirs.contains(&next)
+            {
+                cur = next;
+            } else {
+                return Err(missing());
+            }
+        }
+        Ok(cur)
     }
 
     fn remove_dir_all(&self, p: &Path) -> Result<()> {

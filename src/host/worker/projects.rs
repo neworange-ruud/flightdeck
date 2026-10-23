@@ -4,8 +4,6 @@
 //! Everything is confined to `$HOME`: a requested path is canonicalised and
 //! refused when it resolves outside it, including through a symlink.
 
-// stub: filled by E
-
 use std::path::{Path, PathBuf};
 
 use crate::contracts::{FileSystem, Result};
@@ -32,7 +30,6 @@ pub enum ProjectOpError {
 
 impl std::fmt::Display for ProjectOpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // stub: filled by E (final wording)
         match self {
             ProjectOpError::OutsideHome(p) => write!(f, "{p} is outside your home folder."),
             ProjectOpError::NotFound(p) => write!(f, "{p} does not exist."),
@@ -50,10 +47,9 @@ impl std::error::Error for ProjectOpError {}
 
 impl Confinement {
     /// Confine to `home`, canonicalised.
-    pub fn new(_fs: &dyn FileSystem, home: &Path) -> Result<Confinement> {
-        // stub: filled by E (canonicalize)
+    pub fn new(fs: &dyn FileSystem, home: &Path) -> Result<Confinement> {
         Ok(Confinement {
-            home: home.to_path_buf(),
+            home: fs.canonicalize(home)?,
         })
     }
 
@@ -66,12 +62,58 @@ impl Confinement {
     /// relative `x` are under home; the canonical result must be inside home.
     pub fn resolve(
         &self,
-        _fs: &dyn FileSystem,
-        _requested: Option<&str>,
+        fs: &dyn FileSystem,
+        requested: Option<&str>,
     ) -> std::result::Result<PathBuf, ProjectOpError> {
-        // stub: filled by E
-        Err(not_implemented())
+        let text = requested.map(str::trim).unwrap_or("");
+        let joined = match text {
+            "" | "~" => return Ok(self.home.clone()),
+            _ => match text.strip_prefix("~/") {
+                Some(rest) => self.home.join(rest),
+                None => {
+                    let p = Path::new(text);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        self.home.join(p)
+                    }
+                }
+            },
+        };
+        match fs.canonicalize(&joined) {
+            Ok(canonical) if canonical.starts_with(&self.home) => Ok(canonical),
+            Ok(_) => Err(ProjectOpError::OutsideHome(text.to_string())),
+            // A path that is missing and would not be inside home anyway is
+            // "outside": do not tell a caller what exists beyond home.
+            Err(_) if !lexically_normal(&joined).starts_with(&self.home) => {
+                Err(ProjectOpError::OutsideHome(text.to_string()))
+            }
+            Err(_) => Err(ProjectOpError::NotFound(text.to_string())),
+        }
     }
+
+    /// The canonical form of `p` when it is inside home, else `None`.
+    fn inside(&self, fs: &dyn FileSystem, p: &Path) -> Option<PathBuf> {
+        fs.canonicalize(p)
+            .ok()
+            .filter(|c| c.starts_with(&self.home))
+    }
+}
+
+/// `p` with `.` and `..` folded away without touching the filesystem.
+pub(super) fn lexically_normal(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// One folder of a listing.
@@ -92,43 +134,152 @@ pub struct Listing {
     pub truncated: bool,
 }
 
-fn not_implemented() -> ProjectOpError {
-    ProjectOpError::Io("project browsing is not implemented in this build yet".to_string())
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+/// The sub-folders of canonical `dir` that stay inside home, hidden ones
+/// only when `show_hidden`: `(name, path as listed, canonical path)`, sorted
+/// case-insensitively by name.
+fn child_dirs(
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    dir: &Path,
+    show_hidden: bool,
+) -> std::result::Result<Vec<(String, PathBuf, PathBuf)>, ProjectOpError> {
+    let names = fs
+        .list_dir(dir)
+        .map_err(|e| ProjectOpError::Io(e.to_string()))?;
+    let mut out = Vec::new();
+    for path in names {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if !show_hidden && is_hidden(&name) {
+            continue;
+        }
+        // A link that leaves home, dangles or points at a file is not a
+        // navigable folder.
+        let Some(canonical) = conf.inside(fs, &path) else {
+            continue;
+        };
+        if !fs.is_dir(&canonical) {
+            continue;
+        }
+        out.push((name, path, canonical));
+    }
+    out.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(out)
 }
 
 /// List the folders in `requested` (dirs only, hidden ones only when
 /// `show_hidden`, sorted case-insensitively).
 pub fn browse(
-    _fs: &dyn FileSystem,
-    _conf: &Confinement,
-    _requested: Option<&str>,
-    _show_hidden: bool,
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    requested: Option<&str>,
+    show_hidden: bool,
 ) -> std::result::Result<Listing, ProjectOpError> {
-    // stub: filled by E
-    Err(not_implemented())
+    let path = conf.resolve(fs, requested)?;
+    if !fs.is_dir(&path) {
+        return Err(ProjectOpError::NotADirectory(
+            requested.unwrap_or("~").to_string(),
+        ));
+    }
+    let mut entries: Vec<Entry> = child_dirs(fs, conf, &path, show_hidden)?
+        .into_iter()
+        .map(|(name, listed, canonical)| Entry {
+            name,
+            path: listed,
+            is_git_repo: is_git_repo(fs, &canonical),
+        })
+        .collect();
+    let truncated = entries.len() > MAX_ENTRIES;
+    entries.truncate(MAX_ENTRIES);
+    let parent = if path == conf.home {
+        None
+    } else {
+        path.parent().map(Path::to_path_buf)
+    };
+    Ok(Listing {
+        path,
+        parent,
+        entries,
+        truncated,
+    })
 }
 
 /// The repositories under `root`, `depth` levels deep (a repository is not
-/// descended into; a missing root is empty).
+/// descended into; hidden folders are skipped; a missing root is empty).
 pub fn scan(
-    _fs: &dyn FileSystem,
-    _conf: &Confinement,
-    _root: &Path,
-    _depth: usize,
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    root: &Path,
+    depth: usize,
 ) -> std::result::Result<Vec<Entry>, ProjectOpError> {
-    // stub: filled by E
-    Ok(Vec::new())
+    let root = match conf.resolve(fs, Some(&root.to_string_lossy())) {
+        Ok(root) => root,
+        Err(ProjectOpError::OutsideHome(p)) => return Err(ProjectOpError::RootOutsideHome(p)),
+        Err(ProjectOpError::NotFound(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    if !fs.is_dir(&root) {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    scan_level(fs, conf, &root, depth, &mut found);
+    found.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(found)
+}
+
+fn scan_level(
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    dir: &Path,
+    levels_left: usize,
+    found: &mut Vec<Entry>,
+) {
+    if levels_left == 0 {
+        return;
+    }
+    // An unreadable folder is skipped, not fatal to the whole scan.
+    let Ok(children) = child_dirs(fs, conf, dir, false) else {
+        return;
+    };
+    for (name, listed, canonical) in children {
+        if is_git_repo(fs, &canonical) {
+            found.push(Entry {
+                name,
+                path: listed,
+                is_git_repo: true,
+            });
+        } else {
+            scan_level(fs, conf, &canonical, levels_left - 1, found);
+        }
+    }
 }
 
 /// Check that `requested` may be opened as a project: inside home, a folder.
 /// Returns its canonical path.
 pub fn validate_open(
-    _fs: &dyn FileSystem,
-    _conf: &Confinement,
-    _requested: &str,
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    requested: &str,
 ) -> std::result::Result<PathBuf, ProjectOpError> {
-    // stub: filled by E
-    Err(not_implemented())
+    let path = conf.resolve(fs, Some(requested))?;
+    if !fs.is_dir(&path) {
+        return Err(ProjectOpError::NotADirectory(requested.to_string()));
+    }
+    Ok(path)
 }
 
 /// Whether `dir` is a Git repository: `dir/.git` exists (a folder, or the
@@ -136,3 +287,6 @@ pub fn validate_open(
 pub fn is_git_repo(fs: &dyn FileSystem, dir: &Path) -> bool {
     fs.exists(&dir.join(".git"))
 }
+
+#[cfg(test)]
+mod tests;
