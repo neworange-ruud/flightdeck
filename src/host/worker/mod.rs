@@ -84,22 +84,9 @@ pub const LISTEN_RETRY_MS: u64 = 30_000;
 pub const CLONE_PROGRESS_MIN_MS: u64 = 250;
 
 /// The commands a worker refuses whatever its window says (design §2.4), and
-/// why. The server refuses them first (`commands::inventory_for`); this is the
-/// host's own defence in depth, so a refusal holds even if one slipped past.
-pub fn worker_refusal(name: &str) -> Option<&'static str> {
-    use crate::web::protocol::command as names;
-    match name {
-        names::QUIT => Some("Stop the worker with `flightdeck worker stop` on the box."),
-        names::START_WEB_INTERFACE | names::STOP_WEB_INTERFACE | names::SHOW_WEB_ACCESS => {
-            Some("A worker's network access is managed by the worker itself.")
-        }
-        names::PAIR_PHONE | names::UNPAIR_PHONE => {
-            Some("Workers do not pair with the phone in v1.")
-        }
-        names::OPEN_PROJECT => Some("Use the worker's project picker (browse, scan, clone)."),
-        _ => None,
-    }
-}
+/// why. The server refuses them first; the host re-checks the same table as
+/// defence in depth, so a refusal holds even if one slipped past.
+pub use crate::web::commands::worker_refusal;
 
 /// The one message a worker posts when a newer FlightDeck is out: it has no
 /// status bar to badge, and the update is the user's to run.

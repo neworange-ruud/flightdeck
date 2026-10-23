@@ -39,7 +39,8 @@ struct Fakes {
 impl Fakes {
     fn new() -> Fakes {
         Fakes {
-            fs: FakeFs::new(),
+            // The worker confines itself to a home that must exist.
+            fs: FakeFs::new().with_dir("/home/me"),
             pty: FakePty::new(),
             clock: FakeClock::default(),
             container: FakeContainerRuntime::new(),
