@@ -263,18 +263,23 @@ describe("the wire version mirror", () => {
     expect(tab?.[1]).toBe(host?.[1]);
   });
 
-  /** The host serves exactly one version (D9: server and SPA ship together),
-   * so the floor and the ceiling move with it. A range that drifted open would
-   * let a stale tab attach and then fail on the first frame it cannot parse. */
-  it("the host advertises exactly its own version, with no range", () => {
+  /** The ceiling is the host's own version (D9: server and SPA ship
+   * together). Since v7 the floor sits **one** below it and no lower: a
+   * FlightDeck Desktop does not co-ship with its host, so a v6 Desktop keeps
+   * driving a v7 TUI host, which never sends it a v7 frame (those come only
+   * from a worker, which refuses v6). A range that drifted wider would let a
+   * stale tab attach and then fail on the first frame it cannot parse. */
+  it("the host advertises its own version, and at most one below it", () => {
     const rust = readFileSync(
       new URL("../../../src/web/protocol.rs", import.meta.url),
       "utf8",
     );
-    const of = (name: string): string | undefined =>
-      new RegExp(`pub const ${name}: u16 = (\\d+);`).exec(rust)?.[1];
-    expect(of("MIN_SUPPORTED_VERSION")).toBe(of("PROTOCOL_VERSION"));
-    expect(of("MAX_SUPPORTED_VERSION")).toBe(of("PROTOCOL_VERSION"));
+    const of = (name: string): number =>
+      Number(new RegExp(`pub const ${name}: u16 = (\\d+);`).exec(rust)?.[1]);
+    const current = of("PROTOCOL_VERSION");
+    expect(of("MAX_SUPPORTED_VERSION")).toBe(current);
+    expect(of("MIN_SUPPORTED_VERSION")).toBeGreaterThanOrEqual(current - 1);
+    expect(of("MIN_SUPPORTED_VERSION")).toBeLessThanOrEqual(current);
   });
 });
 

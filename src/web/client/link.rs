@@ -22,6 +22,18 @@
 //!   stream started over (the host restarted); the cursor goes back to zero,
 //!   the front-end is told ([`LinkEvent::StreamReset`]) and the client
 //!   re-attaches so the host replays it from the start.
+//!
+//! And one thing happens here because it is about *which protocol* the socket
+//! speaks (`specs/WORKER_PRD.md` §5): the link dials at [`PROTOCOL_VERSION`],
+//! and a host that refuses it with a `version_mismatch` naming an older
+//! version this build still speaks ([`MIN_SUPPORTED_VERSION`]) is redialled
+//! once, straight away, at that version — so a v7 Desktop keeps driving a v6
+//! TUI. The snapshot must then come back at the version attached with.
+//!
+//! A **background link** ([`ConnectionKind::Background`], v7) is the status-only
+//! connection a Desktop keeps to each worker. It always observes, never types,
+//! never falls back below the worker's floor, and treats the worker going away
+//! as *offline* — it keeps retrying, out to [`LinkConfig::retry_cap_ms`].
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -35,9 +47,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::web::protocol::{
-    Ack, Attach, ClientInfo, ClientMsg, ConfigView, Delta, ErrorCode, GitStatusView, ImagePaste,
+    Ack, Attach, ClientInfo, ClientMsg, CloneProgress, CloneResult, ConfigView, ConnectionKind,
+    Delta, DirListing, ErrorCode, GitStatusView, HostKind, ImagePaste, ProjectScan, ResizeTerminal,
     SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId,
-    WireError, PROTOCOL_VERSION,
+    WireError, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, WORKER_MIN_CLIENT_VERSION,
 };
 use crate::web::server::COOKIE_NAME;
 
@@ -74,6 +87,13 @@ pub struct LinkConfig {
     /// Sent as `User-Agent` and in `Attach.client`, so the controlled instance
     /// can tell this client from a browser and revoke it by name.
     pub user_agent: String,
+    /// A remote window, or a worker's status-only background link (v7). Sent
+    /// as `Attach.connection`; only ever `Background` towards a worker.
+    pub connection: ConnectionKind,
+    /// The longest reconnect delay, overriding the last entry of
+    /// [`RETRY_DELAYS_MS`] (v7: a background link backs off to a minute).
+    /// `None` keeps the browser's 8 s cap.
+    pub retry_cap_ms: Option<u64>,
 }
 
 /// The link's state, for the title and status bars.
@@ -110,6 +130,12 @@ pub enum LinkEnd {
     ServerStopped,
     /// The host speaks a different protocol version; one side must update.
     VersionMismatch(String),
+    /// Another window took this worker over (v7, PRD W17). `by` is its device
+    /// label. The token is still good: reconnecting takes the worker back.
+    TakenOver {
+        /// The device that took over.
+        by: String,
+    },
     /// This client closed the link.
     Stopped,
 }
@@ -129,6 +155,14 @@ pub enum LinkEvent {
     GitStatus(GitStatusView),
     Configuration(ConfigView),
     Error(WireError),
+    /// A worker's directory listing, in answer to `browse_dir` (v7).
+    DirListing(DirListing),
+    /// A worker's project scan, in answer to `scan_projects` (v7).
+    ProjectScan(ProjectScan),
+    /// A worker's clone progress (v7).
+    CloneProgress(CloneProgress),
+    /// How a worker's clone ended (v7).
+    CloneResult(CloneResult),
 }
 
 /// What the client asks the link task to send.
@@ -156,15 +190,20 @@ impl LinkOut {
 pub struct Outbound {
     queue: Arc<Mutex<InputQueue>>,
     tx: UnboundedSender<LinkOut>,
+    /// A background link's way in (v7): it never types, so input is dropped
+    /// here rather than held and replayed at a worker that would only ack it
+    /// `Ignored`.
+    background: bool,
 }
 
 impl Outbound {
-    fn new() -> (Outbound, UnboundedReceiver<LinkOut>) {
+    fn new(connection: ConnectionKind) -> (Outbound, UnboundedReceiver<LinkOut>) {
         let (tx, rx) = unbounded_channel();
         (
             Outbound {
                 queue: Arc::new(Mutex::new(InputQueue::new())),
                 tx,
+                background: connection == ConnectionKind::Background,
             },
             rx,
         )
@@ -173,7 +212,22 @@ impl Outbound {
     /// An outbound with no task behind it — for tests that read what would
     /// have been sent off the receiver.
     pub fn detached() -> (Outbound, UnboundedReceiver<LinkOut>) {
-        Outbound::new()
+        Outbound::new(ConnectionKind::Window)
+    }
+
+    /// Whether this is a background link's way in, which never sends input.
+    pub fn is_background(&self) -> bool {
+        self.background
+    }
+
+    /// Drop input on a background link. Nothing should try: the debug build
+    /// says so loudly, the release build says nothing and sends nothing.
+    fn refuse_input(&self) -> bool {
+        debug_assert!(
+            !self.background,
+            "a background link never sends input (PRD W19)"
+        );
+        self.background
     }
 
     /// Mark the queue live as a snapshot would, for tests of [`Outbound::detached`].
@@ -188,6 +242,9 @@ impl Outbound {
     /// Keystrokes for `terminal_id`: sent now when live, held otherwise and
     /// replayed after the next snapshot.
     pub fn input(&self, terminal_id: TerminalId, data: Vec<u8>) {
+        if self.refuse_input() {
+            return;
+        }
         // The lock is held across the send so channel order is seq order.
         let mut queue = self.lock();
         if let Some(frame) = queue.push(terminal_id, data) {
@@ -197,6 +254,9 @@ impl Outbound {
 
     /// A pasted image for `terminal_id`, held and replayed like keystrokes.
     pub fn input_image(&self, terminal_id: TerminalId, image: ImagePaste) {
+        if self.refuse_input() {
+            return;
+        }
         let mut queue = self.lock();
         if let Some(frame) = queue.push_image(terminal_id, image) {
             let _ = self.tx.send(LinkOut::Frame(frame));
@@ -213,9 +273,24 @@ impl Outbound {
         Some(seq)
     }
 
-    /// Ask for a different seat.
+    /// Ask for a different seat. A background link keeps observing.
     pub fn attach(&self, seat: SeatRequest) {
+        if self.background {
+            return;
+        }
         let _ = self.tx.send(LinkOut::Attach(seat));
+    }
+
+    /// Size one terminal's PTY (v7, worker hosts only — the caller checks).
+    /// Neither sequenced nor held: a size is only worth sending while
+    /// attached, and the next one supersedes it. Returns whether it went out.
+    pub fn resize_terminal(&self, resize: ResizeTerminal) -> bool {
+        if self.background || !self.lock().is_live() {
+            return false;
+        }
+        self.tx
+            .send(LinkOut::Frame(ClientMsg::ResizeTerminal(resize)))
+            .is_ok()
     }
 
     /// Keystroke bursts still waiting for an ack.
@@ -247,7 +322,7 @@ impl LinkHandle {
     /// Dial `config` on the shared runtime. Events arrive on `events`; send
     /// through the returned [`Outbound`].
     pub fn start(config: LinkConfig, events: Sender<LinkEvent>) -> (LinkHandle, Outbound) {
-        let (outbound, out_rx) = Outbound::new();
+        let (outbound, out_rx) = Outbound::new(config.connection);
         let Some(runtime) = crate::remote::runtime::try_shared() else {
             let _ = events.send(LinkEvent::State(LinkState::Ended(LinkEnd::Stopped)));
             return (
@@ -303,6 +378,18 @@ pub fn retry_delay_ms(attempt: u32) -> u64 {
     RETRY_DELAYS_MS[index]
 }
 
+/// The delay before reconnect attempt `attempt` with [`LinkConfig::retry_cap_ms`]
+/// applied: the browser's doubling from 250 ms, stopping at `cap_ms` instead of
+/// 8 s. `None` is [`retry_delay_ms`] exactly.
+pub fn capped_retry_delay_ms(attempt: u32, cap_ms: Option<u64>) -> u64 {
+    let Some(cap_ms) = cap_ms else {
+        return retry_delay_ms(attempt);
+    };
+    // 250 × 2^20 is already past any sane cap, and keeps the shift in range.
+    let doublings = attempt.saturating_sub(1).min(20);
+    (RETRY_DELAYS_MS[0] << doublings).min(cap_ms.max(1))
+}
+
 // ---------------------------------------------------------------------------
 // The task
 // ---------------------------------------------------------------------------
@@ -326,6 +413,9 @@ enum SessionEnd {
     Ended(LinkEnd),
     /// The host is restarting: redial straight away.
     Restarting,
+    /// The host speaks an older version this build still does: redial straight
+    /// away at [`Carry::version`], which has already been lowered.
+    FallBack,
     /// The socket dropped: redial with backoff.
     Dropped,
 }
@@ -335,6 +425,9 @@ struct Carry {
     cursors: HashMap<TerminalId, u64>,
     viewer: Option<ViewerId>,
     seat: SeatRequest,
+    /// The protocol version the next `Attach` names: [`PROTOCOL_VERSION`],
+    /// or the older one a host asked for ([`fall_back`]).
+    version: u16,
 }
 
 async fn run(
@@ -348,7 +441,9 @@ async fn run(
         cursors: HashMap::new(),
         viewer: None,
         seat: settle_seat(config.seat),
+        version: PROTOCOL_VERSION,
     };
+    let retry = |attempt: u32| capped_retry_delay_ms(attempt, config.retry_cap_ms);
     let mut attempt: u32 = 0;
     events.send(LinkEvent::State(LinkState::Connecting));
     loop {
@@ -366,11 +461,11 @@ async fn run(
             }
             Err(DialError::RateLimited(retry_after_ms)) => {
                 attempt += 1;
-                retry_after_ms.max(retry_delay_ms(attempt))
+                retry_after_ms.max(retry(attempt))
             }
             Err(DialError::Network) => {
                 attempt += 1;
-                retry_delay_ms(attempt)
+                retry(attempt)
             }
             Ok(ws) => {
                 let end = session(
@@ -399,12 +494,19 @@ async fn run(
                         return;
                     }
                     SessionEnd::Restarting => {
+                        // A restart is how a host gets updated: ask for this
+                        // build's own version again.
+                        carry.version = PROTOCOL_VERSION;
                         attempt = 1;
                         RETRY_DELAYS_MS[0]
                     }
+                    SessionEnd::FallBack => {
+                        // Not a failure: the very next dial should succeed.
+                        continue;
+                    }
                     SessionEnd::Dropped => {
                         attempt += 1;
-                        retry_delay_ms(attempt)
+                        retry(attempt)
                     }
                 }
             }
@@ -421,6 +523,23 @@ async fn run(
             }
         }
     }
+}
+
+/// The version to redial at after a host refused `carry.version` with
+/// `error`, if there is one worth trying (`specs/WORKER_PRD.md` §5).
+///
+/// Only once per dial cycle — from [`PROTOCOL_VERSION`] down to the host's
+/// `max_supported`, and only when that is a version this build still speaks.
+/// Never for a background link below the worker floor: a background link
+/// exists only for workers, and a host that cannot speak v7 is not one.
+fn fall_back(config: &LinkConfig, carry: &Carry, error: &WireError) -> Option<u16> {
+    let host_max = error.version?.max_supported;
+    let floor = match config.connection {
+        ConnectionKind::Background => WORKER_MIN_CLIENT_VERSION,
+        ConnectionKind::Window => MIN_SUPPORTED_VERSION,
+    };
+    (carry.version == PROTOCOL_VERSION && host_max >= floor && host_max < carry.version)
+        .then_some(host_max)
 }
 
 /// `take_over` is a one-shot act; the seat it leaves behind is a writer.
@@ -478,6 +597,11 @@ async fn dial(config: &LinkConfig) -> Result<Ws, DialError> {
 }
 
 fn attach_frame(config: &LinkConfig, carry: &Carry, seat: SeatRequest) -> ClientMsg {
+    // A background link only ever watches (PRD W19).
+    let seat = match config.connection {
+        ConnectionKind::Background => SeatRequest::Observe,
+        ConnectionKind::Window => seat,
+    };
     let mut cursors: Vec<TermCursor> = carry
         .cursors
         .iter()
@@ -488,7 +612,7 @@ fn attach_frame(config: &LinkConfig, carry: &Carry, seat: SeatRequest) -> Client
         .collect();
     cursors.sort_by(|a, b| a.terminal_id.cmp(&b.terminal_id));
     ClientMsg::Attach(Attach {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: carry.version,
         seat,
         cursors,
         resume_viewer: carry.viewer.clone(),
@@ -497,6 +621,7 @@ fn attach_frame(config: &LinkConfig, carry: &Carry, seat: SeatRequest) -> Client
             user_agent: Some(config.user_agent.clone()),
             label: Some(config.user_agent.clone()),
         }),
+        connection: config.connection,
     })
 }
 
@@ -563,10 +688,18 @@ async fn session(
                 };
                 match frame {
                     ServerMsg::Snapshot(snapshot) => {
-                        if snapshot.protocol_version != PROTOCOL_VERSION {
+                        if snapshot.protocol_version != carry.version {
                             return SessionEnd::Ended(LinkEnd::VersionMismatch(format!(
                                 "The host speaks web protocol v{}; this app speaks v{}.",
-                                snapshot.protocol_version, PROTOCOL_VERSION
+                                snapshot.protocol_version, carry.version
+                            )));
+                        }
+                        if config.connection == ConnectionKind::Background
+                            && snapshot.host_kind != Some(HostKind::Worker)
+                        {
+                            return SessionEnd::Ended(LinkEnd::VersionMismatch(format!(
+                                "{} is not a FlightDeck worker, so it keeps no background link.",
+                                config.address
                             )));
                         }
                         let resets = reconcile_cursors(&mut carry.cursors, &snapshot);
@@ -609,6 +742,10 @@ async fn session(
                     ServerMsg::Configuration(view) => events.send(LinkEvent::Configuration(view)),
                     ServerMsg::Error(error) => {
                         if error.code == ErrorCode::VersionMismatch {
+                            if let Some(version) = fall_back(config, carry, &error) {
+                                carry.version = version;
+                                return SessionEnd::FallBack;
+                            }
                             return SessionEnd::Ended(LinkEnd::VersionMismatch(error.message));
                         }
                         if let Some(seq) = error.seq {
@@ -617,16 +754,33 @@ async fn session(
                         events.send(LinkEvent::Error(error));
                     }
                     ServerMsg::Shutdown { reason, .. } => {
+                        // A worker that stops or quits is *offline* to a
+                        // background link, which keeps trying (design A8).
+                        let background = config.connection == ConnectionKind::Background;
                         return match reason {
                             ShutdownReason::Restarting | ShutdownReason::Unknown => {
                                 SessionEnd::Restarting
                             }
                             ShutdownReason::TokenRevoked => SessionEnd::Ended(LinkEnd::Revoked),
+                            ShutdownReason::HostQuit | ShutdownReason::ServerStopped
+                                if background =>
+                            {
+                                SessionEnd::Dropped
+                            }
                             ShutdownReason::HostQuit => SessionEnd::Ended(LinkEnd::HostQuit),
                             ShutdownReason::ServerStopped => {
                                 SessionEnd::Ended(LinkEnd::ServerStopped)
                             }
                         };
+                    }
+                    ServerMsg::DirListing(listing) => events.send(LinkEvent::DirListing(listing)),
+                    ServerMsg::ProjectScan(scan) => events.send(LinkEvent::ProjectScan(scan)),
+                    ServerMsg::CloneProgress(progress) => {
+                        events.send(LinkEvent::CloneProgress(progress))
+                    }
+                    ServerMsg::CloneResult(result) => events.send(LinkEvent::CloneResult(result)),
+                    ServerMsg::TakenOver { by } => {
+                        return SessionEnd::Ended(LinkEnd::TakenOver { by });
                     }
                     ServerMsg::Unrecognized => {}
                 }
@@ -664,7 +818,9 @@ async fn session(
 }
 
 /// Drop cursors for terminals the host no longer has, and reset any cursor
-/// that is past its terminal's `byte_len` — that stream started over.
+/// that is past its terminal's `byte_len` — that stream started over. A
+/// worker's shell (v7) is a terminal like any other here, though it sits
+/// outside every project.
 fn reconcile_cursors(
     cursors: &mut HashMap<TerminalId, u64>,
     snapshot: &Snapshot,
@@ -677,6 +833,9 @@ fn reconcile_cursors(
         .flat_map(|s| s.terminals.iter())
     {
         lens.insert(terminal.terminal_id.clone(), terminal.byte_len);
+    }
+    if let Some(shell) = snapshot.worker.as_ref().and_then(|w| w.shell.as_ref()) {
+        lens.insert(shell.terminal_id.clone(), shell.byte_len);
     }
     cursors.retain(|id, _| lens.contains_key(id));
     let mut resets: Vec<TerminalId> = cursors
@@ -764,5 +923,213 @@ mod tests {
     fn the_backoff_matches_the_browser_and_caps_at_eight_seconds() {
         let delays: Vec<u64> = (1..=8).map(retry_delay_ms).collect();
         assert_eq!(delays, vec![250, 500, 1000, 2000, 4000, 8000, 8000, 8000]);
+    }
+
+    #[test]
+    fn a_retry_cap_stretches_or_shortens_the_backoff() {
+        let capped = |cap| -> Vec<u64> {
+            (1..=10)
+                .map(|attempt| capped_retry_delay_ms(attempt, cap))
+                .collect()
+        };
+        assert_eq!(
+            capped(None),
+            (1..=10).map(retry_delay_ms).collect::<Vec<_>>()
+        );
+        // A background link backs off to a minute.
+        assert_eq!(
+            capped(Some(60_000)),
+            vec![250, 500, 1000, 2000, 4000, 8000, 16_000, 32_000, 60_000, 60_000]
+        );
+        assert_eq!(capped(Some(1000))[3..], [1000; 7]);
+        assert_eq!(capped_retry_delay_ms(u32::MAX, Some(60_000)), 60_000);
+    }
+
+    // -- against a scripted host --------------------------------------------
+
+    use crate::web::client::fake_host::{self, accept, recv, send};
+    use crate::web::protocol::VersionMismatch;
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn config(address: &str, connection: ConnectionKind) -> LinkConfig {
+        LinkConfig {
+            address: address.to_string(),
+            token: AccessToken::new("t".to_string()),
+            seat: SeatRequest::Write,
+            user_agent: "FlightDeck Desktop/test (box)".to_string(),
+            connection,
+            retry_cap_ms: None,
+        }
+    }
+
+    /// Read link events until one matches, failing after [`WAIT`].
+    fn wait_for(
+        events: &std::sync::mpsc::Receiver<LinkEvent>,
+        what: &str,
+        mut matches: impl FnMut(&LinkEvent) -> bool,
+    ) -> LinkEvent {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(left) {
+                Ok(event) if matches(&event) => return event,
+                Ok(_) => {}
+                Err(_) => panic!("timed out waiting for {what}"),
+            }
+        }
+    }
+
+    fn attach(frame: Option<ClientMsg>) -> Attach {
+        match frame {
+            Some(ClientMsg::Attach(attach)) => attach,
+            other => panic!("expected an attach, got {other:?}"),
+        }
+    }
+
+    fn mismatch(max_supported: u16) -> ServerMsg {
+        ServerMsg::Error(WireError::version_mismatch(VersionMismatch {
+            local: max_supported,
+            peer: PROTOCOL_VERSION,
+            min_supported: max_supported,
+            max_supported,
+        }))
+    }
+
+    #[test]
+    fn a_takeover_ends_the_link_naming_the_new_window() {
+        let (listener, address) = fake_host::listen();
+        let host = std::thread::spawn(move || {
+            let mut ws = accept(&listener).expect("the link dials");
+            let first = attach(recv(&mut ws));
+            send(
+                &mut ws,
+                &ServerMsg::Snapshot(Box::new(fake_host::snapshot(
+                    PROTOCOL_VERSION,
+                    Some(HostKind::Worker),
+                ))),
+            );
+            send(
+                &mut ws,
+                &ServerMsg::TakenOver {
+                    by: "studio".to_string(),
+                },
+            );
+            first
+        });
+        let (tx, events) = std::sync::mpsc::channel();
+        let (link, _outbound) = LinkHandle::start(config(&address, ConnectionKind::Window), tx);
+        let ended = wait_for(&events, "the takeover", |e| {
+            matches!(e, LinkEvent::State(LinkState::Ended(_)))
+        });
+        assert!(matches!(
+            ended,
+            LinkEvent::State(LinkState::Ended(LinkEnd::TakenOver { ref by })) if by == "studio"
+        ));
+        let first = host.join().unwrap();
+        assert_eq!(first.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(first.connection, ConnectionKind::Window);
+        drop(link);
+    }
+
+    #[test]
+    fn a_background_link_observes_and_never_falls_back_below_the_worker_floor() {
+        let (listener, address) = fake_host::listen();
+        let host = std::thread::spawn(move || {
+            let mut ws = accept(&listener).expect("the link dials");
+            let first = attach(recv(&mut ws));
+            send(&mut ws, &mismatch(6));
+            first
+        });
+        let (tx, events) = std::sync::mpsc::channel();
+        let (link, outbound) = LinkHandle::start(config(&address, ConnectionKind::Background), tx);
+        assert!(outbound.is_background());
+        let ended = wait_for(&events, "the refusal", |e| {
+            matches!(e, LinkEvent::State(LinkState::Ended(_)))
+        });
+        assert!(matches!(
+            ended,
+            LinkEvent::State(LinkState::Ended(LinkEnd::VersionMismatch(_)))
+        ));
+        let first = host.join().unwrap();
+        assert_eq!(first.connection, ConnectionKind::Background);
+        assert_eq!(
+            first.seat,
+            SeatRequest::Observe,
+            "asked to write, it watches"
+        );
+        drop(link);
+    }
+
+    #[test]
+    fn a_background_link_keeps_trying_a_worker_that_stopped() {
+        let (listener, address) = fake_host::listen();
+        let host = std::thread::spawn(move || {
+            let mut ws = accept(&listener).expect("the link dials");
+            attach(recv(&mut ws));
+            send(
+                &mut ws,
+                &ServerMsg::Snapshot(Box::new(fake_host::snapshot(
+                    PROTOCOL_VERSION,
+                    Some(HostKind::Worker),
+                ))),
+            );
+            send(
+                &mut ws,
+                &ServerMsg::Shutdown {
+                    reason: ShutdownReason::HostQuit,
+                    self_initiated: false,
+                    detail: Some("worker stopped".to_string()),
+                },
+            );
+            drop(ws);
+            // It comes back for more.
+            let mut ws = accept(&listener).expect("the link redials");
+            attach(recv(&mut ws))
+        });
+        let (tx, events) = std::sync::mpsc::channel();
+        let (link, _outbound) = LinkHandle::start(config(&address, ConnectionKind::Background), tx);
+        wait_for(&events, "offline, retrying", |e| {
+            matches!(e, LinkEvent::State(LinkState::Reconnecting { .. }))
+        });
+        let again = host.join().unwrap();
+        assert_eq!(again.connection, ConnectionKind::Background);
+        drop(link);
+    }
+
+    #[test]
+    fn a_background_link_to_a_host_that_is_not_a_worker_ends() {
+        let (listener, address) = fake_host::listen();
+        let host = std::thread::spawn(move || {
+            let mut ws = accept(&listener).expect("the link dials");
+            attach(recv(&mut ws));
+            send(
+                &mut ws,
+                &ServerMsg::Snapshot(Box::new(fake_host::snapshot(
+                    PROTOCOL_VERSION,
+                    Some(HostKind::Tui),
+                ))),
+            );
+            // Hold the socket until the link lets go.
+            fake_host::recv_all(&mut ws)
+        });
+        let (tx, events) = std::sync::mpsc::channel();
+        let (link, _outbound) = LinkHandle::start(config(&address, ConnectionKind::Background), tx);
+        let ended = wait_for(&events, "the end", |e| {
+            matches!(
+                e,
+                LinkEvent::State(LinkState::Ended(_)) | LinkEvent::Snapshot(_)
+            )
+        });
+        assert!(
+            matches!(
+                ended,
+                LinkEvent::State(LinkState::Ended(LinkEnd::VersionMismatch(ref why)))
+                    if why.contains("not a FlightDeck worker")
+            ),
+            "{ended:?}"
+        );
+        drop(link);
+        host.join().unwrap();
     }
 }

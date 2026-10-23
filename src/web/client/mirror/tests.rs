@@ -107,6 +107,8 @@ fn snapshot() -> Snapshot {
         update: None,
         sidebar_position: AgentTabPosition::default(),
         host_machine: None,
+        host_kind: None,
+        worker: None,
     }
 }
 
@@ -414,4 +416,198 @@ fn dialogs_seats_and_activity_are_mirrored() {
     ws.apply_delta(Delta::Activity(event.clone()));
     ws.apply_delta(Delta::Activity(event));
     assert_eq!(ws.activity.len(), 1, "an event id is recorded once");
+}
+
+// -- a worker host (v7) -----------------------------------------------------
+
+fn shell(byte_len: u64, alive: bool) -> WorkerShellView {
+    WorkerShellView {
+        terminal_id: crate::web::protocol::WORKER_SHELL_TERMINAL_ID.into(),
+        title: "zsh".to_string(),
+        geometry: Geometry {
+            cols: 120,
+            rows: 34,
+        },
+        byte_len,
+        replay_from: 0,
+        alive,
+        exit_code: None,
+    }
+}
+
+fn message(id: u64, text: &str) -> HostMessage {
+    HostMessage {
+        id,
+        at_ms: 1_000 + id as i64,
+        level: crate::web::protocol::MessageLevel::Info,
+        text: text.to_string(),
+    }
+}
+
+fn worker_snapshot(messages: Vec<HostMessage>) -> Snapshot {
+    Snapshot {
+        host_kind: Some(HostKind::Worker),
+        worker: Some(WorkerSnapshot {
+            home: "/home/u".to_string(),
+            shell: Some(shell(10, true)),
+            health: None,
+            status: WorkerStatusView {
+                projects_root: "/home/u/projects".to_string(),
+                ..WorkerStatusView::default()
+            },
+            connections: ConnectionsView::default(),
+            host_messages: messages,
+        }),
+        ..snapshot()
+    }
+}
+
+#[test]
+fn a_v6_snapshot_is_not_a_worker_and_worker_deltas_ask_for_a_snapshot() {
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(Snapshot {
+        protocol_version: 6,
+        ..snapshot()
+    });
+    assert_eq!(ws.host_kind, None);
+    assert!(!ws.is_worker());
+    assert!(ws.worker.is_none());
+    assert!(ws.worker_shell().is_none());
+    assert!(ws.take_notifications().is_empty());
+    assert_eq!(
+        ws.streamed_terminals().len(),
+        ws.terminals().count(),
+        "no shell"
+    );
+    let applied = ws.apply_delta(Delta::WorkerShell(shell(1, true)));
+    assert!(applied.resync && !applied.changed);
+
+    ws.apply_snapshot(Snapshot {
+        host_kind: Some(HostKind::Tui),
+        ..snapshot()
+    });
+    assert!(!ws.is_worker());
+}
+
+#[test]
+fn a_worker_snapshot_and_each_worker_delta_are_mirrored() {
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(worker_snapshot(Vec::new()));
+    assert!(ws.is_worker());
+    assert_eq!(ws.worker.as_ref().unwrap().home, "/home/u");
+    assert_eq!(ws.worker_shell().map(|s| s.byte_len), Some(10));
+    let streamed = ws.streamed_terminals();
+    let shell_view = streamed.last().unwrap();
+    assert_eq!(
+        shell_view.terminal_id.as_str(),
+        crate::web::protocol::WORKER_SHELL_TERMINAL_ID
+    );
+    assert_eq!(shell_view.byte_len, 10);
+
+    let health = Health {
+        sampled_at_ms: 5,
+        uptime_secs: 60,
+        version: "1.2.0".to_string(),
+        load_avg_1m_centi: Some(42),
+        cpu_count: 8,
+        mem_total_bytes: Some(16),
+        mem_available_bytes: None,
+        disk_free_home_bytes: Some(18),
+        disk_free_projects_root_bytes: Some(18),
+        agents_total: 2,
+        agents_running: 1,
+    };
+    assert!(ws.apply_delta(Delta::Health(health.clone())).changed);
+    assert_eq!(ws.worker.as_ref().unwrap().health, Some(health));
+
+    assert!(ws.apply_delta(Delta::WorkerShell(shell(99, false))).changed);
+    assert_eq!(
+        ws.worker_shell().map(|s| (s.byte_len, s.alive)),
+        Some((99, false))
+    );
+
+    let status = WorkerStatusView {
+        listening: vec!["100.64.1.2:7420".to_string()],
+        advertised: Some("box.tail1234.ts.net:7420".to_string()),
+        not_listening_reason: None,
+        unread_messages: 3,
+        projects_root: "/home/u/src".to_string(),
+    };
+    assert!(ws.apply_delta(Delta::WorkerStatus(status.clone())).changed);
+    assert_eq!(ws.worker.as_ref().unwrap().status, status);
+
+    let connections = ConnectionsView {
+        window: Some(crate::web::protocol::WindowInfo {
+            label: "studio".to_string(),
+            address: Some("100.64.1.9".to_string()),
+            since_ms: 7,
+            same_device: true,
+        }),
+        background_links: 2,
+    };
+    assert!(
+        ws.apply_delta(Delta::Connections(connections.clone()))
+            .changed
+    );
+    assert_eq!(ws.worker.as_ref().unwrap().connections, connections);
+
+    let note = NotificationView {
+        at_ms: 9,
+        title: "login".to_string(),
+        body: "Claude finished".to_string(),
+        sound: crate::web::protocol::NotificationSoundView::Completion,
+    };
+    assert!(ws.apply_delta(Delta::Notification(note.clone())).changed);
+    assert_eq!(ws.take_notifications(), vec![note]);
+    assert!(ws.take_notifications().is_empty(), "taken once");
+
+    assert!(
+        ws.apply_delta(Delta::HostMessage(message(1, "hello")))
+            .changed
+    );
+    assert!(
+        !ws.apply_delta(Delta::HostMessage(message(1, "hello")))
+            .changed,
+        "a repeat is recorded once"
+    );
+    assert_eq!(ws.take_new_messages(), vec![message(1, "hello")]);
+    assert!(ws.take_new_messages().is_empty());
+}
+
+#[test]
+fn unread_messages_replay_once_and_the_history_is_capped() {
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(worker_snapshot(vec![message(1, "a"), message(2, "b")]));
+    assert_eq!(ws.take_new_messages().len(), 2, "the replay is new");
+    // A reconnect replays what is still unread; nothing is new twice.
+    ws.apply_snapshot(worker_snapshot(vec![message(2, "b"), message(3, "c")]));
+    assert_eq!(ws.take_new_messages(), vec![message(3, "c")]);
+    assert_eq!(ws.worker.as_ref().unwrap().messages.len(), 3);
+
+    for id in 10..(10 + MESSAGE_CAP as u64) {
+        ws.apply_delta(Delta::HostMessage(message(id, "x")));
+    }
+    let messages = &ws.worker.as_ref().unwrap().messages;
+    assert_eq!(messages.len(), MESSAGE_CAP);
+    assert_eq!(messages.front().map(|m| m.id), Some(10), "oldest dropped");
+}
+
+#[test]
+fn needs_you_counts_waiting_and_failed_sessions_in_every_project() {
+    let mut snap = snapshot();
+    snap.projects[0].sessions[0].status.bucket = StatusBucket::Waiting;
+    snap.projects[1].sessions[0].status.bucket = StatusBucket::Error;
+    let mut ws = RemoteWorkspace::new();
+    ws.apply_snapshot(snap);
+    assert_eq!(ws.needs_you_count(), 2);
+    ws.apply_delta(Delta::Status {
+        session_id: TabId("s1".to_string()),
+        status: SessionStatus {
+            interpreted: crate::contracts::InterpretedStatus::Working,
+            manual: None,
+            bucket: StatusBucket::InProgress,
+            running_time_secs: 1,
+        },
+    });
+    assert_eq!(ws.needs_you_count(), 1);
 }

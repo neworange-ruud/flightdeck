@@ -675,8 +675,12 @@ impl TerminalStreams {
                 self.viewports.insert(viewer_id.clone(), *viewport);
                 Vec::new()
             }
-            // Seats and commands belong to the caller, not to the byte stream.
-            WebInbound::SeatsChanged { .. } | WebInbound::Command { .. } => Vec::new(),
+            // Seats, commands, worker ops and PTY sizing belong to the caller,
+            // not to the byte stream.
+            WebInbound::SeatsChanged { .. }
+            | WebInbound::Command { .. }
+            | WebInbound::ResizeTerminal { .. }
+            | WebInbound::WorkerOp { .. } => Vec::new(),
         }
     }
 }

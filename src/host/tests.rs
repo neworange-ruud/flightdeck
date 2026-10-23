@@ -2071,6 +2071,8 @@ mod native_remote_client {
             token,
             seat: SeatRequest::Write,
             user_agent: "FlightDeck Desktop/test".to_string(),
+            connection: crate::web::protocol::ConnectionKind::Window,
+            retry_cap_ms: None,
         });
         until(&mut host, &mut client, "the snapshot", |_, c| {
             c.state().is_live() && c.workspace().ready

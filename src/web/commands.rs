@@ -118,7 +118,7 @@
 
 use crate::app::commands::{Command, Selector};
 use crate::tui::palette::PaletteAction;
-use crate::web::protocol::{command as names, CommandRun, CommandTarget, CommandView};
+use crate::web::protocol::{command as names, CommandRun, CommandTarget, CommandView, HostKind};
 
 #[cfg(test)]
 mod tests;
@@ -952,6 +952,67 @@ impl CommandSpec {
 /// The whole inventory as the browser receives it, in palette display order.
 pub fn inventory() -> Vec<CommandView> {
     INVENTORY.iter().map(CommandSpec::view).collect()
+}
+
+// ===========================================================================
+// Worker hosts (v7, `specs/WORKER_PRD.md`)
+// ===========================================================================
+
+/// Why a worker will not quit for a remote window.
+pub const WORKER_QUIT_REFUSAL: &str = "Stop the worker with `flightdeck worker stop` on the box.";
+
+/// Why a worker's network access is not a palette action.
+pub const WORKER_WEB_ACCESS_REFUSAL: &str =
+    "A worker's network access is managed by the worker itself.";
+
+/// Why a worker has no phone pairing.
+pub const WORKER_PHONE_REFUSAL: &str = "Workers do not pair with the phone in v1.";
+
+/// Why a worker's window does not get the TUI's folder browser: it would step
+/// outside the `$HOME` confinement the worker's own picker enforces.
+pub const WORKER_OPEN_PROJECT_REFUSAL: &str =
+    "Use the worker's project picker (browse, scan, clone).";
+
+/// The palette rows a **worker** host refuses, and why (design §2.4).
+///
+/// `None` for every other name — including every name on a TUI or Desktop
+/// host, which never consults this table. Kept as a function over the wire
+/// name rather than as a second [`Route`] per row so [`INVENTORY`] stays the
+/// one table, and the overlay cannot drift from it: a worker refuses exactly
+/// the rows named here, with exactly these words, in both the palette it sends
+/// ([`inventory_for`]) and the answer the server gives.
+pub fn worker_refusal(name: &str) -> Option<&'static str> {
+    match name {
+        names::QUIT => Some(WORKER_QUIT_REFUSAL),
+        names::START_WEB_INTERFACE | names::STOP_WEB_INTERFACE | names::SHOW_WEB_ACCESS => {
+            Some(WORKER_WEB_ACCESS_REFUSAL)
+        }
+        names::PAIR_PHONE | names::UNPAIR_PHONE => Some(WORKER_PHONE_REFUSAL),
+        names::OPEN_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
+        _ => None,
+    }
+}
+
+/// The inventory as a host of `kind` sends it (v7).
+///
+/// A TUI or Desktop host sends [`inventory`] unchanged. A worker overlays
+/// [`worker_refusal`] onto the rows it will not run, so a Desktop palette can
+/// hide or explain them before anyone picks one; the server answers those
+/// names `Rejected` all the same.
+pub fn inventory_for(kind: HostKind) -> Vec<CommandView> {
+    match kind {
+        HostKind::Tui | HostKind::Desktop => inventory(),
+        HostKind::Worker => INVENTORY
+            .iter()
+            .map(|spec| {
+                let mut view = spec.view();
+                if let Some(reason) = worker_refusal(spec.name) {
+                    view.refusal = Some(reason.to_string());
+                }
+                view
+            })
+            .collect(),
+    }
 }
 
 // ===========================================================================

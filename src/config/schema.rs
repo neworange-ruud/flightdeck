@@ -3,7 +3,7 @@
 use crate::contracts::{
     AgentDef, Config, ContainersConfig, FlightDeckError, GitConfig, NotificationsConfig,
     ProjectConfig, RemoteConfig, Result, StatusPatterns, UiConfig, UpdateConfig, WebConfig,
-    WorktreesConfig,
+    WorkerConfig, WorktreesConfig,
 };
 use std::collections::BTreeMap;
 
@@ -80,6 +80,7 @@ pub fn default_config(project_name: &str, base_branch: &str) -> Config {
         remote: RemoteConfig::default(),
         web: WebConfig::default(),
         containers: ContainersConfig::default(),
+        worker: WorkerConfig::default(),
         agents,
     }
 }
@@ -170,7 +171,51 @@ pub fn validate(config: &Config) -> Result<()> {
     validate_containers(&config.containers)?;
     validate_web(&config.web)?;
     validate_remote(&config.remote)?;
+    validate_worker(&config.worker)?;
 
+    Ok(())
+}
+
+/// Widest PTY a worker starts an agent at by default. Far past any screen; a
+/// larger value is a typo that would cost every agent's scrollback memory.
+const MAX_WORKER_COLS: u16 = 1000;
+/// Tallest PTY a worker starts an agent at by default (see [`MAX_WORKER_COLS`]).
+const MAX_WORKER_ROWS: u16 = 500;
+
+/// Validate the `[worker]` section (SPECS §33). Checked unconditionally, like
+/// `[web]`: it is cheap, and `flightdeck worker run` refuses to start (exit
+/// 78) on a bad value rather than serving something the user did not mean.
+///
+/// - `port == 0` is rejected: a paired Desktop stores `host:port`, so an OS-
+///   chosen port would break every pairing on the next start.
+/// - `projects_root` empty (or whitespace) is rejected: scan and clone need a
+///   folder; the spelling for "my home folder" is `"~"`.
+/// - `default_cols`/`default_rows` below the terminal grid's minimum would be
+///   clamped anyway (and so say nothing), and above the maxima are a typo.
+fn validate_worker(worker: &WorkerConfig) -> Result<()> {
+    use crate::terminal::session::{MIN_GRID_COLS, MIN_GRID_ROWS};
+    if worker.port == 0 {
+        return Err(FlightDeckError::Config(
+            "worker.port must not be 0 (paired Desktops store a stable port)".to_string(),
+        ));
+    }
+    if worker.projects_root.trim().is_empty() {
+        return Err(FlightDeckError::Config(
+            "worker.projects_root must not be empty (use \"~\" for your home folder)".to_string(),
+        ));
+    }
+    if !(MIN_GRID_COLS..=MAX_WORKER_COLS).contains(&worker.default_cols) {
+        return Err(FlightDeckError::Config(format!(
+            "worker.default_cols {} is not valid (expected {MIN_GRID_COLS} to {MAX_WORKER_COLS})",
+            worker.default_cols
+        )));
+    }
+    if !(MIN_GRID_ROWS..=MAX_WORKER_ROWS).contains(&worker.default_rows) {
+        return Err(FlightDeckError::Config(format!(
+            "worker.default_rows {} is not valid (expected {MIN_GRID_ROWS} to {MAX_WORKER_ROWS})",
+            worker.default_rows
+        )));
+    }
     Ok(())
 }
 
@@ -618,6 +663,96 @@ mod tests {
         assert_eq!(cfg.web.bind, "127.0.0.1");
         assert_eq!(cfg.web.port, 7420);
         assert_eq!(cfg.web.replay_bytes, 262_144);
+    }
+
+    // --- [worker] section (SPECS §33) ---
+
+    #[test]
+    fn default_config_worker_defaults() {
+        let cfg = default_config("proj", "main");
+        assert_eq!(cfg.worker.port, 7420);
+        assert_eq!(cfg.worker.projects_root, "~/flightdeck");
+        assert_eq!(cfg.worker.default_cols, 200);
+        assert_eq!(cfg.worker.default_rows, 50);
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn worker_config_absent_section_loads_defaults() {
+        let cfg: Config = "[project]\nname = \"p\"\ndefault_base_branch = \"main\"\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(cfg.worker, WorkerConfig::default());
+    }
+
+    #[test]
+    fn worker_config_partial_table_keeps_sibling_defaults() {
+        let cfg: Config = "[worker]\nport = 9000\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(cfg.worker.port, 9000);
+        assert_eq!(cfg.worker.projects_root, "~/flightdeck");
+        assert_eq!(cfg.worker.default_cols, 200);
+        assert_eq!(cfg.worker.default_rows, 50);
+    }
+
+    #[test]
+    fn validate_rejects_worker_port_zero() {
+        let mut cfg = default_config("proj", "main");
+        cfg.worker.port = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("worker.port"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_worker_grid_out_of_range() {
+        let mut cfg = default_config("proj", "main");
+        cfg.worker.default_cols = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("worker.default_cols"), "{err}");
+        cfg.worker.default_cols = MAX_WORKER_COLS + 1;
+        assert!(validate(&cfg).is_err());
+        cfg.worker.default_cols = MAX_WORKER_COLS;
+        assert!(validate(&cfg).is_ok(), "the maximum is accepted");
+
+        cfg.worker.default_rows = 0;
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("worker.default_rows"), "{err}");
+        cfg.worker.default_rows = MAX_WORKER_ROWS + 1;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_worker_projects_root() {
+        let mut cfg = default_config("proj", "main");
+        cfg.worker.projects_root = "  ".to_string();
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("worker.projects_root"), "{err}");
+    }
+
+    #[test]
+    fn worker_projects_root_expands_against_home() {
+        let home = std::path::Path::new("/home/u");
+        let at = |root: &str| {
+            WorkerConfig {
+                projects_root: root.to_string(),
+                ..WorkerConfig::default()
+            }
+            .projects_root_path(home)
+        };
+        assert_eq!(at("~/flightdeck"), home.join("flightdeck"));
+        assert_eq!(at("~"), home.to_path_buf());
+        assert_eq!(at("code/repos"), home.join("code/repos"));
+        let absolute = if cfg!(windows) {
+            "C:\\repos"
+        } else {
+            "/srv/repos"
+        };
+        assert_eq!(at(absolute), std::path::PathBuf::from(absolute));
     }
 
     #[test]

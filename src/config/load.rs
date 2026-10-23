@@ -10,7 +10,7 @@
 
 use crate::contracts::{
     AgentDef, Config, ContainersConfig, GitConfig, NotificationsConfig, RemoteConfig, UiConfig,
-    UpdateConfig, WebConfig, WorktreesConfig,
+    UpdateConfig, WebConfig, WorkerConfig, WorktreesConfig,
 };
 use crate::contracts::{FileSystem, FlightDeckError, Result};
 use serde::Serialize;
@@ -86,6 +86,7 @@ struct GlobalConfigView<'a> {
     remote: &'a RemoteConfig,
     web: &'a WebConfig,
     containers: &'a ContainersConfig,
+    worker: &'a WorkerConfig,
     agents: &'a BTreeMap<String, AgentDef>,
 }
 
@@ -141,13 +142,31 @@ const WEB_SECTION_COMMENT: &str = "\
 # that joins or reconnects so it can repaint recent history.
 ";
 
-/// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]` and [`WEB_SECTION_COMMENT`]
-/// above `[web]` in a serialized TOML body. The `toml` crate drops comments on
-/// serialization, so we re-attach these every time we write the global file. A
-/// no-op for any section the body does not contain.
+/// The explanatory comment injected above the `[worker]` section of any global
+/// `config.toml` we write (SPECS §33). The section only matters on a machine
+/// that runs `flightdeck worker`, and only in this global file.
+const WORKER_SECTION_COMMENT: &str = "\
+# FlightDeck Worker (`flightdeck worker start`: a headless host that FlightDeck
+# Desktop controls over Tailscale). Ignored unless a worker runs on this machine,
+# and read from this global file only: a project's [worker] table is ignored.
+#
+# port: TCP port the worker serves on its Tailscale address(es) only, never on
+# other networks. Keep it stable: paired Desktops store it.
+# projects_root: folder scanned (two levels deep) for repositories to offer, and
+# where clones land. \"~\" is your home folder.
+# default_cols / default_rows: terminal size for an agent started while no
+# Desktop window is attached; an attached window resizes them to its panes.
+";
+
+/// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]`, [`WEB_SECTION_COMMENT`]
+/// above `[web]` and [`WORKER_SECTION_COMMENT`] above `[worker]` in a
+/// serialized TOML body. The `toml` crate drops comments on serialization, so
+/// we re-attach these every time we write the global file. A no-op for any
+/// section the body does not contain.
 fn annotate_sections(body: &str) -> String {
     let with_remote = insert_section_comment(body, "[remote]", REMOTE_SECTION_COMMENT);
-    insert_section_comment(&with_remote, "[web]", WEB_SECTION_COMMENT)
+    let with_web = insert_section_comment(&with_remote, "[web]", WEB_SECTION_COMMENT);
+    insert_section_comment(&with_web, "[worker]", WORKER_SECTION_COMMENT)
 }
 
 /// Insert `comment` directly above the first line matching `header` (trimmed)
@@ -181,6 +200,7 @@ pub fn serialize_global_config(config: &Config) -> Result<String> {
         remote: &config.remote,
         web: &config.web,
         containers: &config.containers,
+        worker: &config.worker,
         agents: &config.agents,
     };
     let body = toml::to_string_pretty(&view)
@@ -322,10 +342,10 @@ fn read_table(fs: &dyn FileSystem, path: &Path, lenient: bool) -> Result<toml::T
     match parse_table(&contents) {
         Ok(t) => Ok(t),
         Err(e) if lenient => {
-            eprintln!(
+            crate::best_effort_stderr_line(&format!(
                 "FlightDeck: ignoring unparsable global config {}: {e}",
                 path.display()
-            );
+            ));
             Ok(toml::Table::new())
         }
         Err(e) => Err(e),
@@ -505,6 +525,45 @@ mod tests {
         let comment_idx = out.find("# FlightDeck Web").unwrap();
         let header_idx = out.find("[web]").unwrap();
         assert!(comment_idx < header_idx, "comment must precede header");
+    }
+
+    // --- [worker] section (SPECS §33) ---
+
+    #[test]
+    fn global_config_documents_worker_section() {
+        let toml = serialize_global_config(&default_config("x", "main")).unwrap();
+        assert!(toml.contains("[worker]"), "global: {toml}");
+        assert!(
+            toml.contains("projects_root = \"~/flightdeck\"")
+                && toml.contains("default_cols = 200")
+                && toml.contains("default_rows = 50"),
+            "global: {toml}"
+        );
+        let comment_idx = toml.find("# FlightDeck Worker").unwrap();
+        let header_idx = toml.find("[worker]").unwrap();
+        assert!(comment_idx < header_idx, "comment must precede [worker]");
+        // The comment is inert: the file parses back to the defaults.
+        let cfg = parse_config(&toml).unwrap();
+        assert_eq!(cfg.worker, crate::contracts::WorkerConfig::default());
+    }
+
+    #[test]
+    fn global_table_save_reattaches_worker_comment() {
+        let table: toml::Table = "[worker]\nport = 7421\n".parse().unwrap();
+        let out = serialize_global_table(&table).unwrap();
+        let comment_idx = out.find("# FlightDeck Worker").unwrap();
+        let header_idx = out.find("[worker]").unwrap();
+        assert!(comment_idx < header_idx, "comment must precede header");
+    }
+
+    #[test]
+    fn missing_worker_section_in_the_global_file_loads_defaults() {
+        // A global file written before [worker] existed.
+        let mut global =
+            parse_table(&serialize_global_config(&default_config("x", "main")).unwrap()).unwrap();
+        global.remove("worker");
+        let cfg = effective_config(global, toml::Table::new()).unwrap();
+        assert_eq!(cfg.worker, crate::contracts::WorkerConfig::default());
     }
 
     #[test]

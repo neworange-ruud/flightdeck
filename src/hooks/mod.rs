@@ -119,14 +119,20 @@ pub fn load_hooks(fs: &dyn FileSystem, repo_root: &Path) -> Hooks {
     let contents = match fs.read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("FlightDeck: could not read {}: {e}", path.display());
+            crate::best_effort_stderr_line(&format!(
+                "FlightDeck: could not read {}: {e}",
+                path.display()
+            ));
             return Hooks::default();
         }
     };
     match parse_hooks(&contents) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("FlightDeck: ignoring unparsable {}: {e}", path.display());
+            crate::best_effort_stderr_line(&format!(
+                "FlightDeck: ignoring unparsable {}: {e}",
+                path.display()
+            ));
             Hooks::default()
         }
     }

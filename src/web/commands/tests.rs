@@ -520,3 +520,82 @@ fn only_the_dialog_answers_are_flagged_as_answering_a_dialog() {
         "the palette on either surface is INVENTORY minus these two"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Worker hosts (v7, design §2.4)
+// ---------------------------------------------------------------------------
+
+/// The rows a worker refuses, by name — the list the server answers
+/// `Rejected` and the Desktop palette hides.
+const WORKER_REFUSED: &[&str] = &[
+    names::QUIT,
+    names::START_WEB_INTERFACE,
+    names::STOP_WEB_INTERFACE,
+    names::SHOW_WEB_ACCESS,
+    names::PAIR_PHONE,
+    names::UNPAIR_PHONE,
+    names::OPEN_PROJECT,
+];
+
+#[test]
+fn a_worker_inventory_marks_exactly_its_refusals() {
+    let worker = inventory_for(HostKind::Worker);
+    assert_eq!(
+        worker.len(),
+        INVENTORY.len(),
+        "no row is dropped, only marked"
+    );
+    for name in WORKER_REFUSED {
+        let row = worker
+            .iter()
+            .find(|row| row.id == *name)
+            .unwrap_or_else(|| panic!("`{name}` must still be listed on a worker"));
+        assert_eq!(
+            row.refusal.as_deref(),
+            worker_refusal(name),
+            "`{name}` carries the worker's own words"
+        );
+        assert!(row.refusal.is_some(), "`{name}` is refused on a worker");
+    }
+    // Every other row reads exactly as a TUI host sends it.
+    let tui = inventory();
+    for (on_worker, on_tui) in worker.iter().zip(tui.iter()) {
+        if !WORKER_REFUSED.contains(&on_worker.id.as_str()) {
+            assert_eq!(on_worker, on_tui, "`{}` is untouched", on_worker.id);
+        }
+    }
+}
+
+#[test]
+fn tui_and_desktop_hosts_send_the_inventory_unchanged() {
+    assert_eq!(inventory_for(HostKind::Tui), inventory());
+    assert_eq!(inventory_for(HostKind::Desktop), inventory());
+}
+
+#[test]
+fn the_worker_refusals_say_where_to_go_instead() {
+    assert_eq!(
+        worker_refusal(names::QUIT),
+        Some("Stop the worker with `flightdeck worker stop` on the box.")
+    );
+    assert_eq!(
+        worker_refusal(names::OPEN_PROJECT),
+        Some("Use the worker's project picker (browse, scan, clone).")
+    );
+    assert_eq!(
+        worker_refusal(names::PAIR_PHONE),
+        Some("Workers do not pair with the phone in v1.")
+    );
+    assert_eq!(
+        worker_refusal(names::SHOW_WEB_ACCESS),
+        Some("A worker's network access is managed by the worker itself.")
+    );
+    // Everything else, including the worker's own commands, is not refused
+    // by this table.
+    assert_eq!(worker_refusal(names::REQUEST_SNAPSHOT), None);
+    assert_eq!(worker_refusal(names::CLOSE_PROJECT), None);
+    for name in crate::web::protocol::worker_command::ALL {
+        assert_eq!(worker_refusal(name), None, "`{name}`");
+        assert!(lookup(name).is_none(), "`{name}` stays out of INVENTORY");
+    }
+}

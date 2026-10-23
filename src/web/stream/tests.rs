@@ -718,6 +718,8 @@ fn an_attach_is_answered_with_targeted_resume_frames() {
             seat: Seat::Writing,
             cursors: Vec::new(),
             resume_viewer: None,
+            kind: crate::web::protocol::ConnectionKind::Window,
+            protocol_version: crate::web::protocol::PROTOCOL_VERSION,
         },
         &mut host,
     );
@@ -913,6 +915,8 @@ fn the_drain_carries_the_watermark_across_a_reconnect() {
             seat: Seat::Writing,
             cursors: Vec::new(),
             resume_viewer: Some(old.clone()),
+            kind: crate::web::protocol::ConnectionKind::Window,
+            protocol_version: crate::web::protocol::PROTOCOL_VERSION,
         },
         &mut host,
     );
@@ -1188,5 +1192,184 @@ mod delta {
 
         let out = deltas(&before, &after);
         assert!(matches!(out.as_slice(), [Delta::Selection(_)]), "{out:?}");
+    }
+
+    // -- worker hosts (v7) -------------------------------------------------
+
+    use crate::web::protocol::{
+        Health, HostKind, HostMessage, MessageLevel, WorkerShellView, WorkerStatusView,
+        WORKER_SHELL_TERMINAL_ID,
+    };
+    use crate::web::server::WorkerHostState;
+
+    fn health(sampled_at_ms: i64) -> Health {
+        Health {
+            sampled_at_ms,
+            uptime_secs: 60,
+            version: "1.0.0".to_string(),
+            load_avg_1m_centi: Some(42),
+            cpu_count: 8,
+            mem_total_bytes: Some(1 << 34),
+            mem_available_bytes: None,
+            disk_free_home_bytes: Some(1 << 30),
+            disk_free_projects_root_bytes: Some(1 << 30),
+            agents_total: 2,
+            agents_running: 1,
+        }
+    }
+
+    fn worker_state() -> HostState {
+        HostState {
+            host_kind: HostKind::Worker,
+            worker: Some(WorkerHostState {
+                home: "/home/ruud".to_string(),
+                shell: Some(WorkerShellView {
+                    terminal_id: TerminalId::new(WORKER_SHELL_TERMINAL_ID),
+                    title: "zsh".to_string(),
+                    geometry: Geometry { cols: 80, rows: 24 },
+                    byte_len: 10,
+                    replay_from: 0,
+                    alive: true,
+                    exit_code: None,
+                }),
+                health: Some(health(1_000)),
+                status: WorkerStatusView {
+                    listening: vec!["100.64.1.2:7420".to_string()],
+                    advertised: Some("box.tail1234.ts.net:7420".to_string()),
+                    not_listening_reason: None,
+                    unread_messages: 0,
+                    projects_root: "/home/ruud/Projects".to_string(),
+                },
+                host_messages: Vec::new(),
+            }),
+            ..HostState::default()
+        }
+    }
+
+    /// The first publish of a worker's state tells the window everything.
+    #[test]
+    fn a_first_worker_publish_sends_shell_health_and_status() {
+        let out = deltas(&HostState::default(), &worker_state());
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    Delta::WorkerShell(_),
+                    Delta::Health(_),
+                    Delta::WorkerStatus(_)
+                ]
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_worker_state_produces_no_deltas() {
+        let state = worker_state();
+        assert!(deltas(&state, &state).is_empty());
+    }
+
+    /// A new sample is always a change — its timestamp moved.
+    #[test]
+    fn a_new_health_sample_is_one_health_delta() {
+        let before = worker_state();
+        let mut after = before.clone();
+        after.worker.as_mut().expect("a worker").health = Some(health(11_000));
+        let out = deltas(&before, &after);
+        match out.as_slice() {
+            [Delta::Health(sample)] => assert_eq!(sample.sampled_at_ms, 11_000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_listen_change_is_one_status_delta() {
+        let before = worker_state();
+        let mut after = before.clone();
+        let worker = after.worker.as_mut().expect("a worker");
+        worker.status.listening.clear();
+        worker.status.not_listening_reason = Some("no Tailscale address".to_string());
+        let out = deltas(&before, &after);
+        match out.as_slice() {
+            [Delta::WorkerStatus(status)] => assert_eq!(
+                status.not_listening_reason.as_deref(),
+                Some("no Tailscale address")
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The shell's byte counters move on every tick it prints, and produce
+    /// nothing; its title, grid and liveness each produce one frame.
+    #[test]
+    fn the_shell_is_diffed_on_what_its_tab_renders_only() {
+        let before = worker_state();
+        let mut printed = before.clone();
+        {
+            let shell = printed
+                .worker
+                .as_mut()
+                .and_then(|w| w.shell.as_mut())
+                .expect("a shell");
+            shell.byte_len = 9_999;
+            shell.replay_from = 512;
+        }
+        assert!(deltas(&before, &printed).is_empty());
+
+        let mut resized = before.clone();
+        resized
+            .worker
+            .as_mut()
+            .and_then(|w| w.shell.as_mut())
+            .expect("a shell")
+            .geometry = Geometry {
+            cols: 200,
+            rows: 50,
+        };
+        assert!(
+            matches!(
+                deltas(&before, &resized).as_slice(),
+                [Delta::WorkerShell(_)]
+            ),
+            "a resize reaches the window"
+        );
+
+        let mut exited = before.clone();
+        {
+            let shell = exited
+                .worker
+                .as_mut()
+                .and_then(|w| w.shell.as_mut())
+                .expect("a shell");
+            shell.alive = false;
+            shell.exit_code = Some(0);
+        }
+        match deltas(&before, &exited).as_slice() {
+            [Delta::WorkerShell(shell)] => {
+                assert!(!shell.alive);
+                assert_eq!(shell.exit_code, Some(0));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Host messages reach a window when the host drains them, never through
+    /// a diff — which would deliver each one twice.
+    #[test]
+    fn host_messages_are_never_diffed() {
+        let before = worker_state();
+        let mut after = before.clone();
+        after
+            .worker
+            .as_mut()
+            .expect("a worker")
+            .host_messages
+            .push(HostMessage {
+                id: 1,
+                at_ms: 5,
+                level: MessageLevel::Info,
+                text: "hello".to_string(),
+            });
+        assert!(deltas(&before, &after).is_empty());
     }
 }

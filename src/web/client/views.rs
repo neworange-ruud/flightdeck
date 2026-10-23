@@ -246,6 +246,13 @@ pub enum LocalAction {
     /// A palette row the desktop itself performs — another window, or
     /// another remote ([`PaletteAction::FrontEnd`]).
     FrontEnd(FrontEndAction),
+    /// Open the host's configuration manager in this window: ask with
+    /// `open_configuration` and edit the answer locally
+    /// ([`super::RemoteConfigEditor`]), on any host kind that forwards it.
+    Configuration,
+    /// Open a worker's project picker ([`super::ProjectPicker`]) — what
+    /// Open Project means on a worker, which has no folder dialog to show.
+    ProjectPicker,
 }
 
 /// Which target a sent command names.
@@ -282,6 +289,11 @@ pub const QUIT_UNAVAILABLE: &str =
 pub const SPLIT_VIEW_UNAVAILABLE: &str =
     "Split view arranges the host's own screen, so it is not offered from a remote window.";
 
+/// Why Open Configuration is not offered: the host's inventory does not
+/// forward it (a host older than the remote manager, or one that refuses it).
+pub const CONFIG_UNAVAILABLE: &str =
+    "The host does not offer its configuration manager to a remote window.";
+
 /// What `action` does from a remote window.
 pub fn route_palette(action: &PaletteAction) -> RemoteAction {
     if let PaletteAction::Dispatch(command) = action {
@@ -299,6 +311,8 @@ pub fn route_palette(action: &PaletteAction) -> RemoteAction {
         PaletteAction::FrontEnd(front_end) => {
             RemoteAction::Local(LocalAction::FrontEnd(*front_end))
         }
+        // The manager is drawn here and only its save travels (design A1).
+        PaletteAction::OpenConfig => RemoteAction::Local(LocalAction::Configuration),
         _ => match wire_name(action) {
             Some(name) => RemoteAction::Send {
                 name,
@@ -309,6 +323,27 @@ pub fn route_palette(action: &PaletteAction) -> RemoteAction {
             ),
         },
     }
+}
+
+/// What `action` does from a remote window onto `ws`'s host: as
+/// [`route_palette`], except where the answer depends on the host — Open
+/// Configuration only where the host forwards `open_configuration`, and Open
+/// Project on a worker opens its project picker.
+pub fn route_palette_for(ws: &RemoteWorkspace, action: &PaletteAction) -> RemoteAction {
+    match action {
+        PaletteAction::OpenProject if ws.is_worker() => {
+            RemoteAction::Local(LocalAction::ProjectPicker)
+        }
+        PaletteAction::OpenConfig if !forwards(ws, names::OPEN_CONFIGURATION) => {
+            RemoteAction::Unavailable(CONFIG_UNAVAILABLE)
+        }
+        _ => route_palette(action),
+    }
+}
+
+/// Whether the host offers `name` and does not refuse it.
+fn forwards(ws: &RemoteWorkspace, name: &str) -> bool {
+    ws.command(name).is_some_and(|c| c.refusal.is_none())
 }
 
 /// What a keymap command does from a remote window, where that differs from
@@ -385,13 +420,13 @@ pub fn target(ws: &RemoteWorkspace, scope: Scope) -> Option<Target> {
 /// desktop's own front-end rows (a remote window only exists in the desktop).
 pub fn palette_entries(ws: &RemoteWorkspace) -> Vec<&'static PaletteEntry> {
     crate::tui::palette::rows(true)
-        .filter(|entry| match route_palette(&entry.action) {
+        .filter(|entry| match route_palette_for(ws, &entry.action) {
             RemoteAction::Local(_) => true,
             RemoteAction::Unavailable(_) => false,
             RemoteAction::Send { name, .. } => {
                 // Offered by the host *and* forwarded by it, not a row that
                 // could only come back refused.
-                ws.command(name).is_some_and(|c| c.refusal.is_none())
+                forwards(ws, name)
                     && lookup(name).is_some_and(|spec| matches!(spec.route, Route::Palette(_)))
                     && name != names::CHANGE_PROJECT_DEFAULT_BASE
             }

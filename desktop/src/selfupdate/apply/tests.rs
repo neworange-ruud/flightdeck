@@ -314,6 +314,9 @@ impl FileSystem for FailingRename {
     fn list_dir(&self, p: &Path) -> flightdeck::contracts::Result<Vec<PathBuf>> {
         RealFs.list_dir(p)
     }
+    fn canonicalize(&self, p: &Path) -> flightdeck::contracts::Result<PathBuf> {
+        RealFs.canonicalize(p)
+    }
     fn remove_dir_all(&self, p: &Path) -> flightdeck::contracts::Result<()> {
         RealFs.remove_dir_all(p)
     }

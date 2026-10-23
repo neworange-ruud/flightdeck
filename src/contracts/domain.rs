@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Stable identifier for an Agent Tab.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -635,6 +635,88 @@ impl Default for WebConfig {
 }
 
 // ---------------------------------------------------------------------------
+// FlightDeck Worker (`flightdeck worker …`) — the optional `[worker]` section.
+// (specs/WORKER_PRD.md §4.3, §4.4; SPECS §33)
+// ---------------------------------------------------------------------------
+
+/// Default port a worker serves the web protocol on, over Tailscale only
+/// (`specs/WORKER_PRD.md` §4.3). The same number as `[web] port`: a worker is
+/// not a TUI, so the two never listen on one machine's same interface.
+fn default_worker_port() -> u16 {
+    7420
+}
+
+/// Default folder a worker scans for repositories and clones into.
+fn default_worker_projects_root() -> String {
+    "~/flightdeck".to_string()
+}
+
+/// Default PTY width for an agent spawned while no window is attached (W5).
+fn default_worker_cols() -> u16 {
+    200
+}
+
+/// Default PTY height for an agent spawned while no window is attached (W5).
+fn default_worker_rows() -> u16 {
+    50
+}
+
+/// `[worker]` config section: the headless `flightdeck worker` host (SPECS §33).
+///
+/// Read from the **global** file only: a worker serves every project, so a
+/// project's `[worker]` table has no project to apply to and is ignored. Every
+/// field has its own default, so an absent or partial table keeps working.
+/// Validated by [`crate::config::schema::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// TCP port served on each Tailscale address. A configured `0` is
+    /// rejected: a paired Desktop stores `host:port`.
+    #[serde(default = "default_worker_port")]
+    pub port: u16,
+    /// Where `scan` looks for repositories (two levels deep) and where a
+    /// clone lands. `~` and `~/…` are relative to `$HOME`; see
+    /// [`WorkerConfig::projects_root_path`].
+    #[serde(default = "default_worker_projects_root")]
+    pub projects_root: String,
+    /// PTY width for an agent started while no window has reported a size.
+    #[serde(default = "default_worker_cols")]
+    pub default_cols: u16,
+    /// PTY height for an agent started while no window has reported a size.
+    #[serde(default = "default_worker_rows")]
+    pub default_rows: u16,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        WorkerConfig {
+            port: default_worker_port(),
+            projects_root: default_worker_projects_root(),
+            default_cols: default_worker_cols(),
+            default_rows: default_worker_rows(),
+        }
+    }
+}
+
+impl WorkerConfig {
+    /// [`WorkerConfig::projects_root`] as a path: `~` is `home`, `~/x` and a
+    /// relative `x` are `home/x`, an absolute path is taken as written. Not
+    /// canonicalised: the root may not exist yet (a clone creates it).
+    pub fn projects_root_path(&self, home: &Path) -> PathBuf {
+        let root = self.projects_root.trim();
+        if root == "~" {
+            return home.to_path_buf();
+        }
+        let rest = root.strip_prefix("~/").unwrap_or(root);
+        let path = Path::new(rest);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            home.join(path)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Container execution model (SPECS §31) — the optional `[containers]` section.
 // ---------------------------------------------------------------------------
 
@@ -779,6 +861,10 @@ pub struct Config {
     /// Accepts the legacy `[execution]` section name as a deprecated alias.
     #[serde(default, alias = "execution")]
     pub containers: ContainersConfig,
+    /// The headless worker (SPECS §33). Only the global file's table is used
+    /// by a worker; absent → the per-field defaults.
+    #[serde(default)]
+    pub worker: WorkerConfig,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentDef>,
 }

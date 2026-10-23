@@ -134,6 +134,10 @@ pub trait FileSystem {
     fn append_line(&self, p: &Path, line: &str) -> Result<()>;
     /// List the immediate entries of a directory.
     fn list_dir(&self, p: &Path) -> Result<Vec<PathBuf>>;
+    /// The absolute path of `p` with every symbolic link resolved and `.` /
+    /// `..` removed. `Err` when `p` (or a link on the way) does not exist. The
+    /// worker uses it to keep project browsing inside `$HOME`.
+    fn canonicalize(&self, p: &Path) -> Result<PathBuf>;
     /// Recursively remove a directory and all its contents. Used to clean up an
     /// orphaned worktree directory that git no longer tracks (SPECS §5/§15).
     fn remove_dir_all(&self, p: &Path) -> Result<()>;

@@ -117,6 +117,8 @@ fn workspace() -> RemoteWorkspace {
         update: None,
         sidebar_position: AgentTabPosition::default(),
         host_machine: None,
+        host_kind: None,
+        worker: None,
     });
     ws
 }
@@ -486,4 +488,76 @@ fn vscode_opens_the_shown_session_and_falls_back_to_the_root_on_an_older_host() 
     assert_eq!(open.path, ws.selected_project().unwrap().root);
     assert!(open.root_fallback);
     assert_eq!(open.ssh_target, "10.0.0.5", "SSH picks the user");
+}
+
+fn with_kind(kind: Option<wire::HostKind>) -> RemoteWorkspace {
+    let mut ws = workspace();
+    ws.host_kind = kind;
+    ws
+}
+
+#[test]
+fn open_configuration_is_drawn_here_on_any_host_that_forwards_it() {
+    // Every host kind, as long as its inventory forwards the manager (A1).
+    for kind in [
+        None,
+        Some(wire::HostKind::Tui),
+        Some(wire::HostKind::Desktop),
+        Some(wire::HostKind::Worker),
+    ] {
+        let ws = with_kind(kind);
+        assert_eq!(
+            route_palette_for(&ws, &PaletteAction::OpenConfig),
+            RemoteAction::Local(LocalAction::Configuration),
+            "{kind:?}"
+        );
+        let labels: Vec<&str> = palette_entries(&ws).iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Open Configuration"), "{kind:?}");
+    }
+
+    // A host that refuses it, or predates it, does not get the row.
+    let mut ws = workspace();
+    for command in &mut ws.commands {
+        if command.run.name == names::OPEN_CONFIGURATION {
+            command.refusal = Some("not here".to_string());
+        }
+    }
+    assert_eq!(
+        route_palette_for(&ws, &PaletteAction::OpenConfig),
+        RemoteAction::Unavailable(CONFIG_UNAVAILABLE)
+    );
+    let labels: Vec<&str> = palette_entries(&ws).iter().map(|e| e.label).collect();
+    assert!(!labels.contains(&"Open Configuration"));
+    ws.commands
+        .retain(|c| c.run.name != names::OPEN_CONFIGURATION);
+    assert!(!palette_entries(&ws)
+        .iter()
+        .any(|e| e.label == "Open Configuration"));
+}
+
+#[test]
+fn open_project_opens_the_picker_on_a_worker_and_the_folder_dialog_elsewhere() {
+    let mut ws = with_kind(Some(wire::HostKind::Worker));
+    // A worker refuses the folder dialog; the picker is local, so it stays.
+    for command in &mut ws.commands {
+        if command.run.name == names::OPEN_PROJECT {
+            command.refusal = Some("Use the worker's project picker.".to_string());
+        }
+    }
+    assert_eq!(
+        route_palette_for(&ws, &PaletteAction::OpenProject),
+        RemoteAction::Local(LocalAction::ProjectPicker)
+    );
+    assert!(palette_entries(&ws)
+        .iter()
+        .any(|e| e.label == "Open Project"));
+
+    let ws = with_kind(Some(wire::HostKind::Tui));
+    assert!(matches!(
+        route_palette_for(&ws, &PaletteAction::OpenProject),
+        RemoteAction::Send {
+            name: names::OPEN_PROJECT,
+            ..
+        }
+    ));
 }

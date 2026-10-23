@@ -115,6 +115,8 @@ fn snapshot() -> Snapshot {
             user: Some("dev".to_string()),
             os: "linux".to_string(),
         }),
+        host_kind: None,
+        worker: None,
     }
 }
 
@@ -231,6 +233,7 @@ fn open_in_vscode_uses_the_ssh_target_saved_for_the_remote(app: &mut TestAppCont
         host_version: None,
         warned_unencrypted: true,
         ssh_target: Some("studio-box".to_string()),
+        host_kind: None,
     });
     save_remotes(fs.as_ref(), &path, &file).unwrap();
     let urls = model.update(cx, |m, _| {
@@ -621,6 +624,7 @@ mod connect {
             host_version: None,
             warned_unencrypted: warned,
             ssh_target: None,
+            host_kind: None,
         }
     }
 
@@ -1181,4 +1185,704 @@ fn tab_reaches_the_terminal_for_completion(app: &mut TestAppContext) {
     click(cx, "remote-shell-tab");
     cx.simulate_keystrokes("c d space tab");
     assert_eq!(session.input(), b"cd \t", "the SSH shell");
+}
+
+// ===========================================================================
+// A worker host (`specs/WORKER_PRD.md`): its shell tab, geometry, project
+// picker, takeover, messages, notifications and version skew — and the
+// configuration manager, which every host kind offers (design A1).
+// ===========================================================================
+
+mod worker {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use flightdeck::contracts::{NotificationSound, PtySize};
+    use flightdeck::host::{HostEvent, OverlayInput, OverlayView};
+    use flightdeck::testing::FakeNotifier;
+    use flightdeck::tui::palette::PaletteAction;
+    use flightdeck::web::client::{
+        AckFor, LinkEnd, LinkEvent, LinkOut, LinkState, RemoteClient, Script,
+    };
+    use flightdeck::web::protocol::{
+        Ack, AckOutcome, ClientMsg, CloneProgress, CloneResult, ConfigChange, ConfigFieldKind,
+        ConfigOrigin, ConfigRowView, ConfigSaveRequest, ConfigScopeName, ConfigValue, ConfigView,
+        Delta, DirEntryView, DirListing, Geometry, HostKind, HostMessage, MessageLevel,
+        NotificationSoundView, NotificationView, ProjectScan, ProjectView, ScannedRepo, Snapshot,
+        TermBytes, WorkerShellView, WorkerSnapshot, WorkerStatusView,
+    };
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    use super::{click, commands, inputs, open_on, snapshot, turn};
+    use crate::remote::{RemoteModel, Tab, WORKER_SHELL_COMMAND_REFUSAL};
+
+    fn shell(alive: bool) -> WorkerShellView {
+        WorkerShellView {
+            terminal_id: "worker:shell".into(),
+            title: "zsh".to_string(),
+            geometry: Geometry { cols: 80, rows: 24 },
+            byte_len: 0,
+            replay_from: 0,
+            alive,
+            exit_code: (!alive).then_some(0),
+        }
+    }
+
+    /// The recorded snapshot, from a worker running this app's FlightDeck.
+    fn worker_snapshot() -> Snapshot {
+        let mut snapshot = snapshot();
+        snapshot.host_kind = Some(HostKind::Worker);
+        snapshot.host_version = flightdeck::VERSION.to_string();
+        snapshot.commands = flightdeck::web::commands::inventory_for(HostKind::Worker);
+        snapshot.worker = Some(WorkerSnapshot {
+            home: "/home/dev".to_string(),
+            shell: Some(shell(true)),
+            health: None,
+            status: WorkerStatusView {
+                projects_root: "/home/dev/flightdeck".to_string(),
+                ..WorkerStatusView::default()
+            },
+            connections: Default::default(),
+            host_messages: Vec::new(),
+        });
+        snapshot
+    }
+
+    /// A worker with no project open yet.
+    fn empty_worker() -> Snapshot {
+        let mut snapshot = worker_snapshot();
+        snapshot.projects.clear();
+        snapshot.selection = Default::default();
+        snapshot
+    }
+
+    /// The sizes the window sent, as `(terminal, cols, rows)`.
+    fn resizes(script: &mut Script) -> Vec<(String, u16, u16)> {
+        script
+            .sent()
+            .into_iter()
+            .filter_map(LinkOut::into_frame)
+            .filter_map(|frame| match frame {
+                ClientMsg::ResizeTerminal(r) => {
+                    Some((r.terminal_id.as_str().to_string(), r.cols, r.rows))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The commands sent, with their seqs.
+    fn sent_commands(script: &mut Script) -> Vec<(u64, String, Option<serde_json::Value>)> {
+        script
+            .sent()
+            .into_iter()
+            .filter_map(LinkOut::into_frame)
+            .filter_map(|frame| match frame {
+                ClientMsg::Command(c) => Some((c.seq, c.name, c.args)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn message(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> String {
+        model.read_with(cx, |m, _| match m.overlay() {
+            Some(OverlayView::Message(view)) => view.text,
+            _ => String::new(),
+        })
+    }
+
+    fn ack(seq: u64, outcome: AckOutcome, detail: &str) -> LinkEvent {
+        LinkEvent::Ack(
+            Ack {
+                seq,
+                outcome,
+                detail: Some(detail.to_string()),
+            },
+            AckFor::Command,
+        )
+    }
+
+    // --- the worker shell tab ---------------------------------------------
+
+    #[gpui::test]
+    fn a_worker_has_its_shell_tab_first_and_no_ssh_tab(app: &mut TestAppContext) {
+        let (model, _script, _window, cx) = open_on(app, worker_snapshot());
+        assert!(cx.debug_bounds("remote-shell-tab").is_none(), "no SSH tab");
+        let shell_tab = cx
+            .debug_bounds("remote-worker-shell-tab")
+            .expect("the worker shell tab");
+        let first_project = cx.debug_bounds("remote-project-tab-0").unwrap();
+        assert!(shell_tab.right() <= first_project.left(), "first");
+
+        click(cx, "remote-worker-shell-tab");
+        assert_eq!(model.read_with(cx, |m, _| m.tab()), Tab::WorkerShell);
+        assert!(cx.debug_bounds("agent-row-0").is_none(), "no sidebar");
+        assert!(cx.debug_bounds("git-push").is_none(), "no git strip");
+        click(cx, "remote-project-tab-0");
+        assert_eq!(model.read_with(cx, |m, _| m.tab()), Tab::Project);
+    }
+
+    #[gpui::test]
+    fn the_worker_shell_mirrors_and_takes_what_is_typed(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        click(cx, "remote-worker-shell-tab");
+        script.send(LinkEvent::Bytes(TermBytes::live(
+            "worker:shell".into(),
+            0,
+            b"dev@box:~$ ".to_vec(),
+        )));
+        turn(&model, cx);
+        let screen = model.read_with(cx, |m, _| {
+            m.active_terminal()
+                .map(|t| t.screen().contents())
+                .unwrap_or_default()
+        });
+        assert!(screen.contains("dev@box:~$"), "{screen:?}");
+
+        script.sent();
+        cx.simulate_keystrokes("l s enter");
+        model.update(cx, |m, cx| m.dispatch(HostEvent::Paste("pwd".into()), cx));
+        let typed: Vec<u8> = inputs(&mut script)
+            .into_iter()
+            .flat_map(|(terminal, bytes)| {
+                assert_eq!(terminal, "worker:shell");
+                bytes
+            })
+            .collect();
+        assert!(typed.starts_with(b"ls\r"), "{typed:?}");
+        assert!(String::from_utf8_lossy(&typed).contains("pwd"));
+    }
+
+    #[gpui::test]
+    fn a_host_command_from_the_worker_shell_is_refused(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        click(cx, "remote-worker-shell-tab");
+        script.sent();
+        model.update(cx, |m, cx| {
+            m.dispatch(
+                HostEvent::Command(flightdeck::app::commands::Command::RestartAgent),
+                cx,
+            )
+        });
+        assert!(commands(&mut script).is_empty(), "nothing went to the host");
+        assert_eq!(message(&model, cx), WORKER_SHELL_COMMAND_REFUSAL);
+    }
+
+    #[gpui::test]
+    fn an_exited_worker_shell_offers_to_restart_it(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        click(cx, "remote-worker-shell-tab");
+        assert!(cx.debug_bounds("remote-worker-shell-ended").is_none());
+        script.send(LinkEvent::Delta(Delta::WorkerShell(shell(false))));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-worker-shell-ended").is_some());
+        script.sent();
+        click(cx, "remote-worker-shell-restart");
+        let names: Vec<String> = commands(&mut script).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["restart_worker_shell"]);
+    }
+
+    // --- geometry (W5) ----------------------------------------------------
+
+    #[gpui::test]
+    fn a_worker_is_sent_the_pane_size_once_per_size(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        model.update(cx, |m, _| {
+            m.focus_terminal(flightdeck::view::TerminalRef::Primary)
+        });
+        turn(&model, cx);
+        turn(&model, cx);
+        let sent = resizes(&mut script);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "s2:primary", "the terminal on screen");
+        // The same size again, frame after frame: nothing more.
+        turn(&model, cx);
+        turn(&model, cx);
+        assert!(resizes(&mut script).is_empty());
+
+        // A new size is sent, once.
+        let sent = model.update(cx, |m, _| {
+            m.set_viewport(PtySize { rows: 10, cols: 40 });
+            m.pump();
+            m.pump();
+            resizes(&mut script)
+        });
+        assert_eq!(sent, [("s2:primary".to_string(), 40, 10)]);
+
+        // The worker shell, once on screen, is sized too.
+        click(cx, "remote-worker-shell-tab");
+        turn(&model, cx);
+        let sent = resizes(&mut script);
+        assert!(sent.iter().any(|(id, ..)| id == "worker:shell"), "{sent:?}");
+    }
+
+    #[gpui::test]
+    fn a_host_that_is_not_a_worker_is_never_resized(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, snapshot());
+        model.update(cx, |m, _| {
+            m.focus_terminal(flightdeck::view::TerminalRef::Primary);
+            m.set_viewport(PtySize { rows: 10, cols: 40 });
+        });
+        turn(&model, cx);
+        turn(&model, cx);
+        assert!(
+            resizes(&mut script).is_empty(),
+            "D4: the host owns geometry"
+        );
+    }
+
+    // --- the project picker -----------------------------------------------
+
+    #[gpui::test]
+    fn the_picker_scans_browses_and_opens_a_repository(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, empty_worker());
+        script.sent();
+        click(cx, "remote-open-project");
+        let sent = sent_commands(&mut script);
+        let seq = |name: &str| sent.iter().find(|c| c.1 == name).map(|c| c.0).unwrap();
+        let (scan, browse) = (seq("scan_projects"), seq("browse_dir"));
+        assert!(cx.debug_bounds("remote-picker").is_some());
+
+        script.send(LinkEvent::ProjectScan(ProjectScan {
+            seq: scan,
+            root: "/home/dev/flightdeck".to_string(),
+            root_exists: true,
+            repos: vec![ScannedRepo {
+                name: "api".to_string(),
+                path: "/home/dev/flightdeck/api".to_string(),
+                is_open_project: false,
+            }],
+            refusal: None,
+        }));
+        script.send(LinkEvent::DirListing(DirListing {
+            seq: browse,
+            path: "/home/dev".to_string(),
+            parent: None,
+            home: "/home/dev".to_string(),
+            entries: vec![
+                DirEntryView {
+                    name: "src".to_string(),
+                    path: "/home/dev/src".to_string(),
+                    is_git_repo: false,
+                    is_open_project: false,
+                },
+                DirEntryView {
+                    name: "app".to_string(),
+                    path: "/home/dev/app".to_string(),
+                    is_git_repo: true,
+                    is_open_project: false,
+                },
+            ],
+            truncated: false,
+        }));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-picker-scanned-0").is_some());
+        assert!(cx.debug_bounds("remote-picker-entry-1").is_some());
+        assert!(
+            cx.debug_bounds("remote-picker-open-0").is_none(),
+            "src is no repository"
+        );
+
+        // A folder browses into it.
+        click(cx, "remote-picker-entry-0");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "browse_dir");
+        assert_eq!(sent[0].2.as_ref().unwrap()["path"], "/home/dev/src");
+
+        // A repository opens; a refusal is the worker's words.
+        click(cx, "remote-picker-open-1");
+        let sent = sent_commands(&mut script);
+        assert_eq!(
+            (sent[0].1.as_str(), sent[0].2.clone()),
+            (
+                "open_project_path",
+                Some(serde_json::json!({ "path": "/home/dev/app" }))
+            )
+        );
+        script.send(ack(
+            sent[0].0,
+            AckOutcome::Rejected,
+            "Not a git repository: /home/dev/app",
+        ));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-picker-error").is_some());
+        assert!(message(&model, cx).is_empty(), "not a message overlay");
+
+        click(cx, "remote-picker-open-1");
+        let open = sent_commands(&mut script)[0].0;
+        script.send(ack(open, AckOutcome::Applied, "Opened project 'app'."));
+        script.send(LinkEvent::Delta(Delta::ProjectUpsert(ProjectView {
+            project_id: "/home/dev/app".into(),
+            name: "app".to_string(),
+            root: "/home/dev/app".to_string(),
+            base_branch: "main".to_string(),
+            dot: None,
+            sessions: Vec::new(),
+        })));
+        turn(&model, cx);
+        assert!(
+            model.read_with(cx, |m, _| m.picker().is_none()),
+            "it closed"
+        );
+        assert!(cx.debug_bounds("remote-picker").is_none());
+        let (selected, notice) = model.read_with(cx, |m, _| {
+            (
+                m.workspace().selected_project().map(|p| p.name.clone()),
+                m.notice().map(str::to_string),
+            )
+        });
+        assert_eq!(selected.as_deref(), Some("app"), "the window went to it");
+        assert_eq!(notice.as_deref(), Some("Opened project 'app'."));
+    }
+
+    #[gpui::test]
+    fn open_project_on_a_worker_is_its_picker(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        script.sent();
+        model.update(cx, |m, cx| {
+            m.dispatch(HostEvent::RunPaletteAction(PaletteAction::OpenProject), cx)
+        });
+        assert!(model.read_with(cx, |m, _| m.picker().is_some()));
+        let names: Vec<String> = commands(&mut script).into_iter().map(|c| c.0).collect();
+        assert!(!names.contains(&"open_project".to_string()), "{names:?}");
+        assert!(names.contains(&"scan_projects".to_string()), "{names:?}");
+    }
+
+    #[gpui::test]
+    fn a_clone_shows_its_progress_then_gits_own_error(app: &mut TestAppContext) {
+        let (model, mut script, window, cx) = open_on(app, empty_worker());
+        click(cx, "remote-open-project");
+        script.sent();
+        let picker = window
+            .read_with(cx, |w, _| w.picker_view())
+            .expect("the picker view");
+        cx.update(|window, cx| {
+            picker.update(cx, |view, cx| {
+                view.fill_clone("git@github.com:me/api.git", "api", window, cx)
+            })
+        });
+        click(cx, "remote-picker-clone");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "clone_project");
+        assert_eq!(
+            sent[0].2,
+            Some(serde_json::json!({ "url": "git@github.com:me/api.git", "name": "api" }))
+        );
+        let clone_id = sent[0].0;
+
+        script.send(LinkEvent::CloneProgress(CloneProgress {
+            clone_id,
+            url: "git@github.com:me/api.git".to_string(),
+            phase: "Receiving objects".to_string(),
+            percent: Some(42),
+        }));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-picker-clone-progress").is_some());
+        let line = model.read_with(cx, |m, _| {
+            crate::remote::projects::clone_line(m.picker().unwrap())
+        });
+        assert_eq!(
+            line,
+            Some((
+                "Cloning git@github.com:me/api.git — Receiving objects 42%".to_string(),
+                false
+            ))
+        );
+
+        let git = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        script.send(LinkEvent::CloneResult(CloneResult {
+            clone_id,
+            url: "git@github.com:me/api.git".to_string(),
+            ok: false,
+            path: None,
+            project_id: None,
+            error: Some(git.to_string()),
+        }));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-picker-clone-error").is_some());
+        let error = model.read_with(cx, |m, _| m.picker().and_then(|p| p.error.clone()));
+        assert_eq!(error.as_deref(), Some(git), "git's words, verbatim");
+    }
+
+    #[gpui::test]
+    fn a_finished_clone_opens_the_project(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, empty_worker());
+        click(cx, "remote-open-project");
+        script.sent();
+        model.update(cx, |m, _| m.picker_clone("https://example.com/api.git", ""));
+        let sent = sent_commands(&mut script);
+        assert_eq!(
+            sent[0].2,
+            Some(serde_json::json!({ "url": "https://example.com/api.git" })),
+            "no name: the URL's"
+        );
+        script.send(LinkEvent::CloneResult(CloneResult {
+            clone_id: sent[0].0,
+            url: "https://example.com/api.git".to_string(),
+            ok: true,
+            path: Some("/home/dev/flightdeck/api".to_string()),
+            project_id: Some("/home/dev/flightdeck/api".into()),
+            error: None,
+        }));
+        turn(&model, cx);
+        assert!(model.read_with(cx, |m, _| m.picker().is_none()));
+    }
+
+    // --- takeover and a stopped worker ------------------------------------
+
+    /// A window whose Reconnect dials a new scripted client, kept here.
+    fn with_dialer(
+        model: &Entity<RemoteModel>,
+        cx: &mut VisualTestContext,
+    ) -> Rc<RefCell<Vec<Script>>> {
+        let dialled = Rc::new(RefCell::new(Vec::new()));
+        let sink = dialled.clone();
+        model.update(cx, |m, _| {
+            m.set_dialer(Rc::new(move || {
+                let (client, script) = RemoteClient::scripted();
+                sink.borrow_mut().push(script);
+                client
+            }))
+        });
+        dialled
+    }
+
+    #[gpui::test]
+    fn taken_over_says_by_whom_and_reconnect_takes_it_back(app: &mut TestAppContext) {
+        let (model, script, _window, cx) = open_on(app, worker_snapshot());
+        let dialled = with_dialer(&model, cx);
+        script.send(LinkEvent::State(LinkState::Ended(LinkEnd::TakenOver {
+            by: "laptop".to_string(),
+        })));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-ended").is_some());
+        assert_eq!(
+            model.read_with(cx, |m, _| m.link_label()),
+            "taken over by laptop"
+        );
+
+        click(cx, "remote-reconnect");
+        assert_eq!(dialled.borrow().len(), 1, "dialled again");
+        dialled.borrow()[0].snapshot(worker_snapshot());
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-ended").is_none());
+        assert!(model.read_with(cx, |m, _| m.client().state().is_live()));
+        assert!(cx.debug_bounds("remote-worker-shell-tab").is_some());
+    }
+
+    #[gpui::test]
+    fn a_stopped_worker_offers_to_reconnect(app: &mut TestAppContext) {
+        let (model, script, _window, cx) = open_on(app, worker_snapshot());
+        let dialled = with_dialer(&model, cx);
+        script.send(LinkEvent::State(LinkState::Ended(LinkEnd::HostQuit)));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-ended").is_some());
+        click(cx, "remote-reconnect");
+        assert_eq!(dialled.borrow().len(), 1);
+    }
+
+    // --- host messages, notifications, version skew -----------------------
+
+    fn host_message(id: u64, level: MessageLevel, text: &str) -> HostMessage {
+        HostMessage {
+            id,
+            at_ms: 1_000 + id as i64,
+            level,
+            text: text.to_string(),
+        }
+    }
+
+    #[gpui::test]
+    fn messages_kept_while_away_come_back_as_one_overlay(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        snapshot.worker.as_mut().unwrap().host_messages = vec![
+            host_message(1, MessageLevel::Info, "FlightDeck 9.9.9 is available."),
+            host_message(2, MessageLevel::Error, "Clone failed: repository not found"),
+        ];
+        let (model, _script, _window, cx) = open_on(app, snapshot);
+        let text = message(&model, cx);
+        assert!(
+            text.starts_with("2 messages while you were away\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("Error: Clone failed"), "{text:?}");
+    }
+
+    #[gpui::test]
+    fn a_new_message_is_a_notice_and_an_error_also_an_overlay(app: &mut TestAppContext) {
+        let (model, script, _window, cx) = open_on(app, worker_snapshot());
+        script.send(LinkEvent::Delta(Delta::HostMessage(host_message(
+            1,
+            MessageLevel::Info,
+            "Merged login into main.",
+        ))));
+        turn(&model, cx);
+        assert_eq!(
+            model.read_with(cx, |m, _| m.notice().map(str::to_string)),
+            Some("Merged login into main.".to_string())
+        );
+        assert!(message(&model, cx).is_empty(), "information is not modal");
+
+        script.send(LinkEvent::Delta(Delta::HostMessage(host_message(
+            2,
+            MessageLevel::Error,
+            "Could not start claude: not found",
+        ))));
+        turn(&model, cx);
+        assert_eq!(message(&model, cx), "Could not start claude: not found");
+    }
+
+    #[gpui::test]
+    fn a_workers_notification_is_posted_from_its_window(app: &mut TestAppContext) {
+        let (model, script, _window, cx) = open_on(app, worker_snapshot());
+        let notifier = Rc::new(FakeNotifier::new());
+        model.update(cx, |m, _| m.set_notifier(notifier.clone()));
+        script.send(LinkEvent::Delta(Delta::Notification(NotificationView {
+            at_ms: 5,
+            title: "login".to_string(),
+            body: "Claude Code needs your input".to_string(),
+            sound: NotificationSoundView::InputRequired,
+        })));
+        turn(&model, cx);
+        let posted = notifier.posted();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].title, "studio: login", "named after the window");
+        assert_eq!(posted[0].body, "Claude Code needs your input");
+        assert_eq!(posted[0].sound, NotificationSound::InputRequired);
+        turn(&model, cx);
+        assert_eq!(notifier.posted().len(), 1, "once");
+    }
+
+    #[gpui::test]
+    fn a_worker_on_another_version_shows_the_skew_banner(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        snapshot.host_version = "0.0.1".to_string();
+        let (model, _script, _window, cx) = open_on(app, snapshot);
+        assert!(cx.debug_bounds("remote-version-skew").is_some());
+        let warning = model.read_with(cx, |m, _| m.skew_warning()).unwrap();
+        assert!(warning.starts_with("This worker runs FlightDeck 0.0.1; this app was built with"));
+        assert!(warning.ends_with("`flightdeck update`, then `flightdeck worker restart`."));
+    }
+
+    #[gpui::test]
+    fn the_same_version_or_another_host_kind_shows_no_banner(app: &mut TestAppContext) {
+        let (_model, _script, _window, cx) = open_on(app, worker_snapshot());
+        assert!(cx.debug_bounds("remote-version-skew").is_none());
+    }
+
+    #[gpui::test]
+    fn a_tui_host_on_another_version_shows_no_banner(app: &mut TestAppContext) {
+        // The recorded TUI host runs 1.0.0, not this build.
+        let (_model, _script, _window, cx) = open_on(app, snapshot());
+        assert!(cx.debug_bounds("remote-version-skew").is_none());
+    }
+
+    // --- the configuration manager (every host kind) ----------------------
+
+    fn config_view(seq: u64, value: bool) -> ConfigView {
+        let row = ConfigRowView {
+            key: "notifications.enabled".to_string(),
+            label: "Notifications".to_string(),
+            kind: ConfigFieldKind::Bool,
+            value: ConfigValue::Bool(value),
+            choices: Vec::new(),
+            origin: ConfigOrigin::Default,
+            inherited: ConfigValue::Bool(false),
+            inherited_origin: ConfigOrigin::Default,
+        };
+        ConfigView {
+            seq,
+            project_name: "repo".to_string(),
+            global_path: Some("/home/dev/.flightdeck/config.toml".to_string()),
+            project_path: "/repo/.flightdeck/config.toml".to_string(),
+            project_rows: vec![row.clone()],
+            global_rows: vec![row],
+        }
+    }
+
+    #[gpui::test]
+    fn the_hosts_configuration_is_edited_here_and_saved_there(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, snapshot());
+        script.sent();
+        model.update(cx, |m, cx| {
+            m.dispatch(HostEvent::RunPaletteAction(PaletteAction::OpenConfig), cx)
+        });
+        let sent = sent_commands(&mut script);
+        assert_eq!(
+            (sent[0].1.as_str(), sent[0].2.clone()),
+            (
+                "open_configuration",
+                Some(serde_json::json!({ "project_id": "/repo" }))
+            ),
+            "resolved for the project this window shows"
+        );
+        script.send(ack(sent[0].0, AckOutcome::Applied, "Opened configuration."));
+        script.send(LinkEvent::Configuration(config_view(sent[0].0, false)));
+        turn(&model, cx);
+        let Some(OverlayView::Config(view)) = model.read_with(cx, |m, _| m.overlay()) else {
+            panic!("the configuration card is up");
+        };
+        assert_eq!(view.rows[0].value, "off");
+
+        // Toggle the row, then save: one command, naming the project.
+        model.update(cx, |m, cx| {
+            m.dispatch(HostEvent::Overlay(OverlayInput::Submit), cx);
+            m.dispatch(HostEvent::Overlay(OverlayInput::ConfigSave), cx);
+        });
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "open_configuration");
+        let request: ConfigSaveRequest =
+            serde_json::from_value(sent[0].2.clone().unwrap()).unwrap();
+        assert_eq!(
+            request,
+            ConfigSaveRequest {
+                changes: vec![ConfigChange {
+                    scope: ConfigScopeName::Project,
+                    key: "notifications.enabled".to_string(),
+                    value: Some(ConfigValue::Bool(true)),
+                }],
+                project_id: Some("/repo".into()),
+            }
+        );
+
+        // The host's answer is the card's new truth.
+        script.send(LinkEvent::Configuration(config_view(sent[0].0, true)));
+        turn(&model, cx);
+        let Some(OverlayView::Config(view)) = model.read_with(cx, |m, _| m.overlay()) else {
+            panic!("still up");
+        };
+        assert_eq!(view.rows[0].value, "on");
+        assert!(!view.dirty);
+        assert_eq!(view.status.as_deref(), Some("Saved."));
+
+        // A refused save keeps the edit and says why on the card.
+        model.update(cx, |m, cx| {
+            m.dispatch(HostEvent::Overlay(OverlayInput::Submit), cx);
+            m.dispatch(HostEvent::Overlay(OverlayInput::ConfigSave), cx);
+        });
+        let seq = sent_commands(&mut script)[0].0;
+        script.send(ack(
+            seq,
+            AckOutcome::Rejected,
+            "notifications.enabled: not a boolean",
+        ));
+        turn(&model, cx);
+        let Some(OverlayView::Config(view)) = model.read_with(cx, |m, _| m.overlay()) else {
+            panic!("still up");
+        };
+        assert!(view.dirty);
+        assert_eq!(
+            view.status.as_deref(),
+            Some("notifications.enabled: not a boolean")
+        );
+
+        // Esc closes it.
+        model.update(cx, |m, cx| {
+            m.dispatch(HostEvent::Overlay(OverlayInput::Cancel), cx)
+        });
+        assert!(model.read_with(cx, |m, _| m.overlay()).is_none());
+    }
 }

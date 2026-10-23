@@ -3486,6 +3486,55 @@ nouns.
   exists — and the one that would actually catch the bug.
 
 
+### R28 — protocol v7: the FlightDeck Worker, and the first version range
+
+`flightdeck worker` (`specs/WORKER_PRD.md`, epic `remote-control-qlyd`) is a
+headless host that a FlightDeck Desktop drives over the tailnet with this
+protocol. It needs frames no browser has ever needed, so this is web protocol
+**v7** (`remote-control-qlyd.9`). The types live in `src/web/protocol.rs`.
+
+**New kinds (closed-vocabulary growth, hence the bump).** All of them come only
+from a **worker** host, or in answer to a worker command:
+
+| Direction | Kind | Wire tag |
+| --- | --- | --- |
+| `Delta` | `Health`, `WorkerShell`, `WorkerStatus`, `Connections`, `HostMessage`, `Notification` | `health`, `worker_shell`, `worker_status`, `connections`, `host_message`, `notification` |
+| `ServerMsg` | `DirListing`, `ProjectScan`, `CloneProgress`, `CloneResult`, `TakenOver { by }` | `dir_listing`, `project_scan`, `clone_progress`, `clone_result`, `taken_over` |
+| `ClientMsg` | `ResizeTerminal { terminal_id, cols, rows }` | `resize_terminal` |
+
+**Additive fields (rule 4, `#[serde(default)]`).** `Attach.connection`
+(`window` | `background`, absent = `window`), `Snapshot.host_kind` (`tui` |
+`desktop` | `worker`, absent from a v6 host), `Snapshot.worker` (only from a
+worker; not serialised otherwise) and `ConfigSaveRequest.project_id` (absent =
+the host's active project).
+
+**Worker commands are not palette rows.** `browse_dir`, `scan_projects`,
+`open_project_path`, `clone_project` and `restart_worker_shell` travel as
+ordinary `Command` frames but live in `protocol::worker_command`, parsed by
+`WorkerOp::parse` — never in `protocol::command` or `commands::INVENTORY`,
+whose coverage tests assume every name there is a palette row.
+
+**The first range.** Until v6 the host served exactly its own version (D9: the
+SPA co-ships with the server). A native Desktop does not co-ship with its host,
+so from v7 a TUI or Desktop host accepts **6..=7** (`MIN_SUPPORTED_VERSION = 6`)
+and answers each viewer at `negotiated(peer) = min(peer, 7)` — a v6 Desktop's
+link compares the snapshot's version for equality, so it must be told 6, on the
+first snapshot and on every `request_snapshot`. A v6 peer never receives a v7
+frame, because those come only from a worker, and a **worker** refuses anything
+below `WORKER_MIN_CLIENT_VERSION = 7` with `version_mismatch`. A v7 client that
+is refused by an older host may redial once at the refusal's `max_supported`.
+`tokens.guard.test.ts` rule 4 now pins `MAX = PROTOCOL_VERSION` and allows the
+floor at most one below it, rather than none.
+
+**What changes for D4.** Only on a worker: its one window's `ResizeTerminal`
+sizes the PTYs (PRD W5), since a worker has no pane of its own. A TUI or
+Desktop host drops the frame silently, and D4 holds there unchanged.
+
+**The SPA handles none of it.** A worker serves no SPA (only `/ws`,
+`/auth/exchange` and `/auth/session`), so `webui/src/wire/frames.ts` only
+declares the optional v7 fields and `WireTakenOver`, and bumps its
+`PROTOCOL_VERSION` to 7 to stay in step with the host.
+
 ---
 
 ## 7. Reference
