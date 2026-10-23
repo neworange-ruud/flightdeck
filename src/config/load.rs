@@ -342,10 +342,10 @@ fn read_table(fs: &dyn FileSystem, path: &Path, lenient: bool) -> Result<toml::T
     match parse_table(&contents) {
         Ok(t) => Ok(t),
         Err(e) if lenient => {
-            eprintln!(
+            crate::best_effort_stderr_line(&format!(
                 "FlightDeck: ignoring unparsable global config {}: {e}",
                 path.display()
-            );
+            ));
             Ok(toml::Table::new())
         }
         Err(e) => Err(e),

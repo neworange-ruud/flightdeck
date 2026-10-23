@@ -4375,7 +4375,7 @@ fn restore_terminal_modes(keyboard_enhanced: bool) {
 ///
 /// `eprintln!` treats an I/O failure as a panic. That is normally useful, but
 /// stderr is expected to be gone after a terminal emulator closes its tab.
-fn best_effort_stderr_line(message: &str) {
+pub(crate) fn best_effort_stderr_line(message: &str) {
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
     best_effort_write_line(&mut stderr, message);
