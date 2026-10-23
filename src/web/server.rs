@@ -34,6 +34,25 @@
 //! [`TermCursor`]s so a replay can be answered). This module never inspects a
 //! terminal byte; it decides *who* may send one.
 //!
+//! ## Worker hosts (v7, `specs/WORKER_PRD.md`)
+//!
+//! [`start_with`] runs the same server for a `flightdeck worker`, and three
+//! things change when [`ServerOptions::host_kind`] says so:
+//!
+//! * **Where it listens.** [`ListenPlan::Tailscale`] keeps one listener per
+//!   Tailscale address, re-read on a poll and reconciled — never loopback,
+//!   never the unspecified address — and reports itself through
+//!   [`WebServerHandle::listen_status`]. No SPA is served.
+//! * **Who may connect.** Clients older than
+//!   [`WORKER_MIN_CLIENT_VERSION`] are refused with the worker's own floor.
+//! * **The seat model.** One **window** drives; a new window takes over the
+//!   old one ([`ServerMsg::TakenOver`]), or silently replaces its own stale
+//!   socket. Any number of **background links** watch status and nothing else
+//!   (`background_may_receive`), never take over and are never taken over,
+//!   and every connection is told who holds the window
+//!   ([`Delta::Connections`]). TUI and Desktop hosts keep D14's multi-writer
+//!   model unchanged.
+//!
 //! ## Security posture
 //!
 //! * **Two credentials (Q4).** A ~120 s bootstrap code, read by the browser from
@@ -51,7 +70,8 @@
 //!   `Set-Cookie` headers never reach [`debuglog`]; refusals are logged as
 //!   [`AuthFailure::as_str`] plus the peer IP.
 
-use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,12 +85,16 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::JoinHandle;
 
 use crate::contracts::domain::WebConfig;
 use crate::contracts::traits::Clock;
 use crate::contracts::PtySize;
 use crate::remote::debuglog;
-use crate::remote::direct::net::{AddressOrigin, AddressSource, TailscaleProbe};
+use crate::remote::direct::net::{
+    advertised_host, select_bind_addresses, AddressOrigin, AddressSource, TailscaleProbe,
+    TailscaleStatus,
+};
 use crate::remote::runtime;
 use crate::web::arbiter::{Claim, InputArbiter, SharedInputLock, Writer};
 use crate::web::assets::{self, Lookup};
@@ -80,9 +104,11 @@ use crate::web::credentials::{
 };
 use crate::web::protocol::{
     check_version, negotiated, Ack, AckOutcome, ActivityEvent, Attach, ClientMsg, ConnectionKind,
-    Delta, DialogView, ErrorCode, Geometry, Health, HostKind, HostMessage, ProjectView, Seat,
-    SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot, TermCursor, TerminalId,
-    ViewerId, Viewport, WireError, WorkerOp, WorkerShellView, WorkerStatusView,
+    ConnectionsView, Delta, DialogView, ErrorCode, Geometry, Health, HostKind, HostMessage,
+    ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot,
+    TermCursor, TerminalId, VersionMismatch, ViewerId, Viewport, WindowInfo, WireError, WorkerOp,
+    WorkerShellView, WorkerSnapshot, WorkerStatusView, MAX_SUPPORTED_VERSION, PROTOCOL_VERSION,
+    WORKER_MIN_CLIENT_VERSION,
 };
 
 // ===========================================================================
@@ -151,6 +177,18 @@ const DRAIN_GRACE: Duration = Duration::from_secs(3);
 /// How many disconnected viewers' input cursors are remembered, so a reconnect
 /// can be told what already landed ([`Snapshot::last_input_seq`]).
 const REMEMBERED_INPUT_CURSORS: usize = 64;
+
+/// How often a [`ListenPlan::Tailscale`] server asks Tailscale itself about
+/// this node even when the interface addresses have not moved.
+///
+/// The probe spawns the `tailscale` CLI (up to three seconds), so it is not
+/// run on every poll: the interface list is the cheap signal, and this is the
+/// backstop for a change the interface list cannot show — a node that logged
+/// out keeps its `100.x` address on some platforms (design §2.2).
+const TAILSCALE_REPROBE: Duration = Duration::from_secs(60);
+
+/// The reason a Tailscale plan reports when there is nothing it may bind.
+pub const NO_TAILSCALE_ADDRESS: &str = "no Tailscale address";
 
 /// The label the desktop's own seat row carries, and the name it is refused
 /// under when another writer holds the input lock (2f).
@@ -609,7 +647,12 @@ pub struct ConnectionInfo {
 /// The TUI's end of the server. Dropping it stops the server.
 pub struct WebServerHandle {
     shared: Arc<Shared>,
-    bound: SocketAddr,
+    /// The port the plan asked for, so [`WebServerHandle::bound_addr`] has
+    /// something honest to say while a Tailscale plan has nothing bound.
+    port: u16,
+    /// Where the listeners are right now. Written by the task that owns them
+    /// — once for `Configured` and `Fixed`, on every poll for `Tailscale`.
+    listen: watch::Receiver<ListenStatus>,
     exposure: BindExposure,
     /// `None` once [`WebServerHandle::stop`] has taken it.
     shutdown: Option<watch::Sender<Option<ShutdownNotice>>>,
@@ -626,8 +669,17 @@ impl WebServerHandle {
     /// The address actually bound. With `[web] port = 0` (how the tests avoid
     /// colliding) this is where the OS put the listener, so the caller can print
     /// or QR-encode a URL that works.
+    ///
+    /// With several listeners this is the first of [`Self::bound_addrs`]; with
+    /// none (a Tailscale plan on a node with no Tailscale address) it is the
+    /// unspecified address on the planned port, which nothing can dial.
     pub fn bound_addr(&self) -> SocketAddr {
-        self.bound
+        self.listen
+            .borrow()
+            .bound
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.port))
     }
 
     /// Whether the bound address is reachable off this machine (D5), derived
@@ -748,41 +800,38 @@ impl WebServerHandle {
         !self.shared.registry().writers().is_empty()
     }
 
-    /// How many browsers are attached (observers included).
+    /// How many browsers are attached (observers included) — **windows**
+    /// only. A worker's background links watch for status and notifications,
+    /// and must not make the host believe somebody is looking at its
+    /// terminals (this count drives the background git refresh).
     pub fn viewer_count(&self) -> usize {
-        self.shared.registry().viewers.len()
+        self.window_count()
     }
 
     /// Where the server is listening, and why not when it is not (v7).
-    // stub: filled by A (the Tailscale plan reports its own status).
     pub fn listen_status(&self) -> ListenStatus {
-        ListenStatus {
-            bound: vec![self.bound],
-            ..ListenStatus::default()
-        }
+        self.listen.borrow().clone()
     }
 
     /// Every address a listener is bound on (v7). [`Self::bound_addr`] is the
     /// first of them.
-    // stub: filled by A (one listener per Tailscale address).
     pub fn bound_addrs(&self) -> Vec<SocketAddr> {
-        vec![self.bound]
+        self.listen.borrow().bound.clone()
     }
 
-    /// How many **window** connections are attached (v7).
-    // stub: filled by A (connection kinds); every viewer is a window today.
+    /// How many **window** connections are attached (v7). On a TUI or
+    /// Desktop host every viewer is a window.
     pub fn window_count(&self) -> usize {
-        self.viewer_count()
+        self.shared.registry().count(ConnectionKind::Window)
     }
 
-    /// How many **background links** are attached (v7).
-    // stub: filled by A (connection kinds).
+    /// How many **background links** are attached (v7). Always zero on a TUI
+    /// or Desktop host.
     pub fn background_count(&self) -> usize {
-        0
+        self.shared.registry().count(ConnectionKind::Background)
     }
 
-    /// Every attached connection (v7).
-    // stub: filled by A (connection kinds); every viewer is a window today.
+    /// Every attached connection (v7), in attach order.
     pub fn connections(&self) -> Vec<ConnectionInfo> {
         self.shared
             .registry()
@@ -791,7 +840,7 @@ impl WebServerHandle {
             .map(|viewer| ConnectionInfo {
                 viewer_id: viewer.id.clone(),
                 token: viewer.identity.token.clone(),
-                kind: ConnectionKind::Window,
+                kind: viewer.kind,
                 label: viewer.identity.label(),
                 address: viewer.identity.address,
                 since_ms: viewer.since_ms,
@@ -868,7 +917,7 @@ impl Drop for WebServerHandle {
 impl std::fmt::Debug for WebServerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebServerHandle")
-            .field("bound", &self.bound)
+            .field("bound", &self.bound_addrs())
             .field("exposure", &self.exposure)
             .field("viewers", &self.viewer_count())
             .finish()
@@ -922,9 +971,20 @@ pub fn start(
 /// (v7): the worker's entry point, and what [`start`] wraps.
 ///
 /// `replay_bytes` is `[web] replay_bytes`, the per-terminal ring capacity.
-// stub: filled by A. Today `Configured` and `Fixed` bind their first address
-// through the single-listener path below, `Tailscale` is refused, and
-// `host_kind`, `serve_assets` and `replay_bytes` change nothing yet.
+/// The server itself keeps no ring — `src/web/stream.rs` does, sized by the
+/// host from the same setting — so it is accepted here only so both entry
+/// points take the same facts.
+///
+/// What each [`ListenPlan`] does before this returns:
+///
+/// * **`Configured`** — exactly what [`start`] always did: one listener on
+///   `bind:port`, and a [`StartError::Bind`] if it cannot be had.
+/// * **`Fixed`** — one listener per address; the first that cannot be bound
+///   fails the whole start, and an empty list is refused.
+/// * **`Tailscale`** — one reconcile pass (design §2.2), then `Ok` **whether
+///   or not anything was bound**: a worker on a node whose Tailscale is down
+///   keeps running and keeps polling, and [`WebServerHandle::listen_status`]
+///   says why it is not listening.
 pub fn start_with(
     options: ServerOptions,
     replay_bytes: usize,
@@ -933,24 +993,24 @@ pub fn start_with(
     initial_state: HostState,
     inbound: std::sync::mpsc::Sender<WebInbound>,
 ) -> Result<WebServerHandle, StartError> {
-    let _ = (options.host_kind, options.serve_assets, replay_bytes);
-    let address = match &options.listen {
-        ListenPlan::Configured { bind, port } => listen_address(bind, *port),
-        ListenPlan::Fixed(addrs) => match addrs.first() {
-            Some(addr) => addr.to_string(),
-            None => {
-                return Err(StartError::Bind {
-                    address: String::new(),
-                    reason: "no address to listen on".to_string(),
-                })
-            }
-        },
-        ListenPlan::Tailscale { port, .. } => {
+    let _ = replay_bytes;
+    let ServerOptions {
+        host_kind,
+        listen: plan,
+        serve_assets,
+    } = options;
+    // Refused before a runtime is touched: there is nothing to try.
+    if let ListenPlan::Fixed(addrs) = &plan {
+        if addrs.is_empty() {
             return Err(StartError::Bind {
-                address: format!("tailscale:{port}"),
-                reason: "not implemented".to_string(),
-            })
+                address: String::new(),
+                reason: "no address to listen on".to_string(),
+            });
         }
+    }
+    let port = match &plan {
+        ListenPlan::Configured { port, .. } | ListenPlan::Tailscale { port, .. } => *port,
+        ListenPlan::Fixed(addrs) => addrs.first().map_or(0, SocketAddr::port),
     };
 
     let Some(rt) = runtime::try_shared() else {
@@ -960,6 +1020,7 @@ pub fn start_with(
     let (shutdown_tx, shutdown_rx) = watch::channel::<Option<ShutdownNotice>>(None);
     let (revocations_tx, revocations_rx) = watch::channel::<u64>(0);
     let (state_tx, state_rx) = watch::channel(Arc::new(initial_state));
+    let (listen_tx, listen_rx) = watch::channel(ListenStatus::default());
     let started_ms = clock.now_millis() as i64;
 
     let shared = Arc::new(Shared {
@@ -968,56 +1029,66 @@ pub fn start_with(
         inbound: Mutex::new(inbound),
         state: state_tx,
         state_rx,
-        registry: Mutex::new(SeatRegistry::new(started_ms)),
+        registry: Mutex::new(SeatRegistry::new(started_ms, host_kind)),
         input_lock: InputArbiter::shared(),
         announced_holder: Mutex::new(None),
         shutdown: shutdown_rx,
         revocations: revocations_rx,
         drain: Arc::new(Drain::default()),
+        host_kind,
+        serve_assets,
     });
 
     // Rendezvous: the task reports the bind result, then serves. Blocking the
-    // caller here is bounded by one `bind` syscall and is what lets the palette
-    // command say "listening on …" or "could not bind" synchronously.
-    let (bound_tx, bound_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
+    // caller here is bounded by the binds (plus, for a Tailscale plan, one
+    // bounded probe) and is what lets the palette command say "listening on
+    // …" or "could not bind" synchronously.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartError>>();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
     let task_shared = Arc::clone(&shared);
-    let task_address = address.clone();
     rt.spawn(async move {
         // Owned by the task: dropped when it returns, which is what unblocks
         // `stop`. Never sent on — its drop is the signal.
         let _done = done_tx;
-        let listener = match tokio::net::TcpListener::bind(task_address.as_str()).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                let _ = bound_tx.send(Err(e.to_string()));
-                return;
+        let router = router(Arc::clone(&task_shared));
+        match plan {
+            ListenPlan::Configured { bind, port } => {
+                serve_configured(task_shared, router, &bind, port, listen_tx, ready_tx).await;
             }
-        };
-        let bound = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                let _ = bound_tx.send(Err(e.to_string()));
-                return;
+            ListenPlan::Fixed(addrs) => {
+                serve_fixed(task_shared, router, &addrs, listen_tx, ready_tx).await;
             }
-        };
-        if bound_tx.send(Ok(bound)).is_err() {
-            // Nobody is waiting for this server; do not hold the port.
-            return;
+            ListenPlan::Tailscale {
+                port,
+                source,
+                probe,
+                poll,
+            } => {
+                let plan = TailscalePlan {
+                    port,
+                    source,
+                    probe,
+                    poll,
+                };
+                supervise_tailscale(task_shared, router, plan, listen_tx, ready_tx).await;
+            }
         }
-        serve(task_shared, listener).await;
     });
 
-    match bound_rx.recv() {
-        Ok(Ok(bound)) => {
-            let exposure = if bound.ip().is_loopback() {
+    match ready_rx.recv() {
+        Ok(Ok(())) => {
+            let status = listen_rx.borrow().clone();
+            let exposure = if !status.bound.is_empty()
+                && status.bound.iter().all(|addr| addr.ip().is_loopback())
+            {
                 BindExposure::Loopback
             } else {
                 BindExposure::Routable
             };
             debuglog::log(&format!(
-                "web START bound={bound} exposure={}",
+                "web START kind={host_kind:?} bound={:?} exposure={}",
+                status.bound,
                 match exposure {
                     BindExposure::Loopback => "loopback",
                     BindExposure::Routable => "routable",
@@ -1025,16 +1096,19 @@ pub fn start_with(
             ));
             Ok(WebServerHandle {
                 shared,
-                bound,
+                port,
+                listen: listen_rx,
                 exposure,
                 shutdown: Some(shutdown_tx),
                 revocations: revocations_tx,
                 done: Some(done_rx),
             })
         }
-        Ok(Err(reason)) => {
-            debuglog::log(&format!("web START failed address={address}"));
-            Err(StartError::Bind { address, reason })
+        Ok(Err(error)) => {
+            if let StartError::Bind { address, .. } = &error {
+                debuglog::log(&format!("web START failed address={address}"));
+            }
+            Err(error)
         }
         // The task died before reporting — treat as a runtime failure.
         Err(_) => Err(StartError::NoRuntime),
@@ -1051,9 +1125,319 @@ fn listen_address(bind: &str, port: u16) -> String {
     }
 }
 
-/// Run axum until shutdown, then release the listener.
-async fn serve(shared: Arc<Shared>, listener: tokio::net::TcpListener) {
-    let app = router(Arc::clone(&shared));
+/// The rendezvous [`start_with`] blocks on.
+type Ready = std::sync::mpsc::Sender<Result<(), StartError>>;
+
+/// `[web] bind:port`, exactly as [`start`] always bound it: resolved by tokio
+/// (so `localhost` works), one listener.
+async fn serve_configured(
+    shared: Arc<Shared>,
+    router: Router,
+    bind: &str,
+    port: u16,
+    listen: watch::Sender<ListenStatus>,
+    ready: Ready,
+) {
+    let address = listen_address(bind, port);
+    let listener = match tokio::net::TcpListener::bind(address.as_str()).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = ready.send(Err(StartError::Bind {
+                address,
+                reason: e.to_string(),
+            }));
+            return;
+        }
+    };
+    let bound = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            let _ = ready.send(Err(StartError::Bind {
+                address,
+                reason: e.to_string(),
+            }));
+            return;
+        }
+    };
+    listen.send_replace(ListenStatus {
+        bound: vec![bound],
+        ..ListenStatus::default()
+    });
+    if ready.send(Ok(())).is_err() {
+        // Nobody is waiting for this server; do not hold the port.
+        return;
+    }
+    serve(shared, router, listener).await;
+}
+
+/// Exactly these addresses, all or nothing.
+async fn serve_fixed(
+    shared: Arc<Shared>,
+    router: Router,
+    addrs: &[SocketAddr],
+    listen: watch::Sender<ListenStatus>,
+    ready: Ready,
+) {
+    let mut listeners = Vec::with_capacity(addrs.len());
+    let mut bound = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let listener = bind_std(*addr)
+            .and_then(tokio::net::TcpListener::from_std)
+            .and_then(|l| l.local_addr().map(|local| (l, local)));
+        match listener {
+            Ok((listener, local)) => {
+                bound.push(local);
+                listeners.push(listener);
+            }
+            Err(e) => {
+                // Dropping the listeners bound so far releases them: a plan
+                // that only half binds is not the plan that was asked for.
+                let _ = ready.send(Err(StartError::Bind {
+                    address: addr.to_string(),
+                    reason: e.to_string(),
+                }));
+                return;
+            }
+        }
+    }
+    listen.send_replace(ListenStatus {
+        bound,
+        ..ListenStatus::default()
+    });
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    let tasks: Vec<JoinHandle<()>> = listeners
+        .into_iter()
+        .map(|listener| tokio::spawn(serve(Arc::clone(&shared), router.clone(), listener)))
+        .collect();
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+/// A [`ListenPlan::Tailscale`], unpacked for the task that runs it.
+struct TailscalePlan {
+    port: u16,
+    source: Arc<dyn AddressSource>,
+    probe: Arc<dyn TailscaleProbe>,
+    poll: Duration,
+}
+
+/// Keep one listener per Tailscale address until shutdown (design §2.2).
+///
+/// Every `poll` the interface addresses are read (cheap); Tailscale itself is
+/// asked (the CLI, off the async workers) only when that set changed or
+/// [`TAILSCALE_REPROBE`] has passed. The listeners are then [`reconcile`]d
+/// against what is wanted and the [`ListenStatus`] republished if it moved —
+/// the same shape as `remote::direct::server`'s supervisor, sharing one
+/// [`Shared`] (registry, input lock, credentials) across every listener.
+async fn supervise_tailscale(
+    shared: Arc<Shared>,
+    router: Router,
+    plan: TailscalePlan,
+    listen: watch::Sender<ListenStatus>,
+    ready: Ready,
+) {
+    let mut ready = Some(ready);
+    let mut shutdown = shared.shutdown.clone();
+    let mut listeners: HashMap<IpAddr, ListenerTask> = HashMap::new();
+    let mut seen: Option<Vec<IpAddr>> = None;
+    let mut probed: Option<(tokio::time::Instant, Option<TailscaleStatus>)> = None;
+    loop {
+        let source = Arc::clone(&plan.source);
+        let mut all = tokio::task::spawn_blocking(move || source.addresses())
+            .await
+            .unwrap_or_default();
+        all.sort_unstable();
+        all.dedup();
+        let stale = probed
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= TAILSCALE_REPROBE);
+        if seen.as_ref() != Some(&all) || stale {
+            let probe = Arc::clone(&plan.probe);
+            let status = tokio::task::spawn_blocking(move || probe.status())
+                .await
+                .unwrap_or(None);
+            probed = Some((tokio::time::Instant::now(), status));
+            seen = Some(all.clone());
+        }
+        let status = probed.as_ref().and_then(|(_, status)| status.as_ref());
+        let (wanted, origin) = select_bind_addresses(&all, status.map(|s| s.ips.as_slice()));
+
+        let errors = reconcile(&mut listeners, &wanted, plan.port, &mut |addr| {
+            let listener = bind_std(addr).and_then(tokio::net::TcpListener::from_std)?;
+            debuglog::log(&format!("web LISTEN {addr}"));
+            Ok(ListenerTask(tokio::spawn(serve(
+                Arc::clone(&shared),
+                router.clone(),
+                listener,
+            ))))
+        });
+        for (ip, error) in &errors {
+            debuglog::log(&format!("web LISTEN failed {ip}:{} err={error}", plan.port));
+        }
+        let bound: Vec<IpAddr> = listeners.keys().copied().collect();
+        let next = tailscale_listen_status(
+            plan.port,
+            &wanted,
+            &bound,
+            &errors,
+            status.and_then(|s| s.magic_dns.as_deref()),
+            origin,
+        );
+        listen.send_if_modified(|current| {
+            let moved = *current != next;
+            if moved {
+                *current = next;
+            }
+            moved
+        });
+        if let Some(ready) = ready.take() {
+            if ready.send(Ok(())).is_err() {
+                // Nobody is waiting for this server; do not hold the ports.
+                break;
+            }
+        }
+        tokio::select! {
+            _ = await_shutdown(&mut shutdown) => break,
+            _ = tokio::time::sleep(plan.poll) => {}
+        }
+    }
+    // Every listener watches the same shutdown signal and drains on its own;
+    // waiting for them is what keeps `stop` honest about the ports.
+    for (_, ListenerTask(task)) in listeners {
+        let _ = task.await;
+    }
+}
+
+/// One Tailscale address's listener: the task serving it.
+struct ListenerTask(JoinHandle<()>);
+
+/// Something [`reconcile`] can retire when its address goes away.
+trait Retire {
+    /// Stop serving. Called once, when the address is no longer wanted.
+    fn retire(self);
+}
+
+impl Retire for ListenerTask {
+    fn retire(self) {
+        // The connections already accepted are their own tasks and finish on
+        // their own; only the accept loop — and with it the port — goes.
+        self.0.abort();
+    }
+}
+
+/// Whether an address may be listened on by a Tailscale plan at all.
+///
+/// Defence in depth on top of [`select_bind_addresses`]: whatever Tailscale or
+/// the range check says, a worker never listens on loopback (any local process
+/// could reach it) or on the unspecified address (every interface, the LAN
+/// included). PRD W8.
+fn tailscale_bindable(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified()
+}
+
+/// Bring `current` in line with `wanted`: retire the listeners whose address
+/// went away, bind the ones that appeared, keep the rest untouched (their
+/// connections stay up). Loopback and the unspecified address are never bound,
+/// whatever `wanted` says.
+///
+/// Returns the addresses that could not be bound, with the OS's reason; they
+/// are tried again on the next pass.
+fn reconcile<T: Retire>(
+    current: &mut HashMap<IpAddr, T>,
+    wanted: &[IpAddr],
+    port: u16,
+    bind: &mut dyn FnMut(SocketAddr) -> std::io::Result<T>,
+) -> Vec<(IpAddr, String)> {
+    let wanted: Vec<IpAddr> = wanted
+        .iter()
+        .copied()
+        .filter(|ip| tailscale_bindable(*ip))
+        .collect();
+    let gone: Vec<IpAddr> = current
+        .keys()
+        .filter(|ip| !wanted.contains(ip))
+        .copied()
+        .collect();
+    for ip in gone {
+        if let Some(task) = current.remove(&ip) {
+            task.retire();
+        }
+    }
+    let mut errors = Vec::new();
+    for ip in wanted {
+        if current.contains_key(&ip) {
+            continue;
+        }
+        match bind(SocketAddr::new(ip, port)) {
+            Ok(task) => {
+                current.insert(ip, task);
+            }
+            Err(e) => errors.push((ip, e.to_string())),
+        }
+    }
+    errors
+}
+
+/// What a Tailscale plan reports after one [`reconcile`] pass.
+///
+/// `reason` is set only when nothing is bound: `"no Tailscale address"` when
+/// there was nothing it may bind, `"bind failed: <addr>: <error>"` when every
+/// bind failed. `advertised` is the MagicDNS name (or the first bound address)
+/// plus the port, as a client should dial it.
+fn tailscale_listen_status(
+    port: u16,
+    wanted: &[IpAddr],
+    bound: &[IpAddr],
+    errors: &[(IpAddr, String)],
+    magic_dns: Option<&str>,
+    origin: AddressOrigin,
+) -> ListenStatus {
+    let bound = sort_ipv4_first(bound);
+    let reason = if !bound.is_empty() {
+        None
+    } else if !wanted.iter().any(|ip| tailscale_bindable(*ip)) {
+        Some(NO_TAILSCALE_ADDRESS.to_string())
+    } else {
+        let failures: Vec<String> = errors
+            .iter()
+            .map(|(ip, error)| format!("{}: {error}", SocketAddr::new(*ip, port)))
+            .collect();
+        Some(format!("bind failed: {}", failures.join("; ")))
+    };
+    let advertised =
+        advertised_host("", magic_dns, &bound).map(|host| match host.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, port).to_string(),
+            Err(_) => format!("{host}:{port}"),
+        });
+    ListenStatus {
+        bound: bound.iter().map(|ip| SocketAddr::new(*ip, port)).collect(),
+        advertised,
+        reason,
+        origin: Some(origin),
+    }
+}
+
+/// `ips` IPv4 first, each family ascending — the order the advert picks from
+/// and `worker status` prints.
+fn sort_ipv4_first(ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut sorted = ips.to_vec();
+    sorted.sort_unstable_by_key(|ip| (ip.is_ipv6(), *ip));
+    sorted.dedup();
+    sorted
+}
+
+/// A non-blocking std listener, ready for [`tokio::net::TcpListener::from_std`].
+fn bind_std(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Run axum on one listener until shutdown, then release it.
+async fn serve(shared: Arc<Shared>, app: Router, listener: tokio::net::TcpListener) {
     let graceful = {
         let mut shutdown = shared.shutdown.clone();
         let drain = Arc::clone(&shared.drain);
@@ -1082,14 +1466,20 @@ async fn serve(shared: Arc<Shared>, listener: tokio::net::TcpListener) {
 }
 
 fn router(shared: Arc<Shared>) -> Router {
-    Router::new()
+    let serve_assets = shared.serve_assets;
+    let routes = Router::new()
         .route(WS_PATH, get(ws_route))
         .route(AUTH_EXCHANGE_PATH, post(exchange_route))
-        .route(AUTH_SESSION_PATH, get(session_route))
+        .route(AUTH_SESSION_PATH, get(session_route));
+    let routes = if serve_assets {
         // Everything else is the SPA: `/`, its hashed assets, and its
         // client-side routes (D9). `assets::lookup` owns the fallback rules.
-        .fallback(asset_route)
-        .with_state(shared)
+        routes.fallback(asset_route)
+    } else {
+        // A worker serves the protocol routes and nothing else (design A5).
+        routes.fallback(not_found_route)
+    };
+    routes.with_state(shared)
 }
 
 // ===========================================================================
@@ -1127,6 +1517,12 @@ struct Shared {
     /// consults.
     revocations: watch::Receiver<u64>,
     drain: Arc<Drain>,
+    /// What kind of FlightDeck this server belongs to. A worker gets the
+    /// one-window seat model, background links, the worker commands and the
+    /// v7 floor; every other host keeps the multi-writer model unchanged.
+    host_kind: HostKind,
+    /// Whether the SPA's assets are served (design A5).
+    serve_assets: bool,
 }
 
 impl Shared {
@@ -1177,13 +1573,24 @@ impl Shared {
         }
     }
 
-    /// Route one [`WebOutbound`] to its recipients.
+    fn is_worker(&self) -> bool {
+        self.host_kind == HostKind::Worker
+    }
+
+    /// Route one [`WebOutbound`] to its recipients. A background link only
+    /// ever receives what [`background_may_receive`] lets through, whatever
+    /// the address says — that filter lives in [`SeatRegistry::send_to`].
     fn dispatch(&self, out: WebOutbound) {
         let mut registry = self.registry();
         match out {
-            // Every viewer is a window until A gives background links their
-            // own kind.
-            WebOutbound::All(msg) | WebOutbound::Windows(msg) => registry.send_all(&msg),
+            WebOutbound::All(msg) => registry.send_all(&msg),
+            // On a TUI or Desktop host every viewer is a window, so this is
+            // `All` there.
+            WebOutbound::Windows(msg) => {
+                for id in registry.ids_of(ConnectionKind::Window) {
+                    registry.send_to(&id, msg.clone());
+                }
+            }
             WebOutbound::Viewer { viewer_id, msg } => registry.send_to(&viewer_id, msg),
             WebOutbound::Writers(msg) => {
                 for id in registry.writers() {
@@ -1206,7 +1613,38 @@ impl Shared {
     ) -> Snapshot {
         let state = self.state_rx.borrow().clone();
         let holder = self.holder();
-        let seats = self.registry().seat_rows(Some(viewer_id), holder.as_ref());
+        let (seats, worker) = {
+            let registry = self.registry();
+            let seats = registry.seat_rows(Some(viewer_id), holder.as_ref());
+            // The worker's own state, made this recipient's: who else is
+            // connected is relative to its credential, and a background link
+            // is not somewhere a host message is read.
+            let worker = state.worker.as_ref().filter(|_| self.is_worker()).map(|w| {
+                let recipient = registry.viewer(viewer_id);
+                let background = recipient.is_some_and(|v| v.kind == ConnectionKind::Background);
+                WorkerSnapshot {
+                    home: w.home.clone(),
+                    shell: w.shell.clone(),
+                    health: w.health.clone(),
+                    status: w.status.clone(),
+                    connections: registry.connections_view(recipient.map(|v| &v.identity.token)),
+                    host_messages: if background {
+                        Vec::new()
+                    } else {
+                        w.host_messages.clone()
+                    },
+                }
+            });
+            (seats, worker)
+        };
+        // The server's own kind wins for a worker: it is what decided the
+        // seat model this snapshot describes. Otherwise the host says whether
+        // it is a TUI or a Desktop.
+        let host_kind = if self.is_worker() {
+            HostKind::Worker
+        } else {
+            state.host_kind
+        };
         Snapshot {
             protocol_version,
             host_version: state.host_version.clone(),
@@ -1225,7 +1663,7 @@ impl Shared {
             // rather than on `HostState`: there is no change for a `Delta` to
             // describe, and the browser needs it in the same frame it paints
             // the palette from.
-            commands: crate::web::commands::inventory(),
+            commands: crate::web::commands::inventory_for(host_kind),
             // Both overlays are the host's own words, sent so the browser
             // renders them rather than authoring a copy (§6.5 R16).
             help: Some(state.help.clone()),
@@ -1237,10 +1675,34 @@ impl Shared {
             sidebar_position: state.sidebar_position,
             // Fixed for the life of the process, like `commands`.
             host_machine: Some(crate::web::protocol::HostMachine::current()),
-            host_kind: Some(state.host_kind),
-            // stub: filled by A (from `state.worker` plus this recipient's
-            // connections).
-            worker: None,
+            host_kind: Some(host_kind),
+            worker,
+        }
+    }
+
+    /// Fan out a [`Delta::Connections`] — each recipient's own view, since
+    /// `same_device` is relative to its credential — after any attach,
+    /// detach or takeover on a **worker** host. Nothing on any other host:
+    /// the frame is v7-only and a v6 client must never receive one.
+    fn announce_connections(&self) {
+        if !self.is_worker() {
+            return;
+        }
+        let mut registry = self.registry();
+        let frames: Vec<(ViewerId, ServerMsg)> = registry
+            .viewers
+            .iter()
+            .map(|v| {
+                (
+                    v.id.clone(),
+                    ServerMsg::Delta(Delta::Connections(
+                        registry.connections_view(Some(&v.identity.token)),
+                    )),
+                )
+            })
+            .collect();
+        for (id, msg) in frames {
+            registry.send_to(&id, msg);
         }
     }
 
@@ -1377,6 +1839,9 @@ struct Viewer {
     /// The version this viewer was answered at ([`negotiated`]), so a later
     /// `request_snapshot` is stamped the way its first snapshot was.
     protocol_version: u16,
+    /// A window or a background link (v7). Always [`ConnectionKind::Window`]
+    /// on a TUI or Desktop host, which has no background links.
+    kind: ConnectionKind,
     tx: mpsc::Sender<ServerMsg>,
 }
 
@@ -1414,6 +1879,9 @@ impl Viewer {
 /// a tab is attached.
 struct SeatRegistry {
     viewers: Vec<Viewer>,
+    /// A worker's registry has no desktop row (nobody sits at a worker) and
+    /// keeps its background links out of the seat rows.
+    host_kind: HostKind,
     /// Highest [`crate::web::protocol::Input::seq`] forwarded per viewer, kept
     /// after a disconnect so a reconnect can be told what already landed
     /// ([`Snapshot::last_input_seq`]). Bounded by
@@ -1424,9 +1892,10 @@ struct SeatRegistry {
 }
 
 impl SeatRegistry {
-    fn new(started_ms: i64) -> Self {
+    fn new(started_ms: i64, host_kind: HostKind) -> Self {
         SeatRegistry {
             viewers: Vec::new(),
+            host_kind,
             input_cursors: Vec::new(),
             started_ms,
         }
@@ -1435,17 +1904,28 @@ impl SeatRegistry {
     /// Add a viewer, or return the existing one's slot. New viewers start as
     /// observers: a writer's seat is something you then ask for, and asking is
     /// what makes a browser that only ever watches cost nothing in arbitration.
+    ///
+    /// `kind` is what the attach asked for; a host that is not a worker has
+    /// no background links and records every viewer as a window.
     fn register(
         &mut self,
         id: ViewerId,
         identity: ViewerIdentity,
         since_ms: i64,
         protocol_version: u16,
+        kind: ConnectionKind,
         tx: mpsc::Sender<ServerMsg>,
     ) {
+        let kind = if self.host_kind == HostKind::Worker {
+            kind
+        } else {
+            ConnectionKind::Window
+        };
         if let Some(viewer) = self.viewers.iter_mut().find(|v| v.id == id) {
-            // A re-attach on the same socket may speak another version.
+            // A re-attach on the same socket may speak another version, and
+            // may say what it is differently.
             viewer.protocol_version = protocol_version;
+            viewer.kind = kind;
             return;
         }
         self.viewers.push(Viewer {
@@ -1454,8 +1934,85 @@ impl SeatRegistry {
             seat: Seat::Observing,
             since_ms,
             protocol_version,
+            kind,
             tx,
         });
+    }
+
+    fn viewer(&self, id: &ViewerId) -> Option<&Viewer> {
+        self.viewers.iter().find(|v| &v.id == id)
+    }
+
+    fn kind_of(&self, id: &ViewerId) -> Option<ConnectionKind> {
+        self.viewer(id).map(|v| v.kind)
+    }
+
+    /// How many connections of `kind` are attached.
+    fn count(&self, kind: ConnectionKind) -> usize {
+        self.viewers.iter().filter(|v| v.kind == kind).count()
+    }
+
+    /// Every connection of `kind`, in attach order.
+    fn ids_of(&self, kind: ConnectionKind) -> Vec<ViewerId> {
+        self.viewers
+            .iter()
+            .filter(|v| v.kind == kind)
+            .map(|v| v.id.clone())
+            .collect()
+    }
+
+    /// Who is connected to a worker, as the holder of `token` sees it: the
+    /// window (if any), and whether it is the recipient's own device.
+    fn connections_view(&self, token: Option<&TokenId>) -> ConnectionsView {
+        let window = self
+            .viewers
+            .iter()
+            .find(|v| v.kind == ConnectionKind::Window)
+            .map(|v| WindowInfo {
+                label: v.identity.device_label(),
+                address: Some(v.identity.address.to_string()),
+                since_ms: v.since_ms,
+                same_device: token == Some(&v.identity.token),
+            });
+        ConnectionsView {
+            window,
+            background_links: u32::try_from(self.count(ConnectionKind::Background))
+                .unwrap_or(u32::MAX),
+        }
+    }
+
+    /// A worker's one-window rule (design §2.5): make `keep` the only window
+    /// by removing every other one.
+    ///
+    /// The one `keep` is resuming ([`Attach::resume_viewer`]) is the same
+    /// window coming back over a fresh socket — its old one is usually
+    /// half-open — so it is removed **silently**. Every other window is sent
+    /// [`ServerMsg::TakenOver`] naming `by`, then removed; its connection task
+    /// writes that frame and closes. Removal drops the registry's sender,
+    /// which is what closes a silently replaced socket. Background links are
+    /// never touched: they neither take over nor are taken over.
+    ///
+    /// Returns every id removed, so the caller can free their input lock.
+    fn displace_windows(
+        &mut self,
+        keep: &ViewerId,
+        resuming: Option<&ViewerId>,
+        by: &str,
+    ) -> Vec<ViewerId> {
+        let displaced: Vec<ViewerId> = self
+            .viewers
+            .iter()
+            .filter(|v| v.kind == ConnectionKind::Window && &v.id != keep)
+            .map(|v| v.id.clone())
+            .collect();
+        for id in &displaced {
+            if resuming != Some(id) {
+                debuglog::log(&format!("web VIEWER taken over id={id}"));
+                self.send_to(id, ServerMsg::TakenOver { by: by.to_string() });
+            }
+            self.remove(id);
+        }
+        displaced
     }
 
     /// The version this viewer was answered at; [`PROTOCOL_VERSION`] for one
@@ -1543,8 +2100,21 @@ impl SeatRegistry {
     ///
     /// `holder` is passed in rather than read here because the lock lives in
     /// [`crate::web::arbiter`]; see the type's doc for why the two are apart.
+    ///
+    /// A **worker** has no desktop row — nobody sits at it, and nothing there
+    /// types — and its background links have no row either: they are not
+    /// seated, they watch.
     fn seat_rows(&self, you: Option<&ViewerId>, holder: Option<&Writer>) -> Vec<SeatInfo> {
         let mut rows = Vec::with_capacity(self.viewers.len() + 1);
+        if self.host_kind == HostKind::Worker {
+            rows.extend(
+                self.viewers
+                    .iter()
+                    .filter(|v| v.kind == ConnectionKind::Window)
+                    .map(|v| v.info(you, holder)),
+            );
+            return rows;
+        }
         rows.push(SeatInfo {
             viewer_id: None,
             label: DESKTOP_SEAT_LABEL.to_string(),
@@ -1587,8 +2157,10 @@ impl SeatRegistry {
             Some(Writer::Viewer(id)) => Some(id),
             Some(Writer::Desktop) | None => None,
         };
+        // A background link is not seated, so a seat list is not news to it.
         self.viewers
             .iter()
+            .filter(|v| v.kind == ConnectionKind::Window)
             .map(|v| {
                 (
                     v.id.clone(),
@@ -1610,10 +2182,17 @@ impl SeatRegistry {
     /// Queue a frame for one viewer. A viewer whose queue is full has stopped
     /// keeping up and is dropped from the registry — its connection task sees
     /// its channel close and shuts the socket. See [`VIEWER_QUEUE_FRAMES`].
+    ///
+    /// A background link is sent only what [`background_may_receive`] allows;
+    /// anything else addressed to it is dropped here, which is the one place
+    /// every route out of the host passes.
     fn send_to(&mut self, id: &ViewerId, msg: ServerMsg) {
         let Some(viewer) = self.viewers.iter().find(|v| &v.id == id) else {
             return;
         };
+        if viewer.kind == ConnectionKind::Background && !background_may_receive(&msg) {
+            return;
+        }
         if viewer.tx.try_send(msg).is_err() {
             debuglog::log(&format!(
                 "web VIEWER dropped id={id} address={} reason=queue_full",
@@ -1658,6 +2237,54 @@ impl SeatRegistry {
             self.record_input(now, seq);
         }
         seq
+    }
+}
+
+/// Whether a frame may reach a worker's **background link** (design §2.5).
+///
+/// A background link keeps a Desktop's worker list honest — status, health,
+/// notifications, who is connected — and nothing more. It is denied what only
+/// a window renders, and what would cost the host per-link work for a screen
+/// nobody is looking at: terminal bytes, git and configuration answers, the
+/// project picker's and the clone's frames, and host messages (a window reads
+/// those, and marks them read by being there).
+///
+/// An allow-list *by exception*: everything else passes, so a frame added to
+/// the protocol later reaches a background link unless it is added here.
+fn background_may_receive(msg: &ServerMsg) -> bool {
+    !matches!(
+        msg,
+        ServerMsg::TermBytes(_)
+            | ServerMsg::GitStatus(_)
+            | ServerMsg::Configuration(_)
+            | ServerMsg::DirListing(_)
+            | ServerMsg::ProjectScan(_)
+            | ServerMsg::CloneProgress(_)
+            | ServerMsg::CloneResult(_)
+            | ServerMsg::Delta(Delta::HostMessage(_))
+    )
+}
+
+/// Accept or refuse a peer's protocol version on a host of `kind`.
+///
+/// Every host takes [`check_version`]'s range. A worker additionally refuses
+/// anything below [`WORKER_MIN_CLIENT_VERSION`] — a v6 client knows nothing of
+/// one-window takeover, background links or the worker's commands — and says
+/// so with its own floor, so the client's "update FlightDeck" message names
+/// the right number.
+fn accept_version(kind: HostKind, peer: u16) -> Result<u16, VersionMismatch> {
+    let accepted = check_version(peer);
+    if kind != HostKind::Worker {
+        return accepted;
+    }
+    match accepted {
+        Ok(version) if version >= WORKER_MIN_CLIENT_VERSION => Ok(version),
+        _ => Err(VersionMismatch {
+            local: PROTOCOL_VERSION,
+            peer,
+            min_supported: WORKER_MIN_CLIENT_VERSION,
+            max_supported: MAX_SUPPORTED_VERSION,
+        }),
     }
 }
 
@@ -1849,16 +2476,24 @@ async fn asset_route(uri: axum::http::Uri) -> Response {
     match assets::lookup(uri.path()) {
         Lookup::Found(asset) => asset_response(StatusCode::OK, asset),
         Lookup::NotBuilt => asset_response(StatusCode::OK, assets::not_built_page()),
-        Lookup::NotFound => {
-            let mut response = Response::new(Body::from("not found"));
-            *response.status_mut() = StatusCode::NOT_FOUND;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            response
-        }
+        Lookup::NotFound => not_found(),
     }
+}
+
+/// Every non-protocol path on a server that does not serve the SPA (a
+/// worker, design A5).
+async fn not_found_route() -> Response {
+    not_found()
+}
+
+fn not_found() -> Response {
+    let mut response = Response::new(Body::from("not found"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn asset_response(status: StatusCode, asset: assets::Asset) -> Response {
@@ -2081,6 +2716,28 @@ impl ViewerIdentity {
         }
     }
 
+    /// The device this connection is from, as a worker names it — in
+    /// [`ServerMsg::TakenOver`] and [`WindowInfo::label`].
+    ///
+    /// FlightDeck Desktop introduces itself as
+    /// `FlightDeck Desktop/<version> (<hostname>)` (design A11), and the
+    /// hostname is what tells one Desktop from another. Any other client is
+    /// named by its chip label.
+    fn device_label(&self) -> String {
+        let host = self
+            .user_agent_label
+            .as_deref()
+            .and_then(|agent| agent.strip_prefix(NATIVE_CLIENT_AGENT))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|rest| rest.rsplit_once('('))
+            .map(|(_, host)| host.trim())
+            .filter(|host| !host.is_empty());
+        match host {
+            Some(host) => host.to_string(),
+            None => self.label(),
+        }
+    }
+
     /// Replace the browser's self-description with the claim it sent in its
     /// [`Attach`] frame, if that claim survives sanitising. The address is left
     /// alone unconditionally: it came off the socket, and no frame can move it.
@@ -2216,6 +2873,13 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
     let viewer_id = new_viewer_id();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(VIEWER_QUEUE_FRAMES);
+    // Once attached, the registry holds the **only** strong sender, so the
+    // registry removing this viewer — a takeover, a silent replacement by its
+    // own reconnect, a queue it could not keep up with — closes the channel,
+    // and the `None` below closes the socket. Until then this task holds one
+    // so the channel is open to attach with.
+    let weak_tx = tx.downgrade();
+    let mut unregistered_tx = Some(tx);
     let mut shutdown = shared.shutdown.clone();
     let mut revocations = shared.revocations.clone();
     let mut attached = false;
@@ -2245,12 +2909,15 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
                     &shared,
                     &viewer_id,
                     &identity,
-                    &tx,
+                    &weak_tx,
                     &mut attached,
                     client_msg,
                     &mut sink,
                 )
                 .await;
+                if attached {
+                    drop(unregistered_tx.take());
+                }
                 if verdict == Flow::Close {
                     break;
                 }
@@ -2260,6 +2927,13 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
                 match queued {
                     Some(msg) => {
                         if send_msg(&mut sink, &msg).await.is_err() {
+                            break;
+                        }
+                        // A frame that ends the connection ends it here, right
+                        // after it is written: nothing the host queued behind
+                        // it is for this socket any more.
+                        if is_terminal_frame(&msg) {
+                            let _ = sink.send(Message::Close(None)).await;
                             break;
                         }
                     }
@@ -2326,6 +3000,7 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
         // Nobody was interrupted — a socket that closed took its own turn with
         // it, and the writer that types next is claiming a free lock.
         shared.announce_seats(None);
+        shared.announce_connections();
     }
     // Dropped last: the shutdown path waits on this, so it must outlive the
     // `Shutdown` frame write above (Q5's ordering).
@@ -2340,6 +3015,16 @@ enum Flow {
 }
 
 type Sink = futures_util::stream::SplitSink<WebSocket, Message>;
+
+/// Whether the host queueing `msg` for a viewer means "and then you are
+/// gone": a takeover or a shutdown. The connection closes right after writing
+/// one (design §2.5).
+fn is_terminal_frame(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::TakenOver { .. } | ServerMsg::Shutdown { .. }
+    )
+}
 
 async fn send_msg(sink: &mut Sink, msg: &ServerMsg) -> Result<(), ()> {
     let json = match serde_json::to_string(msg) {
@@ -2407,7 +3092,7 @@ async fn handle_client_msg(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
     identity: &ViewerIdentity,
-    tx: &mpsc::Sender<ServerMsg>,
+    tx: &mpsc::WeakSender<ServerMsg>,
     attached: &mut bool,
     msg: ClientMsg,
     sink: &mut Sink,
@@ -2472,9 +3157,25 @@ async fn handle_client_msg(
             handle_command(shared, viewer_id, command, sink).await;
             Flow::Continue
         }
-        // D4 holds on every host this build serves yet: dropped silently.
-        // stub: filled by A (a worker's window sizes its PTYs, PRD W5).
-        ClientMsg::ResizeTerminal(_) => Flow::Continue,
+        ClientMsg::ResizeTerminal(resize) => {
+            // A worker has no pane of its own, so its one window sizes the
+            // PTYs (PRD W5). Everywhere else D4 holds and the frame is dropped
+            // silently — as it is from a background link, which only watches,
+            // and for a grid nothing could draw.
+            let from_window = shared.is_worker()
+                && shared.registry().kind_of(viewer_id) == Some(ConnectionKind::Window);
+            if from_window && resize.cols > 0 && resize.rows > 0 {
+                shared.notify(WebInbound::ResizeTerminal {
+                    viewer_id: viewer_id.clone(),
+                    terminal_id: resize.terminal_id,
+                    size: PtySize {
+                        rows: resize.rows,
+                        cols: resize.cols,
+                    },
+                });
+            }
+            Flow::Continue
+        }
         ClientMsg::Unrecognized => {
             let _ = send_msg(
                 sink,
@@ -2588,12 +3289,12 @@ async fn handle_attach(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
     identity: &ViewerIdentity,
-    tx: &mpsc::Sender<ServerMsg>,
+    tx: &mpsc::WeakSender<ServerMsg>,
     attached: &mut bool,
     attach: Attach,
     sink: &mut Sink,
 ) -> Flow {
-    if let Err(mismatch) = check_version(attach.protocol_version) {
+    if let Err(mismatch) = accept_version(shared.host_kind, attach.protocol_version) {
         let _ = send_msg(
             sink,
             &ServerMsg::Error(WireError::version_mismatch(mismatch)),
@@ -2620,30 +3321,76 @@ async fn handle_attach(
     // only from worker hosts, which refuse it).
     let protocol_version = negotiated(attach.protocol_version);
     let now = shared.now_ms();
-    let (seat, last_input_seq) = {
+    let Some(tx) = tx.upgrade() else {
+        // The registry already let this socket go (it was taken over, or fell
+        // behind) and the close is on its way: nothing left to attach.
+        return Flow::Close;
+    };
+    let worker = shared.is_worker();
+    let (seat, kind, last_input_seq, displaced) = {
         let mut registry = shared.registry();
         registry.register(
             viewer_id.clone(),
             identity.clone(),
             now,
             protocol_version,
-            tx.clone(),
+            attach.connection,
+            tx,
         );
+        let kind = registry.kind_of(viewer_id).unwrap_or_default();
         let last_input_seq = match attach.resume_viewer.as_ref() {
             Some(previous) => registry.adopt_cursor(previous, viewer_id),
             None => registry.input_cursor(viewer_id),
         };
-        (
-            registry.request_seat(viewer_id, attach.seat),
-            last_input_seq,
-        )
+        // A worker's seat model (design §2.5): its one window is the writer,
+        // whatever seat it asked for, and every other window gives way —
+        // removed here, before anyone is told about seats or connections, so
+        // no announcement can still list it. A background link is never
+        // seated and displaces nobody. Every other host keeps D14's
+        // multi-writer model exactly.
+        let (seat, displaced) = match (worker, kind) {
+            (true, ConnectionKind::Window) => {
+                let displaced = registry.displace_windows(
+                    viewer_id,
+                    attach.resume_viewer.as_ref(),
+                    &identity.device_label(),
+                );
+                (
+                    registry.request_seat(viewer_id, SeatRequest::Write),
+                    displaced,
+                )
+            }
+            (true, ConnectionKind::Background) => (
+                registry.request_seat(viewer_id, SeatRequest::Observe),
+                Vec::new(),
+            ),
+            (false, _) => (registry.request_seat(viewer_id, attach.seat), Vec::new()),
+        };
+        (seat, kind, last_input_seq, displaced)
     };
+    // A displaced window must not keep the turn it held: its socket is
+    // closing, and nobody is coming back to finish that burst.
+    for gone in &displaced {
+        shared.input_lock().release(&Writer::Viewer(gone.clone()));
+    }
 
     // The one explicit override in the model, and the only way past a live burst
     // (D14 as revised). It is a *separate* frame from `Write` precisely because
     // 2f gates it behind a confirmation: seating yourself as a writer must not
     // silently interrupt somebody mid-word.
-    let interrupted = match attach.seat {
+    //
+    // A worker has one writer, so there is nobody to interrupt: its window
+    // claims the lock by typing like any writer, and a background link never
+    // holds it.
+    let request = if worker {
+        match kind {
+            ConnectionKind::Window => SeatRequest::Write,
+            ConnectionKind::Background => SeatRequest::Observe,
+        }
+    } else {
+        attach.seat
+    };
+    let interrupted = match request {
         SeatRequest::TakeOver => preempt_for_viewer(shared, viewer_id, &label, now),
         // A viewer that stops competing must not keep the turn it holds, or the
         // terminal would sit locked to a tab that has promised never to type
@@ -2676,7 +3423,7 @@ async fn handle_attach(
         seat,
         cursors: attach.cursors,
         resume_viewer: attach.resume_viewer,
-        kind: attach.connection,
+        kind,
         protocol_version,
     });
     // Any attach can change the seat map — a first attach adds a row, a
@@ -2686,6 +3433,9 @@ async fn handle_attach(
     // (2f). `interrupted` is `Some` only for the `TakeOver` arm above, so the
     // writer that was cut into is the one — the only one — whose frame says so.
     shared.announce_seats(interrupted.as_ref());
+    // On a worker, who is connected changed too — and a takeover changed it
+    // for everyone, including the background links that never see seats.
+    shared.announce_connections();
     Flow::Continue
 }
 
@@ -2749,6 +3499,16 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
 ///    it through its own palette path and sends the [`Ack`], for the same reason
 ///    input is not acked here: this module has forwarded a frame, which is not
 ///    the same claim as "the host did it".
+///
+/// Two v7 additions sit in front of and inside that order:
+///
+/// * A [`crate::web::protocol::worker_command`] is recognised first, by
+///   [`WorkerOp::parse`], and answered by [`handle_worker_op`] — those names
+///   are deliberately not in the palette's table.
+/// * On a worker, a **background link** may send `request_snapshot` and
+///   nothing else ([`ErrorCode::ReadOnly`] for the rest, checked where step 2
+///   is), and the rows [`crate::web::commands::worker_refusal`] names are
+///   answered `Rejected` with the worker's own reason at step 3.
 async fn handle_command(
     shared: &Arc<Shared>,
     viewer_id: &ViewerId,
@@ -2758,10 +3518,18 @@ async fn handle_command(
     use crate::web::commands::{self, Route};
     use crate::web::protocol::command as names;
 
-    let seat = shared
-        .registry()
-        .seat_of(viewer_id)
-        .unwrap_or(Seat::Observing);
+    let (seat, kind) = {
+        let registry = shared.registry();
+        (
+            registry.seat_of(viewer_id).unwrap_or(Seat::Observing),
+            registry.kind_of(viewer_id).unwrap_or_default(),
+        )
+    };
+
+    if let Some(parsed) = WorkerOp::parse(&command.name, command.args.as_ref()) {
+        handle_worker_op(shared, viewer_id, seat, kind, command.seq, parsed, sink).await;
+        return;
+    }
 
     let Some(spec) = commands::lookup(&command.name) else {
         let _ = send_msg(
@@ -2778,7 +3546,11 @@ async fn handle_command(
         return;
     };
 
-    if spec.requires_control() && seat != Seat::Writing {
+    // A background link watches: it may resync, and nothing else — not even
+    // the seat bookkeeping an observer window may do.
+    let background_refused =
+        kind == ConnectionKind::Background && spec.name != names::REQUEST_SNAPSHOT;
+    if background_refused || (spec.requires_control() && seat != Seat::Writing) {
         // Read-only means read-only. D3 makes the selection shared with the
         // desktop, so letting an observer move it would be input by another
         // name — and the same holds for every command that changes anything.
@@ -2794,6 +3566,24 @@ async fn handle_command(
         )
         .await;
         return;
+    }
+
+    // A worker knows these rows and will not run them for a remote window
+    // (design §2.4) — the same answer, in the same words, as the refusal its
+    // inventory carries.
+    if shared.is_worker() {
+        if let Some(reason) = commands::worker_refusal(spec.name) {
+            let _ = send_msg(
+                sink,
+                &ServerMsg::Ack(Ack {
+                    seq: command.seq,
+                    outcome: AckOutcome::Rejected,
+                    detail: Some(reason.to_string()),
+                }),
+            )
+            .await;
+            return;
+        }
     }
 
     match spec.route {
@@ -2885,6 +3675,60 @@ async fn handle_command(
                 command,
             });
         }
+    }
+}
+
+/// Answer one worker command (v7), in a fixed order:
+///
+/// 1. **Not a worker** → [`ErrorCode::NotSupported`]. A TUI or Desktop has no
+///    project picker and no worker shell to restart.
+/// 2. **Not the window** → [`ErrorCode::ReadOnly`]: a background link only
+///    watches, and a window that released its seat has said it will not drive.
+/// 3. **Bad arguments** → [`ErrorCode::NotSupported`] with the parser's reason.
+/// 4. **Anything else** → forwarded as [`WebInbound::WorkerOp`]; the host
+///    applies it and sends the [`Ack`].
+#[allow(clippy::too_many_arguments)]
+async fn handle_worker_op(
+    shared: &Arc<Shared>,
+    viewer_id: &ViewerId,
+    seat: Seat,
+    kind: ConnectionKind,
+    seq: u64,
+    parsed: Result<WorkerOp, String>,
+    sink: &mut Sink,
+) {
+    let refusal = if !shared.is_worker() {
+        Some(WireError::new(
+            ErrorCode::NotSupported,
+            "This FlightDeck is not a worker.",
+        ))
+    } else if kind != ConnectionKind::Window || seat != Seat::Writing {
+        Some(WireError::new(
+            ErrorCode::ReadOnly,
+            "this connection only watches; open the worker's window to drive it",
+        ))
+    } else {
+        match parsed {
+            Err(reason) => Some(WireError::new(ErrorCode::NotSupported, reason)),
+            Ok(op) => {
+                shared.notify(WebInbound::WorkerOp {
+                    viewer_id: viewer_id.clone(),
+                    seq,
+                    op,
+                });
+                None
+            }
+        }
+    };
+    if let Some(error) = refusal {
+        let _ = send_msg(
+            sink,
+            &ServerMsg::Error(WireError {
+                seq: Some(seq),
+                ..error
+            }),
+        )
+        .await;
     }
 }
 

@@ -4692,3 +4692,747 @@ fn a_targeted_command_reaches_the_host_with_its_target() {
         }
     });
 }
+
+// ===========================================================================
+// FlightDeck Worker (v7): listeners, versions, connection kinds, takeover
+// ===========================================================================
+
+mod worker {
+    use super::*;
+
+    use flightdeck::remote::direct::net::{
+        FixedAddressSource, FixedTailscaleProbe, TailscaleStatus,
+    };
+    use flightdeck::web::protocol::{
+        command as names, worker_command, ClientInfo, HostKind, ResizeTerminal, TermBytes,
+        ViewerId, WorkerOp, WorkerStatusView,
+    };
+    use flightdeck::web::server::{ListenPlan, ServerOptions, WorkerHostState};
+
+    fn worker_state() -> HostState {
+        HostState {
+            host_version: "test-worker".to_string(),
+            host_kind: HostKind::Worker,
+            worker: Some(WorkerHostState {
+                home: "/home/ruud".to_string(),
+                shell: None,
+                health: None,
+                status: WorkerStatusView::default(),
+                host_messages: Vec::new(),
+            }),
+            ..HostState::default()
+        }
+    }
+
+    /// A harness around [`server::start_with`].
+    fn start(options: ServerOptions, state: HostState) -> Harness {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let clock = Arc::new(RealClock);
+        let store =
+            CredentialStore::open(Arc::new(RealFs), clock.clone(), dir.path().join("web.json"));
+        let credentials = Arc::new(Mutex::new(store));
+        let (tx, inbound) = std::sync::mpsc::channel::<WebInbound>();
+        let handle = server::start_with(
+            options,
+            262_144,
+            Arc::clone(&credentials),
+            clock as Arc<dyn Clock + Send + Sync>,
+            state,
+            tx,
+        )
+        .expect("the test host starts");
+        Harness {
+            handle,
+            credentials,
+            inbound,
+            _dir: dir,
+        }
+    }
+
+    /// A worker on loopback through the `Fixed` seam, serving no SPA.
+    fn start_worker() -> Harness {
+        start(
+            ServerOptions {
+                host_kind: HostKind::Worker,
+                listen: ListenPlan::Fixed(vec!["127.0.0.1:0".parse().expect("an address")]),
+                serve_assets: false,
+            },
+            worker_state(),
+        )
+    }
+
+    /// Attach as `kind`, naming the device the way FlightDeck Desktop does.
+    async fn attach_as(
+        ws: &mut Ws,
+        kind: ConnectionKind,
+        device: &str,
+        resume_viewer: Option<ViewerId>,
+    ) -> flightdeck::web::protocol::Snapshot {
+        send(
+            ws,
+            &ClientMsg::Attach(Attach {
+                protocol_version: PROTOCOL_VERSION,
+                seat: SeatRequest::Write,
+                cursors: Vec::new(),
+                resume_viewer,
+                viewport: None,
+                client: Some(ClientInfo {
+                    user_agent: None,
+                    label: Some(format!("FlightDeck Desktop/1.0.0 ({device})")),
+                }),
+                connection: kind,
+            }),
+        )
+        .await;
+        await_snapshot(ws).await
+    }
+
+    async fn command(ws: &mut Ws, seq: u64, name: &str, args: Option<serde_json::Value>) {
+        send(
+            ws,
+            &ClientMsg::Command(WireCommand {
+                seq,
+                name: name.to_string(),
+                args,
+            }),
+        )
+        .await;
+    }
+
+    fn taken_over_in(frames: &[ServerMsg]) -> Option<String> {
+        frames.iter().find_map(|frame| match frame {
+            ServerMsg::TakenOver { by } => Some(by.clone()),
+            _ => None,
+        })
+    }
+
+    /// Wait for the first inbound event `pick` accepts.
+    fn wait_for<T>(harness: &Harness, mut pick: impl FnMut(WebInbound) -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::time::Instant::now() < deadline {
+            for event in harness.inbound() {
+                if let Some(found) = pick(event) {
+                    return found;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the host was never told");
+    }
+
+    // -- listeners -----------------------------------------------------------
+
+    /// `Fixed` binds every address it is given, and a worker serves only the
+    /// protocol routes: every other path is a 404 (design A5).
+    #[test]
+    fn a_worker_binds_every_fixed_address_and_serves_no_spa() {
+        let harness = start(
+            ServerOptions {
+                host_kind: HostKind::Worker,
+                listen: ListenPlan::Fixed(vec![
+                    "127.0.0.1:0".parse().expect("an address"),
+                    "127.0.0.1:0".parse().expect("an address"),
+                ]),
+                serve_assets: false,
+            },
+            worker_state(),
+        );
+        let bound = harness.handle.bound_addrs();
+        assert_eq!(bound.len(), 2, "{bound:?}");
+        assert_eq!(harness.handle.bound_addr(), bound[0]);
+        assert_eq!(harness.handle.listen_status().bound, bound);
+        assert_eq!(harness.handle.listen_status().reason, None);
+
+        on_runtime(async {
+            for addr in &bound {
+                let root = get(&addr.to_string(), "/", &[]).await;
+                assert_eq!(root.status, 404, "no SPA on a worker: {}", root.body);
+                let session = get(&addr.to_string(), "/auth/session", &[]).await;
+                assert_eq!(session.status, 401, "the protocol routes are served");
+            }
+        });
+        harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    #[test]
+    fn an_empty_fixed_plan_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let clock = Arc::new(RealClock);
+        let store =
+            CredentialStore::open(Arc::new(RealFs), clock.clone(), dir.path().join("web.json"));
+        let (tx, _rx) = std::sync::mpsc::channel::<WebInbound>();
+        let started = server::start_with(
+            ServerOptions {
+                host_kind: HostKind::Worker,
+                listen: ListenPlan::Fixed(Vec::new()),
+                serve_assets: false,
+            },
+            0,
+            Arc::new(Mutex::new(store)),
+            clock as Arc<dyn Clock + Send + Sync>,
+            worker_state(),
+            tx,
+        );
+        assert!(matches!(started, Err(server::StartError::Bind { .. })));
+    }
+
+    /// PRD W8: a Tailscale plan on a box whose only addresses are loopback and
+    /// the unspecified address — even if a probe claims them — listens nowhere,
+    /// says why, and keeps running.
+    #[test]
+    fn a_tailscale_plan_never_listens_on_loopback() {
+        for probe in [
+            FixedTailscaleProbe(None),
+            FixedTailscaleProbe(Some(TailscaleStatus {
+                magic_dns: Some("box.tail1234.ts.net".to_string()),
+                ips: vec!["127.0.0.1".parse().expect("an address")],
+            })),
+        ] {
+            let harness = start(
+                ServerOptions {
+                    host_kind: HostKind::Worker,
+                    listen: ListenPlan::Tailscale {
+                        port: 0,
+                        source: Arc::new(FixedAddressSource(vec![
+                            "127.0.0.1".parse().expect("an address"),
+                            "0.0.0.0".parse().expect("an address"),
+                        ])),
+                        probe: Arc::new(probe),
+                        poll: Duration::from_millis(20),
+                    },
+                    serve_assets: false,
+                },
+                worker_state(),
+            );
+            let status = harness.handle.listen_status();
+            assert!(status.bound.is_empty(), "{status:?}");
+            assert_eq!(status.reason.as_deref(), Some("no Tailscale address"));
+            assert_eq!(status.advertised, None);
+            assert!(status.origin.is_some());
+            assert!(harness.handle.bound_addr().ip().is_unspecified());
+
+            // Several polls later, still nothing.
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(harness.handle.bound_addrs().is_empty());
+            harness.handle.stop(ShutdownNotice::server_stopped());
+        }
+    }
+
+    // -- versions ------------------------------------------------------------
+
+    /// A worker refuses a v6 client with its own floor, so the client can say
+    /// "update FlightDeck" with the right number (PRD §5).
+    #[test]
+    fn a_worker_refuses_a_v6_client_with_its_own_floor() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            send(
+                &mut ws,
+                &ClientMsg::Attach(Attach {
+                    protocol_version: 6,
+                    seat: SeatRequest::Write,
+                    cursors: Vec::new(),
+                    resume_viewer: None,
+                    viewport: None,
+                    client: None,
+                    connection: ConnectionKind::Window,
+                }),
+            )
+            .await;
+            let error = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Error(error) => Some(error),
+                _ => None,
+            })
+            .await;
+            assert_eq!(error.code, ErrorCode::VersionMismatch);
+            let version = error.version.expect("the numbers");
+            assert_eq!(version.peer, 6);
+            assert_eq!(version.min_supported, 7);
+            assert_eq!(version.max_supported, 7);
+            assert!(next_frame(&mut ws).await.is_none(), "the socket closes");
+
+            // A v7 client is served, at v7, with the worker's own state.
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            let snapshot = attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+            assert_eq!(snapshot.protocol_version, 7);
+            assert_eq!(snapshot.host_kind, Some(HostKind::Worker));
+            let worker = snapshot.worker.expect("a worker snapshot");
+            assert_eq!(worker.home, "/home/ruud");
+            assert!(
+                worker
+                    .connections
+                    .window
+                    .expect("its own window")
+                    .same_device
+            );
+            assert_eq!(snapshot.seat, Seat::Writing, "the one window drives");
+            assert!(
+                snapshot.seats.iter().all(|row| row.viewer_id.is_some()),
+                "no desktop row on a worker: {:?}",
+                snapshot.seats
+            );
+        });
+    }
+
+    /// A v7 client on a TUI host is answered at v7 and told it is a TUI.
+    #[test]
+    fn a_v7_client_on_a_tui_host_is_answered_at_v7() {
+        let harness = Harness::start();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            attach(&mut ws, SeatRequest::Write).await;
+            let snapshot = await_snapshot(&mut ws).await;
+            assert_eq!(snapshot.protocol_version, 7);
+            assert_eq!(snapshot.host_kind, Some(HostKind::Tui));
+            assert_eq!(snapshot.worker, None);
+        });
+    }
+
+    // -- takeover ------------------------------------------------------------
+
+    /// PRD W10: one window per worker. The newcomer takes over, the old window
+    /// is told by whom and closed — and its credential stays good, so it can
+    /// take the worker straight back.
+    #[test]
+    fn a_new_window_takes_over_and_the_old_device_can_take_it_back() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let (cookie_a, cookie_b) =
+            on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+
+        on_runtime(async {
+            let mut a = ws_connect(&addr, Some(&cookie_a)).await.expect("upgrade");
+            attach_as(&mut a, ConnectionKind::Window, "box-a", None).await;
+
+            let mut b = ws_connect(&addr, Some(&cookie_b)).await.expect("upgrade");
+            let snapshot = attach_as(&mut b, ConnectionKind::Window, "box-b", None).await;
+            assert_eq!(snapshot.seat, Seat::Writing);
+
+            let (frames, closed) = drain_frames(&mut a, WAIT).await;
+            assert_eq!(
+                taken_over_in(&frames).as_deref(),
+                Some("box-b"),
+                "{frames:?}"
+            );
+            assert!(closed, "a taken-over window is closed");
+            assert_eq!(harness.handle.window_count(), 1);
+
+            // Same cookie, new socket: the token was never revoked.
+            let mut a_again = ws_connect(&addr, Some(&cookie_a))
+                .await
+                .expect("the old device's credential still works");
+            let snapshot = attach_as(&mut a_again, ConnectionKind::Window, "box-a", None).await;
+            assert_eq!(snapshot.seat, Seat::Writing);
+            let (frames, closed) = drain_frames(&mut b, WAIT).await;
+            assert_eq!(
+                taken_over_in(&frames).as_deref(),
+                Some("box-a"),
+                "{frames:?}"
+            );
+            assert!(closed);
+            assert_eq!(harness.handle.window_count(), 1);
+            assert_eq!(harness.handle.viewer_count(), 1);
+        });
+    }
+
+    /// A window reconnecting over a fresh socket (its old one half-open)
+    /// replaces itself without being told it was taken over.
+    #[test]
+    fn a_window_resuming_itself_replaces_its_old_socket_silently() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut old = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            let first = attach_as(&mut old, ConnectionKind::Window, "box-a", None).await;
+
+            let mut fresh = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            attach_as(
+                &mut fresh,
+                ConnectionKind::Window,
+                "box-a",
+                Some(first.viewer_id.clone()),
+            )
+            .await;
+
+            let (frames, closed) = drain_frames(&mut old, WAIT).await;
+            assert!(closed, "the old socket is closed");
+            assert_eq!(
+                taken_over_in(&frames),
+                None,
+                "and not told it was taken over"
+            );
+            assert_eq!(harness.handle.window_count(), 1);
+        });
+    }
+
+    // -- background links ----------------------------------------------------
+
+    /// PRD W17/W19: a background link watches status and nothing else — no
+    /// terminal bytes, no input, no commands but a resync — and neither takes
+    /// over nor is taken over.
+    #[test]
+    fn a_background_link_only_watches() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let (cookie, other) =
+            on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+
+        on_runtime(async {
+            let mut window = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
+
+            let mut bg = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            let snapshot = attach_as(&mut bg, ConnectionKind::Background, "box-a", None).await;
+            assert_eq!(snapshot.seat, Seat::Observing);
+            assert_eq!(harness.handle.window_count(), 1, "it took nothing over");
+            assert_eq!(harness.handle.background_count(), 1);
+            assert_eq!(harness.handle.viewer_count(), 1, "windows only");
+            let kinds: Vec<ConnectionKind> = harness
+                .handle
+                .connections()
+                .iter()
+                .map(|c| c.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![ConnectionKind::Window, ConnectionKind::Background]
+            );
+
+            // A second window takes over the first window, never the link.
+            let mut second = ws_connect(&addr, Some(&other)).await.expect("upgrade");
+            attach_as(&mut second, ConnectionKind::Window, "box-b", None).await;
+            let (frames, _) = drain_frames(&mut window, WAIT).await;
+            assert!(taken_over_in(&frames).is_some());
+            assert_eq!(harness.handle.background_count(), 1);
+            let (frames, _) = drain_frames(&mut bg, Duration::from_millis(300)).await;
+            assert_eq!(taken_over_in(&frames), None, "{frames:?}");
+
+            // Terminal bytes reach the window and never the link.
+            harness
+                .handle
+                .send(server::WebOutbound::All(ServerMsg::TermBytes(TermBytes {
+                    terminal_id: "t-agent".into(),
+                    offset: 0,
+                    data: b"secret".to_vec(),
+                    truncated: false,
+                })));
+            frame_matching(&mut second, |frame| {
+                matches!(frame, ServerMsg::TermBytes(_)).then_some(())
+            })
+            .await;
+
+            // Input is acked as ignored, never forwarded.
+            send(
+                &mut bg,
+                &ClientMsg::Input(Input {
+                    seq: 41,
+                    terminal_id: "t-agent".into(),
+                    data: b"ls\r".to_vec(),
+                    image: None,
+                }),
+            )
+            .await;
+            let ack = frame_matching(&mut bg, |frame| match frame {
+                ServerMsg::Ack(ack) if ack.seq == 41 => Some(ack),
+                ServerMsg::TermBytes(_) => panic!("a background link got terminal bytes"),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ack.outcome, AckOutcome::Ignored);
+
+            // Commands are read-only, a worker op included...
+            command(
+                &mut bg,
+                42,
+                names::SELECT_PROJECT,
+                Some(serde_json::json!({ "project_id": "p" })),
+            )
+            .await;
+            let refused = frame_matching(&mut bg, |frame| match frame {
+                ServerMsg::Error(error) if error.seq == Some(42) => Some(error),
+                _ => None,
+            })
+            .await;
+            assert_eq!(refused.code, ErrorCode::ReadOnly);
+            command(&mut bg, 43, worker_command::SCAN_PROJECTS, None).await;
+            let refused = frame_matching(&mut bg, |frame| match frame {
+                ServerMsg::Error(error) if error.seq == Some(43) => Some(error),
+                _ => None,
+            })
+            .await;
+            assert_eq!(refused.code, ErrorCode::ReadOnly);
+
+            // ...except a resync.
+            command(&mut bg, 44, names::REQUEST_SNAPSHOT, None).await;
+            let again = await_snapshot(&mut bg).await;
+            assert_eq!(again.seat, Seat::Observing);
+            let ack = frame_matching(&mut bg, |frame| match frame {
+                ServerMsg::Ack(ack) if ack.seq == 44 => Some(ack),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ack.outcome, AckOutcome::Applied);
+        });
+
+        let events = harness.inbound();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, WebInbound::Input { input, .. } if input.seq == 41)),
+            "a background link's input reached the host"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                WebInbound::ViewerAttached {
+                    kind: ConnectionKind::Background,
+                    ..
+                }
+            )),
+            "the host is told which kind attached"
+        );
+    }
+
+    /// PRD W19: every connection is told who holds the window, relative to its
+    /// own credential.
+    #[test]
+    fn a_connections_delta_says_whether_the_window_is_your_device() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let (mine, theirs) =
+            on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+
+        on_runtime(async {
+            let mut my_link = ws_connect(&addr, Some(&mine)).await.expect("upgrade");
+            attach_as(&mut my_link, ConnectionKind::Background, "box-a", None).await;
+            let mut their_link = ws_connect(&addr, Some(&theirs)).await.expect("upgrade");
+            attach_as(&mut their_link, ConnectionKind::Background, "box-b", None).await;
+
+            let mut window = ws_connect(&addr, Some(&mine)).await.expect("upgrade");
+            attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
+
+            let with_window = |frame: ServerMsg| match frame {
+                ServerMsg::Delta(Delta::Connections(view)) if view.window.is_some() => Some(view),
+                _ => None,
+            };
+            let view = frame_matching(&mut my_link, with_window).await;
+            let info = view.window.expect("a window");
+            assert!(info.same_device, "the window is on this link's device");
+            assert_eq!(info.label, "box-a");
+            assert_eq!(view.background_links, 2);
+
+            let view = frame_matching(&mut their_link, with_window).await;
+            assert!(!view.window.expect("a window").same_device);
+        });
+    }
+
+    /// Revoking a device closes **both** of its connections — the window and
+    /// the background link — and nobody else's.
+    #[test]
+    fn revoking_a_device_closes_its_window_and_its_background_link() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let (doomed, kept) =
+            on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+        let doomed_id = harness.credentials.lock().expect("lock").records()[0]
+            .id
+            .clone();
+
+        on_runtime(async {
+            let mut window = ws_connect(&addr, Some(&doomed)).await.expect("upgrade");
+            attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
+            let mut link = ws_connect(&addr, Some(&doomed)).await.expect("upgrade");
+            attach_as(&mut link, ConnectionKind::Background, "box-a", None).await;
+            let mut survivor = ws_connect(&addr, Some(&kept)).await.expect("upgrade");
+            attach_as(&mut survivor, ConnectionKind::Background, "box-b", None).await;
+
+            harness
+                .credentials
+                .lock()
+                .expect("lock")
+                .revoke(&doomed_id)
+                .expect("the revocation persists");
+            harness.handle.recheck_credentials();
+
+            for ws in [&mut window, &mut link] {
+                let (frames, closed) = drain_frames(ws, WAIT).await;
+                assert!(closed, "{frames:?}");
+                assert_eq!(
+                    shutdown_in(&frames),
+                    Some((ShutdownReason::TokenRevoked, false)),
+                    "{frames:?}"
+                );
+            }
+            let (frames, closed) = drain_frames(&mut survivor, Duration::from_millis(300)).await;
+            assert!(!closed, "another device's link stays up");
+            assert_eq!(shutdown_in(&frames), None);
+        });
+        // The revoked sockets leave the registry as their tasks wind down.
+        let deadline = std::time::Instant::now() + WAIT;
+        while (
+            harness.handle.window_count(),
+            harness.handle.background_count(),
+        ) != (0, 1)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(harness.handle.window_count(), 0);
+        assert_eq!(harness.handle.background_count(), 1);
+    }
+
+    // -- commands and resizes -------------------------------------------------
+
+    /// Design §2.4: a worker refuses the rows that would bypass it, and
+    /// forwards its own commands to the host with their parsed arguments.
+    #[test]
+    fn a_worker_refuses_quit_and_forwards_its_own_commands() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            let snapshot = attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+            let quit = snapshot
+                .commands
+                .iter()
+                .find(|row| row.id == names::QUIT)
+                .expect("quit is listed");
+            assert!(
+                quit.refusal.is_some(),
+                "the palette knows before anyone asks"
+            );
+
+            command(&mut ws, 1, names::QUIT, None).await;
+            let ack = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Ack(ack) if ack.seq == 1 => Some(ack),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some("Stop the worker with `flightdeck worker stop` on the box.")
+            );
+
+            command(&mut ws, 2, names::OPEN_PROJECT, None).await;
+            let ack = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Ack(ack) if ack.seq == 2 => Some(ack),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+
+            command(
+                &mut ws,
+                3,
+                worker_command::BROWSE_DIR,
+                Some(serde_json::json!({ "path": "/home/ruud/src", "show_hidden": true })),
+            )
+            .await;
+            let (seq, op) = wait_for(&harness, |event| match event {
+                WebInbound::WorkerOp { seq, op, .. } => Some((seq, op)),
+                _ => None,
+            });
+            assert_eq!(seq, 3);
+            assert_eq!(
+                op,
+                WorkerOp::BrowseDir {
+                    path: Some("/home/ruud/src".to_string()),
+                    show_hidden: true,
+                }
+            );
+
+            // A required argument missing is refused here, naming the command.
+            command(&mut ws, 4, worker_command::OPEN_PROJECT_PATH, None).await;
+            let refused = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Error(error) if error.seq == Some(4) => Some(error),
+                _ => None,
+            })
+            .await;
+            assert_eq!(refused.code, ErrorCode::NotSupported);
+            assert!(refused.message.contains("open_project_path"), "{refused:?}");
+        });
+        assert!(
+            !harness.inbound().iter().any(|e| matches!(
+                e,
+                WebInbound::Command { command, .. } if command.name == names::QUIT
+            )),
+            "quit never reached the host"
+        );
+    }
+
+    /// PRD W5: a worker's window sizes its PTYs.
+    #[test]
+    fn a_workers_window_sizes_a_pty() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+            send(
+                &mut ws,
+                &ClientMsg::ResizeTerminal(ResizeTerminal {
+                    terminal_id: "worker:shell".into(),
+                    cols: 132,
+                    rows: 40,
+                }),
+            )
+            .await;
+        });
+        let (terminal_id, size) = wait_for(&harness, |event| match event {
+            WebInbound::ResizeTerminal {
+                terminal_id, size, ..
+            } => Some((terminal_id, size)),
+            _ => None,
+        });
+        assert_eq!(terminal_id.as_str(), "worker:shell");
+        assert_eq!((size.cols, size.rows), (132, 40));
+    }
+
+    /// D4 is unchanged on a TUI host: a `resize_terminal` is dropped silently,
+    /// and a worker command is not something a TUI implements.
+    #[test]
+    fn a_tui_host_drops_a_resize_and_refuses_worker_commands() {
+        let harness = Harness::start();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+            attach(&mut ws, SeatRequest::Write).await;
+            await_snapshot(&mut ws).await;
+            send(
+                &mut ws,
+                &ClientMsg::ResizeTerminal(ResizeTerminal {
+                    terminal_id: "t-agent".into(),
+                    cols: 132,
+                    rows: 40,
+                }),
+            )
+            .await;
+            command(&mut ws, 9, worker_command::SCAN_PROJECTS, None).await;
+            let refused = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Error(error) if error.seq == Some(9) => Some(error),
+                _ => None,
+            })
+            .await;
+            assert_eq!(refused.code, ErrorCode::NotSupported);
+            assert_eq!(refused.message, "This FlightDeck is not a worker.");
+        });
+        let events = harness.inbound();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                WebInbound::ResizeTerminal { .. } | WebInbound::WorkerOp { .. }
+            )),
+            "{events:?}"
+        );
+    }
+}
