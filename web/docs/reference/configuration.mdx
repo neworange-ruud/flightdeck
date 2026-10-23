@@ -112,6 +112,18 @@ FlightDeck Web (the browser control surface). See [FlightDeck Web](/web).
   launch.
 </Callout>
 
+## `[worker]`
+
+FlightDeck Worker (headless host controlled from Desktop). Global config only. See
+[Run a FlightDeck Worker](/worker).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `port` | `7420` | TCP port served on each Tailscale address. A configured `0` is rejected |
+| `projects_root` | `"~/flightdeck"` | Scanned two levels deep for repositories to offer; clones land here |
+| `default_cols` | `200` | Terminal width when no window has reported a size (20–1000) |
+| `default_rows` | `50` | Terminal height when no window has reported a size (4–500) |
+
 ## `[containers]`
 
 Run agents in Podman containers. See [Agents in Containers](/desktop/containers).
