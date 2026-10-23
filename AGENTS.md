@@ -88,6 +88,7 @@ cross-cutting work gets several (the seq-deadlock bug was
 | `area:ci` | `.github/workflows/` — CI, release, TestFlight |
 | `area:ops` | infrastructure, mailboxes, App Store admin |
 | `area:git` | worktree and git-plumbing logic |
+| `area:worker` | `flightdeck worker` — the headless host, its supervisor and control socket |
 
 ```bash
 bd list --label=area:relay          # everything touching the relay
