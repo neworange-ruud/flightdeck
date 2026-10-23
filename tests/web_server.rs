@@ -5244,7 +5244,9 @@ mod worker {
             .id
             .clone();
 
-        on_runtime(async {
+        // The survivor is returned, not dropped, so it is still connected when
+        // the counts below are checked.
+        let survivor = on_runtime(async {
             let mut window = ws_connect(&addr, Some(&doomed)).await.expect("upgrade");
             attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
             let mut link = ws_connect(&addr, Some(&doomed)).await.expect("upgrade");
@@ -5272,6 +5274,7 @@ mod worker {
             let (frames, closed) = drain_frames(&mut survivor, Duration::from_millis(300)).await;
             assert!(!closed, "another device's link stays up");
             assert_eq!(shutdown_in(&frames), None);
+            survivor
         });
         // The revoked sockets leave the registry as their tasks wind down.
         let deadline = std::time::Instant::now() + WAIT;
@@ -5285,6 +5288,7 @@ mod worker {
         }
         assert_eq!(harness.handle.window_count(), 0);
         assert_eq!(harness.handle.background_count(), 1);
+        on_runtime(async move { drop(survivor) });
     }
 
     // -- commands and resizes -------------------------------------------------
@@ -5374,7 +5378,9 @@ mod worker {
         let harness = start_worker();
         let addr = harness.addr();
         let cookie = on_runtime(harness.authenticate());
-        on_runtime(async {
+        // The window stays open until the host has been told: a socket closed
+        // right after the frame may lose it (seen on Windows).
+        let ws = on_runtime(async {
             let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
             attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
             send(
@@ -5386,6 +5392,7 @@ mod worker {
                 }),
             )
             .await;
+            ws
         });
         let (terminal_id, size) = wait_for(&harness, |event| match event {
             WebInbound::ResizeTerminal {
@@ -5393,6 +5400,7 @@ mod worker {
             } => Some((terminal_id, size)),
             _ => None,
         });
+        on_runtime(async move { drop(ws) });
         assert_eq!(terminal_id.as_str(), "worker:shell");
         assert_eq!((size.cols, size.rows), (132, 40));
     }
