@@ -12,7 +12,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Releases now publish a Linux arm64 (`aarch64-unknown-linux-gnu`) `flightdeck` binary, built natively on a GitHub arm runner, alongside the existing x86_64 Linux build.
 
 ### Bug fixes
 

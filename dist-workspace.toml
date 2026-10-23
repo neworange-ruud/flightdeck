@@ -20,6 +20,7 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ]
 # Path that installers should place binaries in
@@ -44,3 +45,8 @@ github-build-setup = "build-setup.steps"
 # CI checks would flag the generated workflow as dirty. Re-apply the edit if the
 # workflow is ever regenerated.
 allow-dirty = ["ci"]
+
+# Build aarch64 Linux natively on a GitHub arm64 runner rather than cross-compiling:
+# the graph includes C deps (aws-lc-sys via rustls) that are painful to cross-build.
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
