@@ -9,19 +9,113 @@
 //!
 //! Pure: no socket, no clock, no I/O. Everything here is a function of the
 //! frames it was handed, which is what lets it be snapshot-tested.
+//!
+//! A worker host (v7, `specs/WORKER_PRD.md`) adds a [`WorkerMirror`]: its
+//! shell, health, status, connections, and the host messages and
+//! notifications it raises — the last two queued here until a front-end
+//! takes them, since they are events rather than state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::contracts::{AgentTabPosition, TabId};
 use crate::web::protocol::{
-    AboutDoc, ActivityEvent, CommandView, Delta, DialogView, Geometry, HelpDoc, HostMachine,
-    ProjectId, ProjectView, Seat, SeatInfo, Selection, SessionView, Snapshot, TerminalId,
-    TerminalRole, TerminalView, UpdateNotice, ViewerId,
+    AboutDoc, ActivityEvent, CommandView, ConnectionsView, Delta, DialogView, Geometry, Health,
+    HelpDoc, HostKind, HostMachine, HostMessage, NotificationView, ProjectId, ProjectView, Seat,
+    SeatInfo, Selection, SessionView, Snapshot, StatusBucket, TerminalId, TerminalRole,
+    TerminalView, UpdateNotice, ViewerId, WorkerShellView, WorkerSnapshot, WorkerStatusView,
 };
 
 /// The most activity entries kept. The host retains its own bounded feed and
 /// backfills it on every snapshot; this only bounds what live deltas add.
 const ACTIVITY_CAP: usize = 200;
+
+/// The most host messages a [`WorkerMirror`] keeps — the worker's own ring.
+pub const MESSAGE_CAP: usize = 100;
+
+/// The most notifications held for a front-end that has not taken them.
+const NOTIFICATION_CAP: usize = 100;
+
+/// A worker's own state, as the window or background link sees it (v7).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerMirror {
+    /// `$HOME` on the worker: the project picker's root.
+    pub home: String,
+    /// The worker shell, once one has run.
+    pub shell: Option<WorkerShellView>,
+    /// The latest health sample.
+    pub health: Option<Health>,
+    /// Listen addresses, unread count, projects root.
+    pub status: WorkerStatusView,
+    /// Who else is connected, relative to this client.
+    pub connections: ConnectionsView,
+    /// Every host message seen, oldest first, at most [`MESSAGE_CAP`].
+    pub messages: VecDeque<HostMessage>,
+    /// Notifications not yet taken ([`RemoteWorkspace::take_notifications`]).
+    pub notifications: Vec<NotificationView>,
+    /// Messages not yet taken ([`RemoteWorkspace::take_new_messages`]).
+    new_messages: Vec<HostMessage>,
+}
+
+impl WorkerMirror {
+    fn from_snapshot(snapshot: WorkerSnapshot, previous: Option<WorkerMirror>) -> WorkerMirror {
+        // What was already seen and what a front-end has not taken yet survive
+        // a re-snapshot (a reconnect); the replayed unread messages are added
+        // to them, once.
+        let previous = previous.unwrap_or_default();
+        let mut mirror = WorkerMirror {
+            home: snapshot.home,
+            shell: snapshot.shell,
+            health: snapshot.health,
+            status: snapshot.status,
+            connections: snapshot.connections,
+            messages: previous.messages,
+            notifications: previous.notifications,
+            new_messages: previous.new_messages,
+        };
+        for message in snapshot.host_messages {
+            mirror.push_message(message);
+        }
+        mirror
+    }
+
+    /// Record `message` unless it was seen already. A worker numbers its
+    /// messages per run, so the time is part of what makes one the same.
+    fn push_message(&mut self, message: HostMessage) -> bool {
+        let seen = self
+            .messages
+            .iter()
+            .any(|m| m.id == message.id && m.at_ms == message.at_ms);
+        if seen {
+            return false;
+        }
+        self.messages.push_back(message.clone());
+        while self.messages.len() > MESSAGE_CAP {
+            self.messages.pop_front();
+        }
+        self.new_messages.push(message);
+        let excess = self.new_messages.len().saturating_sub(MESSAGE_CAP);
+        self.new_messages.drain(..excess);
+        true
+    }
+
+    /// The worker shell as a [`TerminalView`], so it is fed, cursored and
+    /// rendered by exactly the code every other remote terminal is. Its
+    /// session is its own id: it belongs to no project.
+    pub fn shell_terminal(&self) -> Option<TerminalView> {
+        let shell = self.shell.as_ref()?;
+        Some(TerminalView {
+            terminal_id: shell.terminal_id.clone(),
+            session_id: TabId(shell.terminal_id.as_str().to_string()),
+            role: TerminalRole::Shell,
+            title: shell.title.clone(),
+            geometry: shell.geometry,
+            byte_len: shell.byte_len,
+            replay_from: shell.replay_from,
+            alive: shell.alive,
+            exit_code: shell.exit_code,
+        })
+    }
+}
 
 /// What applying one frame did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,6 +158,11 @@ pub struct RemoteWorkspace {
     pub update: Option<UpdateNotice>,
     pub sidebar_position: AgentTabPosition,
     pub host_machine: Option<HostMachine>,
+    /// What kind of FlightDeck the host is (v7). `None` from a v6 host,
+    /// which is a TUI or a Desktop.
+    pub host_kind: Option<HostKind>,
+    /// The worker's own state. `Some` only on a worker host.
+    pub worker: Option<WorkerMirror>,
     selection: LocalSelection,
 }
 
@@ -115,6 +214,11 @@ impl RemoteWorkspace {
         self.update = snapshot.update;
         self.sidebar_position = snapshot.sidebar_position;
         self.host_machine = snapshot.host_machine;
+        self.host_kind = snapshot.host_kind;
+        let previous = self.worker.take();
+        self.worker = snapshot
+            .worker
+            .map(|worker| WorkerMirror::from_snapshot(worker, previous));
         if first {
             let host = self.host_selection.clone();
             self.selection.project = host.project_id;
@@ -267,13 +371,52 @@ impl RemoteWorkspace {
                 self.preempted |= you_were_preempted;
                 changed
             }
-            // v7 worker state. stub: filled by B (the worker mirror).
-            Delta::Health(_)
-            | Delta::WorkerShell(_)
-            | Delta::WorkerStatus(_)
-            | Delta::Connections(_)
-            | Delta::HostMessage(_)
-            | Delta::Notification(_) => Applied::default(),
+            // v7 worker state. A worker always snapshots with its state, so
+            // one of these without it means the mirror missed something.
+            Delta::Health(health) => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.health = Some(health);
+                    changed
+                }
+                None => resync(),
+            },
+            Delta::WorkerShell(shell) => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.shell = Some(shell);
+                    changed
+                }
+                None => resync(),
+            },
+            Delta::WorkerStatus(status) => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.status = status;
+                    changed
+                }
+                None => resync(),
+            },
+            Delta::Connections(connections) => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.connections = connections;
+                    changed
+                }
+                None => resync(),
+            },
+            Delta::HostMessage(message) => match self.worker.as_mut() {
+                Some(worker) => Applied {
+                    changed: worker.push_message(message),
+                    resync: false,
+                },
+                None => resync(),
+            },
+            Delta::Notification(notification) => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.notifications.push(notification);
+                    let excess = worker.notifications.len().saturating_sub(NOTIFICATION_CAP);
+                    worker.notifications.drain(..excess);
+                    changed
+                }
+                None => resync(),
+            },
             Delta::Unrecognized => Applied::default(),
         };
         self.repair_selection();
@@ -284,6 +427,54 @@ impl RemoteWorkspace {
     /// lock from this client.
     pub fn take_preempted(&mut self) -> bool {
         std::mem::take(&mut self.preempted)
+    }
+
+    // -- a worker host (v7) -------------------------------------------------
+
+    /// Whether the host is a FlightDeck worker. False for a v6 host.
+    pub fn is_worker(&self) -> bool {
+        self.host_kind == Some(HostKind::Worker)
+    }
+
+    /// The worker's shell, when the host is a worker that has one.
+    pub fn worker_shell(&self) -> Option<&WorkerShellView> {
+        self.worker.as_ref()?.shell.as_ref()
+    }
+
+    /// Notifications the worker raised since the last call, oldest first.
+    pub fn take_notifications(&mut self) -> Vec<NotificationView> {
+        self.worker
+            .as_mut()
+            .map(|w| std::mem::take(&mut w.notifications))
+            .unwrap_or_default()
+    }
+
+    /// Host messages that arrived since the last call — a snapshot's replay of
+    /// the unread ones included — oldest first.
+    pub fn take_new_messages(&mut self) -> Vec<HostMessage> {
+        self.worker
+            .as_mut()
+            .map(|w| std::mem::take(&mut w.new_messages))
+            .unwrap_or_default()
+    }
+
+    /// How many sessions, across every project, need the person: waiting for
+    /// input or in error.
+    pub fn needs_you_count(&self) -> usize {
+        self.projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .filter(|s| matches!(s.status.bucket, StatusBucket::Waiting | StatusBucket::Error))
+            .count()
+    }
+
+    /// Every terminal a client streams: [`RemoteWorkspace::terminals`] plus a
+    /// worker's shell. Owned, because the shell is not a [`TerminalView`] on
+    /// the wire.
+    pub fn streamed_terminals(&self) -> Vec<TerminalView> {
+        let mut out: Vec<TerminalView> = self.terminals().cloned().collect();
+        out.extend(self.worker.as_ref().and_then(WorkerMirror::shell_terminal));
+        out
     }
 
     // -- this client's selection (R2) ---------------------------------------

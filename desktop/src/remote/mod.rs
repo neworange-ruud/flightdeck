@@ -657,6 +657,12 @@ impl RemoteModel {
                 self.open_in_vscode()
             }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
+            // Placeholder until the worker window wires them (package H2).
+            RemoteAction::Local(LocalAction::Configuration | LocalAction::ProjectPicker) => {
+                self.local = Local::Message(
+                    "This window cannot open that yet: update FlightDeck Desktop.".to_string(),
+                )
+            }
             RemoteAction::Unavailable(why) => self.local = Local::Message(why.to_string()),
             RemoteAction::Send { .. } if self.shell => {
                 self.local = Local::Message(

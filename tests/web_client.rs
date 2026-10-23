@@ -27,12 +27,13 @@ use flightdeck::web::client::{
 };
 use flightdeck::web::credentials::CredentialStore;
 use flightdeck::web::protocol::{
-    command as names, ConnectionKind, Geometry, GitBar, ProjectView, SeatRequest, Selection,
-    ServerMsg, SessionPhase, SessionStatus, SessionView, ShutdownReason, StatusBucket, TerminalId,
-    TerminalRole, TerminalView,
+    command as names, ConnectionKind, Geometry, GitBar, HostKind, ProjectView, SeatRequest,
+    Selection, ServerMsg, SessionPhase, SessionStatus, SessionView, ShutdownReason, StatusBucket,
+    TerminalId, TerminalRole, TerminalView, WorkerStatusView,
 };
 use flightdeck::web::server::{
-    self, HostState, ShutdownNotice, WebInbound, WebOutbound, WebServerHandle,
+    self, HostState, ListenPlan, ServerOptions, ShutdownNotice, WebInbound, WebOutbound,
+    WebServerHandle, WorkerHostState,
 };
 use flightdeck::web::stream::{
     child_terminal_id, deltas, primary_terminal_id, write_into_session, TerminalHost,
@@ -76,11 +77,25 @@ struct Host {
     sessions: Vec<(String, String, InterpretedStatus)>,
     selected: usize,
     published: HostState,
+    /// What kind of FlightDeck this plays: a TUI, or a worker (v7).
+    kind: HostKind,
+    /// Every event the server forwarded, in order.
+    seen: Vec<WebInbound>,
     _dir: tempfile::TempDir,
 }
 
 impl Host {
     fn start() -> Host {
+        Host::start_as(HostKind::Tui)
+    }
+
+    /// A worker host (v7) on loopback: the worker's listener plan with a
+    /// fixed address, since a test has no tailnet.
+    fn start_worker() -> Host {
+        Host::start_as(HostKind::Worker)
+    }
+
+    fn start_as(kind: HostKind) -> Host {
         let dir = tempfile::tempdir().expect("a temp dir");
         let clock = Arc::new(RealClock);
         let store =
@@ -99,6 +114,8 @@ impl Host {
             sessions: Vec::new(),
             selected: 0,
             published: HostState::default(),
+            kind,
+            seen: Vec::new(),
             _dir: dir,
         };
         host.listen();
@@ -113,13 +130,28 @@ impl Host {
             replay_bytes: 65_536,
         };
         let state = self.state();
-        let handle = server::start(
-            &config,
-            Arc::clone(&self.credentials),
-            Arc::new(RealClock) as Arc<dyn Clock + Send + Sync>,
-            state.clone(),
-            self.inbound_tx.clone(),
-        )
+        let clock = Arc::new(RealClock) as Arc<dyn Clock + Send + Sync>;
+        let handle = match self.kind {
+            HostKind::Worker => server::start_with(
+                ServerOptions {
+                    host_kind: HostKind::Worker,
+                    listen: ListenPlan::Fixed(vec![([127, 0, 0, 1], self.port).into()]),
+                    serve_assets: false,
+                },
+                config.replay_bytes,
+                Arc::clone(&self.credentials),
+                clock,
+                state.clone(),
+                self.inbound_tx.clone(),
+            ),
+            HostKind::Tui | HostKind::Desktop => server::start(
+                &config,
+                Arc::clone(&self.credentials),
+                clock,
+                state.clone(),
+                self.inbound_tx.clone(),
+            ),
+        }
         .expect("the test host can bind a loopback port");
         self.port = handle.bound_addr().port();
         self.published = state;
@@ -269,6 +301,17 @@ impl Host {
                 rows: 34,
             },
             replay_capacity_bytes: 65_536,
+            host_kind: self.kind,
+            worker: (self.kind == HostKind::Worker).then(|| WorkerHostState {
+                home: "/home/u".to_string(),
+                shell: None,
+                health: None,
+                status: WorkerStatusView {
+                    projects_root: "/home/u/projects".to_string(),
+                    ..WorkerStatusView::default()
+                },
+                host_messages: Vec::new(),
+            }),
             ..HostState::default()
         }
     }
@@ -289,6 +332,7 @@ impl Host {
     /// the published state (byte lengths included) current.
     fn tick(&mut self) {
         let events: Vec<WebInbound> = self.inbound.try_iter().collect();
+        self.seen.extend(events.iter().cloned());
         if let Some(handle) = self.handle.as_ref() {
             for event in &events {
                 for out in self.streams.apply_inbound(event, &mut self.tabs) {
@@ -357,14 +401,54 @@ fn paired(host: &Host) -> AccessToken {
 }
 
 fn connect(host: &Host, seat: SeatRequest) -> RemoteClient {
+    connect_as(
+        host,
+        seat,
+        ConnectionKind::Window,
+        "FlightDeck Desktop/test",
+    )
+}
+
+fn connect_as(
+    host: &Host,
+    seat: SeatRequest,
+    connection: ConnectionKind,
+    label: &str,
+) -> RemoteClient {
     RemoteClient::connect(LinkConfig {
         address: host.addr(),
         token: paired(host),
         seat,
-        user_agent: "FlightDeck Desktop/test".to_string(),
-        connection: ConnectionKind::Window,
-        retry_cap_ms: None,
+        user_agent: label.to_string(),
+        connection,
+        retry_cap_ms: (connection == ConnectionKind::Background).then_some(60_000),
     })
+}
+
+/// Tick the host and pump both clients until `done` holds for them.
+fn until_both(
+    host: &mut Host,
+    a: &mut RemoteClient,
+    b: &mut RemoteClient,
+    what: &str,
+    mut done: impl FnMut(&mut RemoteClient, &mut RemoteClient) -> bool,
+) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        host.tick();
+        a.pump();
+        b.pump();
+        if done(a, b) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for: {what} (states {:?} / {:?})",
+            a.state(),
+            b.state()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Tick the host and pump the client until `done` holds.
@@ -706,5 +790,203 @@ fn a_host_quit_ends_the_link() {
     until(&mut host, &mut client, "the quit", |c| {
         c.state() == &LinkState::Ended(LinkEnd::HostQuit)
     });
+    client.stop();
+}
+
+// ---------------------------------------------------------------------------
+// A worker host (v7, `specs/WORKER_PRD.md`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_worker_host_is_known_as_one_and_takes_worker_calls() {
+    let mut host = Host::start_worker();
+    host.tab("s1", "login");
+    host.publish();
+    let mut client = connect(&host, SeatRequest::Write);
+    until(&mut host, &mut client, "the snapshot", live);
+    assert!(client.is_worker());
+    assert_eq!(client.workspace().host_kind, Some(HostKind::Worker));
+    assert!(
+        client.browse_dir(None, false).is_some(),
+        "a worker is sent its picker's commands"
+    );
+    client.stop();
+}
+
+#[test]
+fn a_tui_host_is_never_sent_a_resize_or_a_worker_command() {
+    let mut host = Host::start();
+    host.tab("s1", "login");
+    host.publish();
+    let mut client = connect(&host, SeatRequest::Write);
+    until(&mut host, &mut client, "the snapshot", live);
+    assert!(!client.is_worker());
+    let size = PtySize {
+        rows: 40,
+        cols: 100,
+    };
+    assert!(!client.resize_terminal(&primary_terminal_id("s1"), size));
+    assert_eq!(client.browse_dir(None, false), None);
+    assert_eq!(client.scan_projects(), None);
+    assert_eq!(client.restart_worker_shell(), None);
+    for _ in 0..20 {
+        host.tick();
+        client.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !host.seen.iter().any(|e| matches!(
+            e,
+            WebInbound::ResizeTerminal { .. } | WebInbound::WorkerOp { .. }
+        )),
+        "nothing of v7 reached the host"
+    );
+    client.stop();
+}
+
+#[test]
+#[ignore = "needs package A (worker server)"]
+fn a_background_link_watches_a_worker_without_its_bytes() {
+    let mut host = Host::start_worker();
+    let agent = host.tab("s1", "login");
+    host.publish();
+    let mut background = connect_as(
+        &host,
+        SeatRequest::Observe,
+        ConnectionKind::Background,
+        "FlightDeck Desktop/test (laptop)",
+    );
+    until(&mut host, &mut background, "the background snapshot", live);
+    assert_eq!(
+        background
+            .workspace()
+            .worker
+            .as_ref()
+            .map(|w| w.connections.window.is_none()),
+        Some(true),
+        "no window yet"
+    );
+
+    // A window attaches: the background link hears about it.
+    let mut window = connect_as(
+        &host,
+        SeatRequest::Write,
+        ConnectionKind::Window,
+        "FlightDeck Desktop/test (studio)",
+    );
+    until_both(
+        &mut host,
+        &mut window,
+        &mut background,
+        "the connections delta",
+        |w, b| {
+            live(w)
+                && b.workspace()
+                    .worker
+                    .as_ref()
+                    .is_some_and(|wk| wk.connections.window.is_some())
+        },
+    );
+    assert_eq!(host.handle().window_count(), 1);
+    assert_eq!(host.handle().background_count(), 1);
+
+    // Bytes go to the window and never to the background link.
+    let mut window_pty = window.pty(&primary_terminal_id("s1"));
+    let mut background_pty = background.pty(&primary_terminal_id("s1"));
+    agent.push_output("for the window\r\n");
+    let mut seen = Vec::new();
+    until_both(
+        &mut host,
+        &mut window,
+        &mut background,
+        "the window's bytes",
+        |_, _| {
+            read_all(&mut window_pty, &mut seen);
+            seen.ends_with(b"for the window\r\n")
+        },
+    );
+    let mut leaked = Vec::new();
+    for _ in 0..20 {
+        host.tick();
+        background.pump();
+        read_all(&mut background_pty, &mut leaked);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        leaked.is_empty(),
+        "a background link gets no terminal bytes"
+    );
+    window.stop();
+    background.stop();
+}
+
+#[test]
+#[ignore = "needs package A (worker server)"]
+fn a_second_window_takes_the_worker_over() {
+    let mut host = Host::start_worker();
+    host.tab("s1", "login");
+    host.publish();
+    let mut first = connect_as(
+        &host,
+        SeatRequest::Write,
+        ConnectionKind::Window,
+        "FlightDeck Desktop/test (laptop)",
+    );
+    until(&mut host, &mut first, "the first window", live);
+    let mut second = connect_as(
+        &host,
+        SeatRequest::Write,
+        ConnectionKind::Window,
+        "FlightDeck Desktop/test (studio)",
+    );
+    until_both(
+        &mut host,
+        &mut first,
+        &mut second,
+        "the takeover",
+        |a, b| live(b) && matches!(a.state(), LinkState::Ended(LinkEnd::TakenOver { .. })),
+    );
+    let LinkState::Ended(LinkEnd::TakenOver { by }) = first.state().clone() else {
+        unreachable!()
+    };
+    assert!(by.contains("studio"), "named by its device: {by}");
+    assert_eq!(host.handle().window_count(), 1);
+    first.stop();
+    second.stop();
+}
+
+#[test]
+#[ignore = "needs package A (worker server)"]
+fn a_window_sizes_the_workers_ptys() {
+    let mut host = Host::start_worker();
+    host.tab("s1", "login");
+    host.publish();
+    let mut client = connect(&host, SeatRequest::Write);
+    until(&mut host, &mut client, "the snapshot", live);
+    let size = PtySize {
+        rows: 40,
+        cols: 100,
+    };
+    assert!(client.resize_terminal(&primary_terminal_id("s1"), size));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        host.tick();
+        client.pump();
+        let resized = host.seen.iter().any(|e| {
+            matches!(
+                e,
+                WebInbound::ResizeTerminal { terminal_id, size: s, .. }
+                    if *terminal_id == primary_terminal_id("s1") && *s == size
+            )
+        });
+        if resized {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the resize never reached the host"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     client.stop();
 }

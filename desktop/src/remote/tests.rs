@@ -233,6 +233,7 @@ fn open_in_vscode_uses_the_ssh_target_saved_for_the_remote(app: &mut TestAppCont
         host_version: None,
         warned_unencrypted: true,
         ssh_target: Some("studio-box".to_string()),
+        host_kind: None,
     });
     save_remotes(fs.as_ref(), &path, &file).unwrap();
     let urls = model.update(cx, |m, _| {
@@ -623,6 +624,7 @@ mod connect {
             host_version: None,
             warned_unencrypted: warned,
             ssh_target: None,
+            host_kind: None,
         }
     }
 

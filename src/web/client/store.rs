@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::{FileSystem, FlightDeckError, Result};
+use crate::web::protocol::HostKind;
 
 use super::exchange::AccessToken;
 
@@ -50,6 +51,18 @@ pub struct SavedRemote {
     /// Only ever set by hand, so it is kept across a re-pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_target: Option<String>,
+    /// What kind of FlightDeck answered the last attach (v7): a worker is
+    /// listed in the launcher's Workers section and kept a background link
+    /// to. Unset until a v7 host says, and absent from the file while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_kind: Option<HostKind>,
+}
+
+impl SavedRemote {
+    /// Whether the last attach found a FlightDeck worker here.
+    pub fn is_worker(&self) -> bool {
+        self.host_kind == Some(HostKind::Worker)
+    }
 }
 
 impl SavedRemote {
@@ -75,7 +88,8 @@ impl RemotesFile {
     }
 
     /// Save `remote`, replacing any record for the same address (a re-pair
-    /// keeps the warning already accepted and a hand-set SSH target).
+    /// keeps the warning already accepted, a hand-set SSH target, and the
+    /// host kind until the next attach says otherwise).
     pub fn upsert(&mut self, mut remote: SavedRemote) {
         match self
             .remotes
@@ -86,6 +100,9 @@ impl RemotesFile {
                 remote.warned_unencrypted |= existing.warned_unencrypted;
                 if remote.ssh_target.is_none() {
                     remote.ssh_target = existing.ssh_target.take();
+                }
+                if remote.host_kind.is_none() {
+                    remote.host_kind = existing.host_kind;
                 }
                 *existing = remote;
             }
@@ -117,6 +134,23 @@ impl RemotesFile {
                 remote.host_version = host_version;
             }
         }
+    }
+
+    /// Record what kind of FlightDeck answered an attach to `address` (v7).
+    /// Returns whether the record changed, so a caller saves only then.
+    pub fn record_host_kind(&mut self, address: &str, kind: HostKind) -> bool {
+        match self.remotes.iter_mut().find(|r| r.address == address) {
+            Some(remote) if remote.host_kind != Some(kind) => {
+                remote.host_kind = Some(kind);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The saved remotes that are workers, in the order saved.
+    pub fn workers(&self) -> Vec<&SavedRemote> {
+        self.remotes.iter().filter(|r| r.is_worker()).collect()
     }
 
     /// Most recently used first, never-used last in the order saved.
@@ -185,6 +219,7 @@ mod tests {
             host_version: None,
             warned_unencrypted: false,
             ssh_target: None,
+            host_kind: None,
         }
     }
 
@@ -261,6 +296,42 @@ mod tests {
         assert!(file.forget("b:7420"));
         assert!(!file.forget("b:7420"));
         assert_eq!(file.remotes.len(), 1);
+    }
+
+    #[test]
+    fn the_host_kind_is_recorded_kept_across_a_re_pair_and_lists_the_workers() {
+        let mut file = RemotesFile::default();
+        file.upsert(remote("box:7420"));
+        file.upsert(remote("studio:7420"));
+        assert!(file.workers().is_empty());
+
+        assert!(file.record_host_kind("box:7420", HostKind::Worker));
+        assert!(
+            !file.record_host_kind("box:7420", HostKind::Worker),
+            "unchanged"
+        );
+        assert!(file.record_host_kind("studio:7420", HostKind::Tui));
+        assert!(!file.record_host_kind("nowhere:7420", HostKind::Worker));
+        let workers: Vec<&str> = file.workers().iter().map(|r| r.address.as_str()).collect();
+        assert_eq!(workers, vec!["box:7420"]);
+
+        // A re-pair does not forget what the host is.
+        file.upsert(SavedRemote {
+            token: "new".to_string(),
+            ..remote("box:7420")
+        });
+        assert!(file.get("box:7420").unwrap().is_worker());
+
+        // On disk only once known, and an old file still loads.
+        let json = serde_json::to_string(file.get("box:7420").unwrap()).unwrap();
+        assert!(json.contains(r#""host_kind":"worker""#), "{json}");
+        let json = serde_json::to_string(&remote("h:1")).unwrap();
+        assert!(!json.contains("host_kind"), "{json}");
+        let old: SavedRemote = serde_json::from_str(
+            r#"{"label":"l","address":"h:1","token":"t","warned_unencrypted":true}"#,
+        )
+        .unwrap();
+        assert_eq!(old.host_kind, None);
     }
 
     #[cfg(unix)]
