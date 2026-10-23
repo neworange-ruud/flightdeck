@@ -18,3 +18,9 @@ pub mod shell_env;
 // The palette lives in the library (the binary re-uses it) because the overlay
 // views paint with it and are tested here, without a window.
 pub mod theme;
+// Which worker remote windows are open (`workers/registry.rs`). Inline so the
+// binary's own `workers` module (`workers/mod.rs`: links, rows) stays the
+// binary's: the remote window and the Workers section meet only here.
+pub mod workers {
+    pub mod registry;
+}

@@ -18,6 +18,7 @@ mod surface;
 mod terminal;
 use flightdeck_desktop::theme;
 mod views;
+mod workers;
 
 #[cfg(test)]
 mod platform_tests;
