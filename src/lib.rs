@@ -92,6 +92,7 @@ use crate::remote::commands::{
     MainLoopAction, PendingFirstTask, ShellAction, Translation,
 };
 use crate::remote::identity::load_or_create_identity;
+use crate::remote::images::ChunkOutcome as ImageChunkOutcome;
 use crate::remote::pairing::PairingSession;
 use crate::remote::shell::ShellManager;
 use crate::remote::state::remote_state_path;
@@ -3463,9 +3464,13 @@ fn service_remote_commands(
         // A fresh index per command: an earlier command in this batch may have
         // closed a tab and shifted indices.
         let index = session_index(workspace, bridge, now_ms);
-        let translation = translate(&cmd.body, &index);
-        let (outcome, message) =
-            execute_queued_translation(translation, bridge, workspace, env, now_ms, first_tasks);
+        let (outcome, message) = match attach_reply_images(cmd.body, bridge, workspace) {
+            Ok(body) => {
+                let translation = translate(&body, &index);
+                execute_queued_translation(translation, bridge, workspace, env, now_ms, first_tasks)
+            }
+            Err(reason) => (CommandOutcome::Rejected, Some(reason)),
+        };
         ledger.record(cmd.command_id.clone(), outcome, message.clone());
         bridge.send_ack(
             CommandAck {
@@ -3480,6 +3485,60 @@ fn service_remote_commands(
     deliver_first_tasks(first_tasks, workspace, now_ms);
     // Report any remote shell whose process has exited (flushed next tick).
     poll_remote_shell_exits(bridge, workspace);
+}
+
+/// A reply naming images the phone uploaded, with each saved image's path typed
+/// ahead of its text the way a pasted image is (container-mapped for a
+/// containerized agent); any other command unchanged. Refused when an image
+/// never arrived, so the reply is not sent without it (remote-control-ty3p).
+fn attach_reply_images(
+    body: flightdeck_remote_protocol::CommandBody,
+    bridge: &mut RemoteBridge,
+    workspace: &Workspace,
+) -> std::result::Result<flightdeck_remote_protocol::CommandBody, String> {
+    use flightdeck_remote_protocol::CommandBody;
+    let CommandBody::Reply {
+        session_id,
+        text,
+        image_ids,
+    } = body
+    else {
+        return Ok(body);
+    };
+    if image_ids.is_empty() {
+        return Ok(CommandBody::Reply {
+            session_id,
+            text,
+            image_ids,
+        });
+    }
+    if !image_ids
+        .iter()
+        .all(|id| bridge.images().is_ready(&session_id, id))
+    {
+        return Err("an attached image did not arrive; attach it again".to_string());
+    }
+    let containerized = workspace
+        .projects
+        .iter()
+        .flat_map(|p| p.state.tabs.iter())
+        .find(|t| t.meta.id == session_id.as_str())
+        .is_some_and(|t| t.meta.containerized);
+    let mut typed = String::new();
+    for id in &image_ids {
+        if let Some(path) = bridge.images().take(&session_id, id) {
+            typed.push_str(&crate::tui::clipboard::pasted_image_text(
+                &path,
+                containerized,
+            ));
+        }
+    }
+    typed.push_str(&text);
+    Ok(CommandBody::Reply {
+        session_id,
+        text: typed,
+        image_ids: Vec::new(),
+    })
 }
 
 /// Flush any deferred keystrokes now due — e.g. Claude's multi-select submit
@@ -3597,6 +3656,31 @@ fn execute_queued_translation(
                     )
                 }
             }
+        },
+        // Reassemble the phone's image; once complete, save it as a pasted
+        // image is saved and keep its path for the reply that names it.
+        Translation::ImageChunk {
+            session_id,
+            upload_id,
+            format,
+            index,
+            count,
+            bytes,
+        } => match bridge
+            .images()
+            .add_chunk(&session_id, &upload_id, &format, index, count, bytes)
+        {
+            Ok(ImageChunkOutcome::Pending) => (CommandOutcome::Applied, None),
+            Ok(ImageChunkOutcome::Complete(image)) => {
+                match crate::tui::clipboard::save_pasted_image(env.fs, &image) {
+                    Ok(path) => {
+                        bridge.images().finish(&session_id, &upload_id, path);
+                        (CommandOutcome::Applied, None)
+                    }
+                    Err(reason) => (CommandOutcome::Failed, Some(reason)),
+                }
+            }
+            Err(reason) => (CommandOutcome::Rejected, Some(reason)),
         },
         other => execute_remote_translation(
             other,
@@ -3749,6 +3833,13 @@ fn execute_remote_translation(
 ) -> (CommandOutcome, Option<String>) {
     match translation {
         Translation::Reject { reason } => (CommandOutcome::Rejected, Some(reason)),
+
+        // Reassembled in `execute_queued_translation`, which owns the bridge's
+        // upload store; never reaches here from the command queue.
+        Translation::ImageChunk { .. } => (
+            CommandOutcome::Failed,
+            Some("the image could not be received".to_string()),
+        ),
 
         Translation::Shell {
             project,
@@ -11206,6 +11297,7 @@ mod tests {
                 body: CommandBody::Reply {
                     session_id: SessionId::new("t1"),
                     text: "hello agent".to_string(),
+                    image_ids: Vec::new(),
                 },
             };
             bridge.handle_inbound(RemoteInbound::Envelope(envelope(1, &cmd)));
@@ -11231,6 +11323,108 @@ mod tests {
             assert_eq!(acks.len(), 1);
             assert_eq!(acks[0].command_id, CommandId::new("c1"));
             assert_eq!(acks[0].outcome, CommandOutcome::Applied);
+        }
+
+        /// A phone image (remote-control-ty3p): two chunks reassemble into a
+        /// saved image, and the reply naming it types the image's path ahead of
+        /// the text. A reply naming an image that never arrived is refused and
+        /// types nothing.
+        #[test]
+        fn reply_with_an_uploaded_image_types_its_saved_path_then_the_text() {
+            use base64::Engine as _;
+            let pty = FakePty::new();
+            let (app, handles) = app_with_tabs(
+                Config::default(),
+                vec![tab_state("t1", "fix", "claude")],
+                &pty,
+            );
+            let mut workspace = workspace_with(app);
+            let fs = FakeFs::new();
+            let clock = FakeClock::default();
+            let container = FakeContainerRuntime::new();
+            let command = crate::testing::FakeCommandRunner::new();
+            let env = Env {
+                fs: &fs,
+                pty: &pty,
+                clock: &clock,
+                container: &container,
+                command: &command,
+                terminal: crate::terminal::session::TerminalProfile::TUI,
+            };
+            let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+            let chunk = |id: &str, index: u32, data: &[u8]| PhoneCommand {
+                command_id: CommandId::new(id),
+                issued_at_ms: 0,
+                body: CommandBody::AttachImageChunk {
+                    session_id: SessionId::new("t1"),
+                    upload_id: "up1".to_string(),
+                    format: "jpg".to_string(),
+                    index,
+                    count: 2,
+                    data: b64(data),
+                },
+            };
+            let reply = |id: &str, image: &str| PhoneCommand {
+                command_id: CommandId::new(id),
+                issued_at_ms: 0,
+                body: CommandBody::Reply {
+                    session_id: SessionId::new("t1"),
+                    text: "see this".to_string(),
+                    image_ids: vec![image.to_string()],
+                },
+            };
+            let mut bridge = RemoteBridge::passthrough(0);
+            for (seq, cmd) in [
+                chunk("c1", 0, &[0xff, 0xd8]),
+                chunk("c2", 1, &[0xff, 0xd9]),
+                reply("c3", "up1"),
+                reply("c4", "never-sent"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                bridge.handle_inbound(RemoteInbound::Envelope(envelope(seq as u64 + 1, cmd)));
+            }
+            let mut ledger = CommandLedger::new();
+            let mut first_tasks: Vec<PendingFirstTask> = Vec::new();
+            let mut sent: Vec<RemoteOutbound> = Vec::new();
+            service_remote_commands(
+                &mut bridge,
+                &mut ledger,
+                &mut first_tasks,
+                &mut workspace,
+                &env,
+                1_000,
+                &mut |o| sent.push(o),
+            );
+
+            let acks = decode_acks(&sent);
+            let outcomes: Vec<CommandOutcome> = acks.iter().map(|a| a.outcome).collect();
+            assert_eq!(
+                outcomes,
+                vec![
+                    CommandOutcome::Applied,
+                    CommandOutcome::Applied,
+                    CommandOutcome::Applied,
+                    CommandOutcome::Rejected,
+                ]
+            );
+            assert!(acks[3]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("did not arrive"));
+
+            let typed = String::from_utf8(handles[0].input()).unwrap();
+            let path = typed
+                .strip_suffix(" see this\r")
+                .unwrap_or_else(|| panic!("the path, then the text: {typed:?}"));
+            assert!(path.ends_with(".jpg"), "{path}");
+            assert_eq!(
+                fs.file_bytes(std::path::Path::new(path)).unwrap(),
+                vec![0xff, 0xd8, 0xff, 0xd9],
+                "the saved image is the reassembled chunks"
+            );
         }
 
         /// A reply to a *not-started* agent (recovered tab whose project was not
@@ -11279,6 +11473,7 @@ mod tests {
                 body: CommandBody::Reply {
                     session_id: SessionId::new("t1"),
                     text: "resume and go".to_string(),
+                    image_ids: Vec::new(),
                 },
             };
             bridge.handle_inbound(RemoteInbound::Envelope(envelope(1, &cmd)));
@@ -11345,6 +11540,7 @@ mod tests {
                 body: CommandBody::Reply {
                     session_id: SessionId::new("t1"),
                     text: "again".to_string(),
+                    image_ids: Vec::new(),
                 },
             };
             let mut ledger = CommandLedger::new();

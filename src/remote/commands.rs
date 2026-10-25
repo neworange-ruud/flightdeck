@@ -338,6 +338,22 @@ pub enum Translation {
         /// The command to dispatch — all safety guards live behind it.
         command: Command,
     },
+    /// One decoded chunk of an image the phone attaches to a later reply; the
+    /// executor reassembles it in the bridge and saves the finished image.
+    ImageChunk {
+        /// The session the image is for.
+        session_id: SessionId,
+        /// The phone's id for the image.
+        upload_id: String,
+        /// The image format, as a file extension.
+        format: String,
+        /// This chunk's 0-based position.
+        index: u32,
+        /// How many chunks the image has.
+        count: u32,
+        /// This chunk's bytes.
+        bytes: Vec<u8>,
+    },
     /// Answer an OpenCode permission through the agent's plugin, which replies
     /// via OpenCode's API: the executor writes `reply` for `request_id` to the
     /// tab's reply file ([`crate::remote::bridge::agent_reply_path`]).
@@ -638,7 +654,11 @@ pub fn encode_reply(text: &str, bracketed: bool) -> Vec<u8> {
 /// Pure: no I/O, no state mutation.
 pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
     match body {
-        CommandBody::Reply { session_id, text } => {
+        // `image_ids` are resolved to typed paths before translation
+        // (`lib::attach_reply_images`), so a reply reaching here is text.
+        CommandBody::Reply {
+            session_id, text, ..
+        } => {
             let Some(s) = index.session(session_id) else {
                 return reject(format!("unknown session '{session_id}'"));
             };
@@ -665,6 +685,31 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
                 project: s.project,
                 tab: s.tab,
                 bytes: encode_reply(text, s.bracketed_paste),
+            }
+        }
+
+        CommandBody::AttachImageChunk {
+            session_id,
+            upload_id,
+            format,
+            index: chunk,
+            count,
+            data,
+        } => {
+            if index.session(session_id).is_none() {
+                return reject(format!("unknown session '{session_id}'"));
+            }
+            use base64::Engine as _;
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                return reject("the image arrived malformed; attach it again");
+            };
+            Translation::ImageChunk {
+                session_id: session_id.clone(),
+                upload_id: upload_id.clone(),
+                format: format.clone(),
+                index: *chunk,
+                count: *count,
+                bytes,
             }
         }
 

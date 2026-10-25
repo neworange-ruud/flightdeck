@@ -184,6 +184,10 @@ enum ProtocolFixtures {
             base64: "ewogICJ0eXBlIjogInNuYXBzaG90IiwKICAic2VydmVyX3RpbWVfbXMiOiAxNzUyNDEyODAwMDAwLAogICJwcm9qZWN0cyI6IFsKICAgIHsKICAgICAgInByb2plY3RfaWQiOiAicHJval9mbGlnaHRkZWNrIiwKICAgICAgIm5hbWUiOiAiZmxpZ2h0ZGVjayIsCiAgICAgICJyb2xsdXAiOiB7CiAgICAgICAgImRvdCI6ICJuZWVkc19pbnB1dCIsCiAgICAgICAgInN1bW1hcnkiOiAiMSBuZWVkcyBpbnB1dCDCtyAxIHdvcmtpbmcgwrcgMyBhZ2VudHMiLAogICAgICAgICJ3b3JraW5nIjogMSwKICAgICAgICAiaWRsZSI6IDEsCiAgICAgICAgIm5lZWRzX2lucHV0IjogMSwKICAgICAgICAibWFudWFsIjogMCwKICAgICAgICAiYWdlbnRfY291bnQiOiAzCiAgICAgIH0sCiAgICAgICJzZXNzaW9ucyI6IFsKICAgICAgICB7CiAgICAgICAgICAic2Vzc2lvbl9pZCI6ICJzZXNzX2ZpeF9sb2dpbiIsCiAgICAgICAgICAicHJvamVjdF9pZCI6ICJwcm9qX2ZsaWdodGRlY2siLAogICAgICAgICAgIm5hbWUiOiAiZml4LWxvZ2luIiwKICAgICAgICAgICJhZ2VudF90eXBlIjogImNsYXVkZV9jb2RlIiwKICAgICAgICAgICJzdGF0dXMiOiB7CiAgICAgICAgICAgICJzdGF0ZSI6ICJuZWVkc19pbnB1dCIKICAgICAgICAgIH0sCiAgICAgICAgICAiZ2l0IjogewogICAgICAgICAgICAiYnJhbmNoIjogImZsaWdodGRlY2svZml4LWxvZ2luIiwKICAgICAgICAgICAgImFkZGVkIjogMCwKICAgICAgICAgICAgIm1vZGlmaWVkIjogMywKICAgICAgICAgICAgInJlbW92ZWQiOiAwLAogICAgICAgICAgICAiYWhlYWQiOiAwLAogICAgICAgICAgICAiYmVoaW5kIjogMCwKICAgICAgICAgICAgImRyaWZ0IjogMiwKICAgICAgICAgICAgImhhc191cHN0cmVhbSI6IHRydWUKICAgICAgICAgIH0sCiAgICAgICAgICAicnVubmluZ190aW1lX3NlY3MiOiA1MTIsCiAgICAgICAgICAicGVuZGluZ19xdWVzdGlvbiI6ICJBbGxvdyBybSAtcmYgZGlzdC8gPyIKICAgICAgICB9LAogICAgICAgIHsKICAgICAgICAgICJzZXNzaW9uX2lkIjogInNlc3NfYWRkX3Rlc3RzIiwKICAgICAgICAgICJwcm9qZWN0X2lkIjogInByb2pfZmxpZ2h0ZGVjayIsCiAgICAgICAgICAibmFtZSI6ICJhZGQtdGVzdHMiLAogICAgICAgICAgImFnZW50X3R5cGUiOiAib3BlbmNvZGUiLAogICAgICAgICAgInN0YXR1cyI6IHsKICAgICAgICAgICAgInN0YXRlIjogIndvcmtpbmciCiAgICAgICAgICB9LAogICAgICAgICAgImdpdCI6IHsKICAgICAgICAgICAgImJyYW5jaCI6ICJmbGlnaHRkZWNrL2FkZC10ZXN0cyIsCiAgICAgICAgICAgICJhZGRlZCI6IDEyLAogICAgICAgICAgICAibW9kaWZpZWQiOiA0LAogICAgICAgICAgICAicmVtb3ZlZCI6IDAsCiAgICAgICAgICAgICJhaGVhZCI6IDAsCiAgICAgICAgICAgICJiZWhpbmQiOiAwLAogICAgICAgICAgICAiZHJpZnQiOiAwLAogICAgICAgICAgICAiaGFzX3Vwc3RyZWFtIjogZmFsc2UKICAgICAgICAgIH0sCiAgICAgICAgICAicnVubmluZ190aW1lX3NlY3MiOiA3MywKICAgICAgICAgICJwZW5kaW5nX3F1ZXN0aW9uIjogbnVsbAogICAgICAgIH0KICAgICAgXQogICAgfQogIF0KfQo="),
         ProtocolFixture(
             category: "desktop_to_phone",
+            name: "snapshot_features",
+            base64: "ewogICJ0eXBlIjogInNuYXBzaG90IiwKICAic2VydmVyX3RpbWVfbXMiOiAxNzUyNDEyODAwMDAwLAogICJwcm9qZWN0cyI6IFtdLAogICJmZWF0dXJlcyI6IFsiaW1hZ2VfYXR0YWNoIl0KfQo="),
+        ProtocolFixture(
+            category: "desktop_to_phone",
             name: "status_update",
             base64: "ewogICJ0eXBlIjogInN0YXR1c191cGRhdGUiLAogICJ1cGRhdGVzIjogWwogICAgewogICAgICAic2Vzc2lvbl9pZCI6ICJzZXNzX2ZpeF9sb2dpbiIsCiAgICAgICJwcm9qZWN0X2lkIjogInByb2pfZmxpZ2h0ZGVjayIsCiAgICAgICJzdGF0dXMiOiB7CiAgICAgICAgInN0YXRlIjogImlkbGUiCiAgICAgIH0sCiAgICAgICJydW5uaW5nX3RpbWVfc2VjcyI6IDU0MCwKICAgICAgInBlbmRpbmdfcXVlc3Rpb24iOiBudWxsCiAgICB9LAogICAgewogICAgICAic2Vzc2lvbl9pZCI6ICJzZXNzX2FkZF90ZXN0cyIsCiAgICAgICJwcm9qZWN0X2lkIjogInByb2pfZmxpZ2h0ZGVjayIsCiAgICAgICJzdGF0dXMiOiB7CiAgICAgICAgInN0YXRlIjogIm1hbnVhbCIsCiAgICAgICAgImxhYmVsIjogInJldmlld2luZyBieSBoYW5kIgogICAgICB9LAogICAgICAicnVubmluZ190aW1lX3NlY3MiOiBudWxsLAogICAgICAicGVuZGluZ19xdWVzdGlvbiI6IG51bGwKICAgIH0KICBdCn0K"),
         ProtocolFixture(
@@ -194,6 +198,10 @@ enum ProtocolFixtures {
             category: "desktop_to_phone",
             name: "transcript_append",
             base64: "ewogICJ0eXBlIjogInRyYW5zY3JpcHRfYXBwZW5kIiwKICAic2Vzc2lvbl9pZCI6ICJzZXNzX2ZpeF9sb2dpbiIsCiAgImZyb21faW5kZXgiOiA1LAogICJyZXBsYWNlIjogZmFsc2UsCiAgIml0ZW1zIjogWwogICAgewogICAgICAidHlwZSI6ICJhZ2VudF9tZXNzYWdlIiwKICAgICAgIml0ZW1faWQiOiAiaXRlbV8wMDA2IiwKICAgICAgInRleHQiOiAiRGVuaWVkLiBJJ2xsIGxlYXZlIGRpc3QvIGluIHBsYWNlIGFuZCBjbGVhbiBpdCBhbm90aGVyIHdheS4iLAogICAgICAiYXRfbXMiOiAxNzUyNDEyNzQwMDAwCiAgICB9CiAgXQp9Cg=="),
+        ProtocolFixture(
+            category: "phone_to_desktop",
+            name: "attach_image_chunk",
+            base64: "ewogICJjb21tYW5kX2lkIjogImNtZF8wMDAwMDAyMCIsCiAgImlzc3VlZF9hdF9tcyI6IDE3NTI0MTI4MTIwMDAsCiAgInR5cGUiOiAiYXR0YWNoX2ltYWdlX2NodW5rIiwKICAic2Vzc2lvbl9pZCI6ICJzZXNzX2ZpeF9sb2dpbiIsCiAgInVwbG9hZF9pZCI6ICJ1cF83ZjNhIiwKICAiZm9ybWF0IjogImpwZyIsCiAgImluZGV4IjogMCwKICAiY291bnQiOiAxLAogICJkYXRhIjogIi85ai80QUFRU2taSlJnQUJBUT09Igp9Cg=="),
         ProtocolFixture(
             category: "phone_to_desktop",
             name: "clear_manual_status",
@@ -232,6 +240,10 @@ enum ProtocolFixtures {
             base64: "ewogICJjb21tYW5kX2lkIjogImNtZF8wMDAwMDAwMSIsCiAgImlzc3VlZF9hdF9tcyI6IDE3NTI0MTI4MTAwMDAsCiAgInR5cGUiOiAicmVwbHkiLAogICJzZXNzaW9uX2lkIjogInNlc3NfZml4X2xvZ2luIiwKICAidGV4dCI6ICJZZXMsIHJ1biBpdC4gVGhlbiByZWJ1aWxkLiIKfQo="),
         ProtocolFixture(
             category: "phone_to_desktop",
+            name: "reply_with_images",
+            base64: "ewogICJjb21tYW5kX2lkIjogImNtZF8wMDAwMDAyMSIsCiAgImlzc3VlZF9hdF9tcyI6IDE3NTI0MTI4MTMwMDAsCiAgInR5cGUiOiAicmVwbHkiLAogICJzZXNzaW9uX2lkIjogInNlc3NfZml4X2xvZ2luIiwKICAidGV4dCI6ICJUaGlzIGlzIHdoYXQgdGhlIGxvZ2luIHBhZ2Ugc2hvd3MuIiwKICAiaW1hZ2VfaWRzIjogWyJ1cF83ZjNhIl0KfQo="),
+        ProtocolFixture(
+            category: "phone_to_desktop",
             name: "request_snapshot",
             base64: "ewogICJjb21tYW5kX2lkIjogImNtZF8wMDAwMDAwZiIsCiAgImlzc3VlZF9hdF9tcyI6IDE3NTI0MTI4MjQwMDAsCiAgInR5cGUiOiAicmVxdWVzdF9zbmFwc2hvdCIsCiAgInByb2plY3RfaWQiOiBudWxsCn0K"),
         ProtocolFixture(
@@ -266,5 +278,5 @@ enum ProtocolFixtures {
 
     /// Number of embedded fixtures, asserted by the conformance test so a
     /// stale FixturesGenerated.swift is caught when new fixtures land.
-    static let expectedCount = 58
+    static let expectedCount = 61
 }

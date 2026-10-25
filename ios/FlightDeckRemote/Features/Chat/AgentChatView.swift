@@ -110,7 +110,12 @@ struct AgentChatView: View {
                                onSend: { sendAndFollow() },
                                isListening: dictation.isListening,
                                onHoldBegin: { dictation.beginHold() },
-                               onHoldEnd: { dictation.endHold() })
+                               onHoldEnd: { dictation.endHold() },
+                               attachments: model.attachments,
+                               attachSlots: model.canAttachImages
+                                   ? ImageAttachmentEncoder.maxPerReply - model.attachments.count : 0,
+                               onAttach: { model.attach($0) },
+                               onRemoveAttachment: { model.removeAttachment($0) })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

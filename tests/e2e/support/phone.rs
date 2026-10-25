@@ -669,6 +669,7 @@ mod tests {
         let snapshot = DesktopToPhone::Snapshot(StateSnapshot {
             server_time_ms: 1_752_412_801_000,
             projects: vec![],
+            features: Vec::new(),
         });
         let snap_bytes = serde_json::to_vec(&snapshot).unwrap();
         let (n2, c2) = desktop
@@ -818,6 +819,7 @@ mod tests {
                 },
                 sessions: Vec::<SessionState>::new(),
             }],
+            features: Vec::new(),
         });
         let snap_bytes = serde_json::to_vec(&snapshot).unwrap();
         // The envelope's `sent_at_ms` MUST equal the value passed to `seal`

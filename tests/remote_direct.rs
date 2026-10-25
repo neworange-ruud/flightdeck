@@ -158,6 +158,7 @@ impl Fixture {
             body: CommandBody::Reply {
                 session_id: SessionId::new("s1"),
                 text: text.to_string(),
+                image_ids: Vec::new(),
             },
         };
         let sent_at_ms = 1_752_000_100_000 + seq as i64;
@@ -194,6 +195,7 @@ fn snapshot() -> DesktopToPhone {
     DesktopToPhone::Snapshot(StateSnapshot {
         server_time_ms: 1_752_000_000_000,
         projects: Vec::new(),
+        features: Vec::new(),
     })
 }
 

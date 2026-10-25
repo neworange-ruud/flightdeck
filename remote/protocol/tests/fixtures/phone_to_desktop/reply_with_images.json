@@ -1,0 +1,8 @@
+{
+  "command_id": "cmd_00000021",
+  "issued_at_ms": 1752412813000,
+  "type": "reply",
+  "session_id": "sess_fix_login",
+  "text": "This is what the login page shows.",
+  "image_ids": ["up_7f3a"]
+}

@@ -148,12 +148,43 @@ extension Wire {
         var serverTimeMs: Int64
         /// All open projects (each stays live in the background).
         var projects: [ProjectState]
+        /// Optional commands the desktop accepts, by name (e.g.
+        /// `Wire.featureImageAttach`). Empty from an older desktop, which is
+        /// then never offered a command it would drop.
+        var features: [String] = []
 
         private enum CodingKeys: String, CodingKey {
-            case projects
+            case projects, features
             case serverTimeMs = "server_time_ms"
         }
+
+        init(serverTimeMs: Int64, projects: [ProjectState], features: [String] = []) {
+            self.serverTimeMs = serverTimeMs
+            self.projects = projects
+            self.features = features
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            serverTimeMs = try c.decode(Int64.self, forKey: .serverTimeMs)
+            projects = try c.decode([ProjectState].self, forKey: .projects)
+            features = try c.decodeIfPresent([String].self, forKey: .features) ?? []
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(serverTimeMs, forKey: .serverTimeMs)
+            try c.encode(projects, forKey: .projects)
+            // `skip_serializing_if = "Vec::is_empty"` on the Rust side.
+            if !features.isEmpty { try c.encode(features, forKey: .features) }
+        }
     }
+
+    /// `StateSnapshot.features` entry: the desktop accepts `attachImageChunk`
+    /// and `reply.imageIds`.
+    static let featureImageAttach = "image_attach"
+    /// The most image bytes one `attachImageChunk` carries (before base64).
+    static let maxImageChunkBytes = 256 * 1024
 
     /// An incremental status change for one session.
     struct SessionStatusDelta: Codable, Hashable, Sendable {
@@ -792,8 +823,14 @@ extension Wire {
 
     /// The action a phone command performs. Internally tagged by `type`.
     enum CommandBody: Codable, Hashable, Sendable {
-        /// Reply / follow-up prose to an agent.
-        case reply(sessionId: SessionId, text: String)
+        /// Reply / follow-up prose to an agent. `imageIds` names images
+        /// uploaded earlier with `attachImageChunk`, attached ahead of the text
+        /// (only to a desktop listing `Wire.featureImageAttach`).
+        case reply(sessionId: SessionId, text: String, imageIds: [String] = [])
+        /// One chunk of an image a later `reply` attaches. `data` is base64 of
+        /// at most `Wire.maxImageChunkBytes` bytes.
+        case attachImageChunk(sessionId: SessionId, uploadId: String, format: String,
+                              index: Int, count: Int, data: String)
         /// Resolve a permission/question prompt. Exactly one of `choice`
         /// (binary fast-path), `optionIndex` (single-select Question, by
         /// position), `optionIndices` (multi-select checklist), or `freeText`
@@ -850,7 +887,9 @@ extension Wire {
             case optionIndex = "option_index"
             case optionIndices = "option_indices"
             case freeText = "free_text"
-            case answers
+            case answers, format, index, count
+            case imageIds = "image_ids"
+            case uploadId = "upload_id"
         }
 
         init(from decoder: Decoder) throws {
@@ -860,7 +899,16 @@ extension Wire {
             case "reply":
                 self = .reply(
                     sessionId: try c.decode(SessionId.self, forKey: .sessionId),
-                    text: try c.decode(String.self, forKey: .text))
+                    text: try c.decode(String.self, forKey: .text),
+                    imageIds: try c.decodeIfPresent([String].self, forKey: .imageIds) ?? [])
+            case "attach_image_chunk":
+                self = .attachImageChunk(
+                    sessionId: try c.decode(SessionId.self, forKey: .sessionId),
+                    uploadId: try c.decode(String.self, forKey: .uploadId),
+                    format: try c.decode(String.self, forKey: .format),
+                    index: try c.decode(Int.self, forKey: .index),
+                    count: try c.decode(Int.self, forKey: .count),
+                    data: try c.decode(String.self, forKey: .data))
             case "permission_decision":
                 self = .permissionDecision(
                     sessionId: try c.decode(SessionId.self, forKey: .sessionId),
@@ -939,10 +987,20 @@ extension Wire {
         func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             switch self {
-            case let .reply(sessionId, text):
+            case let .reply(sessionId, text, imageIds):
                 try c.encode("reply", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)
                 try c.encode(text, forKey: .text)
+                // `skip_serializing_if = "Vec::is_empty"` on the Rust side.
+                if !imageIds.isEmpty { try c.encode(imageIds, forKey: .imageIds) }
+            case let .attachImageChunk(sessionId, uploadId, format, index, count, data):
+                try c.encode("attach_image_chunk", forKey: .type)
+                try c.encode(sessionId, forKey: .sessionId)
+                try c.encode(uploadId, forKey: .uploadId)
+                try c.encode(format, forKey: .format)
+                try c.encode(index, forKey: .index)
+                try c.encode(count, forKey: .count)
+                try c.encode(data, forKey: .data)
             case let .permissionDecision(sessionId, promptId, choice, optionIndex, optionIndices, freeText, answers):
                 try c.encode("permission_decision", forKey: .type)
                 try c.encode(sessionId, forKey: .sessionId)

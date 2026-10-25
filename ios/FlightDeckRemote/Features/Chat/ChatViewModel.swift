@@ -49,6 +49,13 @@ final class ChatViewModel {
     /// The compose field's current text (bound by the compose bar).
     var draft: String = ""
 
+    /// Images attached to the next reply (remote-control-ty3p).
+    private(set) var attachments: [ImageAttachment] = []
+
+    /// Forces image attach on or off regardless of the desktop's snapshot
+    /// (fixtures / tests, where no live store is bound).
+    var imageAttachOverride: Bool?
+
     /// Optimistically-appended outgoing user messages, in send order. Merged
     /// into the rendered transcript until the desktop echoes them back.
     private(set) var outgoing: [OutgoingMessage] = []
@@ -223,7 +230,7 @@ final class ChatViewModel {
         let authoritative = items
         let visible = ChatSendLogic.visibleOutgoing(outgoing, against: authoritative)
         let optimistic = visible.map { msg in
-            Wire.TranscriptItem.userMessage(itemId: msg.localId, text: msg.text,
+            Wire.TranscriptItem.userMessage(itemId: msg.localId, text: msg.displayText,
                                             atMs: msg.issuedAtMs)
         }
         return authoritative + optimistic
@@ -252,23 +259,67 @@ final class ChatViewModel {
         }
     }
 
+    // MARK: - Image attachments
+
+    /// Whether the desktop accepts images: its snapshot lists the feature (an
+    /// older desktop would drop the upload commands).
+    var canAttachImages: Bool {
+        if let imageAttachOverride { return imageAttachOverride }
+        return store?.snapshot?.features.contains(Wire.featureImageAttach) ?? false
+    }
+
+    /// Whether another image may be attached to this reply.
+    var canAttachMoreImages: Bool {
+        canAttachImages && attachments.count < ImageAttachmentEncoder.maxPerReply
+    }
+
+    /// Attach an image to the next reply. Ignored past the per-reply limit.
+    func attach(_ image: ImageAttachment) {
+        guard canAttachMoreImages, !attachments.contains(where: { $0.id == image.id }) else { return }
+        attachments.append(image)
+    }
+
+    /// Remove an attached image before sending.
+    func removeAttachment(_ id: String) {
+        attachments.removeAll { $0.id == id }
+    }
+
     // MARK: - Sending (reply / follow-up)
 
-    /// Send the current `draft` as a reply / follow-up: optimistically append it
-    /// (marked pending), clear the field, and track delivery honestly.
+    /// Send the current `draft` (and any attached images) as a reply /
+    /// follow-up: optimistically append it (marked pending), clear the field,
+    /// and track delivery honestly. Images upload first, as chunk commands; the
+    /// reply that names them follows on the same ordered stream.
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !commandsPaused, let sender else { return }
+        let images = canAttachImages ? attachments : []
+        guard !text.isEmpty || !images.isEmpty, !commandsPaused, let sender else { return }
         let localId = Wire.ItemId("local-\(Self.localToken())")
         let issuedAt = now()
-        let handle = sender.send(.reply(sessionId: sessionId, text: text), reusingId: nil)
+        let handle = sendReply(text: text, images: images, reusingId: nil, via: sender)
         outgoing.append(OutgoingMessage(
             localId: localId, text: text, issuedAtMs: issuedAt,
             commandId: handle.commandId,
-            state: ChatSendLogic.outgoingState(for: handle.delivery)))
+            state: ChatSendLogic.outgoingState(for: handle.delivery),
+            images: images))
         commandToOutgoing[handle.commandId] = localId
         draft = ""
+        attachments = []
         track(handle)
+    }
+
+    /// Upload `images`, then send the reply naming them. Only the reply is
+    /// tracked: the desktop refuses it when an image did not arrive, so its
+    /// outcome stands for the whole message.
+    private func sendReply(text: String, images: [ImageAttachment], reusingId: Wire.CommandId?,
+                           via sender: any ChatCommandSending) -> CommandHandle {
+        for image in images {
+            for chunk in image.uploadCommands(for: sessionId) {
+                sender.send(chunk, reusingId: nil)
+            }
+        }
+        return sender.send(.reply(sessionId: sessionId, text: text, imageIds: images.map(\.id)),
+                           reusingId: reusingId)
     }
 
     /// Retry a failed outgoing message. Reuses the original command id when the
@@ -280,7 +331,7 @@ final class ChatViewModel {
               case let .failed(_, reusesId) = outgoing[idx].state else { return }
         let msg = outgoing[idx]
         let reuseId: Wire.CommandId? = reusesId ? msg.commandId : nil
-        let handle = sender.send(.reply(sessionId: sessionId, text: msg.text), reusingId: reuseId)
+        let handle = sendReply(text: msg.text, images: msg.images, reusingId: reuseId, via: sender)
         commandToOutgoing[msg.commandId] = nil
         commandToOutgoing[handle.commandId] = localId
         outgoing[idx].commandId = handle.commandId

@@ -39,7 +39,8 @@ pub use e2e::{
     EventKind, PermissionChoice, PermissionOption, PhoneCommand, ProjectRollup, ProjectState,
     PromptKind, PromptQuestion, PushPayload, QuestionAnswer, RollupUpdate, SessionState,
     SessionStatusDelta, ShellEvent, ShellEventKind, ShellOutput, ShellStream, StateSnapshot,
-    StatusRollup, StatusUpdate, TranscriptFeed, TranscriptItem,
+    StatusRollup, StatusUpdate, TranscriptFeed, TranscriptItem, FEATURE_IMAGE_ATTACH,
+    MAX_IMAGE_CHUNK_BYTES,
 };
 pub use ids::{
     CommandId, DeviceId, EventId, ItemId, PairingId, ProjectId, PromptId, SessionId, ShellId,
@@ -265,13 +266,57 @@ mod tests {
             body: CommandBody::Reply {
                 session_id: SessionId::new("sess_1"),
                 text: "go".into(),
+                image_ids: Vec::new(),
             },
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["command_id"], "cmd_1");
         assert_eq!(v["type"], "reply");
         assert_eq!(v["session_id"], "sess_1");
+        assert!(
+            v.get("image_ids").is_none(),
+            "a plain reply is byte-identical to the pre-image wire"
+        );
         assert_eq!(serde_json::from_value::<PhoneCommand>(v).unwrap(), cmd);
+    }
+
+    #[test]
+    fn image_attach_is_additive_on_the_wire() {
+        // A reply naming uploaded images, and one chunk of an upload.
+        let reply: CommandBody = serde_json::from_value(serde_json::json!({
+            "type": "reply", "session_id": "s", "text": "look", "image_ids": ["up_1"]
+        }))
+        .unwrap();
+        assert_eq!(
+            reply,
+            CommandBody::Reply {
+                session_id: SessionId::new("s"),
+                text: "look".into(),
+                image_ids: vec!["up_1".into()],
+            }
+        );
+        let chunk = CommandBody::AttachImageChunk {
+            session_id: SessionId::new("s"),
+            upload_id: "up_1".into(),
+            format: "jpg".into(),
+            index: 0,
+            count: 2,
+            data: "AAEC".into(),
+        };
+        let v = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(v["type"], "attach_image_chunk");
+        assert_eq!(serde_json::from_value::<CommandBody>(v).unwrap(), chunk);
+
+        // A snapshot from an older desktop has no features; one without any
+        // features serializes without the key.
+        let old: StateSnapshot =
+            serde_json::from_value(serde_json::json!({"server_time_ms": 1, "projects": []}))
+                .unwrap();
+        assert!(old.features.is_empty());
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("features")
+            .is_none());
     }
 
     #[test]

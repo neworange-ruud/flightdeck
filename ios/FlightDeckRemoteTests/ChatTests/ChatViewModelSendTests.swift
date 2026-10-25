@@ -61,7 +61,7 @@ import Foundation
 
         // The reply command was sent with the right body.
         #expect(sender.sends.count == 1)
-        if case let .reply(sessionId, text) = sender.sends.first?.body {
+        if case let .reply(sessionId, text, _) = sender.sends.first?.body {
             #expect(sessionId == Wire.SessionId("s1"))
             #expect(text == "run the tests")
         } else {
