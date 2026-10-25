@@ -1124,7 +1124,8 @@ Every command is a `PhoneCommand`:
 
 | `type` | Key fields | Purpose |
 |--------|-----------|---------|
-| `reply` | `session_id`, `text` | Reply / follow-up prose to an agent. |
+| `reply` | `session_id`, `text`, optional `image_ids[]` | Reply / follow-up prose to an agent. `image_ids` names images uploaded with `attach_image_chunk`; the desktop types each saved image's path ahead of the text and rejects the reply if one never arrived. Omitted when empty. |
+| `attach_image_chunk` | `session_id`, `upload_id`, `format`, `index`, `count`, `data` | One chunk of an image a later `reply` attaches: `data` is base64 of at most 256 KiB (`MAX_IMAGE_CHUNK_BYTES`), so an envelope stays inside the direct link's 1 MiB message limit. `format` is `png`/`jpg`/`gif`/`webp`; an image is at most 10 MB. The desktop saves it once all `count` chunks are in. |
 | `permission_decision` | `session_id`, `prompt_id`, optional `choice`, optional `option_index`, optional `free_text` | Resolve a prompt. Binary fast-path sends `choice` (`allow_once`/`deny`); a `question` answer sends `option_index` (0-based) or `free_text`. Exactly one of the three is set; absent fields are omitted (not `null`). |
 | `new_agent` | `project_id`, `agent_type`, `name`, `base_branch`, `first_task` | Launch a new session (v1 fields only; model/effort inherit desktop defaults). |
 | `restart_agent` | `session_id` | Fresh process, same worktree/branch, transcript preserved. |
@@ -1141,6 +1142,12 @@ Every command is a `PhoneCommand`:
 | `request_snapshot` | `project_id?` | Ask for a fresh snapshot (all or one project). |
 | `request_transcript` | `session_id`, `from_index?` | Ask for a transcript slice (or the whole thing). |
 | `mark_read` | `event_ids[]` | Mark Activity events read. |
+
+**Optional commands.** A `snapshot` may carry `features[]`, the optional
+commands the desktop accepts. `image_attach` covers `attach_image_chunk` and
+`reply.image_ids`. A phone sends those only to a desktop that lists the feature:
+an older desktop drops a command type it cannot parse, and sends no `features`.
+The field and the commands are additive, so there was no version bump.
 
 **Safety invariants preserved (PRD §8):** there is **no push / no PR / no
 GitHub** command — pushing is the agent's job, not the remote's. The only

@@ -119,7 +119,23 @@ pub struct StateSnapshot {
     pub server_time_ms: i64,
     /// All open projects (each stays live in the background).
     pub projects: Vec<ProjectState>,
+    /// Optional commands this desktop accepts, by name (for example
+    /// [`FEATURE_IMAGE_ATTACH`]). A phone offers a feature only when its name is
+    /// listed, so an older desktop, which sends none, is never sent a command
+    /// it would drop. Additive: absent on older desktops, ignored by older
+    /// phones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
+
+/// The desktop accepts [`CommandBody::AttachImageChunk`] and
+/// `CommandBody::Reply::image_ids`.
+pub const FEATURE_IMAGE_ATTACH: &str = "image_attach";
+
+/// The most image bytes one [`CommandBody::AttachImageChunk`] carries (before
+/// base64), so a chunk's envelope stays well inside the direct link's 1 MiB
+/// message limit.
+pub const MAX_IMAGE_CHUNK_BYTES: usize = 256 * 1024;
 
 /// An incremental status change for one session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +590,29 @@ pub enum CommandBody {
         session_id: SessionId,
         /// The reply text.
         text: String,
+        /// Images uploaded earlier with [`CommandBody::AttachImageChunk`], by
+        /// `upload_id`, attached ahead of the text. Sent only to a desktop
+        /// listing [`FEATURE_IMAGE_ATTACH`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        image_ids: Vec<String>,
+    },
+    /// One chunk of an image the phone attaches to a later
+    /// [`CommandBody::Reply`]. An image travels as `count` chunks of at most
+    /// [`MAX_IMAGE_CHUNK_BYTES`]; the desktop saves it once every chunk has
+    /// arrived. Sent only to a desktop listing [`FEATURE_IMAGE_ATTACH`].
+    AttachImageChunk {
+        /// The session the image is for.
+        session_id: SessionId,
+        /// Client-generated id grouping one image's chunks; the reply names it.
+        upload_id: String,
+        /// The image format as a file extension: `png`, `jpg`, `gif`, `webp`.
+        format: String,
+        /// This chunk's 0-based position.
+        index: u32,
+        /// How many chunks the image has.
+        count: u32,
+        /// This chunk's bytes, base64 (standard alphabet, padded).
+        data: String,
     },
     /// Resolve a permission prompt.
     PermissionDecision {

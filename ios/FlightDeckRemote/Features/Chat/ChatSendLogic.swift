@@ -109,8 +109,17 @@ struct OutgoingMessage: Identifiable, Equatable, Sendable {
     var commandId: Wire.CommandId
     /// Current display state.
     var state: OutgoingState
+    /// Images sent ahead of the text, kept so a failed send can be retried.
+    var images: [ImageAttachment] = []
 
     var id: String { localId.rawValue }
+
+    /// What the optimistic row shows: one `[Image]` marker per attached image,
+    /// then the prose.
+    var displayText: String {
+        let markers = images.map { _ in "[Image]" }
+        return (markers + [text]).filter { !$0.isEmpty }.joined(separator: " ")
+    }
 }
 
 /// Namespace for the send / permission / reconciliation state machine.
@@ -208,19 +217,36 @@ enum ChatSendLogic {
     /// dedupes the instant the transcript feed carries it, while a truly
     /// undelivered (failed) message — which never gets echoed — stays visible
     /// with its retry affordance.
+    ///
+    /// A message with images is echoed with each image ahead of the prose (its
+    /// saved path, or the agent's own `[Image #1]` marker), so it matches an
+    /// echo that ENDS with its prose — or, with no prose, one that mentions an
+    /// image — and only at or after its issue time.
     static func isReconciled(_ outgoing: OutgoingMessage,
                              against items: [Wire.TranscriptItem],
                              slackMs: Int64 = reconciliationSlackMs) -> Bool {
         let wanted = outgoing.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !wanted.isEmpty else { return false }
+        let hasImages = !outgoing.images.isEmpty
+        guard !wanted.isEmpty || hasImages else { return false }
         for item in items {
             guard case let .userMessage(_, text, atMs) = item else { continue }
             let candidate = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if candidate == wanted, atMs >= outgoing.issuedAtMs - slackMs {
+            guard atMs >= outgoing.issuedAtMs - slackMs else { continue }
+            if !hasImages {
+                if candidate == wanted { return true }
+            } else if wanted.isEmpty {
+                if mentionsImage(candidate), atMs >= outgoing.issuedAtMs { return true }
+            } else if candidate.hasSuffix(wanted), candidate.count > wanted.count {
                 return true
             }
         }
         return false
+    }
+
+    /// Whether an echoed user message refers to an attached image.
+    private static func mentionsImage(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return ["[image", ".jpg", ".jpeg", ".png", ".gif", ".webp"].contains { lower.contains($0) }
     }
 
     /// The subset of `outgoing` that has NOT yet been reconciled against the

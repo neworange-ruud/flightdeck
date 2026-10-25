@@ -270,6 +270,7 @@ fn snap(sessions: Vec<SessionState>) -> StateSnapshot {
     StateSnapshot {
         server_time_ms: 0,
         projects: vec![project],
+        features: Vec::new(),
     }
 }
 

@@ -470,6 +470,35 @@ struct ProtocolFixtureConformanceTests {
             text: "Yes, run it. Then rebuild."))
     }
 
+    @Test func imageAttachFixturesDecode() throws {
+        // remote-control-ty3p: a reply naming uploaded images, one upload chunk,
+        // and a snapshot advertising the feature.
+        let reply = try JSONDecoder().decode(
+            Wire.PhoneCommand.self, from: try fixture("phone_to_desktop", "reply_with_images"))
+        #expect(reply.body == .reply(sessionId: Wire.SessionId("sess_fix_login"),
+                                     text: "This is what the login page shows.",
+                                     imageIds: ["up_7f3a"]))
+
+        let chunk = try JSONDecoder().decode(
+            Wire.PhoneCommand.self, from: try fixture("phone_to_desktop", "attach_image_chunk"))
+        #expect(chunk.body == .attachImageChunk(sessionId: Wire.SessionId("sess_fix_login"),
+                                                uploadId: "up_7f3a", format: "jpg",
+                                                index: 0, count: 1, data: "/9j/4AAQSkZJRgABAQ=="))
+
+        let message = try JSONDecoder().decode(
+            Wire.DesktopToPhone.self, from: try fixture("desktop_to_phone", "snapshot_features"))
+        guard case let .snapshot(snapshot) = message else {
+            Issue.record("expected .snapshot, got \(message)")
+            return
+        }
+        #expect(snapshot.features == [Wire.featureImageAttach])
+
+        // An older desktop's snapshot has no features: nothing is offered.
+        let old = try JSONDecoder().decode(
+            Wire.DesktopToPhone.self, from: try fixture("desktop_to_phone", "snapshot"))
+        if case let .snapshot(snapshot) = old { #expect(snapshot.features.isEmpty) }
+    }
+
     @Test func machineNameFrameDecodesPairingIdAndName() throws {
         let data = try fixture("relay", "machine_name")
         let frame = try JSONDecoder().decode(Wire.RelayFrame.self, from: data)

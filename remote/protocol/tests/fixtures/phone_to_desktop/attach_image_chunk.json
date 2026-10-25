@@ -1,0 +1,11 @@
+{
+  "command_id": "cmd_00000020",
+  "issued_at_ms": 1752412812000,
+  "type": "attach_image_chunk",
+  "session_id": "sess_fix_login",
+  "upload_id": "up_7f3a",
+  "format": "jpg",
+  "index": 0,
+  "count": 1,
+  "data": "/9j/4AAQSkZJRgABAQ=="
+}

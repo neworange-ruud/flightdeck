@@ -15,7 +15,12 @@
 //  keyboard's dictation key is reachable — the v1 affordance, still available
 //  (and the only behaviour when no hold-to-talk handler is wired).
 //
+//  Images (remote-control-ty3p): when the desktop accepts them, a photo button
+//  opens the system photo picker; picks are downscaled off the main thread and
+//  shown as removable thumbnails above the field until the reply is sent.
+//
 
+import PhotosUI
 import SwiftUI
 
 struct ChatComposeBar: View {
@@ -36,11 +41,24 @@ struct ChatComposeBar: View {
     /// Push-to-talk hold ended (mic released) — the controller stops recording
     /// and either drops the transcript in or (on a mis-tap) triggers the field.
     var onHoldEnd: (() -> Void)?
+    /// Images attached to the reply, shown as removable thumbnails.
+    var attachments: [ImageAttachment] = []
+    /// How many more images may be attached; `0` hides the photo button (the
+    /// desktop does not accept images, or the reply is full).
+    var attachSlots: Int = 0
+    /// A picked image, ready to attach.
+    var onAttach: ((ImageAttachment) -> Void)?
+    /// Remove an attached image by id.
+    var onRemoveAttachment: ((String) -> Void)?
 
     @FocusState private var isFocused: Bool
     /// When the mic is pressed, the wall-clock press start — a release before
     /// `quickTapThreshold` is treated as a tap (focus the field), not a hold.
     @State private var pressStart: Date?
+    /// The photo picker's current selection, drained into `onAttach`.
+    @State private var pickerItems: [PhotosPickerItem] = []
+    /// Shown when a picked item could not be turned into an attachment.
+    @State private var attachError: String?
 
     /// Below this hold duration a mic press is a tap (focus the field), not a
     /// dictation. Matches `DictationStateMachine.minimumHoldDuration`.
@@ -52,7 +70,7 @@ struct ChatComposeBar: View {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var canSend: Bool { !trimmed.isEmpty && !commandsPaused }
+    private var canSend: Bool { (!trimmed.isEmpty || !attachments.isEmpty) && !commandsPaused }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
@@ -63,9 +81,21 @@ struct ChatComposeBar: View {
                     .typography(Typography.caption)
                     .foregroundStyle(Theme.textDim)
                     .accessibilityIdentifier("compose-paused-label")
+            } else if let attachError {
+                Text(attachError)
+                    .typography(Typography.caption)
+                    .foregroundStyle(Theme.textDim)
+                    .accessibilityIdentifier("compose-attach-error")
+            }
+
+            if !attachments.isEmpty {
+                attachmentStrip
             }
 
             HStack(alignment: .bottom, spacing: Theme.Spacing.sm) {
+                if attachSlots > 0 || !attachments.isEmpty {
+                    photoButton
+                }
                 micButton
 
                 TextField("", text: $text, axis: .vertical)
@@ -100,6 +130,83 @@ struct ChatComposeBar: View {
         .background(Theme.bgDeep)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat-compose-bar")
+    }
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Spacing.sm) {
+                ForEach(attachments) { image in
+                    thumbnail(image)
+                }
+            }
+        }
+        .accessibilityIdentifier("compose-attachments")
+    }
+
+    private func thumbnail(_ image: ImageAttachment) -> some View {
+        Group {
+            if let ui = UIImage(data: image.data) {
+                Image(uiImage: ui).resizable().scaledToFill()
+            } else {
+                Theme.bgField
+            }
+        }
+        .frame(width: 56, height: 56)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .overlay(alignment: .topTrailing) {
+            Button {
+                onRemoveAttachment?(image.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(Theme.textPrimary, Theme.bgDeep)
+            }
+            .buttonStyle(.plain)
+            .offset(x: 6, y: -6)
+            .accessibilityLabel("Remove image")
+            .accessibilityIdentifier("compose-remove-attachment")
+        }
+        .padding(.top, 6)
+        .padding(.trailing, 6)
+    }
+
+    private var photoButton: some View {
+        PhotosPicker(selection: $pickerItems,
+                     maxSelectionCount: max(attachSlots, 1),
+                     selectionBehavior: .ordered,
+                     matching: .images) {
+            Image(systemName: "photo")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(attachSlots > 0 ? Theme.textMuted : Theme.textDim)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(Theme.bgField))
+        }
+        .disabled(attachSlots == 0)
+        .accessibilityLabel("Attach a photo")
+        .accessibilityIdentifier("compose-attach-photo")
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            pickerItems = []
+            Task { await attach(items) }
+        }
+    }
+
+    /// Load and downscale the picked items off the main thread, then attach
+    /// each in pick order.
+    private func attach(_ items: [PhotosPickerItem]) async {
+        attachError = nil
+        for item in items {
+            let data = try? await item.loadTransferable(type: Data.self)
+            let image = await Task.detached(priority: .userInitiated) {
+                data.flatMap { ImageAttachmentEncoder.attachment(from: $0) }
+            }.value
+            if let image {
+                onAttach?(image)
+            } else {
+                attachError = "That photo could not be attached."
+            }
+        }
     }
 
     private var listeningIndicator: some View {

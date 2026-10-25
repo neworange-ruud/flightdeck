@@ -192,7 +192,7 @@ import CryptoKit
         if case let .envelope(env) = phoneEnv {
             let command = try desktop.openPhoneCommand(env)
             #expect(command.commandId == cmdId)
-            if case let .reply(_, text) = command.body { #expect(text == "live round trip") }
+            if case let .reply(_, text, _) = command.body { #expect(text == "live round trip") }
         }
 
         await client.stop()

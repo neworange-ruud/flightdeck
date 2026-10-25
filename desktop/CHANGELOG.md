@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Attach images from the iOS app.** The chat composer has a photo button. Pick up to four images, and they are sent with your reply: the host saves each one and types its path ahead of your text, the same way a pasted image is attached on the desktop (container paths are mapped for containerized agents). Photos are scaled down to 2048 px JPEG on the phone and sent in 256 KB pieces, so they also work over the direct link. The button only appears when the host is new enough to accept images.
 
 ### Improvements
 

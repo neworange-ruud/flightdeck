@@ -346,6 +346,8 @@ pub struct RemoteBridge {
     /// has rendered or the Ink TUI drops it (remote-control-dc9). Flushed by
     /// `service_remote_commands` once `due_ms` passes.
     deferred_pty: Vec<(SessionId, u64, Vec<u8>)>,
+    /// Images the phone is attaching to a reply (remote-control-ty3p).
+    images: crate::remote::images::ImageUploads,
 }
 
 impl RemoteBridge {
@@ -387,6 +389,7 @@ impl RemoteBridge {
             out_seq: 0,
             last_unpaired_sync_ms: None,
             deferred_pty: Vec::new(),
+            images: Default::default(),
         }
     }
 
@@ -871,6 +874,11 @@ impl RemoteBridge {
             .and_then(|b| b.last_prompt_id())
     }
 
+    /// Images the phone is attaching to a reply, reassembled from their chunks.
+    pub fn images(&mut self) -> &mut crate::remote::images::ImageUploads {
+        &mut self.images
+    }
+
     /// The prompt `session_id` is waiting on right now, as the phone was sent
     /// it — or `None` when the session is not waiting, or is waiting but its
     /// prompt has not been surfaced yet (a Claude wait inside the
@@ -1301,6 +1309,7 @@ impl RemoteBridge {
         StateSnapshot {
             server_time_ms: now_ms as i64,
             projects: out,
+            features: vec![flightdeck_remote_protocol::FEATURE_IMAGE_ATTACH.to_string()],
         }
     }
 

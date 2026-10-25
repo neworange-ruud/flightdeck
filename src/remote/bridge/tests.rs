@@ -257,6 +257,11 @@ fn a_repeat_phone_connected_presence_still_rearms_the_snapshot() {
         snap.projects[0].sessions[0].name, "connection-issues-v2",
         "the snapshot must carry the CURRENT session set, not the stale one"
     );
+    assert_eq!(
+        snap.features,
+        vec![flightdeck_remote_protocol::FEATURE_IMAGE_ATTACH.to_string()],
+        "the phone offers image attach only to a desktop that lists it"
+    );
 }
 
 // --- snapshot on connect ---------------------------------------------------
@@ -735,6 +740,7 @@ fn unknown_command_is_queued_for_command_bridge() {
         body: CommandBody::Reply {
             session_id: SessionId::new("t1"),
             text: "keep going".to_string(),
+            image_ids: Vec::new(),
         },
     };
     b.handle_inbound(RemoteInbound::Envelope(envelope(&cmd)));

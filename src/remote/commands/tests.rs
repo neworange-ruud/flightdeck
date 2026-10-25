@@ -87,6 +87,7 @@ fn reply_translates_to_bracketed_paste_plus_enter() {
         &CommandBody::Reply {
             session_id: SessionId::new("t1"),
             text: "fix the tests\nplease".to_string(),
+            image_ids: Vec::new(),
         },
         &index,
     );
@@ -120,6 +121,7 @@ fn reply_without_bracketed_paste_sends_raw_text_plus_enter() {
         &CommandBody::Reply {
             session_id: SessionId::new("t1"),
             text: "run it\n".to_string(),
+            image_ids: Vec::new(),
         },
         &index,
     );
@@ -142,6 +144,7 @@ fn reply_rejections() {
             &CommandBody::Reply {
                 session_id: SessionId::new("nope"),
                 text: "hi".to_string(),
+                image_ids: Vec::new(),
             },
             &index,
         ),
@@ -153,6 +156,7 @@ fn reply_rejections() {
             &CommandBody::Reply {
                 session_id: SessionId::new("t1"),
                 text: "  \n".to_string(),
+                image_ids: Vec::new(),
             },
             &index,
         ),
@@ -167,6 +171,7 @@ fn reply_rejections() {
             &CommandBody::Reply {
                 session_id: SessionId::new("t2"),
                 text: "hi".to_string(),
+                image_ids: Vec::new(),
             },
             &index,
         ),
@@ -187,6 +192,7 @@ fn reply_to_not_started_agent_resumes_and_defers() {
         &CommandBody::Reply {
             session_id: SessionId::new("t2"),
             text: "resume and go".to_string(),
+            image_ids: Vec::new(),
         },
         &index,
     );
@@ -213,6 +219,7 @@ fn reply_to_stopped_agent_still_rejects() {
             &CommandBody::Reply {
                 session_id: SessionId::new("t2"),
                 text: "hi".to_string(),
+                image_ids: Vec::new(),
             },
             &index,
         ),

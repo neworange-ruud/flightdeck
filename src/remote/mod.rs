@@ -45,6 +45,7 @@ pub mod debuglog;
 pub mod direct;
 pub mod feed;
 pub mod identity;
+pub mod images;
 pub mod notifier;
 pub mod opencode;
 pub mod pairing;

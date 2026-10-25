@@ -401,6 +401,7 @@ fn remote_capabilities_end_to_end() {
     let reply_cmd = h.phone.command(CommandBody::Reply {
         session_id: session_a_id.clone(),
         text: REPLY_TEXT.to_string(),
+        image_ids: Vec::new(),
     });
     let ack = await_ack(&mut h.phone, &reply_cmd, ACK_TIMEOUT);
     assert_eq!(
@@ -1203,6 +1204,7 @@ fn a_desktop_push_reaches_the_relay_over_the_live_socket() {
     let reply = h.phone.command(CommandBody::Reply {
         session_id: session.session_id.clone(),
         text: "__WAIT__".to_string(),
+        image_ids: Vec::new(),
     });
     let ack = await_ack(&mut h.phone, &reply, ACK_TIMEOUT);
     assert_eq!(ack.outcome, CommandOutcome::Applied, "{:?}", ack.message);
