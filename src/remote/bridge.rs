@@ -219,6 +219,11 @@ pub struct RemoteBridge {
     /// AskUserQuestion to be ingested from the JSONL before falling back to the
     /// binary allow/deny prompt (remote-control-qa1). Absent once resolved.
     needs_input_since: HashMap<SessionId, u64>,
+    /// For OpenCode sessions whose plugin can answer a permission through
+    /// OpenCode's own API: the prompt the phone was shown and the OpenCode
+    /// permission request it answers (remote-control-9dnm). Set on the
+    /// needs-input edge, dropped when the wait ends.
+    agent_requests: HashMap<SessionId, (PromptId, String)>,
     /// The push decision layered on the arming edges (remote-control-fglt).
     push: PushDecider,
     /// Pushes decided but not yet taken by the sender
@@ -361,6 +366,7 @@ impl RemoteBridge {
             previews: HashMap::new(),
             prev_status: HashMap::new(),
             needs_input_since: HashMap::new(),
+            agent_requests: HashMap::new(),
             push: PushDecider::new(),
             push_intents: Vec::new(),
             held_needs_input: HashMap::new(),
@@ -871,6 +877,14 @@ impl RemoteBridge {
             .and_then(|b| b.last_prompt_id())
     }
 
+    /// The OpenCode permission request the session's pending prompt answers,
+    /// when its plugin replies through OpenCode's API instead of keystrokes —
+    /// only while that prompt is still the pending one.
+    pub fn pending_agent_request(&self, session_id: &str) -> Option<String> {
+        let (prompt_id, request) = self.agent_requests.get(&SessionId::new(session_id))?;
+        (self.pending_prompt_id(session_id).as_ref() == Some(prompt_id)).then(|| request.clone())
+    }
+
     /// The prompt `session_id` is waiting on right now, as the phone was sent
     /// it — or `None` when the session is not waiting, or is waiting but its
     /// prompt has not been surfaced yet (a Claude wait inside the
@@ -985,6 +999,7 @@ impl RemoteBridge {
                 let is_opencode = matches!(backend, Some(StatusBackend::OpenCode));
                 let is_claude = matches!(backend, Some(StatusBackend::Claude));
                 if now_needs && !was_needs {
+                    self.agent_requests.remove(&sid);
                     // Read the agent's prompt sidecar BEFORE `on_needs_input` so a
                     // captured structured prompt supplants the binary fallback:
                     // OpenCode's plugin writes `agent-prompt.json`; Claude's
@@ -993,12 +1008,13 @@ impl RemoteBridge {
                     // flips to `waiting`, so it is present on this edge and the
                     // real question shows immediately — never the binary card whose
                     // keystroke would answer it (remote-control-qa1).
-                    let sidecar = if is_opencode {
+                    let (sidecar, agent_request) = if is_opencode {
                         read_prompt_sidecar(&status_root)
+                            .map_or((None, None), |(sp, request)| (Some(sp), request))
                     } else if is_claude {
-                        read_claude_question_sidecar(&status_root)
+                        (read_claude_question_sidecar(&status_root), None)
                     } else {
-                        None
+                        (None, None)
                     };
                     let builder = self
                         .transcripts
@@ -1029,6 +1045,13 @@ impl RemoteBridge {
                     }
                     if is_opencode {
                         let _ = std::fs::remove_file(prompt_sidecar_path(&status_root));
+                        // Remember which OpenCode permission this prompt answers,
+                        // so the phone's decision is replied through the plugin.
+                        let prompt_id = self.transcripts.get(&sid).and_then(|b| b.last_prompt_id());
+                        if let (Some(prompt_id), Some(request)) = (prompt_id, agent_request) {
+                            self.agent_requests
+                                .insert(sid.clone(), (prompt_id, request));
+                        }
                     }
                     if is_claude {
                         // Consume the sidecar so a later, unrelated wait never
@@ -1058,6 +1081,7 @@ impl RemoteBridge {
                 } else if !now_needs && was_needs {
                     self.previews.remove(&sid);
                     self.needs_input_since.remove(&sid);
+                    self.agent_requests.remove(&sid);
                     // The prompt was answered (agent left needs-input) — clear the
                     // open-prompt dedup guard so the NEXT question in this session
                     // surfaces as a fresh prompt instead of being suppressed as a
@@ -1517,10 +1541,11 @@ impl RemoteBridge {
 /// The plugin normalizes OpenCode's (undocumented) `event.properties` into this
 /// stable shape, so the reader only depends on `kind`/`text`/`options`.
 ///
-/// EMPIRICAL ASSUMPTION: OpenCode's `event.properties` field names are
-/// unverified. The plugin probes several likely names; if it cannot extract
-/// options it writes an empty array and this reader returns `None` so the
-/// bridge keeps the binary allow/deny fallback.
+/// A permission's shape is known (`{id, sessionID, permission, patterns,
+/// metadata}`, captured from OpenCode 1.18): the plugin describes it and offers
+/// Allow once / Reject. A question's field names are still probed; if the
+/// plugin cannot extract options it writes an empty array and this reader
+/// returns `None` so the bridge keeps the binary allow/deny fallback.
 #[derive(serde::Deserialize)]
 struct PromptSidecar {
     kind: String,
@@ -1532,6 +1557,10 @@ struct PromptSidecar {
     /// OpenCode runtime plugin probes `multiple`/`multiSelect` and writes this.
     #[serde(default)]
     multiple: bool,
+    /// The OpenCode permission request id, present only when the plugin can
+    /// reply to it through OpenCode's API (see [`agent_reply_path`]).
+    #[serde(default, rename = "requestID")]
+    request_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1596,21 +1625,23 @@ fn classify_permission_choice(label: &str) -> Option<PermissionChoice> {
     }
 }
 
-/// Read and parse the OpenCode prompt sidecar into a [`StructuredPrompt`], or
-/// `None` (binary fallback) when the file is absent, malformed, or optionless.
+/// Read and parse the OpenCode prompt sidecar into a [`StructuredPrompt`] and
+/// the permission request id the plugin can reply to (if any), or `None`
+/// (binary fallback) when the file is absent, malformed, or optionless.
 ///
 /// - `kind == "question"` → [`PromptKind::Question`], `allow_free_text = true`,
 ///   options carry no binary choice (index/label/description only).
 /// - `kind == "permission"` → [`PromptKind::Permission`], `allow_free_text =
 ///   false`; each option must classify to allow/deny — if any label is unclear
 ///   the whole structured prompt is abandoned in favour of the binary fallback.
-fn read_prompt_sidecar(status_root: &Path) -> Option<StructuredPrompt> {
+fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<String>)> {
     let raw = std::fs::read_to_string(prompt_sidecar_path(status_root)).ok()?;
     let parsed: PromptSidecar = serde_json::from_str(&raw).ok()?;
     if parsed.options.is_empty() {
         return None;
     }
-    match parsed.kind.as_str() {
+    let request_id = parsed.request_id.filter(|id| !id.is_empty());
+    let prompt = match parsed.kind.as_str() {
         "question" => {
             let options = parsed
                 .options
@@ -1658,7 +1689,21 @@ fn read_prompt_sidecar(status_root: &Path) -> Option<StructuredPrompt> {
             })
         }
         _ => None,
-    }
+    }?;
+    // Only a permission is answered through the plugin; a question is typed.
+    let request_id = request_id.filter(|_| prompt.kind == PromptKind::Permission);
+    Some((prompt, request_id))
+}
+
+/// Where FlightDeck writes a phone's answer to an OpenCode permission for the
+/// plugin to reply through OpenCode's API (sibling of the prompt sidecar under
+/// `status_root`). The plugin polls for it while a permission is waiting; an
+/// injected Enter was acknowledged but never reached OpenCode's permission
+/// dialog (remote-control-9dnm).
+pub(crate) fn agent_reply_path(status_root: &Path) -> PathBuf {
+    status_root
+        .join(".flightdeck")
+        .join("agent-prompt-reply.json")
 }
 
 /// A short label for a [`DesktopToPhone`] variant, for the diagnostic log.
