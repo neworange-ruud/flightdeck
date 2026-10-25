@@ -28,6 +28,11 @@ const OPENCODE_CHECKLIST: &str = r#"{"kind":"question","text":"Which checks?","m
 /// The OpenCode permission from the bridge's sidecar tests.
 const OPENCODE_PERMISSION: &str = r#"{"kind":"permission","text":"Run rm -rf?","options":[
     {"label":"Allow once"},{"label":"Deny"}]}"#;
+/// An OpenCode permission the runtime plugin can reply to through OpenCode's
+/// API (it carries the request id).
+const OPENCODE_PLUGIN_PERMISSION: &str = r#"{"kind":"permission",
+    "text":"Access external directory /elsewhere\n- /elsewhere/*",
+    "options":[{"label":"Allow once"},{"label":"Reject"}],"requestID":"per_1"}"#;
 /// The Claude AskUserQuestion hook payload from the bridge's sidecar tests.
 const CLAUDE_QUESTION: &str = r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Lunch?","header":"L","options":[{"label":"Pizza","description":"cheesy"},{"label":"Sushi"}]}]}}"#;
 /// A Claude AskUserQuestion carrying two questions: a tabbed form.
@@ -346,6 +351,50 @@ fn an_inline_answer_types_exactly_what_the_phone_types_on_the_same_ticks() {
             bytes,
             "{agent} {answer:?}"
         );
+    }
+}
+
+#[test]
+fn an_opencode_permission_is_answered_through_the_plugin_not_typed() {
+    for (answer, reply) in [
+        (PromptAnswer::Approve, "once"),
+        (PromptAnswer::Deny, "reject"),
+    ] {
+        for remote in [false, true] {
+            let fakes = Fakes::new();
+            let mut w = waiting(
+                &fakes,
+                "opencode",
+                Sidecar::OpenCode(OPENCODE_PLUGIN_PERMISSION),
+                remote,
+            );
+            let view = w.prompt().expect("the permission is offered");
+            assert_eq!(view.shape, PromptShape::Binary);
+            assert!(
+                view.text
+                    .starts_with("Access external directory /elsewhere"),
+                "the phone shows what OpenCode asks, not the agent's last prose: {:?}",
+                view.text
+            );
+            if remote {
+                w.phone_answers(answer);
+            } else {
+                w.answer(answer);
+            }
+            let typed = timeline(&mut w, &fakes, 5);
+            assert!(
+                typed.iter().all(Vec::is_empty),
+                "{answer:?} (remote: {remote}): no keystroke reaches OpenCode's dialog"
+            );
+            let reply_file = crate::remote::bridge::agent_reply_path(w._root.path());
+            let written: serde_json::Value =
+                serde_json::from_str(&fakes.fs.read_to_string(&reply_file).unwrap()).unwrap();
+            assert_eq!(
+                written,
+                serde_json::json!({ "requestID": "per_1", "reply": reply }),
+                "{answer:?} (remote: {remote})"
+            );
+        }
     }
 }
 
