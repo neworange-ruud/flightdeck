@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode no longer hangs after you answer one of several permission requests.** When OpenCode asked for several permissions at once (one per parallel tool call), the phone and the inline prompt only offered the last one. Answering it left the others pending, so the agent stayed blocked with nothing left to answer. FlightDeck now offers them one after another, in the order OpenCode's own dialog shows them, and the session stays waiting until the last one is answered.
 
 ## [0.9.0] - 2026-10-25
 

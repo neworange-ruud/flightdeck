@@ -1066,6 +1066,33 @@ impl RemoteBridge {
                         // reuses this question.
                         let _ = std::fs::remove_file(claude_question_sidecar_path(&status_root));
                     }
+                } else if now_needs
+                    && was_needs
+                    && is_opencode
+                    && prompt_sidecar_path(&status_root).exists()
+                {
+                    // Still waiting, but on the next prompt: OpenCode asks one
+                    // permission per parallel tool call and the plugin writes
+                    // the sidecar again once the shown one is answered, without
+                    // leaving `waiting` (remote-control-v9x2).
+                    let next = read_prompt_sidecar(&status_root);
+                    let _ = std::fs::remove_file(prompt_sidecar_path(&status_root));
+                    if let Some((sp, request)) = next {
+                        let builder = self
+                            .transcripts
+                            .entry(sid.clone())
+                            .or_insert_with(|| TranscriptBuilder::new(sid.clone()));
+                        builder.clear_open_prompt();
+                        builder.set_structured_prompt(sp);
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                        self.agent_requests.remove(&sid);
+                        let prompt_id = builder.last_prompt_id();
+                        if let (Some(prompt_id), Some(request)) = (prompt_id, request) {
+                            self.agent_requests
+                                .insert(sid.clone(), (prompt_id, request));
+                        }
+                    }
                 } else if now_needs && was_needs {
                     // Still waiting with a deferred Claude binary fallback: resolve
                     // it once the AskUserQuestion has been ingested (surface the

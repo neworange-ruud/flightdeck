@@ -59,6 +59,8 @@ struct Waiting<'f> {
     tab_id: String,
     /// Holds the sidecars; the tab's status root.
     _root: TempDir,
+    /// Phone commands sent so far, so each gets a fresh id and seq.
+    phone_sent: u64,
 }
 
 fn agent_def(fakes: &Fakes, agent: &str) -> AgentDef {
@@ -134,6 +136,7 @@ fn waiting<'f>(fakes: &'f Fakes, agent: &str, sidecar: Sidecar, remote: bool) ->
         pty,
         tab_id,
         _root: root,
+        phone_sent: 0,
     }
 }
 
@@ -165,8 +168,10 @@ impl Waiting<'_> {
             PromptAnswer::Deny => (Some(PermissionChoice::Deny), None),
             PromptAnswer::Option(i) => (None, Some(i)),
         };
+        self.phone_sent += 1;
+        let seq = self.phone_sent;
         let cmd = PhoneCommand {
-            command_id: CommandId::new("c1"),
+            command_id: CommandId::new(format!("c{seq}")),
             issued_at_ms: 0,
             body: CommandBody::PermissionDecision {
                 session_id: SessionId::new(self.tab_id.clone()),
@@ -179,14 +184,14 @@ impl Waiting<'_> {
             },
         };
         let plain = serde_json::to_vec(&cmd).unwrap();
-        let (nonce, ciphertext) = passthrough_seal()(&plain, 1, 0).unwrap();
+        let (nonce, ciphertext) = passthrough_seal()(&plain, seq, 0).unwrap();
         self.host
             .remote_bridge
             .as_mut()
             .unwrap()
             .handle_inbound(RemoteInbound::Envelope(EncryptedEnvelope {
                 pairing_id: PairingId::new("pair-1"),
-                seq: 1,
+                seq,
                 sender: Role::Phone,
                 sent_at_ms: 0,
                 nonce,
@@ -395,6 +400,64 @@ fn an_opencode_permission_is_answered_through_the_plugin_not_typed() {
                 "{answer:?} (remote: {remote})"
             );
         }
+    }
+}
+
+#[test]
+fn queued_opencode_permissions_are_offered_one_after_another() {
+    // OpenCode asks once per parallel tool call; the plugin shows the oldest and,
+    // once it is replied, writes the next sidecar without leaving `waiting`
+    // (remote-control-v9x2).
+    for remote in [false, true] {
+        let fakes = Fakes::new();
+        let mut w = waiting(
+            &fakes,
+            "opencode",
+            Sidecar::OpenCode(OPENCODE_PLUGIN_PERMISSION),
+            remote,
+        );
+        let first = w.prompt().expect("the first permission is offered");
+        if remote {
+            w.phone_answers(PromptAnswer::Approve);
+        } else {
+            w.answer(PromptAnswer::Approve);
+        }
+        timeline(&mut w, &fakes, 2);
+
+        let dir = w._root.path().join(".flightdeck");
+        std::fs::write(
+            dir.join("agent-prompt.json"),
+            r#"{"kind":"permission","text":"Access external directory /other\n- /other/*",
+                "options":[{"label":"Allow once"},{"label":"Reject"}],"requestID":"per_2"}"#,
+        )
+        .unwrap();
+        fakes
+            .fs
+            .write(&dir.join("agent-status"), "working\nwaiting\nwaiting\n")
+            .unwrap();
+        timeline(&mut w, &fakes, 2);
+
+        let next = w.prompt().expect("the next permission is offered");
+        assert_ne!(next.prompt_id, first.prompt_id, "remote: {remote}");
+        assert!(
+            next.text.starts_with("Access external directory /other"),
+            "remote: {remote}: {:?}",
+            next.text
+        );
+        if remote {
+            w.phone_answers(PromptAnswer::Approve);
+        } else {
+            w.answer(PromptAnswer::Approve);
+        }
+        timeline(&mut w, &fakes, 2);
+        let reply_file = crate::remote::bridge::agent_reply_path(w._root.path());
+        let written: serde_json::Value =
+            serde_json::from_str(&fakes.fs.read_to_string(&reply_file).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "requestID": "per_2", "reply": "once" }),
+            "remote: {remote}"
+        );
     }
 }
 

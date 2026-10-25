@@ -500,11 +500,21 @@ export const FlightDeckStatus = async ({ client } = {}) => {
           })
       : null;
   const replyFile = join(fdDir, "agent-prompt-reply.json");
-  // requestID -> sessionID for every permission awaiting an answer.
-  const awaiting = new Map();
+  const sidecarFile = join(fdDir, "agent-prompt.json");
+  // Every permission OpenCode is waiting on, oldest first: requestID ->
+  // {sessionID, prompt}. OpenCode asks once per parallel tool call (four
+  // external_directory requests within 18ms, remote-control-v9x2) and its
+  // dialog takes them in order, so the sidecar shows only the oldest and a
+  // reply moves on to the next rather than reporting `working` while the rest
+  // still block the session.
+  const pending = new Map();
+  const showOldest = () => {
+    const oldest = pending.values().next().value;
+    if (oldest) writeFileSync(sidecarFile, JSON.stringify(oldest.prompt));
+  };
   let poll = null;
   const stopPolling = () => {
-    if (poll && awaiting.size === 0) {
+    if (poll && pending.size === 0) {
       clearInterval(poll);
       poll = null;
     }
@@ -520,14 +530,12 @@ export const FlightDeckStatus = async ({ client } = {}) => {
     try {
       unlinkSync(replyFile);
     } catch (_) {}
-    const sessionID = awaiting.get(r?.requestID);
-    if (!sessionID || (r.reply !== "once" && r.reply !== "reject")) return;
-    awaiting.delete(r.requestID);
-    stopPolling();
-    Promise.resolve(replyToPermission(sessionID, r.requestID, r.reply)).catch(() => {});
+    const entry = pending.get(r?.requestID);
+    if (!entry || (r.reply !== "once" && r.reply !== "reject")) return;
+    // permission.replied removes it and shows the next one.
+    Promise.resolve(replyToPermission(entry.sessionID, r.requestID, r.reply)).catch(() => {});
   };
-  const awaitReply = (requestID, sessionID) => {
-    awaiting.set(requestID, sessionID);
+  const startPolling = () => {
     if (!poll) {
       poll = setInterval(checkReply, 200);
       poll.unref?.();
@@ -581,11 +589,17 @@ export const FlightDeckStatus = async ({ client } = {}) => {
           text: describePermission(p),
           options: [{ label: "Allow once" }, { label: "Reject" }],
         };
-        if (replyToPermission && typeof p.id === "string" && typeof p.sessionID === "string") {
-          prompt.requestID = p.id;
-          awaitReply(p.id, p.sessionID);
+        if (typeof p.id !== "string") {
+          writeFileSync(sidecarFile, JSON.stringify(prompt));
+          return;
         }
-        writeFileSync(join(fdDir, "agent-prompt.json"), JSON.stringify(prompt));
+        if (replyToPermission && typeof p.sessionID === "string") {
+          prompt.requestID = p.id;
+          startPolling();
+        }
+        pending.set(p.id, { sessionID: p.sessionID, prompt });
+        // A later request waits its turn behind the one FlightDeck shows.
+        if (pending.size === 1) showOldest();
         return;
       }
       // OpenCode's question payload uses `questions[]` (each with `options`/
@@ -618,20 +632,34 @@ export const FlightDeckStatus = async ({ client } = {}) => {
       );
       const multiple = Boolean(q.multiple ?? q.multiSelect ?? p.multiple ?? false);
       writeFileSync(
-        join(fdDir, "agent-prompt.json"),
+        sidecarFile,
         JSON.stringify({ kind: "question", text: String(text), options, multiple }),
       );
     } catch (_) {}
+  };
+  // An idle session has nothing left to ask; forget what it was waiting on.
+  const forgetSession = (sessionID) => {
+    for (const [id, entry] of pending) {
+      if (!sessionID || entry.sessionID === sessionID) pending.delete(id);
+    }
+    stopPolling();
   };
   return {
     event: async ({ event }) => {
       if (event.type === "session.status") {
         const type = event.properties?.status?.type;
-        if (type === "idle") write("idle");
-        if (type === "busy" || type === "retry") write("working");
+        if (type === "idle") {
+          forgetSession(event.properties?.sessionID);
+          write("idle");
+        }
+        // Busy while a permission is still open is not working yet.
+        if ((type === "busy" || type === "retry") && pending.size === 0) write("working");
         return;
       }
-      if (event.type === "session.idle") write("idle");
+      if (event.type === "session.idle") {
+        forgetSession(event.properties?.sessionID);
+        write("idle");
+      }
       if (event.type === "permission.asked" || event.type === "question.asked") {
         // The sidecar first: FlightDeck reads it on the edge to `waiting`.
         writePrompt(event);
@@ -639,8 +667,20 @@ export const FlightDeckStatus = async ({ client } = {}) => {
         return;
       }
       if (event.type === "permission.replied") {
-        awaiting.delete(event.properties?.requestID ?? event.properties?.permissionID);
+        const id = event.properties?.requestID ?? event.properties?.permissionID;
+        const wasShown = pending.keys().next().value === id;
+        pending.delete(id);
         stopPolling();
+        if (pending.size > 0) {
+          // Still blocked on the next one: show it and stay `waiting`.
+          if (wasShown) {
+            try {
+              showOldest();
+            } catch (_) {}
+          }
+          write("waiting");
+          return;
+        }
       }
       if (
         event.type === "permission.replied" ||
