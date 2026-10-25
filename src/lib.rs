@@ -3573,7 +3573,12 @@ pub(crate) fn session_index(
             cache: &p.cache,
         })
         .collect();
-    build_index(&views, now_ms, &|sid| bridge.pending_prompt_id(sid))
+    build_index(
+        &views,
+        now_ms,
+        &|sid| bridge.pending_prompt_id(sid),
+        &|sid| bridge.pending_agent_request(sid),
+    )
 }
 
 /// The inline view of the prompt session `tab_id` of project `project` is
@@ -3884,6 +3889,39 @@ fn execute_remote_translation(
                     CommandOutcome::Failed,
                     Some("could not write to the agent terminal".to_string()),
                 )
+            }
+        }
+
+        Translation::AgentPermissionReply {
+            project,
+            tab,
+            request_id,
+            reply,
+        } => {
+            let Some(p) = workspace.projects.get(project) else {
+                return remote_target_gone();
+            };
+            let Some(t) = p.state.tabs.get(tab) else {
+                return remote_target_gone();
+            };
+            // The plugin watches the reply file under the same root its status
+            // file lives in (the worktree, or an isolated run's redirect).
+            let status_root = t
+                .status_file
+                .as_deref()
+                .and_then(|f| f.parent()?.parent())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| p.state.repo_root.join(&t.meta.worktree_path_relative));
+            let body = serde_json::json!({ "requestID": request_id, "reply": reply }).to_string();
+            match env.fs.write(
+                &crate::remote::bridge::agent_reply_path(&status_root),
+                &body,
+            ) {
+                Ok(()) => (CommandOutcome::Applied, None),
+                Err(e) => (
+                    CommandOutcome::Failed,
+                    Some(format!("could not hand the answer to the agent: {e}")),
+                ),
             }
         }
 

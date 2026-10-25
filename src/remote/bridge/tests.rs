@@ -1013,7 +1013,7 @@ fn sidecar_question_surfaces_structured_question_prompt() {
             {"label":"Svelte","description":"Use Svelte"}]}"#,
     );
 
-    let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
+    let (sp, _) = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
     assert_eq!(sp.kind, PromptKind::Question);
     assert!(sp.allow_free_text, "questions allow a free-text answer");
     assert!(
@@ -1061,7 +1061,7 @@ fn sidecar_multi_select_question_sets_the_flag() {
             {"label":"Tests"},{"label":"Clippy"}]}"#,
     );
 
-    let sp = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
+    let (sp, _) = read_prompt_sidecar(wt.path()).expect("question sidecar parses");
     assert_eq!(sp.kind, PromptKind::Question);
     assert!(sp.multi_select, "`multiple`:true is a checklist question");
     assert_eq!(sp.options.len(), 2);
@@ -1078,7 +1078,7 @@ fn sidecar_permission_is_never_multi_select() {
             {"label":"Allow"},{"label":"Deny"}]}"#,
     );
 
-    let sp = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    let (sp, _) = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
     assert_eq!(sp.kind, PromptKind::Permission);
     assert!(!sp.multi_select, "permissions are never multi-select");
 }
@@ -1119,11 +1119,42 @@ fn sidecar_permission_maps_options_to_binary_choices() {
         r#"{"kind":"permission","text":"Run rm -rf?","options":[
             {"label":"Allow once"},{"label":"Deny"}]}"#,
     );
-    let sp = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    let (sp, _) = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
     assert_eq!(sp.kind, PromptKind::Permission);
     assert!(!sp.allow_free_text);
     assert_eq!(sp.options[0].choice, Some(PermissionChoice::AllowOnce));
     assert_eq!(sp.options[1].choice, Some(PermissionChoice::Deny));
+}
+
+#[test]
+fn sidecar_permission_carries_the_plugin_request_id() {
+    // The runtime plugin's real permission sidecar (OpenCode 1.18): a
+    // described permission, Allow once / Reject, and the request it replies to.
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"Access external directory /repo\n- /repo/*",
+            "options":[{"label":"Allow once"},{"label":"Reject"}],"requestID":"per_1"}"#,
+    );
+    let (sp, request) = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
+    assert_eq!(request.as_deref(), Some("per_1"));
+    assert_eq!(sp.command, "Access external directory /repo\n- /repo/*");
+    assert_eq!(sp.options[0].choice, Some(PermissionChoice::AllowOnce));
+    assert_eq!(sp.options[1].choice, Some(PermissionChoice::Deny));
+
+    // Without a request id (an older plugin) the answer is typed instead.
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"x","options":[{"label":"Allow once"},{"label":"Reject"}]}"#,
+    );
+    assert_eq!(read_prompt_sidecar(wt.path()).unwrap().1, None);
+
+    // Only permissions are answered through the plugin.
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"?","options":[{"label":"A"}],"requestID":"que_1"}"#,
+    );
+    assert_eq!(read_prompt_sidecar(wt.path()).unwrap().1, None);
 }
 
 #[test]

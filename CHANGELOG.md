@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode permission prompts work from the phone and the inline prompt.** The prompt used to show the agent's last message instead of the request. Allow was acknowledged but never reached OpenCode, so the agent kept waiting. The prompt now says what OpenCode is asking for (for example "Access external directory …" with the command and paths it covers), and Allow once / Reject is answered through OpenCode's own API by FlightDeck's OpenCode plugin instead of an injected keystroke.
 
 ## [1.27.0] - 2026-10-23
 

@@ -137,6 +137,10 @@ pub struct SessionEntry {
     /// The currently pending permission prompt id, if any (the most recently
     /// minted one from the transcript builder).
     pub pending_prompt: Option<PromptId>,
+    /// The OpenCode permission request the pending prompt answers, when the
+    /// agent's plugin replies to it through OpenCode's API rather than by
+    /// keystroke (remote-control-9dnm).
+    pub agent_request: Option<String>,
 }
 
 /// One open project, for `new_agent` routing.
@@ -174,11 +178,13 @@ impl SessionIndex {
 
 /// Build the [`SessionIndex`] from the same read-only [`ProjectView`]s the
 /// outbound feed uses. `pending_prompt` resolves a session id to its current
-/// permission-prompt id (the bridge's transcript builders own that state).
+/// permission-prompt id and `agent_request` to the OpenCode permission request
+/// that prompt answers (the bridge owns both).
 pub fn build_index(
     projects: &[ProjectView<'_>],
     now_ms: u64,
     pending_prompt: &dyn Fn(&str) -> Option<PromptId>,
+    agent_request: &dyn Fn(&str) -> Option<String>,
 ) -> SessionIndex {
     let mut index = SessionIndex::default();
     for (pi, pv) in projects.iter().enumerate() {
@@ -209,6 +215,7 @@ pub fn build_index(
                     .map(|t| t.bracketed_paste())
                     .unwrap_or(false),
                 pending_prompt: pending_prompt(&tab.meta.id),
+                agent_request: agent_request(&tab.meta.id),
             });
         }
     }
@@ -346,6 +353,19 @@ pub enum Translation {
         count: u32,
         /// This chunk's bytes.
         bytes: Vec<u8>,
+    },
+    /// Answer an OpenCode permission through the agent's plugin, which replies
+    /// via OpenCode's API: the executor writes `reply` for `request_id` to the
+    /// tab's reply file ([`crate::remote::bridge::agent_reply_path`]).
+    AgentPermissionReply {
+        /// Workspace project index.
+        project: usize,
+        /// Tab index within the project.
+        tab: usize,
+        /// The OpenCode permission request id.
+        request_id: String,
+        /// OpenCode's reply: `"once"` or `"reject"`.
+        reply: &'static str,
     },
     /// Deferred to the event loop (async two-phase creation).
     NeedsMainLoop(MainLoopAction),
@@ -743,6 +763,20 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             //   5. `option_index`   — single-question single-option selection
             //                         (the untouched number-key path).
             //   6. otherwise        — nothing actionable; reject honestly.
+            // An OpenCode permission the plugin can answer is replied through
+            // OpenCode's API: its dialog ignored the injected Enter
+            // (remote-control-9dnm).
+            if let (Some(request_id), Some(choice)) = (&s.agent_request, choice) {
+                return Translation::AgentPermissionReply {
+                    project: s.project,
+                    tab: s.tab,
+                    request_id: request_id.clone(),
+                    reply: match choice {
+                        PermissionChoice::AllowOnce => "once",
+                        PermissionChoice::Deny => "reject",
+                    },
+                };
+            }
             let free_text = free_text.as_deref().filter(|t| !t.is_empty());
             let answers = answers.as_deref().filter(|a| !a.is_empty());
             let option_indices = option_indices.as_deref().filter(|v| !v.is_empty());

@@ -19,6 +19,7 @@ fn entry(id: &str) -> SessionEntry {
         all_stopped: false,
         bracketed_paste: true,
         pending_prompt: None,
+        agent_request: None,
     }
 }
 
@@ -373,6 +374,45 @@ fn permission_decision_injects_backend_keystroke() {
             project: 0,
             tab: 0,
             bytes: b"\x1b".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
+    let mut index = answerable("t1:p2", StatusBackend::OpenCode);
+    index.sessions[0].agent_request = Some("per_abc".to_string());
+    for (choice, reply) in [
+        (PermissionChoice::AllowOnce, "once"),
+        (PermissionChoice::Deny, "reject"),
+    ] {
+        assert_eq!(
+            translate(&decision("t1:p2", choice), &index),
+            Translation::AgentPermissionReply {
+                project: 0,
+                tab: 0,
+                request_id: "per_abc".to_string(),
+                reply,
+            },
+            "no keystroke reaches OpenCode's permission dialog"
+        );
+    }
+    // A stale prompt is still refused before the plugin is involved.
+    assert!(matches!(
+        translate(&decision("t1:p1", PermissionChoice::AllowOnce), &index),
+        Translation::Reject { .. }
+    ));
+}
+
+#[test]
+fn opencode_permission_without_a_plugin_request_falls_back_to_keystrokes() {
+    let index = answerable("t1:p2", StatusBackend::OpenCode);
+    assert_eq!(
+        translate(&decision("t1:p2", PermissionChoice::AllowOnce), &index),
+        Translation::PtyInput {
+            project: 0,
+            tab: 0,
+            bytes: b"\r".to_vec(),
         }
     );
 }
@@ -1273,9 +1313,12 @@ fn build_index_reflects_live_workspace() {
         state: &app,
         cache: &cache,
     }];
-    let index = build_index(&views, 1_000, &|sid| {
-        (sid == "t1").then(|| PromptId::new("t1:p1"))
-    });
+    let index = build_index(
+        &views,
+        1_000,
+        &|sid| (sid == "t1").then(|| PromptId::new("t1:p1")),
+        &|sid| (sid == "t2").then(|| "per_t2".to_string()),
+    );
 
     assert_eq!(index.projects.len(), 1);
     assert_eq!(index.projects[0].base_branch, "main");
@@ -1291,6 +1334,7 @@ fn build_index_reflects_live_workspace() {
         "fresh terminal has not enabled DECSET 2004"
     );
     assert_eq!(s1.pending_prompt, Some(PromptId::new("t1:p1")));
+    assert_eq!(s1.agent_request, None);
     assert_eq!(s1.name, "fix-login");
 
     let s2 = index.session(&SessionId::new("t2")).unwrap();
