@@ -46,6 +46,7 @@ use base64::Engine;
 use crate::agents::setup::{status_backend, StatusBackend};
 use crate::app::state::AppState;
 use crate::contracts::AgentDef;
+use crate::remote::commands::AgentRequest;
 use crate::remote::crypto::E2eChannel;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
 use crate::remote::notifier::{
@@ -223,7 +224,7 @@ pub struct RemoteBridge {
     /// OpenCode's own API: the prompt the phone was shown and the OpenCode
     /// permission request it answers (remote-control-9dnm). Set on the
     /// needs-input edge, dropped when the wait ends.
-    agent_requests: HashMap<SessionId, (PromptId, String)>,
+    agent_requests: HashMap<SessionId, (PromptId, AgentRequest)>,
     /// The push decision layered on the arming edges (remote-control-fglt).
     push: PushDecider,
     /// Pushes decided but not yet taken by the sender
@@ -888,7 +889,7 @@ impl RemoteBridge {
     /// The OpenCode permission request the session's pending prompt answers,
     /// when its plugin replies through OpenCode's API instead of keystrokes —
     /// only while that prompt is still the pending one.
-    pub fn pending_agent_request(&self, session_id: &str) -> Option<String> {
+    pub fn pending_agent_request(&self, session_id: &str) -> Option<AgentRequest> {
         let (prompt_id, request) = self.agent_requests.get(&SessionId::new(session_id))?;
         (self.pending_prompt_id(session_id).as_ref() == Some(prompt_id)).then(|| request.clone())
     }
@@ -1065,6 +1066,33 @@ impl RemoteBridge {
                         // Consume the sidecar so a later, unrelated wait never
                         // reuses this question.
                         let _ = std::fs::remove_file(claude_question_sidecar_path(&status_root));
+                    }
+                } else if now_needs
+                    && was_needs
+                    && is_opencode
+                    && prompt_sidecar_path(&status_root).exists()
+                {
+                    // Still waiting, but on the next prompt: OpenCode asks one
+                    // permission per parallel tool call and the plugin writes
+                    // the sidecar again once the shown one is answered, without
+                    // leaving `waiting` (remote-control-v9x2).
+                    let next = read_prompt_sidecar(&status_root);
+                    let _ = std::fs::remove_file(prompt_sidecar_path(&status_root));
+                    if let Some((sp, request)) = next {
+                        let builder = self
+                            .transcripts
+                            .entry(sid.clone())
+                            .or_insert_with(|| TranscriptBuilder::new(sid.clone()));
+                        builder.clear_open_prompt();
+                        builder.set_structured_prompt(sp);
+                        let preview = builder.on_needs_input(now_ms as i64);
+                        self.previews.insert(sid.clone(), preview);
+                        self.agent_requests.remove(&sid);
+                        let prompt_id = builder.last_prompt_id();
+                        if let (Some(prompt_id), Some(request)) = (prompt_id, request) {
+                            self.agent_requests
+                                .insert(sid.clone(), (prompt_id, request));
+                        }
                     }
                 } else if now_needs && was_needs {
                     // Still waiting with a deferred Claude binary fallback: resolve
@@ -1578,6 +1606,10 @@ struct PromptSidecarOption {
     label: String,
     #[serde(default)]
     description: Option<String>,
+    /// OpenCode's reply for this permission option (`once`, `always`,
+    /// `reject`), set by a plugin that answers through OpenCode's API.
+    #[serde(default)]
+    reply: Option<String>,
 }
 
 /// Path of the OpenCode prompt sidecar under `status_root` (sibling of the
@@ -1643,13 +1675,14 @@ fn classify_permission_choice(label: &str) -> Option<PermissionChoice> {
 /// - `kind == "permission"` → [`PromptKind::Permission`], `allow_free_text =
 ///   false`; each option must classify to allow/deny — if any label is unclear
 ///   the whole structured prompt is abandoned in favour of the binary fallback.
-fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<String>)> {
+fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<AgentRequest>)> {
     let raw = std::fs::read_to_string(prompt_sidecar_path(status_root)).ok()?;
     let parsed: PromptSidecar = serde_json::from_str(&raw).ok()?;
     if parsed.options.is_empty() {
         return None;
     }
     let request_id = parsed.request_id.filter(|id| !id.is_empty());
+    let mut replies = Vec::new();
     let prompt = match parsed.kind.as_str() {
         "question" => {
             let options = parsed
@@ -1677,12 +1710,25 @@ fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<S
         // Permissions are binary. Build a structured prompt only when every
         // option maps cleanly to allow/deny; otherwise fall back to binary.
         "permission" => {
+            let tagged = parsed.options.iter().all(|o| o.reply.is_some());
             let mut options = Vec::with_capacity(parsed.options.len());
             for (i, o) in parsed.options.into_iter().enumerate() {
-                let choice = classify_permission_choice(&o.label)?;
+                // A tagged option says what it replies. Allow always has no
+                // binary choice, so the phone answers it by index; it must
+                // never read as Allow once.
+                let choice = match o.reply.as_deref() {
+                    _ if !tagged => Some(classify_permission_choice(&o.label)?),
+                    Some("once") => Some(PermissionChoice::AllowOnce),
+                    Some("reject") => Some(PermissionChoice::Deny),
+                    Some("always") => None,
+                    _ => return None,
+                };
+                if tagged {
+                    replies.extend(o.reply);
+                }
                 options.push(PermissionOption {
                     index: i as u32,
-                    choice: Some(choice),
+                    choice,
                     label: o.label,
                     description: o.description,
                 });
@@ -1700,8 +1746,10 @@ fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<S
         _ => None,
     }?;
     // Only a permission is answered through the plugin; a question is typed.
-    let request_id = request_id.filter(|_| prompt.kind == PromptKind::Permission);
-    Some((prompt, request_id))
+    let request = request_id
+        .filter(|_| prompt.kind == PromptKind::Permission)
+        .map(|id| AgentRequest { id, replies });
+    Some((prompt, request))
 }
 
 /// Where FlightDeck writes a phone's answer to an OpenCode permission for the

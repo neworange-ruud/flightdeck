@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Allow always for OpenCode permissions on the phone.** OpenCode permission prompts now offer Allow once, Allow always and Reject, the same choices as OpenCode's own dialog. Allow always approves the request for the rest of the session, and OpenCode also settles any other pending requests it covers, so a burst of identical requests takes one tap.
 
 ### Improvements
 
@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode no longer hangs after you answer one of several permission requests.** When OpenCode asked for several permissions at once (one per parallel tool call), the phone and the inline prompt only offered the last one. Answering it left the others pending, so the agent stayed blocked with nothing left to answer. FlightDeck now offers them one after another, in the order OpenCode's own dialog shows them, and the session stays waiting until the last one is answered.
 
 ## [0.9.0] - 2026-10-25
 

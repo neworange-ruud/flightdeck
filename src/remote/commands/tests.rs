@@ -381,7 +381,10 @@ fn permission_decision_injects_backend_keystroke() {
 #[test]
 fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
     let mut index = answerable("t1:p2", StatusBackend::OpenCode);
-    index.sessions[0].agent_request = Some("per_abc".to_string());
+    index.sessions[0].agent_request = Some(AgentRequest {
+        id: "per_abc".to_string(),
+        replies: Vec::new(),
+    });
     for (choice, reply) in [
         (PermissionChoice::AllowOnce, "once"),
         (PermissionChoice::Deny, "reject"),
@@ -392,7 +395,7 @@ fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
                 project: 0,
                 tab: 0,
                 request_id: "per_abc".to_string(),
-                reply,
+                reply: reply.to_string(),
             },
             "no keystroke reaches OpenCode's permission dialog"
         );
@@ -401,6 +404,43 @@ fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
     assert!(matches!(
         translate(&decision("t1:p1", PermissionChoice::AllowOnce), &index),
         Translation::Reject { .. }
+    ));
+}
+
+#[test]
+fn opencode_permission_options_reply_what_the_plugin_tagged_them_with() {
+    // With Allow always the phone renders a list and answers by index.
+    let mut index = answerable("t1:p2", StatusBackend::OpenCode);
+    index.sessions[0].agent_request = Some(AgentRequest {
+        id: "per_abc".to_string(),
+        replies: vec!["once".into(), "always".into(), "reject".into()],
+    });
+    for (option, reply) in [(0, "once"), (1, "always"), (2, "reject")] {
+        assert_eq!(
+            translate(&decision_option("t1:p2", option), &index),
+            Translation::AgentPermissionReply {
+                project: 0,
+                tab: 0,
+                request_id: "per_abc".to_string(),
+                reply: reply.to_string(),
+            },
+            "option {option}"
+        );
+    }
+    // A voice "approve" still sends the binary choice.
+    assert_eq!(
+        translate(&decision("t1:p2", PermissionChoice::AllowOnce), &index),
+        Translation::AgentPermissionReply {
+            project: 0,
+            tab: 0,
+            request_id: "per_abc".to_string(),
+            reply: "once".to_string(),
+        }
+    );
+    // An index the plugin never offered is not replied through it.
+    assert!(!matches!(
+        translate(&decision_option("t1:p2", 3), &index),
+        Translation::AgentPermissionReply { .. }
     ));
 }
 
@@ -1317,7 +1357,12 @@ fn build_index_reflects_live_workspace() {
         &views,
         1_000,
         &|sid| (sid == "t1").then(|| PromptId::new("t1:p1")),
-        &|sid| (sid == "t2").then(|| "per_t2".to_string()),
+        &|sid| {
+            (sid == "t2").then(|| AgentRequest {
+                id: "per_t2".to_string(),
+                replies: Vec::new(),
+            })
+        },
     );
 
     assert_eq!(index.projects.len(), 1);
