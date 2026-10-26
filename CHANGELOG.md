@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.29.0] - 2026-10-26
+
+### New features
+
 - **Allow always for OpenCode permissions on the phone.** OpenCode permission prompts now offer Allow once, Allow always and Reject, the same choices as OpenCode's own dialog. Allow always approves the request for the rest of the session, and OpenCode also settles any other pending requests it covers, so a burst of identical requests takes one tap.
 
 ### Improvements
