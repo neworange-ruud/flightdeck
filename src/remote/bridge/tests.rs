@@ -1137,7 +1137,9 @@ fn sidecar_permission_carries_the_plugin_request_id() {
             "options":[{"label":"Allow once"},{"label":"Reject"}],"requestID":"per_1"}"#,
     );
     let (sp, request) = read_prompt_sidecar(wt.path()).expect("permission sidecar parses");
-    assert_eq!(request.as_deref(), Some("per_1"));
+    let request = request.expect("the plugin replies to it");
+    assert_eq!(request.id, "per_1");
+    assert!(request.replies.is_empty(), "answered by choice");
     assert_eq!(sp.command, "Access external directory /repo\n- /repo/*");
     assert_eq!(sp.options[0].choice, Some(PermissionChoice::AllowOnce));
     assert_eq!(sp.options[1].choice, Some(PermissionChoice::Deny));
@@ -1155,6 +1157,41 @@ fn sidecar_permission_carries_the_plugin_request_id() {
         r#"{"kind":"question","text":"?","options":[{"label":"A"}],"requestID":"que_1"}"#,
     );
     assert_eq!(read_prompt_sidecar(wt.path()).unwrap().1, None);
+}
+
+#[test]
+fn tagged_permission_options_carry_their_replies() {
+    // The plugin offers OpenCode's three choices, each tagged with its reply.
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"Access external directory /repo","requestID":"per_1",
+            "options":[{"label":"Allow once","reply":"once"},
+                       {"label":"Allow always","reply":"always"},
+                       {"label":"Reject","reply":"reject"}]}"#,
+    );
+    let (sp, request) = read_prompt_sidecar(wt.path()).expect("tagged sidecar parses");
+    let request = request.expect("the plugin replies to it");
+    assert_eq!(request.replies, ["once", "always", "reject"]);
+    let choices: Vec<_> = sp.options.iter().map(|o| o.choice).collect();
+    // Allow always must never be sent as Allow once: no binary choice, so the
+    // phone answers it by index.
+    assert_eq!(
+        choices,
+        [
+            Some(PermissionChoice::AllowOnce),
+            None,
+            Some(PermissionChoice::Deny)
+        ]
+    );
+
+    // A reply the bridge does not know falls back to binary.
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"permission","text":"x","requestID":"per_1",
+            "options":[{"label":"Allow once","reply":"once"},{"label":"Maybe","reply":"maybe"}]}"#,
+    );
+    assert!(read_prompt_sidecar(wt.path()).is_none());
 }
 
 #[test]

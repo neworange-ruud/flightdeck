@@ -508,9 +508,35 @@ export const FlightDeckStatus = async ({ client } = {}) => {
   // reply moves on to the next rather than reporting `working` while the rest
   // still block the session.
   const pending = new Map();
+  // The request the sidecar last showed.
+  let shownID = null;
   const showOldest = () => {
-    const oldest = pending.values().next().value;
+    const [id, oldest] = pending.entries().next().value ?? [];
+    shownID = id ?? null;
     if (oldest) writeFileSync(sidecarFile, JSON.stringify(oldest.prompt));
+  };
+  // One answer can settle several requests: Allow always also allows every
+  // pending one it covers and Reject rejects them all, each with its own
+  // permission.replied. Act once the burst has landed, so FlightDeck never
+  // shows a request that is already settled.
+  let settle = null;
+  const settleSoon = () => {
+    if (settle) clearTimeout(settle);
+    settle = setTimeout(() => {
+      settle = null;
+      if (pending.size === 0) {
+        shownID = null;
+        write("working");
+        return;
+      }
+      // Still blocked on the next one: show it and stay `waiting`.
+      if (!pending.has(shownID)) {
+        try {
+          showOldest();
+        } catch (_) {}
+      }
+      write("waiting");
+    }, 100);
   };
   let poll = null;
   const stopPolling = () => {
@@ -531,7 +557,7 @@ export const FlightDeckStatus = async ({ client } = {}) => {
       unlinkSync(replyFile);
     } catch (_) {}
     const entry = pending.get(r?.requestID);
-    if (!entry || (r.reply !== "once" && r.reply !== "reject")) return;
+    if (!entry || !["once", "always", "reject"].includes(r.reply)) return;
     // permission.replied removes it and shows the next one.
     Promise.resolve(replyToPermission(entry.sessionID, r.requestID, r.reply)).catch(() => {});
   };
@@ -594,7 +620,15 @@ export const FlightDeckStatus = async ({ client } = {}) => {
           return;
         }
         if (replyToPermission && typeof p.sessionID === "string") {
+          // Replied through the API, so offer all of OpenCode's own choices,
+          // each tagged with the reply it sends. Allow always also settles
+          // every other pending request it covers.
           prompt.requestID = p.id;
+          prompt.options = [
+            { label: "Allow once", reply: "once" },
+            { label: "Allow always", reply: "always" },
+            { label: "Reject", reply: "reject" },
+          ];
           startPolling();
         }
         pending.set(p.id, { sessionID: p.sessionID, prompt });
@@ -643,6 +677,11 @@ export const FlightDeckStatus = async ({ client } = {}) => {
       if (!sessionID || entry.sessionID === sessionID) pending.delete(id);
     }
     stopPolling();
+    // A settle still due would report `working` after `idle`.
+    if (settle && pending.size === 0) {
+      clearTimeout(settle);
+      settle = null;
+    }
   };
   return {
     event: async ({ event }) => {
@@ -668,22 +707,12 @@ export const FlightDeckStatus = async ({ client } = {}) => {
       }
       if (event.type === "permission.replied") {
         const id = event.properties?.requestID ?? event.properties?.permissionID;
-        const wasShown = pending.keys().next().value === id;
         pending.delete(id);
         stopPolling();
-        if (pending.size > 0) {
-          // Still blocked on the next one: show it and stay `waiting`.
-          if (wasShown) {
-            try {
-              showOldest();
-            } catch (_) {}
-          }
-          write("waiting");
-          return;
-        }
+        settleSoon();
+        return;
       }
       if (
-        event.type === "permission.replied" ||
         event.type === "question.replied" ||
         event.type === "question.rejected"
       ) {

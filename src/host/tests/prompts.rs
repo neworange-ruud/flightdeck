@@ -403,6 +403,42 @@ fn an_opencode_permission_is_answered_through_the_plugin_not_typed() {
     }
 }
 
+/// What the runtime plugin writes when it can reply through OpenCode's API.
+const OPENCODE_PLUGIN_PERMISSION_TAGGED: &str = r#"{"kind":"permission",
+    "text":"Access external directory /elsewhere\n- /elsewhere/*","requestID":"per_1",
+    "options":[{"label":"Allow once","reply":"once"},{"label":"Allow always","reply":"always"},
+               {"label":"Reject","reply":"reject"}]}"#;
+
+#[test]
+fn allow_always_from_the_phone_is_replied_through_the_plugin() {
+    for (option, reply) in [(0, "once"), (1, "always"), (2, "reject")] {
+        let fakes = Fakes::new();
+        let mut w = waiting(
+            &fakes,
+            "opencode",
+            Sidecar::OpenCode(OPENCODE_PLUGIN_PERMISSION_TAGGED),
+            true,
+        );
+        // The desktop's inline tile still offers Approve / Deny.
+        let view = w.prompt().expect("the permission is offered");
+        assert_eq!(view.shape, PromptShape::Binary);
+        w.phone_answers(PromptAnswer::Option(option));
+        let typed = timeline(&mut w, &fakes, 5);
+        assert!(
+            typed.iter().all(Vec::is_empty),
+            "option {option}: nothing typed"
+        );
+        let reply_file = crate::remote::bridge::agent_reply_path(w._root.path());
+        let written: serde_json::Value =
+            serde_json::from_str(&fakes.fs.read_to_string(&reply_file).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "requestID": "per_1", "reply": reply }),
+            "option {option}"
+        );
+    }
+}
+
 #[test]
 fn queued_opencode_permissions_are_offered_one_after_another() {
     // OpenCode asks once per parallel tool call; the plugin shows the oldest and,

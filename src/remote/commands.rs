@@ -140,7 +140,19 @@ pub struct SessionEntry {
     /// The OpenCode permission request the pending prompt answers, when the
     /// agent's plugin replies to it through OpenCode's API rather than by
     /// keystroke (remote-control-9dnm).
-    pub agent_request: Option<String>,
+    pub agent_request: Option<AgentRequest>,
+}
+
+/// An OpenCode permission the agent's runtime plugin replies to through
+/// OpenCode's API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRequest {
+    /// The OpenCode permission request id.
+    pub id: String,
+    /// OpenCode's reply (`once`, `always`, `reject`) for each option index of
+    /// the prompt, when the plugin tagged its options; empty for a plugin that
+    /// offers only Allow once / Reject and is answered by `choice`.
+    pub replies: Vec<String>,
 }
 
 /// One open project, for `new_agent` routing.
@@ -184,7 +196,7 @@ pub fn build_index(
     projects: &[ProjectView<'_>],
     now_ms: u64,
     pending_prompt: &dyn Fn(&str) -> Option<PromptId>,
-    agent_request: &dyn Fn(&str) -> Option<String>,
+    agent_request: &dyn Fn(&str) -> Option<AgentRequest>,
 ) -> SessionIndex {
     let mut index = SessionIndex::default();
     for (pi, pv) in projects.iter().enumerate() {
@@ -364,8 +376,8 @@ pub enum Translation {
         tab: usize,
         /// The OpenCode permission request id.
         request_id: String,
-        /// OpenCode's reply: `"once"` or `"reject"`.
-        reply: &'static str,
+        /// OpenCode's reply: `"once"`, `"always"` or `"reject"`.
+        reply: String,
     },
     /// Deferred to the event loop (async two-phase creation).
     NeedsMainLoop(MainLoopAction),
@@ -765,17 +777,23 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             //   6. otherwise        — nothing actionable; reject honestly.
             // An OpenCode permission the plugin can answer is replied through
             // OpenCode's API: its dialog ignored the injected Enter
-            // (remote-control-9dnm).
-            if let (Some(request_id), Some(choice)) = (&s.agent_request, choice) {
-                return Translation::AgentPermissionReply {
-                    project: s.project,
-                    tab: s.tab,
-                    request_id: request_id.clone(),
-                    reply: match choice {
-                        PermissionChoice::AllowOnce => "once",
-                        PermissionChoice::Deny => "reject",
-                    },
+            // (remote-control-9dnm). The phone sends `choice` for a two-button
+            // prompt and `option_index` once Allow always makes it a list.
+            if let Some(request) = &s.agent_request {
+                let reply = match (choice, option_index) {
+                    (Some(PermissionChoice::AllowOnce), _) => Some("once"),
+                    (Some(PermissionChoice::Deny), _) => Some("reject"),
+                    (None, Some(i)) => request.replies.get(*i as usize).map(String::as_str),
+                    (None, None) => None,
                 };
+                if let Some(reply) = reply {
+                    return Translation::AgentPermissionReply {
+                        project: s.project,
+                        tab: s.tab,
+                        request_id: request.id.clone(),
+                        reply: reply.to_string(),
+                    };
+                }
             }
             let free_text = free_text.as_deref().filter(|t| !t.is_empty());
             let answers = answers.as_deref().filter(|a| !a.is_empty());
