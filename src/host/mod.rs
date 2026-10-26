@@ -58,7 +58,7 @@ use crate::{
     refresh_web_access_overlay, reload_all_projects_config, resize_workspace,
     resolve_dialog_outcomes, service_remote_commands, session_index, spawn_finish_count,
     spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
-    terminate_all_sessions, update_check_enabled, web_dialog_view, web_host_state_now,
+    terminate_all_sessions, update_check_enabled, web_dialog_now, web_host_state_now,
     web_input_holder, web_started_message, Env, RemoteSetup, RemoteStart, StatusMsg, Ui,
     WebSurface, Workspace, WorkspaceTerminals,
 };
@@ -1084,10 +1084,7 @@ impl<'a> AppHost<'a> {
 
         if web_surface.running() {
             let activity = web_surface.activity_events(env.clock);
-            let dialog = workspace
-                .projects
-                .get(workspace.active)
-                .and_then(|p| web_dialog_view(ui, &p.name, &p.state));
+            let dialog = web_dialog_now(workspace, ui);
             let mut next = build_web_host_state(
                 workspace,
                 &web_surface.streams,
@@ -1586,10 +1583,7 @@ impl<'a> AppHost<'a> {
             workspace,
             &self.web_surface.streams,
             Vec::new(),
-            workspace
-                .projects
-                .get(workspace.active)
-                .and_then(|p| web_dialog_view(&self.ui, &p.name, &p.state)),
+            web_dialog_now(workspace, &self.ui),
             self.now_ms,
             &self.web_surface.flavor,
         );

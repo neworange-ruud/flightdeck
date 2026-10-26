@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Abandoning a worktree from FlightDeck Desktop or a browser works when the host has more than one project open.** The abandon and rebase confirmations were checked against whichever project the host itself had in front, not the one the session belongs to. With the session in any other project, the dialog said "The host can no longer name what this would destroy" and could only be cancelled. This always happened on a `flightdeck worker` with several projects.
 
 ## [1.29.0] - 2026-10-26
 

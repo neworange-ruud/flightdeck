@@ -2695,21 +2695,32 @@ fn web_host_state_now(
         workspace,
         &web.streams,
         activity,
-        {
-            // A dialog a targeted command opened is about its own project's tab.
-            // An empty (worker) workspace has no project to ask about.
-            let project = ui
-                .prompt
-                .as_ref()
-                .and_then(|p| p.target.as_ref())
-                .and_then(|t| t.project(workspace))
-                .or(Some(workspace.active))
-                .and_then(|i| workspace.projects.get(i));
-            project.and_then(|project| web_dialog_view(ui, &project.name, &project.state))
-        },
+        web_dialog_now(workspace, ui),
         now_ms,
         &web.flavor,
     )
+}
+
+/// The open dialog as a browser receives it, read against the project it is
+/// about.
+///
+/// A dialog a targeted command opened is about **its own project's** tab, which
+/// need not be the active one: a remote desktop names a tab in whichever project
+/// its window shows, while the host's `active` is whatever the host last had in
+/// front. Reading the gate against the active project looks the tab id up in the
+/// wrong project, finds nothing, and refuses with
+/// [`crate::web::commands::GATE_UNRESOLVED_REFUSAL`] — so every publish of a
+/// dialog goes through here. An empty (worker) workspace has no project to ask
+/// about.
+fn web_dialog_now(workspace: &Workspace, ui: &Ui) -> Option<crate::web::protocol::DialogView> {
+    let project = ui
+        .prompt
+        .as_ref()
+        .and_then(|p| p.target.as_ref())
+        .and_then(|t| t.project(workspace))
+        .or(Some(workspace.active))
+        .and_then(|i| workspace.projects.get(i))?;
+    web_dialog_view(ui, &project.name, &project.state)
 }
 
 /// Open the access overlay against the running listener, minting the bootstrap
@@ -14498,6 +14509,60 @@ mod tests {
                 "cancelling is never gated"
             );
             assert!(ui.prompt.is_none());
+        }
+
+        /// A targeted abandon in a project the host is not showing still names
+        /// its own tab. A remote desktop targets a tab in whichever project its
+        /// window shows, while the host's `active` is whatever the host last had
+        /// in front — reading the gate against that project found no such tab
+        /// and refused every abandon a desktop sent to a multi-project worker.
+        #[test]
+        fn a_targeted_gate_names_its_tab_in_a_background_project() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            let other = two_project_workspace(false).projects.pop().unwrap();
+            ws.projects.push(other);
+            ws.active = 1;
+            // What a targeted `abandon_worktree` leaves behind: the question,
+            // carrying the tab the desktop named.
+            let mut ui = Ui {
+                web_origin: Some(browser_origin()),
+                web_target: Some(WebTarget {
+                    project_root: PathBuf::from("/repo"),
+                    target: Some(crate::app::commands::TabTarget::tab(
+                        ws.projects[0].state.tabs[0].id(),
+                    )),
+                }),
+                ..Ui::default()
+            };
+            start_prompt(&mut ui, Prompt::AbandonConfirm { dirty: false });
+
+            let body = body(&web_dialog_now(&ws, &ui).expect("the question is published"));
+            assert_eq!(body.refusal, None);
+            assert!(body.confirmable);
+            assert_eq!(
+                body.confirm_gate
+                    .expect("1g's step 2 is published")
+                    .expected,
+                "Task"
+            );
+
+            // The confirm checks the name the view published, in the same
+            // project: a wrong one is a mismatch, not an unresolved gate.
+            let confirm = answer(
+                2,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "nope" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail,
+                Some(crate::web::commands::gate_mismatch_refusal("nope", "Task"))
+            );
         }
 
         /// **The git confirmations are answerable from a browser**
