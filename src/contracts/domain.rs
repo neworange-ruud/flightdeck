@@ -327,6 +327,10 @@ pub struct UiConfig {
     /// Dim the terminal viewport while in APP mode (it is not receiving keys).
     #[serde(default = "default_true")]
     pub dim_terminal_in_app_mode: bool,
+    /// Animate the TUI's spinners. When `false` every spinner shows a fixed
+    /// `⠿`, so a working agent no longer redraws the screen on every tick.
+    #[serde(default = "default_true")]
+    pub animations: bool,
     /// Desktop app only: the terminal text size in points, a whole number in
     /// [`UiConfig::DESKTOP_TERMINAL_FONT_SIZES`] (validated at load). Cmd +/-
     /// on macOS zooms from it for the session and Cmd-0 returns to it. The TUI
@@ -362,6 +366,7 @@ impl Default for UiConfig {
             app_mode_color: default_app_mode_color(),
             mode_border: default_mode_border(),
             dim_terminal_in_app_mode: true,
+            animations: true,
             desktop_terminal_font_size: default_desktop_terminal_font_size(),
         }
     }

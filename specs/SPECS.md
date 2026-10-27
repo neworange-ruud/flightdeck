@@ -1013,6 +1013,7 @@ Settings (`[ui]`):
 | `app_mode_color` | (same set) | cyan |
 | `mode_border` | off, dim, normal, bright | off |
 | `dim_terminal_in_app_mode` | true / false | true |
+| `animations` | true / false | true |
 | `macos_option_as_meta` | true / false | false |
 | `desktop_terminal_font_size` | 8 to 32 (points) | 13 |
 

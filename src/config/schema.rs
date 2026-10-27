@@ -765,6 +765,17 @@ mod tests {
     }
 
     #[test]
+    fn ui_animations_default_on_and_parse_off() {
+        assert!(default_config("proj", "main").ui.animations);
+        let cfg: Config = "[ui]\nagent_tab_position = \"right\"\ndefault_agent = \"opencode\"\nanimations = false\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(!cfg.ui.animations);
+    }
+
+    #[test]
     fn ui_config_partial_table_fills_mode_defaults() {
         // A config that includes the required fields must still get the new defaults.
         let cfg: Config = "[ui]\nagent_tab_position = \"right\"\ndefault_agent = \"opencode\"\n"

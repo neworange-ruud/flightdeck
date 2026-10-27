@@ -2400,7 +2400,14 @@ fn event_loop(terminal: &mut TuiTerminal, host: &mut AppHost) -> Result<()> {
                         crate::tui::mode_style::border_enabled(&p.state.config.ui),
                         p.state.config.ui.agent_tab_side(),
                     );
-                    draw_project_tab_bar(frame, ml.project_tabs, &infos, active_idx, now_ms);
+                    draw_project_tab_bar(
+                        frame,
+                        ml.project_tabs,
+                        &infos,
+                        active_idx,
+                        now_ms,
+                        p.state.config.ui.animations,
+                    );
                     draw(frame, &p.state, &p.cache, &overlay, input_holder, now_ms);
                 })
                 .map_err(|e| FlightDeckError::Io(format!("render failed: {e}")))?;

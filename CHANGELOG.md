@@ -13,6 +13,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 ### Improvements
 
 - **A quiet TUI when nothing changes.** The TUI no longer writes to the terminal on frames where nothing changed, and no longer resends a cursor position or visibility that is already in effect. Idle, it used to write about 20 times a second; now it writes nothing, which matters most in terminals that render without a GPU, such as Windows Terminal in a virtual machine.
+- **Turn spinner animations off.** A new `[ui] animations` setting (on by default, also in the configuration manager as "Animations") controls the spinners. Set `animations = false` and every spinner shows a fixed `⠿` instead of cycling, so a working agent no longer redraws the screen about 12 times a second.
 
 ### Bug fixes
 

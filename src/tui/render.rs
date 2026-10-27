@@ -960,6 +960,7 @@ pub fn draw_project_tab_bar(
     projects: &[ProjectTabView],
     active: usize,
     now_ms: u64,
+    animations: bool,
 ) {
     // A zero-height (or zero-width) area means the row is collapsed. Bail out
     // before building any sub-rect: `project_new_button` derives a fixed
@@ -991,7 +992,7 @@ pub fn draw_project_tab_bar(
         // another is working in the same project.
         let (indicator, indicator_color) = match p.status {
             ProjectStatus::NeedsAttention => ('●', Color::Red),
-            ProjectStatus::Working => (spinner_frame(now_ms), Color::Red),
+            ProjectStatus::Working => (spinner_frame(now_ms, animations), Color::Red),
             ProjectStatus::Idle => ('●', Color::Green),
         };
         spans.push(Span::styled(" ", tab_style));
@@ -1107,7 +1108,10 @@ pub fn draw_sidebar(
                 side,
                 marker,
                 name_style,
-                Span::styled(format!("{} ", spinner_frame(now_ms)), spin),
+                Span::styled(
+                    format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
+                    spin,
+                ),
                 &row.name,
             ));
             lines.push(Line::from(vec![
@@ -1129,7 +1133,7 @@ pub fn draw_sidebar(
                 .map(|_| Color::Cyan)
                 .unwrap_or_else(|| badge_color(row.badge))
         };
-        let indicator = badge_indicator(row.badge, now_ms);
+        let indicator = badge_indicator(row.badge, now_ms, state.config.ui.animations);
         lines.push(sidebar_name_line(
             width,
             side,
@@ -1180,7 +1184,13 @@ fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_m
     let lines: Vec<Line> =
         crate::view::agent_row_views(state, &HashMap::new(), now_ms, now_ms / 1000)
             .iter()
-            .map(|row| Line::from(collapsed_agent_span(row, now_ms)))
+            .map(|row| {
+                Line::from(collapsed_agent_span(
+                    row,
+                    now_ms,
+                    state.config.ui.animations,
+                ))
+            })
             .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1190,7 +1200,7 @@ fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_m
 /// selection arrow, a spinner while it works, or its status dot. Same glyphs
 /// and colours the full sidebar draws on each agent's name line, with the text
 /// removed.
-fn collapsed_agent_span(row: &AgentRowView, now_ms: u64) -> Span<'static> {
+fn collapsed_agent_span(row: &AgentRowView, now_ms: u64, animations: bool) -> Span<'static> {
     if row.selected {
         return Span::styled(
             "▸",
@@ -1201,7 +1211,7 @@ fn collapsed_agent_span(row: &AgentRowView, now_ms: u64) -> Span<'static> {
     }
     let spinner = || {
         Span::styled(
-            spinner_frame(now_ms).to_string(),
+            spinner_frame(now_ms, animations).to_string(),
             Style::default().fg(Color::Red),
         )
     };
@@ -1310,18 +1320,28 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     }
 }
 
+/// The spinner glyph shown in place of the animated frames when
+/// `[ui] animations` is off.
+const STATIC_SPINNER: char = '⠿';
+
 /// A braille spinner frame chosen from the wall clock (≈12.5 fps), used to
 /// animate in-progress work (e.g. a tab whose worktree is being created).
-pub fn spinner_frame(now_ms: u64) -> char {
+///
+/// With `animations` off it is the fixed [`STATIC_SPINNER`] whatever the time,
+/// so a working agent no longer changes the screen on every tick.
+pub fn spinner_frame(now_ms: u64, animations: bool) -> char {
+    if !animations {
+        return STATIC_SPINNER;
+    }
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[((now_ms / 80) % FRAMES.len() as u64) as usize]
 }
 
 /// Use the smooth one-cell braille spinner for a working agent and the stable
 /// centered dot for every settled state.
-fn badge_indicator(badge: AgentBadge, now_ms: u64) -> char {
+fn badge_indicator(badge: AgentBadge, now_ms: u64, animations: bool) -> char {
     match badge {
-        AgentBadge::Working => spinner_frame(now_ms),
+        AgentBadge::Working => spinner_frame(now_ms, animations),
         _ => '●',
     }
 }
@@ -1500,7 +1520,7 @@ pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, n
     if tab.phase == TabPhase::Creating {
         let msg = Paragraph::new(Line::from(vec![
             Span::styled(
-                format!("{} ", spinner_frame(now_ms)),
+                format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
@@ -1648,7 +1668,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
     if tab.phase == TabPhase::Creating {
         let msg = Paragraph::new(Line::from(vec![
             Span::styled(
-                format!("{} ", spinner_frame(now_ms)),
+                format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
@@ -4102,7 +4122,7 @@ mod tests {
     }
 
     fn status_indicator(status: crate::contracts::InterpretedStatus, now_ms: u64) -> char {
-        badge_indicator(crate::view::agent_badge(status), now_ms)
+        badge_indicator(crate::view::agent_badge(status), now_ms, true)
     }
 
     fn empty_cache() -> GitStatusCache {
@@ -4222,6 +4242,48 @@ mod tests {
     }
 
     /// Read a full row of a rendered buffer as a string.
+    #[test]
+    fn spinner_is_fixed_when_animations_are_off_and_cycles_when_on() {
+        assert!((0..40).all(|i| spinner_frame(i * 80, false) == '\u{283F}'));
+        let distinct: std::collections::HashSet<char> =
+            (0..10).map(|i| spinner_frame(i * 80, true)).collect();
+        assert_eq!(distinct.len(), 10);
+        assert_eq!(badge_indicator(AgentBadge::Working, 160, false), '\u{283F}');
+        assert_eq!(badge_indicator(AgentBadge::Idle, 160, false), '●');
+    }
+
+    #[test]
+    fn working_badge_shows_fixed_spinner_when_animations_are_off() {
+        let mut state = state_with_tabs(1);
+        state.tabs[0].phase = TabPhase::Creating;
+        state.config.ui.animations = false;
+        let rows = |state: &AppState, now_ms: u64| {
+            let mut term = test_terminal(40, 8);
+            term.draw(|frame| {
+                draw_sidebar(
+                    frame,
+                    state,
+                    &empty_cache(),
+                    Rect::new(0, 0, 40, 8),
+                    layout::Chrome::Full,
+                    now_ms,
+                )
+            })
+            .unwrap();
+            let buffer = term.backend().buffer().clone();
+            (0..8)
+                .map(|y| buffer_row(&buffer, y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let off_a = rows(&state, 0);
+        let off_b = rows(&state, 400);
+        assert!(off_a.contains('\u{283F}'), "{off_a}");
+        assert_eq!(off_a, off_b, "frames must not change with the clock");
+        state.config.ui.animations = true;
+        assert!(!rows(&state, 0).contains('\u{283F}'));
+    }
+
     fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .map(|x| buffer[(x, row)].symbol().to_string())
@@ -4254,7 +4316,7 @@ mod tests {
         assert_eq!(strip_glyph(&buffer, 1), "▸");
         assert_eq!(
             strip_glyph(&buffer, 2),
-            spinner_frame(0).to_string(),
+            spinner_frame(0, true).to_string(),
             "a tab being created shows a spinner, not a status dot"
         );
         // No heading: there is no room for the word "Agents".
@@ -4391,7 +4453,7 @@ mod tests {
                 mode_style::border_enabled(&state.config.ui),
                 state.config.ui.agent_tab_side(),
             );
-            draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0);
+            draw_project_tab_bar(frame, ml.project_tabs, projects, 0, 0, true);
             draw(frame, state, &empty_cache(), &UiOverlay::None, None, 0);
         })
         .unwrap();
@@ -4634,8 +4696,10 @@ mod tests {
             project_view("alpha".to_string(), false, true),
             project_view("beta".to_string(), true, false),
         ];
-        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))
-            .unwrap();
+        term.draw(|frame| {
+            draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0, true)
+        })
+        .unwrap();
         let buffer = term.backend().buffer().clone();
         let row: String = (0..80)
             .map(|x| buffer[(x, 0)].symbol().to_string())
@@ -4653,7 +4717,7 @@ mod tests {
             .map(|n| project_view((*n).to_string(), false, false))
             .collect();
         term.draw(|frame| {
-            draw_project_tab_bar(frame, Rect::new(0, 0, width, 1), &projects, active, 0)
+            draw_project_tab_bar(frame, Rect::new(0, 0, width, 1), &projects, active, 0, true)
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -4789,8 +4853,10 @@ mod tests {
             project_view("beta".to_string(), false, false),
         ];
 
-        term.draw(|frame| draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0))
-            .unwrap();
+        term.draw(|frame| {
+            draw_project_tab_bar(frame, Rect::new(0, 0, 80, 1), &projects, 0, 0, true)
+        })
+        .unwrap();
         let buffer = term.backend().buffer();
 
         // First indicator is at x=1. The second tab begins after the first

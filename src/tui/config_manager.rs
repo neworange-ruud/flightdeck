@@ -640,6 +640,7 @@ fn build_fields(agent_keys: Vec<String>) -> Vec<CuratedField> {
             ),
         },
         b("Dim terminal in app mode", "ui", "dim_terminal_in_app_mode"),
+        b("Animations", "ui", "animations"),
         b(
             "Option as Meta (macOS desktop app)",
             "ui",
