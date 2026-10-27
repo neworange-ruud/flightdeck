@@ -15,5 +15,6 @@ pub mod opener;
 pub(crate) mod overlay_bridge;
 pub mod palette;
 pub mod platform;
+pub mod quiet_backend;
 pub mod render;
 pub mod selection;

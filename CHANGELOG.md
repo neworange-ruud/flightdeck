@@ -8,11 +8,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Windows Defender exclusion offer.** On Windows, FlightDeck now asks at startup whether to add itself to your Defender exclusions, which keeps real-time scanning from slowing it down. Yes opens an elevated PowerShell window that runs `Add-MpPreference -ExclusionProcess` for the running `flightdeck.exe` and waits for a key; No (or Esc) asks again after the next version. The answer is remembered in `~/.flightdeck/global-state.json`. Never shown on macOS or Linux, or in an isolated (`-I`) run.
 
 ### Improvements
 
-- None yet.
+- **A quiet TUI when nothing changes.** The TUI no longer writes to the terminal on frames where nothing changed, and no longer resends a cursor position or visibility that is already in effect. Idle, it used to write about 20 times a second; now it writes nothing, which matters most in terminals that render without a GPU, such as Windows Terminal in a virtual machine.
 
 ### Bug fixes
 

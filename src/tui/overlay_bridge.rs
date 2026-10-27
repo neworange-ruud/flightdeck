@@ -196,6 +196,7 @@ fn is_destructive(prompt: &Prompt, accel: DialogAccel) -> bool {
         | Prompt::SelectChildAgent { .. }
         | Prompt::RenameTab { .. }
         | Prompt::SetManualStatus
+        | Prompt::DefenderExclusion
         | Prompt::OpenProject { .. }
         | Prompt::ChangeProjectBase { .. } => false,
     }
@@ -283,6 +284,10 @@ fn dialog_kind(prompt: &Prompt) -> DialogKind {
         Prompt::CloseProjectConfirm { index } => DialogKind::CloseProject { index: *index },
         Prompt::UnpairConfirm => DialogKind::UnpairPhone,
         Prompt::QuitConfirm => DialogKind::ConfirmQuit,
+        // Only the TUI opens it; a mirror draws it generically.
+        Prompt::DefenderExclusion => DialogKind::Remote {
+            kind: "defender_exclusion".to_string(),
+        },
     }
 }
 

@@ -1244,6 +1244,8 @@ struct FakeRunnerState {
     /// When set, `run_shell` returns this error instead of running (simulates a
     /// shell that could not be launched).
     launch_error: Option<String>,
+    /// Recorded `spawn_detached` calls as `(program, args)`.
+    spawned: Vec<(String, Vec<String>)>,
 }
 
 impl FakeCommandRunner {
@@ -1270,6 +1272,11 @@ impl FakeCommandRunner {
     pub fn invocations(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().invocations.clone()
     }
+
+    /// The recorded `(program, args)` detached spawns, in order.
+    pub fn spawned(&self) -> Vec<(String, Vec<String>)> {
+        self.inner.lock().unwrap().spawned.clone()
+    }
 }
 
 impl CommandRunner for FakeCommandRunner {
@@ -1290,6 +1297,15 @@ impl CommandRunner for FakeCommandRunner {
                 code: Some(0),
                 output: String::new(),
             }))
+    }
+
+    fn spawn_detached(&self, program: &str, args: &[String]) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(msg) = &state.launch_error {
+            return Err(FlightDeckError::Io(msg.clone()));
+        }
+        state.spawned.push((program.to_string(), args.to_vec()));
+        Ok(())
     }
 }
 

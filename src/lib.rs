@@ -12,6 +12,7 @@ pub mod testing;
 pub mod agents;
 pub mod app;
 pub mod config;
+pub mod defender;
 pub mod fs;
 pub mod git;
 pub mod hooks;
@@ -110,17 +111,34 @@ use crate::tui::render::{
 };
 use flightdeck_remote_protocol::{CommandAck, CommandOutcome, PairingId, ProjectId, SessionId};
 
+use crate::tui::quiet_backend::QuietBackend;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 
 /// How long to block waiting for an input event before looping again so PTY
 /// output keeps flowing and statuses keep refreshing. One wait is one
 /// [`AppHost`] turn, so this also paces [`crate::host::GIT_REFRESH_EVERY`].
 const POLL_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// The TUI's terminal: crossterm on stdout behind [`QuietBackend`], so the
+/// frame drawn every [`POLL_TIMEOUT`] writes nothing when nothing changed.
+type TuiTerminal = ratatui::Terminal<QuietBackend<CrosstermBackend<std::io::Stdout>>>;
+
+/// Enter raw mode and the alternate screen, install ratatui's panic-restore
+/// hook, and return the TUI's terminal.
+///
+/// `ratatui::try_init` does the first three; its plain crossterm terminal is
+/// dropped (a fresh terminal has not hidden the cursor, so that writes
+/// nothing) for one behind [`QuietBackend`].
+fn init_terminal() -> std::io::Result<TuiTerminal> {
+    drop(ratatui::try_init()?);
+    ratatui::Terminal::new(QuietBackend::new(CrosstermBackend::new(std::io::stdout())))
+}
 
 /// Entry point invoked by the binary: run first-run init, recover state, and
 /// drive the Ratatui event loop (SPECS §4, §7, §10).
@@ -203,7 +221,7 @@ pub fn run() -> Result<()> {
 
     // 5–8. Initialise the terminal (raw mode + alt screen + panic-restore hook)
     // and run the loop, ensuring teardown happens no matter how we exit.
-    let mut terminal = ratatui::try_init()
+    let mut terminal = init_terminal()
         .map_err(|e| FlightDeckError::Io(format!("failed to initialise terminal: {e}")))?;
 
     // Enable mouse capture so tabs are clickable (best effort).
@@ -1132,6 +1150,9 @@ enum Prompt {
     /// other once open: shared, origin-tagged, cancellable from either surface —
     /// and from a browser its `y` is behind artboard 1g's typed-name step.
     QuitConfirm,
+    /// Offer to add FlightDeck to the Windows Defender exclusions (Windows
+    /// TUI only; once per version until accepted, see [`crate::defender`]).
+    DefenderExclusion,
 }
 
 /// State for the project-folder browser prompt ([`Prompt::OpenProject`]): the
@@ -2287,9 +2308,15 @@ fn next_loop_step(
 /// thread, mapping keys and mouse gestures, sizing terminals to the ratatui
 /// layout, drawing the frame, and suspending itself for `$EDITOR` — and routes
 /// input until the user quits or a fatal error occurs.
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, host: &mut AppHost) -> Result<()> {
+fn event_loop(terminal: &mut TuiTerminal, host: &mut AppHost) -> Result<()> {
     // Grace window, update check, FlightDeck Remote and FlightDeck Web.
     host.start();
+
+    // The one-time Windows Defender exclusion offer (a no-op elsewhere).
+    {
+        let (workspace, env, ui) = host.tui_parts();
+        offer_defender_exclusion(workspace, env, ui);
+    }
 
     // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
     // so the caller's clean teardown (persist `state.json` + terminate agents)
@@ -6986,6 +7013,13 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 DialogButton::new(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
+        Prompt::DefenderExclusion => Dialog::confirm(
+            crate::defender::QUESTION,
+            vec![
+                DialogButton::new(DialogAccel::Char('y'), "Yes"),
+                DialogButton::new(DialogAccel::Char('n'), "No"),
+            ],
+        ),
     }
 }
 
@@ -7056,12 +7090,67 @@ fn dialog_decision(dialog: &Dialog, key: KeyEvent) -> crate::web::protocol::Dial
     }
 }
 
+/// Answer the Defender exclusion offer. `y` is Yes; `n` and Esc are No; any
+/// other key leaves the question open.
+///
+/// Yes is recorded before anything is spawned, so the offer never returns
+/// whatever the elevated window then does. A failed spawn is shown as a
+/// message and is not retried.
+fn handle_defender_exclusion_key(key: KeyEvent, env: &Env, ui: &mut Ui) -> Result<()> {
+    use crate::persistence::global_state::DefenderExclusionChoice;
+    match key.code {
+        KeyCode::Char('y') => {
+            ui.prompt = None;
+            crate::defender::record_choice(env.fs, DefenderExclusionChoice::Accepted);
+            if let Err(e) = crate::defender::spawn_elevated_exclusion(env.command) {
+                ui.message(format!("Could not open the Defender exclusion window: {e}"));
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            ui.prompt = None;
+            crate::defender::record_choice(
+                env.fs,
+                DefenderExclusionChoice::Declined {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Open the Defender exclusion offer when it is due (Windows, not isolated,
+/// not answered for this version) and nothing else holds the screen.
+fn offer_defender_exclusion(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    let isolated = workspace.active_project().state.isolated;
+    if !ui.modal_active()
+        && crate::defender::due(
+            env.fs,
+            crate::tui::platform::IS_WINDOWS,
+            isolated,
+            env!("CARGO_PKG_VERSION"),
+        )
+    {
+        start_prompt(ui, Prompt::DefenderExclusion);
+    }
+}
+
 fn handle_prompt_key_inner(
     key: KeyEvent,
     workspace: &mut Workspace,
     env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
+    // The Defender offer is answered before the generic Esc: Esc is "No" here,
+    // and a "No" is remembered for this version.
+    if matches!(
+        ui.prompt.as_ref().map(|p| &p.prompt),
+        Some(Prompt::DefenderExclusion)
+    ) {
+        return handle_defender_exclusion_key(key, env, ui);
+    }
+
     // Esc always cancels the prompt.
     if key.code == KeyCode::Esc {
         ui.clear();
@@ -7520,7 +7609,8 @@ fn handle_prompt_key_project(
         | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
         | Prompt::UnpairConfirm
-        | Prompt::QuitConfirm => {
+        | Prompt::QuitConfirm
+        | Prompt::DefenderExclusion => {
             ui.prompt = Some(pstate);
         }
     }
@@ -8179,6 +8269,7 @@ fn dialog_kind(prompt: &Prompt) -> &'static str {
         Prompt::CloseProjectConfirm { .. } => "close_project",
         Prompt::UnpairConfirm => "unpair_phone",
         Prompt::QuitConfirm => "confirm_quit",
+        Prompt::DefenderExclusion => "defender_exclusion",
     }
 }
 
@@ -8257,7 +8348,8 @@ fn browser_confirm_gate(prompt: &Prompt) -> crate::web::commands::BrowserConfirm
         | Prompt::OpenProject { .. }
         | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
-        | Prompt::UnpairConfirm => BrowserConfirm::OneStep,
+        | Prompt::UnpairConfirm
+        | Prompt::DefenderExclusion => BrowserConfirm::OneStep,
     }
 }
 
@@ -9033,7 +9125,7 @@ fn preferred_editor() -> String {
 /// terminal (SPECS §8). The editor inherits the real terminal so full-screen
 /// editors work; on return the alt screen, mouse capture, and bracketed paste
 /// are re-enabled and the screen is cleared for a full redraw.
-fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Result<()> {
+fn open_in_editor(terminal: &mut TuiTerminal, path: &Path) -> Result<()> {
     // Tear down our terminal ownership so the editor has a clean TTY.
     let _ = crossterm::execute!(
         std::io::stdout(),
@@ -9046,7 +9138,7 @@ fn open_in_editor(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Resul
     let status = std::process::Command::new(&editor).arg(path).status();
 
     // Re-initialise the terminal regardless of how the editor exited.
-    *terminal = ratatui::try_init()
+    *terminal = init_terminal()
         .map_err(|e| FlightDeckError::Io(format!("failed to re-initialise terminal: {e}")))?;
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     if matches!(
@@ -15494,6 +15586,197 @@ mod tests {
             );
             workspace.projects[0].state.config.update.check = false;
             assert!(!update_check_enabled(&workspace.projects[0].state));
+        }
+    }
+
+    /// The Windows Defender exclusion popup: its keys, its buttons and what
+    /// each answer records and spawns, all against fakes.
+    mod defender_prompt {
+        use super::isolated_refusals::one_project_workspace;
+        use super::*;
+        use crate::persistence::global_state::{
+            global_state_path, load_global_state, DefenderExclusionChoice,
+        };
+
+        struct Fakes {
+            fs: FakeFs,
+            pty: FakePty,
+            clock: FakeClock,
+            container: crate::testing::FakeContainerRuntime,
+            command: crate::testing::FakeCommandRunner,
+        }
+
+        impl Fakes {
+            fn new() -> Fakes {
+                Fakes {
+                    fs: FakeFs::new(),
+                    pty: FakePty::new(),
+                    clock: FakeClock::default(),
+                    container: crate::testing::FakeContainerRuntime::new(),
+                    command: crate::testing::FakeCommandRunner::new(),
+                }
+            }
+
+            fn env(&self) -> Env<'_> {
+                Env {
+                    fs: &self.fs,
+                    pty: &self.pty,
+                    clock: &self.clock,
+                    container: &self.container,
+                    command: &self.command,
+                    terminal: crate::terminal::session::TerminalProfile::TUI,
+                }
+            }
+
+            fn recorded(&self) -> Option<DefenderExclusionChoice> {
+                let path = global_state_path()?;
+                load_global_state(&self.fs, &path).defender_exclusion
+            }
+        }
+
+        fn open() -> Ui {
+            let mut ui = Ui::default();
+            start_prompt(&mut ui, Prompt::DefenderExclusion);
+            ui
+        }
+
+        /// Press `code` through the same entry point a keypress and a mouse
+        /// click on a button both reach.
+        fn press(code: KeyCode, fakes: &Fakes, ui: &mut Ui) {
+            let mut workspace = one_project_workspace(false);
+            let env = fakes.env();
+            handle_prompt_key(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                &mut workspace,
+                &env,
+                ui,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn the_popup_asks_the_approved_question_with_yes_and_no() {
+            let ui = open();
+            let dialog = ui.active_dialog().expect("a dialog is open");
+            assert!(ui.modal_active());
+            assert_eq!(
+                dialog.title,
+                "You are on a Windows machine. Would you like to add FlightDeck to your Defender exclusions?"
+            );
+            let labels: Vec<&str> = dialog.buttons.iter().map(|b| b.label.as_str()).collect();
+            assert_eq!(labels, ["Yes", "No"]);
+        }
+
+        #[test]
+        fn yes_records_acceptance_and_opens_the_elevated_window() {
+            let fakes = Fakes::new();
+            let mut ui = open();
+            press(KeyCode::Char('y'), &fakes, &mut ui);
+            assert!(ui.prompt.is_none());
+            if global_state_path().is_some() {
+                assert_eq!(fakes.recorded(), Some(DefenderExclusionChoice::Accepted));
+            }
+            let spawned = fakes.command.spawned();
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].0, "powershell.exe");
+        }
+
+        #[test]
+        fn yes_is_remembered_even_when_the_window_cannot_open() {
+            let fakes = Fakes::new();
+            fakes.command.fail_to_launch("no powershell");
+            let mut ui = open();
+            press(KeyCode::Char('y'), &fakes, &mut ui);
+            if global_state_path().is_some() {
+                assert_eq!(fakes.recorded(), Some(DefenderExclusionChoice::Accepted));
+            }
+            assert!(
+                matches!(ui.overlay, UiOverlay::Dialog(_)),
+                "the failure is shown, not swallowed"
+            );
+        }
+
+        #[test]
+        fn no_and_escape_record_a_decline_for_this_version_and_spawn_nothing() {
+            for code in [KeyCode::Char('n'), KeyCode::Esc] {
+                let fakes = Fakes::new();
+                let mut ui = open();
+                press(code, &fakes, &mut ui);
+                assert!(ui.prompt.is_none(), "{code:?} closes the popup");
+                if global_state_path().is_some() {
+                    assert_eq!(
+                        fakes.recorded(),
+                        Some(DefenderExclusionChoice::Declined {
+                            version: env!("CARGO_PKG_VERSION").to_string()
+                        }),
+                        "{code:?}"
+                    );
+                }
+                assert!(fakes.command.spawned().is_empty(), "{code:?}");
+            }
+        }
+
+        #[test]
+        fn another_key_leaves_the_question_open_and_records_nothing() {
+            let fakes = Fakes::new();
+            let mut ui = open();
+            press(KeyCode::Char('x'), &fakes, &mut ui);
+            assert!(ui.prompt.is_some());
+            assert_eq!(fakes.recorded(), None);
+            assert!(fakes.command.spawned().is_empty());
+        }
+
+        /// A click on a button fires its accelerator, so Yes and No work by
+        /// mouse through the very same keys.
+        #[test]
+        fn the_buttons_work_by_mouse() {
+            let fakes = Fakes::new();
+            let mut workspace = one_project_workspace(false);
+            let env = fakes.env();
+            let mut ui = open();
+            let dialog = ui.active_dialog().unwrap();
+            let area = Rect::new(0, 0, 120, 40);
+            let yes = (0..area.width)
+                .flat_map(|c| (0..area.height).map(move |r| (c, r)))
+                .find(|&(c, r)| {
+                    matches!(
+                        crate::tui::render::dialog_hit(area, &dialog, c, r),
+                        crate::tui::render::DialogHit::Button(0)
+                    )
+                })
+                .expect("the Yes button has a hit area");
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: yes.0,
+                row: yes.1,
+                modifiers: KeyModifiers::NONE,
+            };
+            handle_mouse(click, area, &mut workspace, &env, &mut ui);
+            assert!(ui.prompt.is_none());
+            assert_eq!(fakes.command.spawned().len(), 1);
+        }
+
+        #[test]
+        fn it_is_offered_only_when_due_and_nothing_else_holds_the_screen() {
+            let fakes = Fakes::new();
+            let workspace = one_project_workspace(false);
+            let mut ui = Ui::default();
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut ui);
+            assert_eq!(
+                ui.prompt.is_some(),
+                crate::tui::platform::IS_WINDOWS,
+                "offered on Windows, never elsewhere"
+            );
+
+            let isolated = one_project_workspace(true);
+            let mut ui = Ui::default();
+            offer_defender_exclusion(&isolated, &fakes.env(), &mut ui);
+            assert!(ui.prompt.is_none(), "never in an isolated run");
+
+            let mut busy = Ui::default();
+            busy.message("something else");
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut busy);
+            assert!(busy.prompt.is_none(), "never over another dialog");
         }
     }
 
