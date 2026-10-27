@@ -2315,7 +2315,7 @@ fn event_loop(terminal: &mut TuiTerminal, host: &mut AppHost) -> Result<()> {
     // The one-time Windows Defender exclusion offer (a no-op elsewhere).
     {
         let (workspace, env, ui) = host.tui_parts();
-        offer_defender_exclusion(workspace, env, ui);
+        offer_defender_exclusion(workspace, env, ui, crate::tui::platform::IS_WINDOWS);
     }
 
     // Trap SIGTERM/SIGINT/SIGHUP: on an external signal we break out of the loop
@@ -6724,7 +6724,7 @@ fn digit_accel(i: usize) -> DialogAccel {
 /// one button per available action. Each button's accelerator matches the key
 /// [`handle_prompt_key`] expects, so mouse and keyboard stay in lockstep.
 fn prompt_dialog(prompt: &Prompt) -> Dialog {
-    let cancel = DialogButton::new(DialogAccel::Esc, "Cancel");
+    let cancel = DialogButton::cancelling(DialogAccel::Esc, "Cancel");
     match prompt {
         Prompt::NewAgentForm {
             agents,
@@ -6853,7 +6853,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             format!("Close {label}?"),
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Close"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
         Prompt::CloseAgentChoice { .. } => Dialog::confirm(
@@ -6861,21 +6861,21 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             vec![
                 DialogButton::new(DialogAccel::Char('a'), "Abandon"),
                 DialogButton::new(DialogAccel::Char('c'), "Close"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
         Prompt::QuitConfirm => Dialog::confirm(
             "Quit FlightDeck? Every agent it is running is stopped.",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Quit"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
         Prompt::PushConfirm => Dialog::confirm(
             "The worktree has uncommitted changes. Push the committed changes only?",
             vec![
                 DialogButton::new(DialogAccel::Char('p'), "Push committed"),
-                DialogButton::new(DialogAccel::Char('c'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('c'), "Cancel"),
             ],
         ),
         Prompt::AbandonConfirm { dirty } => {
@@ -6891,7 +6891,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 title,
                 vec![
                     DialogButton::new(DialogAccel::Char('y'), yes),
-                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
                 ],
             )
         }
@@ -6911,7 +6911,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 ),
                 vec![
                     DialogButton::new(DialogAccel::Char('y'), "Merge"),
-                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
                 ],
             )
         }
@@ -6937,7 +6937,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 ),
                 vec![
                     DialogButton::new(DialogAccel::Char('y'), "Rebase"),
-                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
                 ],
             )
         }
@@ -6971,7 +6971,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 list,
                 vec![
                     DialogButton::new(DialogAccel::Enter, "Open"),
-                    DialogButton::new(DialogAccel::Esc, "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Esc, "Cancel"),
                 ],
             )
         }
@@ -7002,7 +7002,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 list,
                 vec![
                     DialogButton::new(DialogAccel::Enter, "Use branch"),
-                    DialogButton::new(DialogAccel::Esc, "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Esc, "Cancel"),
                 ],
             )
         }
@@ -7010,21 +7010,21 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             "Close this project? Its agents will be stopped.",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Close"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
         Prompt::UnpairConfirm => Dialog::confirm(
             "Unpair this phone? It loses access until you pair it again.",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Unpair"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         ),
         Prompt::DefenderExclusion => Dialog::confirm(
             crate::defender::QUESTION,
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Yes"),
-                DialogButton::new(DialogAccel::Char('n'), "No"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "No"),
             ],
         ),
     }
@@ -7129,15 +7129,10 @@ fn handle_defender_exclusion_key(key: KeyEvent, env: &Env, ui: &mut Ui) -> Resul
 
 /// Open the Defender exclusion offer when it is due (Windows, not isolated,
 /// not answered for this version) and nothing else holds the screen.
-fn offer_defender_exclusion(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+fn offer_defender_exclusion(workspace: &Workspace, env: &Env, ui: &mut Ui, is_windows: bool) {
     let isolated = workspace.active_project().state.isolated;
     if !ui.modal_active()
-        && crate::defender::due(
-            env.fs,
-            crate::tui::platform::IS_WINDOWS,
-            isolated,
-            env!("CARGO_PKG_VERSION"),
-        )
+        && crate::defender::due(env.fs, is_windows, isolated, env!("CARGO_PKG_VERSION"))
     {
         start_prompt(ui, Prompt::DefenderExclusion);
     }
@@ -8181,6 +8176,9 @@ fn web_dialog_view(
     // see `GATE_UNRESOLVED_REFUSAL`.
     let (confirm_gate, refusal) = match browser_confirm_gate(&open.prompt) {
         BrowserConfirm::OneStep => (None, None),
+        // Not published: a remote surface cannot answer it, so it is not shown
+        // one it could only be refused.
+        BrowserConfirm::LocalOnly => return None,
         BrowserConfirm::TypedName(gate) => {
             match gate_expectation(
                 gate.subject,
@@ -8355,8 +8353,12 @@ fn browser_confirm_gate(prompt: &Prompt) -> crate::web::commands::BrowserConfirm
         | Prompt::OpenProject { .. }
         | Prompt::ChangeProjectBase { .. }
         | Prompt::CloseProjectConfirm { .. }
-        | Prompt::UnpairConfirm
-        | Prompt::DefenderExclusion => BrowserConfirm::OneStep,
+        | Prompt::UnpairConfirm => BrowserConfirm::OneStep,
+        // The Windows Defender offer changes the machine's security settings
+        // and spawns an elevated window on this machine's own screen: only the
+        // person at the terminal may answer it, so no remote surface is shown
+        // it, confirms it or cancels it.
+        Prompt::DefenderExclusion => BrowserConfirm::LocalOnly,
     }
 }
 
@@ -8458,12 +8460,17 @@ fn apply_web_dialog(
         ));
     }
 
+    let gate = browser_confirm_gate(&open.prompt);
+    if gate == crate::web::commands::BrowserConfirm::LocalOnly {
+        // Neither answer: a cancel is a recorded "No" for this prompt.
+        return Err(crate::web::commands::LOCAL_ONLY_REFUSAL.to_string());
+    }
+
     if act == DialogAct::Cancel {
         feed_dialog_key(KeyCode::Esc, workspace, env, ui);
         return Ok(Some("Cancelled the dialog.".to_string()));
     }
 
-    let gate = browser_confirm_gate(&open.prompt);
     let dialog = open.dialog.clone();
     let choice = args.and_then(|a| a.get("choice")).and_then(|c| c.as_str());
     let text = args.and_then(|a| a.get("text")).and_then(|t| t.as_str());
@@ -14231,14 +14238,14 @@ mod tests {
                 "Close shell 2?",
                 vec![
                     DialogButton::new(DialogAccel::Char('y'), "Close"),
-                    DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
                 ],
             );
             let c_cancel = Dialog::confirm(
                 "Push the committed changes only?",
                 vec![
                     DialogButton::new(DialogAccel::Char('p'), "Push committed"),
-                    DialogButton::new(DialogAccel::Char('c'), "Cancel"),
+                    DialogButton::cancelling(DialogAccel::Char('c'), "Cancel"),
                 ],
             );
             let press = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
@@ -14338,7 +14345,7 @@ mod tests {
                     );
                     true
                 }
-                BrowserConfirm::OneStep => false,
+                BrowserConfirm::OneStep | BrowserConfirm::LocalOnly => false,
             };
 
             for prompt in [
@@ -15685,7 +15692,9 @@ mod tests {
             }
             let spawned = fakes.command.spawned();
             assert_eq!(spawned.len(), 1);
-            assert_eq!(spawned[0].0, "powershell.exe");
+            assert!(spawned[0]
+                .0
+                .ends_with(r"WindowsPowerShell\v1.0\powershell.exe"));
         }
 
         #[test]
@@ -15764,26 +15773,103 @@ mod tests {
         }
 
         #[test]
-        fn it_is_offered_only_when_due_and_nothing_else_holds_the_screen() {
+        fn it_is_offered_on_windows_when_due() {
             let fakes = Fakes::new();
             let workspace = one_project_workspace(false);
             let mut ui = Ui::default();
-            offer_defender_exclusion(&workspace, &fakes.env(), &mut ui);
-            assert_eq!(
-                ui.prompt.is_some(),
-                crate::tui::platform::IS_WINDOWS,
-                "offered on Windows, never elsewhere"
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut ui, true);
+            assert!(
+                matches!(
+                    ui.prompt.as_ref().map(|p| &p.prompt),
+                    Some(Prompt::DefenderExclusion)
+                ),
+                "offered"
             );
+        }
 
+        #[test]
+        fn it_is_never_offered_off_windows() {
+            let fakes = Fakes::new();
+            let workspace = one_project_workspace(false);
+            let mut ui = Ui::default();
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut ui, false);
+            assert!(ui.prompt.is_none());
+        }
+
+        #[test]
+        fn it_is_never_offered_in_an_isolated_run() {
+            let fakes = Fakes::new();
             let isolated = one_project_workspace(true);
             let mut ui = Ui::default();
-            offer_defender_exclusion(&isolated, &fakes.env(), &mut ui);
-            assert!(ui.prompt.is_none(), "never in an isolated run");
+            offer_defender_exclusion(&isolated, &fakes.env(), &mut ui, true);
+            assert!(ui.prompt.is_none());
+        }
 
+        #[test]
+        fn it_is_never_offered_over_another_dialog() {
+            let fakes = Fakes::new();
+            let workspace = one_project_workspace(false);
             let mut busy = Ui::default();
             busy.message("something else");
-            offer_defender_exclusion(&workspace, &fakes.env(), &mut busy);
-            assert!(busy.prompt.is_none(), "never over another dialog");
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut busy, true);
+            assert!(busy.prompt.is_none());
+        }
+
+        #[test]
+        fn it_is_not_offered_again_once_declined_for_this_version() {
+            let fakes = Fakes::new();
+            let workspace = one_project_workspace(false);
+            let mut ui = open();
+            press(KeyCode::Char('n'), &fakes, &mut ui);
+            let mut again = Ui::default();
+            offer_defender_exclusion(&workspace, &fakes.env(), &mut again, true);
+            if global_state_path().is_some() {
+                assert!(again.prompt.is_none());
+            }
+        }
+
+        #[test]
+        fn no_is_the_cancelling_button() {
+            let ui = open();
+            let dialog = ui.active_dialog().unwrap();
+            let cancels: Vec<bool> = dialog.buttons.iter().map(|b| b.cancels()).collect();
+            assert_eq!(cancels, [false, true]);
+            let no = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(
+                dialog_decision(&dialog, no),
+                crate::web::protocol::DialogOutcome::Cancelled
+            );
+        }
+
+        #[test]
+        fn a_remote_confirm_or_cancel_records_nothing_and_spawns_nothing() {
+            use crate::web::commands::DialogAct;
+            let fakes = Fakes::new();
+            for act in [DialogAct::Confirm, DialogAct::Cancel] {
+                for choice in [None, Some("y"), Some("n")] {
+                    let mut ui = open();
+                    let id = ui.prompt.as_ref().unwrap().id.clone();
+                    let mut args = serde_json::json!({ "dialog_id": id });
+                    if let Some(c) = choice {
+                        args["choice"] = serde_json::json!(c);
+                    }
+                    let mut workspace = one_project_workspace(false);
+                    let result =
+                        apply_web_dialog(act, Some(&args), &mut workspace, &fakes.env(), &mut ui);
+                    assert!(result.is_err(), "{act:?} {choice:?}");
+                    assert!(ui.prompt.is_some(), "still open: {act:?} {choice:?}");
+                }
+            }
+            assert_eq!(fakes.recorded(), None);
+            assert!(fakes.command.spawned().is_empty());
+        }
+
+        #[test]
+        fn no_remote_surface_is_shown_the_prompt() {
+            let ui = open();
+            let workspace = one_project_workspace(false);
+            let state = &workspace.active_project().state;
+            assert!(web_dialog_view(&ui, "proj", state).is_none());
         }
     }
 

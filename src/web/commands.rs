@@ -239,6 +239,10 @@ pub enum BrowserConfirm {
     /// Every *other* button on the same dialog — and cancelling, always — is
     /// still one press away.
     TypedName(TypedNameGate),
+    /// Only the local terminal may answer. A remote surface is not shown the
+    /// dialog, and confirming or cancelling it is refused with
+    /// [`LOCAL_ONLY_REFUSAL`].
+    LocalOnly,
 }
 
 /// Artboard 1g's step 2, as the host states it before a browser can pass it.
@@ -317,6 +321,11 @@ pub fn gate_mismatch_refusal(typed: &str, expected: &str) -> String {
          for character — nothing has happened."
     )
 }
+
+/// The refusal for a dialog only the local terminal may answer
+/// ([`BrowserConfirm::LocalOnly`]).
+pub const LOCAL_ONLY_REFUSAL: &str =
+    "This question can only be answered in the terminal FlightDeck is running in.";
 
 /// The refusal for a gate whose subject the host cannot name right now: the tab
 /// it was about is gone, or the dialog outlived what it asked about.

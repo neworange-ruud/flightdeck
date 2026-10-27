@@ -57,6 +57,10 @@ pub(crate) fn overlay_view(
     let state = &workspace.active_project().state;
     let use_f2 = state.config.ui.use_f2_to_leave_terminal_focus;
     if let Some(open) = &ui.prompt {
+        // Local terminal only: no other front-end is shown it.
+        if matches!(open.prompt, Prompt::DefenderExclusion) {
+            return None;
+        }
         return Some(OverlayView::Dialog(dialog_view(open)));
     }
     if let Some(cm) = &ui.config {
@@ -338,6 +342,12 @@ pub(crate) fn apply_overlay_input(
     env: &Env,
     ui: &mut Ui,
 ) -> Result<()> {
+    if matches!(
+        ui.prompt.as_ref().map(|p| &p.prompt),
+        Some(Prompt::DefenderExclusion)
+    ) {
+        return Err(refused(crate::web::commands::LOCAL_ONLY_REFUSAL));
+    }
     match input {
         OverlayInput::Key(key) => press(key_code(key), workspace, env, ui),
         OverlayInput::Submit => press(KeyCode::Enter, workspace, env, ui),

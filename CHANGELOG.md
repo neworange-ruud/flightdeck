@@ -8,12 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- **Windows Defender exclusion offer.** On Windows, FlightDeck now asks at startup whether to add itself to your Defender exclusions, which keeps real-time scanning from slowing it down. Yes opens an elevated PowerShell window that runs `Add-MpPreference -ExclusionProcess` for the running `flightdeck.exe` and waits for a key; No (or Esc) asks again after the next version. The answer is remembered in `~/.flightdeck/global-state.json`. Never shown on macOS or Linux, or in an isolated (`-I`) run.
+- **Windows Defender exclusion offer.** On Windows, FlightDeck now asks at startup whether to add itself to your Defender exclusions, which keeps real-time scanning from slowing it down. Yes opens an elevated PowerShell window that runs `Add-MpPreference -ExclusionProcess` for the running `flightdeck.exe` and waits for a key; No (or Esc) asks again after the next version. The exclusion covers files opened by `flightdeck.exe` itself, not those opened by the agents, git or node processes it starts. The answer is remembered in `~/.flightdeck/global-state.json`. Only the local terminal UI shows and answers it: never on macOS or Linux, in an isolated (`-I`) run, or from the web interface, the phone or the desktop app.
 
 ### Improvements
 
 - **A quiet TUI when nothing changes.** The TUI no longer writes to the terminal on frames where nothing changed, and no longer resends a cursor position or visibility that is already in effect. Idle, it used to write about 20 times a second; now it writes nothing, which matters most in terminals that render without a GPU, such as Windows Terminal in a virtual machine.
-- **Turn spinner animations off.** A new `[ui] animations` setting (on by default, also in the configuration manager as "Animations") controls the spinners. Set `animations = false` and every spinner shows a fixed `⠿` instead of cycling, so a working agent no longer redraws the screen about 12 times a second.
+- **Turn spinner animations off.** A new `[ui] animations` setting (on by default, also in the configuration manager as "Animations (terminal UI)"; it affects the terminal UI only, not the desktop app) controls the spinners. Set `animations = false` and every spinner shows a fixed `⠿` instead of cycling, so a working agent no longer redraws the screen about 12 times a second.
 
 ### Bug fixes
 

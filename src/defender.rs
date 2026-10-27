@@ -68,12 +68,17 @@ fn ps_single_quote_escape(s: &str) -> String {
     out
 }
 
+/// `s` as a PowerShell single-quoted string literal.
+fn ps_literal(s: &str) -> String {
+    format!("'{}'", ps_single_quote_escape(s))
+}
+
 /// The script the elevated window runs: add the exclusion, say what happened,
-/// wait for a key. Single quotes only, so it nests inside another layer.
+/// wait for a key.
 fn elevated_script(exe: &Path) -> String {
-    let exe = ps_single_quote_escape(&exe.to_string_lossy());
+    let exe = ps_literal(&exe.to_string_lossy());
     format!(
-        "try {{ Add-MpPreference -ExclusionProcess '{exe}' -ErrorAction Stop; \
+        "try {{ Add-MpPreference -ExclusionProcess {exe} -ErrorAction Stop; \
          Write-Host 'FlightDeck was added to the Windows Defender exclusions.' \
          -ForegroundColor Green }} \
          catch {{ Write-Host ('Could not add the exclusion: ' + $_.Exception.Message) \
@@ -83,28 +88,50 @@ fn elevated_script(exe: &Path) -> String {
     )
 }
 
-/// The arguments for `powershell.exe` that open a new, elevated PowerShell
-/// window running [`elevated_script`] for `exe`.
+/// What `-EncodedCommand` takes: the script as UTF-16LE, base64. The encoded
+/// text holds no quote or space, so no layer of quoting can mangle it.
+fn encode_command(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The absolute path of Windows PowerShell, so a `powershell.exe` planted in
+/// the working directory or earlier on `PATH` is never the one that runs
+/// elevated. Under `%SystemRoot%`, falling back to `C:\Windows`.
+fn powershell_path() -> String {
+    let root = std::env::var("SystemRoot")
+        .ok()
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| r"C:\Windows".to_string());
+    format!(
+        r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
+        root.trim_end_matches(['\\', '/'])
+    )
+}
+
+/// The arguments for the PowerShell at `powershell` that open a new, elevated
+/// PowerShell window running [`elevated_script`] for `exe`.
 ///
 /// The launcher is not elevated: it only runs `Start-Process -Verb RunAs`,
 /// which raises the UAC prompt and gives the elevated process a console of its
-/// own. The script is inline (`-Command`), not a file, and no execution policy
-/// is touched. Quoting: the script holds only single quotes; it is wrapped in
-/// double quotes for the child's command line, and that whole argument string
-/// sits in a single-quoted PowerShell literal, where each `'` is doubled.
-pub fn launcher_args(exe: &Path) -> Vec<String> {
-    let child_args = format!("-NoProfile -Command \"{}\"", elevated_script(exe));
+/// own. Both scripts travel as `-EncodedCommand`, not as quoted text, so the
+/// only quoting left is the executable's path inside a single PowerShell
+/// literal. No script file is written and no execution policy is touched.
+pub fn launcher_args(exe: &Path, powershell: &str) -> Vec<String> {
     let outer = format!(
-        "Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList '{}'",
-        child_args.replace('\'', "''")
+        "Start-Process -FilePath {} -Verb RunAs -ArgumentList \
+         '-NoProfile','-EncodedCommand','{}'",
+        ps_literal(powershell),
+        encode_command(&elevated_script(exe)),
     );
     vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         "-WindowStyle".to_string(),
         "Hidden".to_string(),
-        "-Command".to_string(),
-        outer,
+        "-EncodedCommand".to_string(),
+        encode_command(&outer),
     ]
 }
 
@@ -113,7 +140,8 @@ pub fn spawn_elevated_exclusion(runner: &dyn CommandRunner) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| {
         FlightDeckError::Io(format!("could not find the FlightDeck executable: {e}"))
     })?;
-    runner.spawn_detached("powershell.exe", &launcher_args(&exe))
+    let powershell = powershell_path();
+    runner.spawn_detached(&powershell, &launcher_args(&exe, &powershell))
 }
 
 #[cfg(test)]
@@ -187,49 +215,110 @@ mod tests {
         assert!(raw.contains("accepted"), "{raw}");
     }
 
-    #[test]
-    fn launcher_runs_an_inline_elevated_command_without_a_script_or_bypass() {
-        let args = launcher_args(Path::new(r"C:\Tools\flightdeck.exe"));
-        let joined = args.join(" ");
-        assert_eq!(args[0], "-NoProfile");
-        assert!(args.contains(&"-Command".to_string()));
-        assert!(joined.contains("Start-Process -FilePath powershell.exe -Verb RunAs"));
-        assert!(joined.contains(r"Add-MpPreference -ExclusionProcess ''C:\Tools\flightdeck.exe''"));
-        assert!(joined.contains("ReadKey"));
-        assert!(!joined.contains("-ExecutionPolicy"));
-        assert!(!joined.contains("-File "));
+    fn decode(b64: &str) -> String {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
+    const PS: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+    const MARK: &str = "'-EncodedCommand','";
+
+    /// The base64 of the elevated script inside a launcher's outer script.
+    fn inner_b64(outer: &str) -> &str {
+        outer.split(MARK).nth(1).unwrap().trim_end_matches('\'')
+    }
+
+    /// The two scripts behind a launcher: (outer, elevated inner).
+    fn scripts(args: &[String]) -> (String, String) {
+        let outer = decode(args.last().unwrap());
+        let inner = decode(inner_b64(&outer));
+        (outer, inner)
     }
 
     #[test]
-    fn a_path_with_spaces_and_a_quote_is_quoted_for_every_layer() {
-        let exe = PathBuf::from(r"C:\Users\O'Brien\Program Files\flightdeck.exe");
-        let script = elevated_script(&exe);
-        // Layer 1: inside the script's own single-quoted literal.
-        assert!(script.contains(r"'C:\Users\O''Brien\Program Files\flightdeck.exe'"));
-        assert!(!script.contains('"'));
-        // Layer 2: the outer literal doubles every quote again.
-        let outer = launcher_args(&exe).pop().unwrap();
-        assert!(outer.contains(r"''C:\Users\O''''Brien\Program Files\flightdeck.exe''"));
+    fn the_launcher_runs_encoded_commands_without_a_script_file_or_bypass() {
+        let args = launcher_args(Path::new(r"C:\Tools\flightdeck.exe"), PS);
+        assert_eq!(
+            args[..5],
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand"
+            ]
+        );
+        assert_eq!(args.len(), 6);
+        let (outer, inner) = scripts(&args);
+        assert!(outer.starts_with(&format!("Start-Process -FilePath '{PS}' -Verb RunAs ")));
+        assert!(inner.contains(r"Add-MpPreference -ExclusionProcess 'C:\Tools\flightdeck.exe' "));
+        assert!(inner.contains("ReadKey"));
+        for text in [&outer, &inner] {
+            assert!(!text.contains("-ExecutionPolicy"));
+            assert!(!text.contains("-File "));
+        }
     }
 
     #[test]
-    fn typographic_quotes_are_doubled_too() {
-        assert_eq!(ps_single_quote_escape("a\u{2019}b"), "a\u{2019}\u{2019}b");
+    fn a_path_with_spaces_and_quotes_is_one_escaped_literal() {
+        let exe =
+            PathBuf::from("C:\\Users\\D\u{2019}Angelo\\O'Brien\\Program Files\\flightdeck.exe");
+        let (_, inner) = scripts(&launcher_args(&exe, PS));
+        assert!(
+            inner.contains(
+                "-ExclusionProcess 'C:\\Users\\D\u{2019}\u{2019}Angelo\\O''Brien\\Program Files\\flightdeck.exe' "
+            ),
+            "{inner}"
+        );
     }
 
     #[test]
-    fn spawning_goes_through_the_runner() {
+    fn the_encoded_arguments_hold_no_quote_or_space() {
+        let exe = PathBuf::from("C:\\O'Brien \u{2018}x\u{201B}\\flightdeck.exe");
+        let args = launcher_args(&exe, PS);
+        let outer = decode(args.last().unwrap());
+        for arg in [args.last().unwrap().as_str(), inner_b64(&outer)] {
+            assert!(arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')));
+        }
+    }
+
+    #[test]
+    fn every_typographic_quote_is_doubled() {
+        for q in ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            assert_eq!(ps_literal(&format!("a{q}b")), format!("'a{q}{q}b'"));
+        }
+    }
+
+    #[test]
+    fn the_command_is_utf16le_base64() {
+        // "A" is 0x41 0x00; a char outside the BMP takes a surrogate pair.
+        assert_eq!(encode_command("A"), "QQA=");
+        assert_eq!(decode(&encode_command("\u{1F680}x")), "\u{1F680}x");
+    }
+
+    #[test]
+    fn spawning_goes_through_the_runner_with_the_absolute_powershell() {
         let runner = FakeCommandRunner::new();
         spawn_elevated_exclusion(&runner).unwrap();
         let spawned = runner.spawned();
         assert_eq!(spawned.len(), 1);
-        assert_eq!(spawned[0].0, "powershell.exe");
-        let exe = std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let escaped = ps_single_quote_escape(&exe).replace('\'', "''");
-        assert!(spawned[0].1.last().unwrap().contains(&escaped));
+        assert_eq!(spawned[0].0, powershell_path());
+        assert!(spawned[0]
+            .0
+            .ends_with(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        let (outer, inner) = scripts(&spawned[0].1);
+        assert!(outer.contains(&ps_literal(&powershell_path())));
+        let exe = std::env::current_exe().unwrap();
+        assert!(inner.contains(&ps_literal(&exe.to_string_lossy())));
     }
 
     #[test]

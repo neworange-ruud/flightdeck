@@ -142,26 +142,39 @@ impl DialogAccel {
 pub struct DialogButton {
     pub label: String,
     pub accel: DialogAccel,
+    /// Set by [`DialogButton::cancelling`]: this button dismisses the dialog.
+    cancel: bool,
 }
 
 impl DialogButton {
+    /// A button that decides the dialog.
     pub fn new(accel: DialogAccel, label: impl Into<String>) -> DialogButton {
         DialogButton {
             accel,
             label: label.into(),
+            cancel: false,
+        }
+    }
+
+    /// A button that dismisses the dialog (`Cancel`, `No`): whatever its label.
+    pub fn cancelling(accel: DialogAccel, label: impl Into<String>) -> DialogButton {
+        DialogButton {
+            cancel: true,
+            ..DialogButton::new(accel, label)
         }
     }
 
     /// Whether this button **dismisses** the dialog rather than deciding it.
     ///
     /// The dialogs do not agree on a cancel key — `n` in the close
-    /// confirmations, `c` in the push confirmation, `Esc` in the forms — but
-    /// they all agree on the *label*, because `prompt_dialog` writes it. One
-    /// rule, read by `dialog_decision` (which key cancelled) and by
+    /// confirmations, `c` in the push confirmation, `Esc` in the forms — so
+    /// `prompt_dialog` says which button it is, with
+    /// [`DialogButton::cancelling`], instead of anyone guessing from the label.
+    /// One rule, read by `dialog_decision` (which key cancelled) and by
     /// `web_dialog_view` (which button a browser should cancel with), so the
     /// two cannot drift.
     pub fn cancels(&self) -> bool {
-        self.label == "Cancel"
+        self.cancel
     }
 
     /// The rendered cell text, e.g. `" [y] Close "`.
@@ -4242,6 +4255,12 @@ mod tests {
     }
 
     /// Read a full row of a rendered buffer as a string.
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
     #[test]
     fn spinner_is_fixed_when_animations_are_off_and_cycles_when_on() {
         assert!((0..40).all(|i| spinner_frame(i * 80, false) == '\u{283F}'));
@@ -4282,12 +4301,6 @@ mod tests {
         assert_eq!(off_a, off_b, "frames must not change with the clock");
         state.config.ui.animations = true;
         assert!(!rows(&state, 0).contains('\u{283F}'));
-    }
-
-    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
-        (0..buffer.area.width)
-            .map(|x| buffer[(x, row)].symbol().to_string())
-            .collect()
     }
 
     #[test]
@@ -6330,7 +6343,7 @@ mod tests {
             "Abandon this worktree?",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Abandon"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         );
         term.draw(|frame| draw_dialog(frame, &dialog, frame.area()))
@@ -6362,7 +6375,7 @@ mod tests {
             "Set status override",
             vec![
                 DialogButton::new(DialogAccel::Char('d'), "Done"),
-                DialogButton::new(DialogAccel::Esc, "Cancel"),
+                DialogButton::cancelling(DialogAccel::Esc, "Cancel"),
             ],
         )
         .from_origin("opened from browser · 192.168.2.20");
@@ -6432,7 +6445,7 @@ mod tests {
             "Close shell 2?",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Close"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         );
         let tagged = plain
@@ -6464,7 +6477,7 @@ mod tests {
             "Abandon this worktree?",
             vec![
                 DialogButton::new(DialogAccel::Char('y'), "Abandon"),
-                DialogButton::new(DialogAccel::Char('n'), "Cancel"),
+                DialogButton::cancelling(DialogAccel::Char('n'), "Cancel"),
             ],
         );
         // Hit-test the center of the first button's rect.
