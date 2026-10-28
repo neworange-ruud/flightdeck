@@ -792,6 +792,38 @@ async fn unpairing_on_the_mac_tells_the_connected_phone() {
     }
 }
 
+/// An unpair landing while the link is still announcing itself (after
+/// `auth_ok`, before the session starts watching the registry) still reaches
+/// the phone, rather than slipping past a session that subscribed too late.
+#[tokio::test]
+async fn unpairing_during_the_announcement_still_tells_the_phone() {
+    let fx = Fixture::new();
+    let (link, _rx) = fx.start(OutboxLimits::default());
+    let store = link.wrap_store(Box::new(FileRemoteStore::at(
+        fx.dir.path().join("remote.json"),
+    )));
+    store.save(&fx.state);
+    let mut phone = Phone::connect(&link).await;
+    let phone_key = &fx.phone;
+    let reply = phone
+        .authenticate_with(phone_key.device_id(), &[PAIRING], |nonce| {
+            STANDARD.encode(phone_key.sign(&direct_auth_message(nonce)))
+        })
+        .await;
+    assert!(matches!(reply, RelayFrame::AuthOk { .. }), "{reply:?}");
+    store.save(&RemoteState::default());
+    loop {
+        match phone.recv().await {
+            RelayFrame::MachineName { .. } | RelayFrame::PeerPresence { .. } => continue,
+            RelayFrame::PairingRevoked { pairing_id } => {
+                assert_eq!(pairing_id.as_str(), PAIRING);
+                break;
+            }
+            other => panic!("expected pairing_revoked, got {other:?}"),
+        }
+    }
+}
+
 /// Bootstrap and push frames are not served on the direct link (`bad_frame`),
 /// data-plane frames need auth first, other paths do not upgrade, and the link
 /// answers pings.

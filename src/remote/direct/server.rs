@@ -406,6 +406,13 @@ async fn run_connection(shared: Arc<Shared>, tcp: TcpStream, stop: watch::Receiv
         return;
     };
     let session = shared.new_session_id();
+    // Watch the registry before `attach` (which bumps it), so the pump's first
+    // turn re-checks every pairing: an unpair landing while we announce is
+    // still answered with `pairing_revoked` instead of slipping past unseen.
+    let ticks = Ticks {
+        outbox: shared.outbox_tick.subscribe(),
+        registry: shared.registry_tick.subscribe(),
+    };
     crate::remote::debuglog::log(&format!(
         "direct AUTH ok session={session} pairings={:?}",
         pairings.iter().map(|p| p.as_str()).collect::<Vec<_>>()
@@ -440,7 +447,16 @@ async fn run_connection(shared: Arc<Shared>, tcp: TcpStream, stop: watch::Receiv
         .await;
     }
     shared.attach(session, &pairings, &device_id);
-    let active = pump(&shared, session, pairings, &mut sink, &mut stream, stop).await;
+    let active = pump(
+        &shared,
+        session,
+        pairings,
+        ticks,
+        &mut sink,
+        &mut stream,
+        stop,
+    )
+    .await;
     shared.detach(session, &active);
     close(&mut sink).await;
     crate::remote::debuglog::log(&format!("direct END session={session}"));
@@ -608,12 +624,19 @@ async fn handshake(
     Some((device_id.as_str().to_string(), pairing_ids))
 }
 
+/// The change feeds a session's pump wakes on, subscribed before it attaches.
+struct Ticks {
+    outbox: watch::Receiver<u64>,
+    registry: watch::Receiver<u64>,
+}
+
 /// The authenticated steady state. Returns the pairings the session still
 /// served when it ended (for presence).
 async fn pump(
     shared: &Shared,
     session: u64,
     pairings: Vec<PairingId>,
+    ticks: Ticks,
     sink: &mut Sink,
     stream: &mut Stream,
     mut stop: watch::Receiver<bool>,
@@ -625,8 +648,10 @@ async fn pump(
         .map(|p| (p.as_str().to_string(), None))
         .collect();
     let mut revoked_here: HashSet<String> = HashSet::new();
-    let mut outbox_rx = shared.outbox_tick.subscribe();
-    let mut registry_rx = shared.registry_tick.subscribe();
+    let Ticks {
+        outbox: mut outbox_rx,
+        registry: mut registry_rx,
+    } = ticks;
     let liveness = sleep(LIVENESS_TIMEOUT);
     tokio::pin!(liveness);
 

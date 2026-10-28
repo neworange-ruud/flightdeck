@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **Unpairing a phone from the computer while it was just connecting over the direct link (Tailscale) now always tells the phone.** If the unpair landed in the moment between the phone signing in and the link starting to watch for changes, the phone never heard `pairing_revoked` and stayed on a link that no longer served it.
 
 ## [0.10.1] - 2026-10-28
 
