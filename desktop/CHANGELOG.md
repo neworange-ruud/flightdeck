@@ -23,6 +23,7 @@ uses that version's section as the GitHub Release notes.
 ### Bug fixes
 
 - **Unpairing a phone from the computer while it was just connecting over the direct link (Tailscale) now always tells the phone.** If the unpair landed in the moment between the phone signing in and the link starting to watch for changes, the phone never heard `pairing_revoked` and stayed on a link that no longer served it.
+- **Alt-o opens the agent's worktree on Windows again.** Stored worktree paths contain `/`, and Explorer, handed a path with a `/` in it, silently opened your Documents folder instead. The path is now passed with `\` separators only.
 
 ## [0.10.1] - 2026-10-28
 
