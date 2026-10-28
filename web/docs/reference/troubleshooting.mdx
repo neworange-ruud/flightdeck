@@ -52,9 +52,11 @@ folder. See [Git Workflow](/desktop/git).
 ### `flightdeck update` says it can't self-update
 
 Self-update only replaces binaries installed via the installer script. If you
-installed with Homebrew, update with `brew update && brew upgrade flightdeck`; on
-Windows, re-run the PowerShell installer. This is expected behavior, not an
-error. See [CLI & Updating](/desktop/cli).
+installed with Homebrew, update with `brew update && brew upgrade flightdeck`;
+otherwise re-run the installer. This is expected behavior, not an error. On
+Windows, if the update window keeps waiting, a FlightDeck process is still
+running from the installed `flightdeck.exe`; the window lists it. See
+[CLI & Updating](/desktop/cli).
 
 ### Containers won't start
 

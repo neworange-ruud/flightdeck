@@ -1396,6 +1396,17 @@ executable.
   treated exactly like a missing one, so a leftover receipt can never produce a
   misleading "already up to date".
 
+**On Windows** the same receipt gate applies, but a running `.exe` cannot be
+replaced, and the Windows build has no axoupdater (its TLS stack needs a C
+toolchain the pure-Rust windows-msvc build avoids). There `flightdeck update`
+checks the latest release over SChannel and, when it is newer, opens a separate
+PowerShell window and exits. That window waits until the executable can be
+opened for writing — every FlightDeck process from that path has closed, which
+it tells the user, listing the ones still running — and only then runs that
+exact release's `flightdeck-installer.ps1` into the receipt's install prefix.
+Closing the window cancels the update. The update notice (§30) is not built on
+Windows yet.
+
 FlightDeck never auto-updates silently: downloading and replacing the binary is
 always an explicit, user-invoked command. (The update *notice* in §30
 may check for a newer version, but it only informs — it never updates.)

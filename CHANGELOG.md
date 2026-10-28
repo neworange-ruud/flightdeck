@@ -8,7 +8,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **`flightdeck update` works on Windows.** It checks GitHub for a newer release and, when there is one, opens a separate window that waits until every FlightDeck process has closed (it lists the ones still running) and then runs the PowerShell installer for that release. Closing the window cancels the update. As on macOS and Linux, only installs done with the PowerShell installer update this way; before, the command did nothing on Windows.
 
 ### Improvements
 

@@ -66,9 +66,12 @@ a newer version exists. It works from any directory and does not require a repo.
 
 ### Windows
 
-The Windows build is pure-Rust and ships **without** the self-updater, so
-`flightdeck update` is a no-op there. Upgrade by re-running the PowerShell
-installer, which fetches the latest release.
+On Windows a running `.exe` cannot be replaced, so `flightdeck update` checks
+for a newer release and then hands the install to a separate PowerShell window.
+That window waits until every FlightDeck process (the app, workers) has closed,
+lists the ones still running, and then runs the PowerShell installer for that
+release. Close the window to cancel. Like on macOS and Linux, this only works for
+installs done with the PowerShell installer; anything else is told to re-run it.
 
 ## Setup helpers
 
