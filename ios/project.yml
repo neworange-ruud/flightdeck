@@ -73,7 +73,7 @@ targets:
         # About. The Notification Service Extension repeats it (App Store Connect
         # requires the two to match); `scripts/release` rewrites every
         # occurrence.
-        CFBundleShortVersionString: "1.29.0"
+        CFBundleShortVersionString: "1.30.0"
         # Build number. Must strictly increase on EVERY App Store Connect
         # upload, independently of the marketing version — reusing one is
         # rejected.
@@ -206,7 +206,7 @@ targets:
         CFBundleDisplayName: "FlightDeck Remote Notifications"
         # Must equal the app's (App Store Connect rejects a mismatch);
         # `scripts/release` rewrites both. DistributionMetadataTests guards it.
-        CFBundleShortVersionString: "1.29.0"
+        CFBundleShortVersionString: "1.30.0"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         FlightDeckSharedKeychainGroup: "$(AppIdentifierPrefix)agency.neworange.flightdeck.remote.shared"
         NSExtension:

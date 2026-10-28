@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.30.0] - 2026-10-28
+
+### New features
+
 - **Windows Defender exclusion offer.** On Windows, FlightDeck now asks at startup whether to add itself to your Defender exclusions, which keeps real-time scanning from slowing it down. Yes opens an elevated PowerShell window that runs `Add-MpPreference -ExclusionProcess` for the running `flightdeck.exe` and waits for a key; No (or Esc) asks again after the next version. The exclusion covers files opened by `flightdeck.exe` itself, not those opened by the agents, git or node processes it starts. The answer is remembered in `~/.flightdeck/global-state.json`. Only the local terminal UI shows and answers it: never on macOS or Linux, in an isolated (`-I`) run, or from the web interface, the phone or the desktop app.
 
 ### Improvements
