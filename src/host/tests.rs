@@ -2223,3 +2223,64 @@ fn background_projects_refresh_only_while_a_remote_viewer_is_attached() {
         "the viewer count is read only when otherwise due"
     );
 }
+
+/// The dialog a turn publishes is read against the project its command
+/// targeted, not the host's active one. A remote desktop targets a tab in
+/// whichever project its window shows; reading the abandon gate against the
+/// host's active project found no such tab and refused every abandon a desktop
+/// sent to a multi-project worker with "The host can no longer name what this
+/// would destroy".
+#[test]
+fn a_published_dialog_gate_names_its_tab_in_a_background_project() {
+    let fakes = Fakes::new();
+    let (state, _pty) = fakes.state_with_a_tab();
+    let tab = state.tabs[0].id();
+    let other = AppState::new(
+        Config::default(),
+        default_state("main"),
+        "/repo2",
+        "/repo2/.flightdeck/state.json",
+    );
+    let workspace = Workspace {
+        projects: vec![
+            project("proj", "/repo", state, Arc::clone(&fakes.git)),
+            project("other", "/repo2", other, Arc::clone(&fakes.git)),
+        ],
+        active: 1,
+    };
+    let mut host = AppHost::from_parts(
+        fakes.env(),
+        &fakes.notifier,
+        workspace,
+        web_surface(),
+        false,
+    );
+    {
+        // What a targeted `abandon_worktree` from a desktop leaves behind.
+        let (_, _, ui) = host.tui_parts();
+        ui.web_origin = Some(crate::web::protocol::DialogOrigin::Browser {
+            viewer_id: None,
+            label: "100.73.111.96".to_string(),
+        });
+        ui.web_target = Some(crate::WebTarget {
+            project_root: PathBuf::from("/repo"),
+            target: Some(crate::app::commands::TabTarget::tab(tab)),
+        });
+        crate::start_prompt(ui, crate::Prompt::AbandonConfirm { dirty: false });
+    }
+
+    let dialog = host
+        .web_host_state()
+        .dialog
+        .expect("the question is published");
+    let body: crate::web::protocol::DialogBody =
+        serde_json::from_value(dialog.body.expect("the dialog carries a body")).unwrap();
+    assert_eq!(body.refusal, None);
+    assert!(body.confirmable);
+    assert_eq!(
+        body.confirm_gate
+            .expect("1g's step 2 is published")
+            .expected,
+        "Task"
+    );
+}

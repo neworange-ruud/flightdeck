@@ -18,6 +18,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 ### Bug fixes
 
 - **No more duplicate "recovered" sessions on Windows.** A session created on Windows could reappear at the next launch as an extra *recovered* tab for the same worktree, while the original session still worked. Recovery compared the two spellings of the worktree path (`/` and `\`) as text and missed that they were the same folder. It now compares them as paths, and new sessions store their path with `/` only.
+- **Abandoning a worktree from FlightDeck Desktop or a browser works when the host has more than one project open.** The abandon and rebase confirmations were checked against whichever project the host itself had in front, not the one the session belongs to. With the session in any other project, the dialog said "The host can no longer name what this would destroy" and could only be cancelled. This always happened on a `flightdeck worker` with several projects.
 
 ## [1.29.0] - 2026-10-26
 

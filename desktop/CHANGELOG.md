@@ -23,6 +23,7 @@ uses that version's section as the GitHub Release notes.
 ### Bug fixes
 
 - **No more duplicate "recovered" sessions on Windows.** A session created on Windows could reappear at the next launch as an extra *recovered* tab for the same worktree, while the original session still worked. Recovery compared the two spellings of the worktree path (`/` and `\`) as text and missed that they were the same folder. It now compares them as paths, and new sessions store their path with `/` only.
+- **Abandon Worktree works on a worker with more than one project open.** The confirmation used to say "The host can no longer name what this would destroy" and offer only Cancel, because the host checked the session name against its own active project instead of the session's project. The same fix covers Rebase.
 
 ## [0.10.0] - 2026-10-26
 
