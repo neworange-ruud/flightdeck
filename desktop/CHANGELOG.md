@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **No more duplicate "recovered" sessions on Windows.** A session created on Windows could reappear at the next launch as an extra *recovered* tab for the same worktree, while the original session still worked. Recovery compared the two spellings of the worktree path (`/` and `\`) as text and missed that they were the same folder. It now compares them as paths, and new sessions store their path with `/` only.
 
 ## [0.10.0] - 2026-10-26
 
