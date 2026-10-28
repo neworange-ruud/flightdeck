@@ -227,6 +227,30 @@ impl CommandRunner for SystemCommandRunner {
             output: combined,
         })
     }
+
+    fn spawn_detached(&self, program: &str, args: &[String]) -> Result<()> {
+        use std::process::Stdio;
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            // CREATE_NO_WINDOW: the launcher itself gets no console, so it can
+            // neither draw on FlightDeck's nor flash one of its own.
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| FlightDeckError::Io(format!("failed to start {program}: {e}")))?;
+        // Reap it off-thread so a finished launcher never lingers as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
 }
 
 /// System-clock-backed [`Clock`] producing UTC ISO-8601 timestamps.

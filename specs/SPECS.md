@@ -293,12 +293,42 @@ FlightDeck layers two TOML files into one effective config:
 ```text
 ~/.flightdeck/config.toml       # per-user GLOBAL base (all settings, documented)
 <repo>/.flightdeck/config.toml  # per-project OVERRIDE (only changed values)
+~/.flightdeck/global-state.json # answers FlightDeck asked for once (see below)
 ```
 
 The per-project config is committed and human-readable. The global base is
 per-user (created on first run) and documents every overridable setting so it is
 clear what a project may override; it deliberately omits `[project]` (project
 identity — `name` / `default_base_branch` — is per-repo).
+
+### Global state and the Windows Defender exclusion offer
+
+`~/.flightdeck/global-state.json` holds answers FlightDeck itself asked for once
+that apply to every project; it is not a setting and is not edited by hand.
+Unknown fields are kept when it is rewritten, a Defender answer a build cannot
+read counts as "never answered", and a file that is not valid JSON is read as
+empty and copied to `global-state.json.bak` before it is replaced.
+
+On Windows, Defender's real-time scan slows FlightDeck down. At startup the
+terminal UI offers once to add `flightdeck.exe` to Defender's process
+exclusions: "You are on a Windows machine. Would you like to add FlightDeck to
+your Defender exclusions?" with Yes (`y`) and No (`n` or Esc).
+
+- **Windows TUI only.** Never offered on macOS or Linux, never in an isolated
+  run (`-I`), never over another dialog, and not by the desktop app or the
+  worker.
+- **Never answerable remotely.** The question is not published to FlightDeck
+  Web, the phone or the desktop app, and a remote confirm or cancel is refused.
+  Only the person at the terminal can approve a change to the machine's
+  security settings.
+- **Yes is permanent.** It is recorded before anything starts, then an elevated
+  PowerShell window (UAC prompt) runs `Add-MpPreference -ExclusionProcess` for
+  the running executable and waits for a key. The offer does not return, even if
+  that window fails.
+- **No lasts for the version.** It is recorded with the running version and the
+  question returns after an update.
+- The exclusion covers files opened by `flightdeck.exe` itself, not those opened
+  by the agents, git or node processes it starts.
 
 ### Layering rules
 
@@ -1013,8 +1043,15 @@ Settings (`[ui]`):
 | `app_mode_color` | (same set) | cyan |
 | `mode_border` | off, dim, normal, bright | off |
 | `dim_terminal_in_app_mode` | true / false | true |
+| `animations` | true / false | true |
 | `macos_option_as_meta` | true / false | false |
 | `desktop_terminal_font_size` | 8 to 32 (points) | 13 |
+
+`ui.animations` turns the terminal UI's spinners on or off. When `true` (default)
+a working agent's spinner cycles; when `false` every spinner shows a fixed `⠿`
+and an idle screen stops redrawing. It affects the TUI only; the desktop app's
+spinner ignores it. It is shown in the configuration manager as "Animations
+(terminal UI)".
 
 `ui.macos_option_as_meta` applies to the native desktop app on macOS only: when
 `true`, an Option+key that FlightDeck does not bind is sent to the terminal as
@@ -1609,6 +1646,7 @@ not create `~/.flightdeck/worker/` on a machine that never ran a worker.
 
 | Path | What |
 | --- | --- |
+| `~/.flightdeck/global-state.json` | The terminal UI's remembered one-time answers (the Defender exclusion offer, §8). Not part of the worker, and not under `worker/`. |
 | `~/.flightdeck/worker/` | The worker directory, mode 0700. |
 | `~/.flightdeck/worker/control.sock` | The control socket, mode 0600: one JSON request and one JSON answer per connection. Only the account can reach it, so minting a pairing code already requires a shell on the box. |
 | `~/.flightdeck/worker/supervisor.pid`, `worker.pid` | Informational pids (the locks are the truth). |
