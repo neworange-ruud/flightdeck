@@ -216,6 +216,13 @@ pub trait CommandRunner {
     /// stdout+stderr. Returns a [`CommandOutcome`]; an `Err` means the shell
     /// itself could not be launched, not that the script exited non-zero.
     fn run_shell(&self, script: &str, cwd: &Path) -> Result<CommandOutcome>;
+
+    /// Start `program` with `args` and return at once, without waiting for it
+    /// and without sharing FlightDeck's terminal: stdio is detached and no
+    /// console window is created for the child itself. Fire-and-forget; an
+    /// `Err` means the process could not be started. Used for helpers that
+    /// open a window of their own (the Defender exclusion launcher).
+    fn spawn_detached(&self, program: &str, args: &[String]) -> Result<()>;
 }
 
 /// Posts OS notifications when an agent finishes a running task (SPECS §24).

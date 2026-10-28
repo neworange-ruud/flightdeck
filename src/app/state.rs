@@ -25,7 +25,7 @@ use crate::contracts::{
     NotificationSound, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize,
     Result, TabId, TabState,
 };
-use crate::fs::paths::{to_absolute, to_relative, worktree_path};
+use crate::fs::paths::{to_absolute, to_relative, to_stored_string, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
 use crate::git::remote::{github_pr_url, plan_push, push_branch, PushPlan};
 use crate::git::status::{
@@ -1374,10 +1374,9 @@ impl AppState {
         // (g) record the placeholder TabState. The base SHA is a cheap, lock-free
         //     read so we resolve it now; the session is spawned in `finalize`.
         let base_commit_sha = services.git.rev_parse(&self.base_branch)?;
-        let worktree_rel = to_relative(&self.repo_root, &worktree_abs)
-            .unwrap_or_else(|_| worktree_abs.clone())
-            .to_string_lossy()
-            .to_string();
+        let worktree_rel = to_stored_string(
+            &to_relative(&self.repo_root, &worktree_abs).unwrap_or_else(|_| worktree_abs.clone()),
+        );
         // Load the repo's `[worktree_created]` hook commands to run once the new
         // worktree is materialized. Only a freshly-created worktree runs them; a
         // reused one is already set up (SPECS §7 hooks). Best-effort: loading a

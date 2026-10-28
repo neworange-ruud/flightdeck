@@ -64,10 +64,6 @@ primary_host = "github"
 default_base_branch = "main"
 name = "flightdeck"
 
-[ui]
-agent_tab_position = "left"
-default_agent = "opencode"
-
 [update]
 check = true
 
