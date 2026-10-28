@@ -303,7 +303,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn tracked_tab_with_mixed_separators_is_not_recovered_again() {
-        let repo_root = Path::new("C:\\repo");
+        // Real git prints `/`-separated paths on Windows (`rev-parse
+        // --show-toplevel`, `worktree list`); the scan joins with `\`.
+        let repo_root = Path::new("C:/repo");
         let worktrees_root = repo_root.join(".flightdeck").join("worktrees");
         let wt_path = worktrees_root.join("firewall");
 
@@ -312,7 +314,7 @@ mod tests {
             .with_dir(wt_path.to_str().unwrap());
         let git = FakeGit::new().with_root(repo_root);
         git.add_existing_worktree(WorktreeInfo {
-            path: wt_path.clone(),
+            path: PathBuf::from("C:/repo/.flightdeck/worktrees/firewall"),
             branch: Some("flightdeck/firewall".to_string()),
             head: None,
         });
