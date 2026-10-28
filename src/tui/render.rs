@@ -4935,6 +4935,93 @@ mod tests {
         assert!(all_text.contains("SHELL_PANE"), "shell column must render");
     }
 
+    /// How long the idle test watches, and how often the event loop draws
+    /// (`POLL_TIMEOUT` in `lib.rs`).
+    const IDLE_WATCH_MS: u64 = 120_000;
+    const FRAME_MS: u64 = 50;
+
+    #[test]
+    fn an_idle_screen_writes_nothing_to_the_terminal() {
+        // The event loop draws every 50 ms whether or not anything changed;
+        // `QuietBackend` keeps that silent only while every frame renders the
+        // same cells. Anything on screen that moves with the clock alone — a
+        // ticking clock, a pulse, a shimmer — would send the terminal a write
+        // 20 times a second, and lag returns on software-rendered terminals.
+        // The tab runs a plain shell rather than an agent, so no agent output
+        // or status detection can make the screen legitimately change.
+        use crate::contracts::PtySize;
+        use crate::testing::FakePty;
+        use crate::tui::quiet_backend::recording::Recording;
+        use crate::tui::quiet_backend::QuietBackend;
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(1);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "sh", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.tabs[0]
+            .session
+            .primary_mut()
+            .unwrap()
+            .process_output(b"$ ");
+        state.focus_terminal();
+        let projects = [project_view("repo", false, false)];
+        let cache = empty_cache();
+
+        let (w, h) = (120, 30);
+        let mut term = Terminal::new(QuietBackend::new(Recording::new(w, h))).unwrap();
+        let start_ms = 1_000_000;
+        let mut writes = Vec::new();
+        let mut now_ms = start_ms;
+        while now_ms <= start_ms + IDLE_WATCH_MS {
+            let before = term.backend().inner().writes.len();
+            // The same two calls the event loop makes for every frame.
+            term.draw(|frame| {
+                let area = frame.area();
+                let chrome = layout::chrome_for(area, state.mode());
+                let ml = layout::compute(
+                    area,
+                    chrome,
+                    crate::tui::mode_style::border_enabled(&state.config.ui),
+                    state.config.ui.agent_tab_side(),
+                );
+                draw_project_tab_bar(
+                    frame,
+                    ml.project_tabs,
+                    &projects,
+                    0,
+                    now_ms,
+                    state.config.ui.animations,
+                );
+                draw(frame, &state, &cache, &UiOverlay::None, None, now_ms);
+            })
+            .unwrap();
+            if now_ms > start_ms {
+                for write in &term.backend().inner().writes[before..] {
+                    writes.push(format!("+{} ms: {write}", now_ms - start_ms));
+                }
+            }
+            now_ms += FRAME_MS;
+        }
+
+        assert!(
+            writes.is_empty(),
+            "an idle FlightDeck must not repaint, but after the first frame it wrote \
+             {} times in {} s:\n{}",
+            writes.len(),
+            IDLE_WATCH_MS / 1000,
+            writes
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
     #[test]
     fn hit_test_in_split_view_selects_column() {
         use crate::contracts::PtySize;

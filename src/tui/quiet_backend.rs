@@ -133,24 +133,26 @@ impl<B: Backend> Backend for QuietBackend<B> {
     }
 }
 
+/// Test support: a backend that logs the writes reaching it, shared with the
+/// render tests that hold the whole UI to the quiet-frame promise.
 #[cfg(test)]
-mod tests {
+pub(crate) mod recording {
     use super::*;
     use ratatui::backend::TestBackend;
-    use ratatui::widgets::Paragraph;
-    use ratatui::Terminal;
 
     /// A [`TestBackend`] that also logs every call that would write to a real
     /// terminal, so a test can assert that a quiet frame wrote nothing.
-    struct Recording {
+    pub struct Recording {
         screen: TestBackend,
-        writes: Vec<String>,
+        /// One entry per terminal write, in order.
+        pub writes: Vec<String>,
     }
 
     impl Recording {
-        fn new() -> Self {
+        /// A recording screen of `width` × `height` cells.
+        pub fn new(width: u16, height: u16) -> Self {
             Self {
-                screen: TestBackend::new(20, 4),
+                screen: TestBackend::new(width, height),
                 writes: Vec::new(),
             }
         }
@@ -214,9 +216,17 @@ mod tests {
             self.screen.flush()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recording::Recording;
+    use super::*;
+    use ratatui::widgets::Paragraph;
+    use ratatui::Terminal;
 
     fn terminal() -> Terminal<QuietBackend<Recording>> {
-        Terminal::new(QuietBackend::new(Recording::new())).unwrap()
+        Terminal::new(QuietBackend::new(Recording::new(20, 4))).unwrap()
     }
 
     /// Draw `text` with the cursor at `cursor` (hidden when `None`) and return
