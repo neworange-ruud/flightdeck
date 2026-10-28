@@ -46,9 +46,10 @@ installs it defers to the package manager — update those with:
 brew update && brew upgrade flightdeck
 ```
 
-The Windows build is pure-Rust and ships **without** the self-updater
-(`flightdeck update` is a no-op there); upgrade by re-running the PowerShell
-installer above, which fetches the latest release.
+On Windows a running `.exe` cannot be replaced, so `flightdeck update` opens a
+separate window that waits until every FlightDeck process has closed and then
+runs the PowerShell installer above for the new release. Close that window to
+cancel.
 
 ### Update Notice
 

@@ -224,9 +224,9 @@ http-body-util = "0.1"
 # (rather than only behind a feature) keeps the Windows build pure-Rust even when
 # the default features are enabled: each of these graphs pulls in a C library
 # (`aws-lc-sys`, SQLite) that would otherwise need a C toolchain on the
-# windows-msvc release runner. On Windows the `update` module falls back to a
-# no-op stand-in (see src/lib.rs) and TLS comes from SChannel instead — see the
-# `cfg(windows)` table below.
+# windows-msvc release runner. On Windows `flightdeck update` runs the
+# PowerShell installer instead (src/update_windows.rs) and TLS comes from
+# SChannel — see the `cfg(windows)` table below.
 [target.'cfg(not(windows))'.dependencies]
 # Self-update for installer-based installs (`flightdeck update`). The `blocking`
 # feature exposes the `*_sync` methods so a caller needs no runtime of its own;

@@ -345,8 +345,12 @@ async fn deliver_with(push: &HttpsPush, retry_delay: Duration) -> PushHttpOutcom
     }
 }
 
-/// Bytes both TLS backends and a plain socket hand to hyper.
-trait PushIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+/// Bytes both TLS backends and a plain socket hand to hyper. Shared with the
+/// Windows `flightdeck update` release check (src/update_windows.rs).
+pub(crate) trait PushIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> PushIo for T {}
 
 /// One HTTP/1.1 POST of `json` to `url`; returns the response status.
@@ -407,7 +411,7 @@ async fn post_once(
 /// TLS for the push POST off Windows: rustls with the webpki roots, the same
 /// backend and trust store the relay WebSocket uses on this target.
 #[cfg(not(windows))]
-async fn tls_connect(
+pub(crate) async fn tls_connect(
     host: &str,
     tcp: tokio::net::TcpStream,
 ) -> std::result::Result<Box<dyn PushIo>, String> {
@@ -430,7 +434,7 @@ async fn tls_connect(
 /// TLS for the push POST on Windows: SChannel via native-tls, the same backend
 /// the relay WebSocket uses on this target.
 #[cfg(windows)]
-async fn tls_connect(
+pub(crate) async fn tls_connect(
     host: &str,
     tcp: tokio::net::TcpStream,
 ) -> std::result::Result<Box<dyn PushIo>, String> {

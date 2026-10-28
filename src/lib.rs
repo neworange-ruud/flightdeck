@@ -26,6 +26,11 @@ pub mod terminal;
 pub mod tui;
 #[cfg(all(feature = "self-update", not(windows)))]
 pub mod update;
+// Windows has no axoupdater (its TLS stack needs a C toolchain, see
+// Cargo.toml); the same subcommand runs cargo-dist's PowerShell installer.
+#[cfg(all(feature = "self-update", windows))]
+#[path = "update_windows.rs"]
+pub mod update;
 pub mod view;
 pub mod web;
 pub mod worker;
@@ -34,14 +39,11 @@ pub mod worker;
 /// status and the web protocol's `host_version` report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// No-op stand-in when the real self-updater is not built: either the
-// `self-update` feature is off (a pure-Rust build with no C toolchain), or the
-// target is Windows (where the updater deps are gated out in Cargo.toml so the
-// released windows-msvc binary stays pure-Rust). Keeps
-// `update::run`/`update::start_check` callable so the subcommand dispatch and the
-// update-notice channel plumbing below need no `cfg` of their own; `update`
-// becomes a no-op and `start_check` never sends.
-#[cfg(not(all(feature = "self-update", not(windows))))]
+// No-op stand-in when the `self-update` feature is off (a pure-Rust build with
+// no C toolchain). Keeps `update::run`/`update::start_check` callable so the
+// subcommand dispatch and the update-notice channel plumbing below need no
+// `cfg` of their own; `update` becomes a no-op and `start_check` never sends.
+#[cfg(not(feature = "self-update"))]
 pub mod update {
     use crate::contracts::error::Result;
     use std::sync::mpsc::Sender;
@@ -494,9 +496,13 @@ fn run_setup_update() -> Result<()> {
         "It never auto-updates — run `flightdeck update` (or `brew update && brew upgrade flightdeck`)."
     );
     println!("Disable any time by setting `check = false` under [update].");
-    #[cfg(not(all(feature = "self-update", not(windows))))]
+    #[cfg(not(feature = "self-update"))]
     println!(
         "Note: this build was compiled without self-update support, so the check above will never run."
+    );
+    #[cfg(all(feature = "self-update", windows))]
+    println!(
+        "Note: the update notice is not available on Windows yet, so the check above will never run."
     );
     Ok(())
 }
