@@ -4151,7 +4151,7 @@ mod tests {
                 slug: format!("tab{i}"),
                 agent: "opencode".to_string(),
                 branch: format!("flightdeck/tab{i}"),
-                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}"),
+                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}").into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "sha".to_string(),
                 created_at: "t".to_string(),

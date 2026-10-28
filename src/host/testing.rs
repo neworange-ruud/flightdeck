@@ -63,7 +63,7 @@ pub fn state_with_tabs(project: &str, tabs: &[&str]) -> AppState {
             slug: name.to_string(),
             agent: "opencode".to_string(),
             branch: format!("flightdeck/{name}"),
-            worktree_path_relative: format!(".flightdeck/worktrees/{name}"),
+            worktree_path_relative: format!(".flightdeck/worktrees/{name}").into(),
             base_branch: "main".to_string(),
             base_commit_sha: "sha".to_string(),
             created_at: "t".to_string(),

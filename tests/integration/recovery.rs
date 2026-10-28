@@ -115,7 +115,7 @@ fn flags_stale_state_entry_when_worktree_dir_removed() {
         slug: "gone".to_string(),
         agent: "opencode".to_string(),
         branch: "flightdeck/gone".to_string(),
-        worktree_path_relative: ".flightdeck/worktrees/gone".to_string(),
+        worktree_path_relative: ".flightdeck/worktrees/gone".to_string().into(),
         base_branch: "main".to_string(),
         base_commit_sha: "deadbeef".to_string(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
