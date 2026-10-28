@@ -2,7 +2,8 @@
 //! (SPECS §10). Never auto-relaunches agents.
 
 use crate::contracts::{FileSystem, GitExecutor, ProjectState, Result, TabState};
-use std::path::Path;
+use crate::fs::paths::to_stored_string;
+use std::path::{Path, PathBuf};
 
 /// Actions offered for a recovered tab (SPECS §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,27 +72,24 @@ pub fn recover(
         vec![]
     };
 
-    // Build a set of worktree_path_relative values already tracked in state.
-    let tracked_relatives: std::collections::HashSet<String> = state
+    // Absolute paths of worktrees already tracked in state. Compared as `Path`
+    // (component-wise), not as strings: a stored path may mix `/` and `\` on
+    // Windows and must still match the scanned directory.
+    let tracked_paths: Vec<PathBuf> = state
         .tabs
         .iter()
-        .map(|t| t.worktree_path_relative.clone())
+        .map(|t| repo_root.join(&t.worktree_path_relative))
         .collect();
 
     for entry in dir_entries {
-        // Compute the relative path from repo_root to this entry.
-        let relative = match entry.strip_prefix(repo_root) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => {
-                // entry is not under repo_root — use the full path string as relative key.
-                entry.to_string_lossy().to_string()
-            }
-        };
-
         // Skip entries already tracked.
-        if tracked_relatives.contains(&relative) {
+        if tracked_paths.iter().any(|p| p == &entry) {
             continue;
         }
+
+        // Compute the relative path from repo_root to this entry; an entry
+        // not under repo_root keeps its full path.
+        let relative = to_stored_string(entry.strip_prefix(repo_root).unwrap_or(&entry));
 
         // Check whether this directory corresponds to a real git worktree.
         let matching_wt = known_worktrees.iter().find(|w| w.path == entry);
@@ -270,6 +268,70 @@ mod tests {
         assert_eq!(tab.last_known_status, "session lost");
         assert_eq!(tab.base_branch, "main");
         assert!(tab.manual_status.is_none());
+    }
+
+    #[test]
+    fn reconstructed_tab_stores_forward_slash_relative_path() {
+        // The stored path must read the same on every OS, so a later launch
+        // (or another platform) recognises it as tracked.
+        let repo_root = Path::new("/repo");
+        let worktrees_root = repo_root.join(".flightdeck").join("worktrees");
+        let wt_path = worktrees_root.join("feature-x");
+
+        let fs = FakeFs::new()
+            .with_dir(worktrees_root.to_str().unwrap())
+            .with_dir(wt_path.to_str().unwrap());
+        let git = FakeGit::new().with_root(repo_root);
+        git.add_existing_worktree(WorktreeInfo {
+            path: wt_path.clone(),
+            branch: Some("flightdeck/feature-x".to_string()),
+            head: None,
+        });
+
+        let mut state = default_state("main");
+        recover(&fs, &git, repo_root, &worktrees_root, &mut state).unwrap();
+
+        assert_eq!(
+            state.tabs[0].worktree_path_relative,
+            ".flightdeck/worktrees/feature-x"
+        );
+    }
+
+    /// Regression: a tab created on Windows stored `.flightdeck/worktrees\x`
+    /// while recovery scanned `.flightdeck\worktrees\x`; the string mismatch
+    /// added a duplicate `recovered-x` tab for a worktree already in use.
+    #[cfg(windows)]
+    #[test]
+    fn tracked_tab_with_mixed_separators_is_not_recovered_again() {
+        let repo_root = Path::new("C:\\repo");
+        let worktrees_root = repo_root.join(".flightdeck").join("worktrees");
+        let wt_path = worktrees_root.join("firewall");
+
+        let fs = FakeFs::new()
+            .with_dir(worktrees_root.to_str().unwrap())
+            .with_dir(wt_path.to_str().unwrap());
+        let git = FakeGit::new().with_root(repo_root);
+        git.add_existing_worktree(WorktreeInfo {
+            path: wt_path.clone(),
+            branch: Some("flightdeck/firewall".to_string()),
+            head: None,
+        });
+
+        let mut state = default_state("main");
+        state.tabs.push(make_tab(
+            "firewall-1",
+            "firewall",
+            ".flightdeck/worktrees\\firewall",
+        ));
+
+        let report = recover(&fs, &git, repo_root, &worktrees_root, &mut state).unwrap();
+
+        assert!(
+            report.recovered_tabs.is_empty(),
+            "{:?}",
+            report.recovered_tabs
+        );
+        assert_eq!(state.tabs.len(), 1);
     }
 
     // -------------------------------------------------------------------------
