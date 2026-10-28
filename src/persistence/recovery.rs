@@ -1,8 +1,7 @@
 //! Startup recovery of Agent Tabs from `state.json` + on-disk worktrees
 //! (SPECS §10). Never auto-relaunches agents.
 
-use crate::contracts::{FileSystem, GitExecutor, ProjectState, Result, TabState};
-use crate::fs::paths::to_stored_string;
+use crate::contracts::{FileSystem, GitExecutor, ProjectState, Result, StoredPath, TabState};
 use std::path::{Path, PathBuf};
 
 /// Actions offered for a recovered tab (SPECS §10).
@@ -54,7 +53,7 @@ pub fn recover(
 
     // Step 1: Validate stored tabs — detect stale entries.
     for tab in &mut state.tabs {
-        let abs_path = repo_root.join(&tab.worktree_path_relative);
+        let abs_path = tab.worktree_path_relative.resolve(repo_root);
         let on_disk = fs.exists(&abs_path);
         let in_git = known_worktrees.iter().any(|w| w.path == abs_path);
 
@@ -78,7 +77,7 @@ pub fn recover(
     let tracked_paths: Vec<PathBuf> = state
         .tabs
         .iter()
-        .map(|t| repo_root.join(&t.worktree_path_relative))
+        .map(|t| t.worktree_path_relative.resolve(repo_root))
         .collect();
 
     for entry in dir_entries {
@@ -89,7 +88,7 @@ pub fn recover(
 
         // Compute the relative path from repo_root to this entry; an entry
         // not under repo_root keeps its full path.
-        let relative = to_stored_string(entry.strip_prefix(repo_root).unwrap_or(&entry));
+        let relative = StoredPath::from_path(entry.strip_prefix(repo_root).unwrap_or(&entry));
 
         // Check whether this directory corresponds to a real git worktree.
         let matching_wt = known_worktrees.iter().find(|w| w.path == entry);
@@ -102,7 +101,7 @@ pub fn recover(
         let slug = entry
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| relative.clone());
+            .unwrap_or_else(|| relative.to_string());
 
         // Derive branch from WorktreeInfo or fall back to slug.
         let branch = wt_info
@@ -158,7 +157,7 @@ mod tests {
             slug: slug.to_string(),
             agent: "opencode".to_string(),
             branch: format!("flightdeck/{slug}"),
-            worktree_path_relative: relative.to_string(),
+            worktree_path_relative: relative.into(),
             base_branch: "main".to_string(),
             base_commit_sha: "abc".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

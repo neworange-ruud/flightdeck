@@ -5,10 +5,9 @@
 //! platform launcher and the non-blocking spawn itself live in
 //! [`crate::tui::opener`], shared with the browser.
 
-use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::tui::{opener, platform};
+use crate::tui::opener;
 
 /// Resolve the launcher program and its fixed arguments.
 ///
@@ -27,18 +26,7 @@ pub fn launcher(configured: &str) -> (String, Vec<String>) {
 /// when the launcher cannot be started.
 pub fn open(path: &Path, configured: &str) -> Result<(), String> {
     let (program, args) = launcher(configured);
-    let path = native_separators(path, platform::IS_WINDOWS);
     opener::spawn_detached(&program, &args, path.as_os_str(), "file manager")
-}
-
-/// On Windows, rewrite every `/` in `path` as `\`. Stored worktree paths are
-/// `/`-separated, and Explorer reads a `/` as the start of a switch: handed
-/// `D:\repo\.flightdeck/worktrees/x` it silently opens Documents instead.
-fn native_separators(path: &Path, windows: bool) -> Cow<'_, Path> {
-    match path.to_str() {
-        Some(s) if windows && s.contains('/') => Cow::Owned(PathBuf::from(s.replace('/', "\\"))),
-        _ => Cow::Borrowed(path),
-    }
 }
 
 #[cfg(test)]
@@ -80,23 +68,6 @@ mod tests {
         let (program, args) = launcher("flatpak run org.gnome.Nautilus");
         assert_eq!(program, "flatpak");
         assert_eq!(args, vec!["run", "org.gnome.Nautilus"]);
-    }
-
-    #[test]
-    fn windows_paths_get_backslashes_only() {
-        // Explorer reads any `/` as a switch and silently opens Documents, and
-        // stored worktree paths are `/`-separated.
-        let mixed = Path::new(r"D:\repo\.flightdeck/worktrees/my-task");
-        assert_eq!(
-            native_separators(mixed, true),
-            Path::new(r"D:\repo\.flightdeck\worktrees\my-task")
-        );
-    }
-
-    #[test]
-    fn other_platforms_keep_the_path_as_is() {
-        let path = Path::new("/home/me/repo/.flightdeck/worktrees/my-task");
-        assert_eq!(native_separators(path, false), path);
     }
 
     #[test]

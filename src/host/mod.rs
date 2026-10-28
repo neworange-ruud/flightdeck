@@ -1512,10 +1512,7 @@ impl<'a> AppHost<'a> {
     pub fn selected_folder(&self) -> std::path::PathBuf {
         let state = self.active_state();
         let folder = match state.selected() {
-            Some(tab) => crate::fs::paths::to_absolute(
-                &state.repo_root,
-                std::path::Path::new(&tab.meta.worktree_path_relative),
-            ),
+            Some(tab) => tab.meta.worktree_path_relative.resolve(&state.repo_root),
             None => state.repo_root.clone(),
         };
         folder

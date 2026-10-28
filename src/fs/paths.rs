@@ -23,18 +23,6 @@ pub fn to_relative(root: &Path, abs: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Render a path for storing in `state.json`, always `/`-separated, so the
-/// same worktree reads identically however the path was assembled (Windows
-/// mixes `/` from config with `\` from `Path::join`).
-pub fn to_stored_string(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if cfg!(windows) {
-        s.replace('\\', "/")
-    } else {
-        s.into_owned()
-    }
-}
-
 /// Resolve a stored relative path against `root` (runtime absolute path).
 ///
 /// - If `rel` is already absolute, return it unchanged.
@@ -125,21 +113,6 @@ mod tests {
         let already_abs = abs("other/place");
         let target = to_absolute(&root, &already_abs);
         assert_eq!(target, already_abs);
-    }
-
-    // --- to_stored_string ---
-
-    #[test]
-    fn to_stored_string_uses_forward_slashes() {
-        let rel = Path::new(".flightdeck/worktrees").join("my-task");
-        assert_eq!(to_stored_string(&rel), ".flightdeck/worktrees/my-task");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn to_stored_string_normalises_windows_separators() {
-        let rel = Path::new(".flightdeck\\worktrees/my-task");
-        assert_eq!(to_stored_string(rel), ".flightdeck/worktrees/my-task");
     }
 
     // --- round-trip ---

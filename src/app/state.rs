@@ -23,9 +23,9 @@ use crate::contracts::{
     AgentDef, Clock, CommandRunner, Config, ContainerRuntime, ContainerState, ContainersConfig,
     FileSystem, FlightDeckError, GitExecutor, InterpretedStatus, ManualStatus, Notification,
     NotificationSound, NotificationsConfig, ProcessState, ProjectState, PtyBackend, PtySize,
-    Result, TabId, TabState,
+    Result, StoredPath, TabId, TabState,
 };
-use crate::fs::paths::{to_absolute, to_relative, to_stored_string, worktree_path};
+use crate::fs::paths::{to_absolute, to_relative, worktree_path};
 use crate::git::branch::{branch_name, decide_branch, slugify, BranchDecision};
 use crate::git::remote::{github_pr_url, plan_push, push_branch, PushPlan};
 use crate::git::status::{
@@ -1374,7 +1374,7 @@ impl AppState {
         // (g) record the placeholder TabState. The base SHA is a cheap, lock-free
         //     read so we resolve it now; the session is spawned in `finalize`.
         let base_commit_sha = services.git.rev_parse(&self.base_branch)?;
-        let worktree_rel = to_stored_string(
+        let worktree_rel = StoredPath::from_path(
             &to_relative(&self.repo_root, &worktree_abs).unwrap_or_else(|_| worktree_abs.clone()),
         );
         // Load the repo's `[worktree_created]` hook commands to run once the new
@@ -1520,7 +1520,7 @@ impl AppState {
             agent: key,
             branch: head.clone(),
             // The project root, relative to itself.
-            worktree_path_relative: ".".to_string(),
+            worktree_path_relative: ".".to_string().into(),
             base_branch: base.clone(),
             base_commit_sha,
             created_at,
@@ -1579,10 +1579,10 @@ impl AppState {
             .get(&agent_key)
             .cloned()
             .ok_or_else(|| FlightDeckError::Config(format!("unknown agent '{agent_key}'")))?;
-        let worktree_abs = to_absolute(
-            &self.repo_root,
-            Path::new(&self.tabs[idx].meta.worktree_path_relative),
-        );
+        let worktree_abs = self.tabs[idx]
+            .meta
+            .worktree_path_relative
+            .resolve(&self.repo_root);
         let branch = self.tabs[idx].meta.branch.clone();
         let attached = self.tabs[idx].meta.attached_existing_branch;
         let tab_id = self.tabs[idx].meta.id.clone();
@@ -1761,7 +1761,7 @@ impl AppState {
         let Some(tab) = tab.and_then(|i| self.tabs.get(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let worktree = tab.meta.worktree_path_relative.resolve(&self.repo_root);
         let branch = tab.meta.branch.clone();
         let base = tab.meta.base_branch.clone();
 
@@ -1806,8 +1806,7 @@ impl AppState {
         let tab = &self.tabs[idx];
         let agent_branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
-        let agent_worktree =
-            to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let agent_worktree = tab.meta.worktree_path_relative.resolve(&self.repo_root);
         let base_worktree = self.repo_root.clone();
         // A running primary agent does NOT block the merge — "Finish" stops it and
         // removes the worktree afterwards. We only track it to inform the prompt.
@@ -1909,8 +1908,7 @@ impl AppState {
         let agent_branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
         let base_commit_sha = tab.meta.base_commit_sha.clone();
-        let agent_worktree =
-            to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let agent_worktree = tab.meta.worktree_path_relative.resolve(&self.repo_root);
         let primary_running = tab.session.primary_state() == ProcessState::Running;
 
         let req = RebaseRequest {
@@ -2057,10 +2055,10 @@ impl AppState {
                 "This tab runs on the base branch in the project root — it has no worktree to abandon. Close the tab instead.".to_string(),
             ));
         }
-        let worktree = to_absolute(
-            &self.repo_root,
-            Path::new(&self.tabs[idx].meta.worktree_path_relative),
-        );
+        let worktree = self.tabs[idx]
+            .meta
+            .worktree_path_relative
+            .resolve(&self.repo_root);
 
         // Abandoning always asks first (SPECS §5/§15); a clean worktree is also
         // confirmed, just without the dirty-changes warning.
@@ -2101,7 +2099,7 @@ impl AppState {
         let Some(tab) = tab.and_then(|i| self.tabs.get(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let worktree = tab.meta.worktree_path_relative.resolve(&self.repo_root);
         let Some(name) = [".env.local", ".env"]
             .into_iter()
             .find(|name| services.fs.exists(&self.repo_root.join(name)))
@@ -2128,7 +2126,7 @@ impl AppState {
         let Some(tab) = tab.and_then(|i| self.tabs.get_mut(i)) else {
             return Err(FlightDeckError::Other("no tab selected".to_string()));
         };
-        let cwd = to_absolute(&repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let cwd = tab.meta.worktree_path_relative.resolve(&repo_root);
         let (cmd, args) = if tab.meta.containerized {
             let name = container_name(&tab.meta.id);
             // The container is always Linux, so the child shell must be a
@@ -2181,10 +2179,10 @@ impl AppState {
             &repo_root,
         )?;
 
-        let cwd = to_absolute(
-            &repo_root,
-            Path::new(&self.tabs[idx].meta.worktree_path_relative),
-        );
+        let cwd = self.tabs[idx]
+            .meta
+            .worktree_path_relative
+            .resolve(&repo_root);
         let (cmd, args) = if self.tabs[idx].meta.containerized {
             let name = container_name(&self.tabs[idx].meta.id);
             (
@@ -2589,10 +2587,10 @@ impl AppState {
             &self.repo_root,
         )?;
 
-        let cwd = to_absolute(
-            &repo_root,
-            Path::new(&self.tabs[idx].meta.worktree_path_relative),
-        );
+        let cwd = self.tabs[idx]
+            .meta
+            .worktree_path_relative
+            .resolve(&repo_root);
         // Never spawn into a missing worktree: portable-pty silently falls back
         // to the user's home directory for a cwd that is not an existing
         // directory (this is how a restart could leave the agent running in
@@ -2712,10 +2710,10 @@ impl AppState {
             if self.tabs[idx].session.primary_state() != ProcessState::NotStarted {
                 continue;
             }
-            let cwd = to_absolute(
-                &self.repo_root,
-                Path::new(&self.tabs[idx].meta.worktree_path_relative),
-            );
+            let cwd = self.tabs[idx]
+                .meta
+                .worktree_path_relative
+                .resolve(&self.repo_root);
             if !services.fs.exists(&cwd) {
                 continue;
             }
@@ -2788,10 +2786,10 @@ impl AppState {
                 continue;
             };
             let agent_key = self.tabs[idx].meta.agent.clone();
-            let cwd = to_absolute(
-                &self.repo_root,
-                Path::new(&self.tabs[idx].meta.worktree_path_relative),
-            );
+            let cwd = self.tabs[idx]
+                .meta
+                .worktree_path_relative
+                .resolve(&self.repo_root);
             let current = crate::agents::resume::store_session_ids(&agent_key, &cwd, home);
             if let Some(id) = crate::agents::resume::newest_new_session(&snapshot, &current) {
                 if let Some(args) = crate::agents::resume::resume_args_for(&agent_key, &id) {
@@ -2814,7 +2812,7 @@ impl AppState {
         let branch = tab.meta.branch.clone();
         let base_branch = tab.meta.base_branch.clone();
         let base_commit_sha = tab.meta.base_commit_sha.clone();
-        let worktree = to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative));
+        let worktree = tab.meta.worktree_path_relative.resolve(&self.repo_root);
         let status = collect_status(
             services.git,
             &branch,
@@ -2843,7 +2841,7 @@ impl AppState {
     /// launcher (SPECS §27).
     fn cmd_open_in_file_manager(&self, tab: Option<usize>) -> Effect {
         let path = match tab.and_then(|i| self.tabs.get(i)) {
-            Some(tab) => to_absolute(&self.repo_root, Path::new(&tab.meta.worktree_path_relative)),
+            Some(tab) => tab.meta.worktree_path_relative.resolve(&self.repo_root),
             None => self.repo_root.clone(),
         };
         Effect::OpenInFileManager {
@@ -3388,10 +3386,10 @@ mod tests {
         assert!(matches!(effect, Effect::Message(_)));
 
         // The update hook ran once, in the rebased worktree.
-        let wt = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let wt = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         assert_eq!(
             command.invocations(),
             vec![("npm install".to_string(), wt.to_string_lossy().to_string())]
@@ -4999,10 +4997,10 @@ mod tests {
             .unwrap();
         match effect {
             Effect::OpenInFileManager { path, command } => {
-                let expected = to_absolute(
-                    &app.repo_root,
-                    Path::new(&app.tabs[0].meta.worktree_path_relative),
-                );
+                let expected = app.tabs[0]
+                    .meta
+                    .worktree_path_relative
+                    .resolve(&app.repo_root);
                 assert_eq!(path, expected);
                 // Nothing configured → the launcher module picks the per-OS default.
                 assert_eq!(command, "");
@@ -5313,10 +5311,10 @@ mod tests {
             other => panic!("expected Message, got {other:?}"),
         }
         // Rebased the agent worktree onto the base branch.
-        let wt = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let wt = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         assert_eq!(git.rebases(), vec![("main".to_string(), wt)]);
         // Stored base SHA advanced to the current base tip so §12 drift resets.
         assert_eq!(app.tabs[0].meta.base_commit_sha, "sha-main-new");
@@ -5386,10 +5384,10 @@ mod tests {
             &svc,
         )
         .unwrap();
-        let wt = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let wt = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         git.set_dirty_at(&wt, true);
 
         let effect = app
@@ -5599,10 +5597,10 @@ mod tests {
             &svc,
         )
         .unwrap();
-        let wt = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let wt = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         git.set_dirty_at(&wt, true);
 
         // First push: warning, no push.
@@ -5766,10 +5764,10 @@ mod tests {
             &svc,
         )
         .unwrap();
-        let wt = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let wt = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         git.set_dirty_at(&wt, true);
 
         // Unconfirmed abandon on a dirty worktree asks for confirmation and
@@ -5882,7 +5880,7 @@ mod tests {
             slug: "x".to_string(),
             agent: "opencode".to_string(),
             branch: "flightdeck/x".to_string(),
-            worktree_path_relative: ".flightdeck/worktrees/x".to_string(),
+            worktree_path_relative: ".flightdeck/worktrees/x".to_string().into(),
             base_branch: "main".to_string(),
             base_commit_sha: "abc".to_string(),
             created_at: String::new(),
@@ -5963,7 +5961,7 @@ mod tests {
             slug: slug.to_string(),
             agent: "opencode".to_string(),
             branch: format!("flightdeck/{slug}"),
-            worktree_path_relative: format!(".flightdeck/worktrees/{slug}"),
+            worktree_path_relative: format!(".flightdeck/worktrees/{slug}").into(),
             base_branch: "main".to_string(),
             base_commit_sha: "abc".to_string(),
             created_at: String::new(),
@@ -6673,10 +6671,10 @@ mod tests {
             "a containerized run must never write status plumbing to the isolated temp root: {:?}",
             fs.writes_under(Path::new("/tmp/fd-isolated-container-guard"))
         );
-        let worktree = to_absolute(
-            Path::new(REPO),
-            Path::new(&app.tabs[0].meta.worktree_path_relative),
-        );
+        let worktree = app.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(Path::new(REPO));
         assert!(
             fs.exists(&worktree.join(".flightdeck/runtime/status/opencode/plugins/flightdeck.js")),
             "the plugin must still land in the bind-mounted worktree: {:?}",
@@ -6943,7 +6941,7 @@ mod tests {
                 slug: format!("tab{i}"),
                 agent: "opencode".to_string(),
                 branch: format!("flightdeck/tab{i}"),
-                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}"),
+                worktree_path_relative: format!(".flightdeck/worktrees/tab{i}").into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "sha".to_string(),
                 created_at: "t".to_string(),
