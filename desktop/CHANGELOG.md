@@ -18,6 +18,16 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.10.1] - 2026-10-28
+
+### Improvements
+
 - **New `[ui] animations` setting in the shared configuration.** It appears in the configuration manager as "Animations (terminal UI)" but only affects the terminal UI; the desktop app's spinner is not changed by it.
 
 ### Bug fixes
