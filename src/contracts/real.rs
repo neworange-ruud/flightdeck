@@ -34,6 +34,32 @@ impl FileSystem for RealFs {
         fs::read_to_string(p).map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
     }
 
+    fn file_len(&self, p: &Path) -> Result<u64> {
+        fs::metadata(p)
+            .map(|m| m.len())
+            .map_err(|e| FlightDeckError::Io(format!("{}: {e}", p.display())))
+    }
+
+    fn read_from(&self, p: &Path, offset: u64) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let io = |e: std::io::Error| FlightDeckError::Io(format!("{}: {e}", p.display()));
+        let mut f = fs::File::open(p).map_err(io)?;
+        f.seek(SeekFrom::Start(offset)).map_err(io)?;
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).map_err(io)?;
+        Ok(out)
+    }
+
+    fn truncate_if_len(&self, p: &Path, expected_len: u64) -> Result<bool> {
+        let io = |e: std::io::Error| FlightDeckError::Io(format!("{}: {e}", p.display()));
+        let f = fs::OpenOptions::new().write(true).open(p).map_err(io)?;
+        if f.metadata().map_err(io)?.len() != expected_len {
+            return Ok(false);
+        }
+        f.set_len(0).map_err(io)?;
+        Ok(true)
+    }
+
     fn write(&self, p: &Path, contents: &str) -> Result<()> {
         // Atomic full-file write: stage into a sibling temp file, then rename it
         // over the destination. Resolve a symlink first so editing config updates
@@ -330,6 +356,30 @@ mod tests {
             fs.try_lock_exclusive(&path).unwrap().is_some(),
             "released on drop"
         );
+    }
+
+    /// What the status-file poller relies on: a size check, a read of only the
+    /// appended bytes, and a truncate that refuses once the file has grown.
+    #[test]
+    fn appended_bytes_are_read_from_an_offset_and_truncate_checks_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-status");
+        let fs = RealFs;
+        fs::write(&path, "idle\n").unwrap();
+        fs.append_line(&path, "working").unwrap();
+
+        assert_eq!(fs.file_len(&path).unwrap(), 13);
+        assert_eq!(fs.read_from(&path, 5).unwrap(), b"working\n");
+        assert!(fs.read_from(&path, 99).unwrap().is_empty());
+
+        assert!(!fs.truncate_if_len(&path, 5).unwrap(), "grown since read");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "idle\nworking\n");
+        assert!(fs.truncate_if_len(&path, 13).unwrap());
+        assert_eq!(fs.file_len(&path).unwrap(), 0);
+
+        // A hook appending after the truncate starts the file afresh.
+        fs.append_line(&path, "idle").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "idle\n");
     }
 
     #[test]

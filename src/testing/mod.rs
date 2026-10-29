@@ -183,6 +183,32 @@ impl FileSystem for FakeFs {
             .ok_or_else(|| FlightDeckError::Io(format!("no such file: {}", p.display())))
     }
 
+    fn file_len(&self, p: &Path) -> Result<u64> {
+        self.read_to_string(p).map(|s| s.len() as u64)
+    }
+
+    fn read_from(&self, p: &Path, offset: u64) -> Result<Vec<u8>> {
+        let bytes = self.read_to_string(p)?.into_bytes();
+        let start = (offset as usize).min(bytes.len());
+        Ok(bytes[start..].to_vec())
+    }
+
+    fn truncate_if_len(&self, p: &Path, expected_len: u64) -> Result<bool> {
+        let mut st = self.inner.lock().unwrap();
+        let Some(content) = st.files.get_mut(p) else {
+            return Err(FlightDeckError::Io(format!(
+                "no such file: {}",
+                p.display()
+            )));
+        };
+        if content.len() as u64 != expected_len {
+            return Ok(false);
+        }
+        content.clear();
+        st.writes.push(p.to_path_buf());
+        Ok(true)
+    }
+
     fn write(&self, p: &Path, contents: &str) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);

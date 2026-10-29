@@ -121,6 +121,16 @@ pub trait FileSystem {
     fn create_dir_all(&self, p: &Path) -> Result<()>;
     /// Read a file to a string.
     fn read_to_string(&self, p: &Path) -> Result<String>;
+    /// The size of a file in bytes. Lets a poller of an append-only file see
+    /// "nothing new" from metadata alone, without reading it.
+    fn file_len(&self, p: &Path) -> Result<u64>;
+    /// Read a file's bytes from `offset` to its end (empty when `offset` is at
+    /// or past the end). Used to read only what was appended since last time.
+    fn read_from(&self, p: &Path, offset: u64) -> Result<Vec<u8>>;
+    /// Empty the file at `p`, but only while it is still exactly `expected_len`
+    /// bytes long; `Ok(false)` when it has grown or shrunk since the caller
+    /// last read it, so a line appended in between is never discarded unseen.
+    fn truncate_if_len(&self, p: &Path, expected_len: u64) -> Result<bool>;
     /// Write (truncating) a file.
     fn write(&self, p: &Path, contents: &str) -> Result<()>;
     /// Write (truncating) a file of raw bytes: a pasted image, which is not
