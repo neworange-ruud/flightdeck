@@ -18,7 +18,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **The agent status file no longer grows for as long as the agent runs.** FlightDeck now reads only the lines an agent's hooks appended since the last check, instead of the whole `.flightdeck/agent-status` file on every tick, and empties the file once it passes 64 KB and the agent has settled. A long-running tab's status polling stays as cheap as a fresh one's.
 
 ### Bug fixes
 

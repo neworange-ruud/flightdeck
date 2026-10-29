@@ -299,6 +299,15 @@ impl FileSystem for FailingRename {
     fn read_to_string(&self, p: &Path) -> flightdeck::contracts::Result<String> {
         RealFs.read_to_string(p)
     }
+    fn file_len(&self, p: &Path) -> flightdeck::contracts::Result<u64> {
+        RealFs.file_len(p)
+    }
+    fn read_from(&self, p: &Path, offset: u64) -> flightdeck::contracts::Result<Vec<u8>> {
+        RealFs.read_from(p, offset)
+    }
+    fn truncate_if_len(&self, p: &Path, len: u64) -> flightdeck::contracts::Result<bool> {
+        RealFs.truncate_if_len(p, len)
+    }
     fn write(&self, p: &Path, c: &str) -> flightdeck::contracts::Result<()> {
         RealFs.write(p, c)
     }

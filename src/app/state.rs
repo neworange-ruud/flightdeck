@@ -14,6 +14,7 @@ use crate::agents::adapter::{build_launch, validate_agent};
 use crate::agents::registry::AgentRegistry;
 use crate::agents::setup::{prepare_status_launch, status_backend};
 use crate::agents::status::{combine_status, DisplayStatus};
+use crate::agents::status_log::StatusCursor;
 use crate::app::activity::{ActivityProbe, GitFingerprint};
 use crate::app::commands::{
     CloseAction, CloseTabOptions, Command, Effect, PushConfirm, Selector, TabTarget, TerminalPick,
@@ -315,10 +316,11 @@ pub struct RuntimeTab {
     /// launch-scoped status hook/plugin and polled by FlightDeck. `None`
     /// until the agent is spawned.
     pub status_file: Option<PathBuf>,
-    /// Last raw status-file content applied. Hooks append lifecycle events, so
-    /// the poller can process every transition even when a short turn starts
-    /// and finishes between two UI ticks.
-    pub status_file_seen: Option<String>,
+    /// How far the status file has been read. Hooks append lifecycle events,
+    /// so the poller reads only what was appended and processes every
+    /// transition, even when a short turn starts and finishes between two UI
+    /// ticks.
+    pub status_cursor: StatusCursor,
     /// Whether this tab was last observed in an *active* state (working /
     /// starting). When it next settles (idle / waiting / completed / failed) a
     /// single OS notification fires and this is cleared, so a quiet agent never
@@ -372,7 +374,7 @@ impl RuntimeTab {
             session: Session::new(),
             interpreted: None,
             status_file: None,
-            status_file_seen: None,
+            status_cursor: StatusCursor::default(),
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
@@ -494,14 +496,14 @@ fn initial_status_snapshot(
     fs: &dyn FileSystem,
     path: &Path,
     explicit: bool,
-) -> (InterpretedStatus, Option<String>) {
+) -> (InterpretedStatus, StatusCursor) {
     let fallback = if explicit {
         InterpretedStatus::Idle
     } else {
         InterpretedStatus::Unknown
     };
     let Ok(content) = fs.read_to_string(path) else {
-        return (fallback, None);
+        return (fallback, StatusCursor::default());
     };
     let interpreted = if explicit {
         content
@@ -512,7 +514,7 @@ fn initial_status_snapshot(
     } else {
         fallback
     };
-    (interpreted, Some(content))
+    (interpreted, StatusCursor::at_end_of(content.as_bytes()))
 }
 
 /// How long after the event loop starts finish-notifications are suppressed
@@ -840,23 +842,20 @@ impl AppState {
     /// that starts and finishes between ticks still leaves an active edge.
     /// Missing/unreadable files are ignored, so this is safe before any hook is
     /// installed. Call on each tick (SPECS §24).
+    ///
+    /// Only appended bytes are read (see [`StatusCursor`]), and a large file is
+    /// emptied once it is fully read and the agent has settled, so a long-lived
+    /// agent's file stays small. Settled means the next event normally waits on
+    /// the user, which keeps a hook from appending during the truncate.
     pub fn poll_status_files(&mut self, services: &Services, _now_ms: u64) {
         for tab in self.tabs.iter_mut() {
             let Some(path) = tab.status_file.as_ref() else {
                 continue;
             };
-            let Ok(content) = services.fs.read_to_string(path) else {
+            let Ok(fresh) = tab.status_cursor.read_new(services.fs, path) else {
                 continue;
             };
-            if tab.status_file_seen.as_deref() == Some(content.as_str()) {
-                continue; // unchanged since last poll
-            }
-            let fresh = tab
-                .status_file_seen
-                .as_deref()
-                .and_then(|seen| content.strip_prefix(seen))
-                .unwrap_or(content.as_str());
-            for line in fresh.lines() {
+            for line in &fresh {
                 if let Some(status) = status_keyword_to_interpreted(line) {
                     // Preserve an active edge even if a very short turn also
                     // appended its settled event before this poll.
@@ -866,7 +865,12 @@ impl AppState {
                     tab.interpreted = Some(status);
                 }
             }
-            tab.status_file_seen = Some(content);
+            let settled = tab
+                .interpreted
+                .is_some_and(|s| !matches!(notify_phase(s), NotifyPhase::Active));
+            if settled {
+                let _ = tab.status_cursor.compact(services.fs, path);
+            }
         }
     }
 
@@ -1416,7 +1420,7 @@ impl AppState {
             session: Session::new(),
             interpreted: None,
             status_file: None,
-            status_file_seen: None,
+            status_cursor: StatusCursor::default(),
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
@@ -1541,7 +1545,7 @@ impl AppState {
             session: Session::new(),
             interpreted: None,
             status_file: None,
-            status_file_seen: None,
+            status_cursor: StatusCursor::default(),
             notify_armed: false,
             activity_seen: None,
             probe: ActivityProbe::default(),
@@ -1623,14 +1627,14 @@ impl AppState {
         }
 
         let status_file = agent_status_file(&self.status_root(&worktree_abs));
-        let (initial_status, status_file_seen) =
+        let (initial_status, status_cursor) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         let tab = &mut self.tabs[idx];
         tab.session = session;
         tab.phase = TabPhase::Ready;
         tab.interpreted = Some(initial_status);
         tab.status_file = Some(status_file);
-        tab.status_file_seen = status_file_seen;
+        tab.status_cursor = status_cursor;
         tab.meta.containerized = spawn.containerized;
         tab.meta.container_image = spawn.image;
 
@@ -2672,11 +2676,11 @@ impl AppState {
             }
             return Err(e);
         }
-        let (initial_status, status_file_seen) =
+        let (initial_status, status_cursor) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         tab.interpreted = Some(initial_status);
         tab.status_file = Some(status_file);
-        tab.status_file_seen = status_file_seen;
+        tab.status_cursor = status_cursor;
         tab.meta.containerized = spawn.containerized;
         if let Some(image) = spawn.image {
             tab.meta.container_image = Some(image);
@@ -4575,8 +4579,9 @@ mod tests {
         status: &str,
         now_ms: u64,
     ) {
+        // Append, as the real hooks do: the poller reads only what is new.
         let path = app.tabs[0].status_file.clone().expect("status file path");
-        fs.write(&path, &format!("{status}\n")).unwrap();
+        fs.append_line(&path, status).unwrap();
         app.poll_status_files(&services(git, fs, pty, clock), now_ms);
     }
 
@@ -4586,13 +4591,15 @@ mod tests {
             FakeFs::new().with_file("/repo/.flightdeck/agent-status", "working\nwaiting\nidle\n");
         let path = Path::new("/repo/.flightdeck/agent-status");
 
-        let (status, seen) = initial_status_snapshot(&fs, path, true);
-        assert_eq!(status, InterpretedStatus::Idle);
-        assert_eq!(seen.as_deref(), Some("working\nwaiting\nidle\n"));
+        let at_end = StatusCursor::at_end_of(b"working\nwaiting\nidle\n");
 
-        let (status, seen) = initial_status_snapshot(&fs, path, false);
+        let (status, cursor) = initial_status_snapshot(&fs, path, true);
+        assert_eq!(status, InterpretedStatus::Idle);
+        assert_eq!(cursor, at_end);
+
+        let (status, cursor) = initial_status_snapshot(&fs, path, false);
         assert_eq!(status, InterpretedStatus::Unknown);
-        assert_eq!(seen.as_deref(), Some("working\nwaiting\nidle\n"));
+        assert_eq!(cursor, at_end);
     }
 
     #[test]
@@ -4815,6 +4822,33 @@ mod tests {
     }
 
     #[test]
+    fn a_large_status_file_is_emptied_only_once_the_agent_settles() {
+        use crate::agents::status_log::STATUS_COMPACT_BYTES;
+        let dir = TempDir::new().unwrap();
+        let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
+        let path = app.tabs[0].status_file.clone().unwrap();
+        let turn = "working\n".repeat(STATUS_COMPACT_BYTES as usize / 8 + 1);
+        fs.write(&path, &format!("idle\n{turn}")).unwrap();
+
+        app.poll_status_files(&services(&git, &fs, &pty, &clock), 1_000);
+        assert_eq!(app.tabs[0].interpreted, Some(InterpretedStatus::Working));
+        assert!(
+            fs.file_contents(&path).unwrap().len() as u64 > STATUS_COMPACT_BYTES,
+            "a working agent's file is not truncated under its hooks"
+        );
+
+        fs.append_line(&path, "idle").unwrap();
+        app.poll_status_files(&services(&git, &fs, &pty, &clock), 2_000);
+        assert_eq!(app.tabs[0].interpreted, Some(InterpretedStatus::Idle));
+        assert_eq!(fs.file_contents(&path).as_deref(), Some(""));
+        assert_eq!(app.take_finish_notifications(2_000).len(), 1);
+
+        fs.append_line(&path, "working").unwrap();
+        app.poll_status_files(&services(&git, &fs, &pty, &clock), 3_000);
+        assert_eq!(app.tabs[0].interpreted, Some(InterpretedStatus::Working));
+    }
+
+    #[test]
     fn notifies_when_agent_waits_for_input() {
         let dir = TempDir::new().unwrap();
         let (mut app, git, fs, pty, clock, _id) = app_with_running_tab(config_notify_on(&dir));
@@ -4936,9 +4970,9 @@ mod tests {
         )
         .unwrap();
 
-        // The agent's hook writes "waiting" to the tab's status file.
+        // The agent's hook appends "waiting" to the tab's status file.
         let path = app.tabs[0].status_file.clone().expect("status file path");
-        fs.write(&path, "waiting\n").unwrap();
+        fs.append_line(&path, "waiting").unwrap();
 
         app.poll_status_files(&svc, 5_000);
         // The signal remains authoritative until the backend emits another.
@@ -4947,7 +4981,7 @@ mod tests {
             InterpretedStatus::WaitingForInput
         );
 
-        fs.write(&path, "working\n").unwrap();
+        fs.append_line(&path, "working").unwrap();
         app.poll_status_files(&svc, 6_000);
         assert_eq!(
             app.tabs[0].display_status(6_050).interpreted,
