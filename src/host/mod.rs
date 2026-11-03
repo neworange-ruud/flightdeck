@@ -468,6 +468,56 @@ impl<'a> AppHost<'a> {
                 RemoteStart::Off => None,
             };
         }
+        self.install_remote_bridge(now0);
+
+        // FlightDeck Web (optional): the embedded browser surface, started here
+        // only when `[web] enabled` opted in — D10 makes auto-start the
+        // front-end's decision, which is why `server::start` deliberately ignores
+        // the flag. The surface itself was built with the host (it is cheap and
+        // holds no buffers until the server runs).
+        //
+        // Test / E2E seam, debug builds only (read once at startup): when
+        // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
+        // always has *that* bootstrap code live, so the Playwright suite (D15) can
+        // exchange it in a real browser instead of screen-scraping a TUI overlay for
+        // a random one. `None` in every normal run, and absent entirely from a
+        // release build — see `WebSurface::ensure_test_bootstrap_code`.
+        #[cfg(debug_assertions)]
+        {
+            self.web_test_code = std::env::var("FLIGHTDECK_WEB_TEST_CODE")
+                .ok()
+                .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
+        }
+        let web_config = self
+            .workspace
+            .projects
+            .get(self.workspace.active)
+            .map(|p| &p.state.config.web)
+            .filter(|web| web.enabled)
+            .cloned();
+        if let Some(config) = web_config {
+            // Deliberately no access overlay here. `[web] enabled` is a user who
+            // asked for the server on every launch, not for a modal on every
+            // launch; `Show Web Access` in the palette is how they reach the code.
+            let initial = web_host_state_now(
+                &self.workspace,
+                &mut self.web_surface,
+                &self.ui,
+                self.env.clock,
+                now0,
+            );
+            match self.web_surface.start(&config, initial) {
+                Ok((addr, exposure)) => self.ui.message(web_started_message(addr, exposure)),
+                Err(e) => self.ui.message(format!("Web interface did not start: {e}")),
+            }
+        }
+    }
+
+    /// Build the phone bridge over the relay client [`start_remote`] (or the
+    /// worker's [`crate::start_remote_at`]) just brought up: the outbound
+    /// feed, every established pairing's E2E channel, the autopair seam and
+    /// the persisted-pairing flag. A no-op while no relay client runs.
+    fn install_remote_bridge(&mut self, now0: u64) {
         // The outbound feed bridge exists only while the relay thread does. It builds
         // the phone-facing snapshots/deltas/transcript/events each tick and seals
         // them. A passthrough sealer is the default; when an already-established
@@ -533,48 +583,6 @@ impl<'a> AppHost<'a> {
             .as_ref()
             .map(|s| s.established.is_some())
             .unwrap_or(false);
-
-        // FlightDeck Web (optional): the embedded browser surface, started here
-        // only when `[web] enabled` opted in — D10 makes auto-start the
-        // front-end's decision, which is why `server::start` deliberately ignores
-        // the flag. The surface itself was built with the host (it is cheap and
-        // holds no buffers until the server runs).
-        //
-        // Test / E2E seam, debug builds only (read once at startup): when
-        // `FLIGHTDECK_WEB_TEST_CODE` holds four digits, the running web server
-        // always has *that* bootstrap code live, so the Playwright suite (D15) can
-        // exchange it in a real browser instead of screen-scraping a TUI overlay for
-        // a random one. `None` in every normal run, and absent entirely from a
-        // release build — see `WebSurface::ensure_test_bootstrap_code`.
-        #[cfg(debug_assertions)]
-        {
-            self.web_test_code = std::env::var("FLIGHTDECK_WEB_TEST_CODE")
-                .ok()
-                .filter(|v| v.len() == 4 && v.bytes().all(|b| b.is_ascii_digit()));
-        }
-        let web_config = self
-            .workspace
-            .projects
-            .get(self.workspace.active)
-            .map(|p| &p.state.config.web)
-            .filter(|web| web.enabled)
-            .cloned();
-        if let Some(config) = web_config {
-            // Deliberately no access overlay here. `[web] enabled` is a user who
-            // asked for the server on every launch, not for a modal on every
-            // launch; `Show Web Access` in the palette is how they reach the code.
-            let initial = web_host_state_now(
-                &self.workspace,
-                &mut self.web_surface,
-                &self.ui,
-                self.env.clock,
-                now0,
-            );
-            match self.web_surface.start(&config, initial) {
-                Ok((addr, exposure)) => self.ui.message(web_started_message(addr, exposure)),
-                Err(e) => self.ui.message(format!("Web interface did not start: {e}")),
-            }
-        }
     }
 
     /// Stop the background services: tell any attached browser that FlightDeck
@@ -674,6 +682,15 @@ impl<'a> AppHost<'a> {
         let remote_bridge = &mut self.remote_bridge;
         let now_ms = env.clock.now_millis();
         self.now_ms = now_ms;
+        // A worker with a Desktop window attached shows its agents there:
+        // the phone gets no pushes until the window detaches (the Desktop's
+        // background link notifies from then on, too).
+        let is_worker = self.worker.is_some();
+        let mute_phone_pushes = is_worker
+            && web_surface
+                .handle
+                .as_ref()
+                .is_some_and(|h| h.window_count() > 0);
         let active = workspace.active;
         let n = workspace.projects.len();
         let before = status_fingerprint(workspace, now_ms);
@@ -877,10 +894,13 @@ impl<'a> AppHost<'a> {
                         self.pairing_session = None;
                         self.remote_has_persisted_pairing = false;
                         ui.close_remote_overlay();
-                        ui.message(
+                        ui.message(if is_worker {
                             "Phone pairing is no longer recognized by the relay. \
-                             Open Settings → Remote to pair again.",
-                        );
+                             Run `flightdeck worker pair --phone` on the worker to pair again."
+                        } else {
+                            "Phone pairing is no longer recognized by the relay. \
+                             Open Settings → Remote to pair again."
+                        });
                     }
                     RemoteInbound::PairingRevoked { .. } => {
                         // The phone unpaired this Mac (spec §10.2). The client
@@ -889,10 +909,13 @@ impl<'a> AppHost<'a> {
                         self.pairing_session = None;
                         self.remote_has_persisted_pairing = false;
                         ui.close_remote_overlay();
-                        ui.message(
+                        ui.message(if is_worker {
+                            "Your phone unpaired this worker. \
+                             Run `flightdeck worker pair --phone` on the worker to pair again."
+                        } else {
                             "Your phone unpaired this Mac. \
-                             Open Settings → Remote to pair again.",
-                        );
+                             Open Settings → Remote to pair again."
+                        });
                     }
                     _ => {}
                 }
@@ -916,7 +939,10 @@ impl<'a> AppHost<'a> {
             // Pushes the bridge decided this tick (remote-control-fglt), sealed
             // for the pairing: over the relay socket when it can carry them,
             // otherwise a signed HTTPS POST on the shared runtime. Never blocks.
-            let pushes = b.take_push_notifies();
+            let mut pushes = b.take_push_notifies();
+            if mute_phone_pushes {
+                pushes.clear();
+            }
             if let Some(setup) = self.remote_setup.as_ref() {
                 let now_unix_ms = (env.clock.now_unix_secs() as i64).saturating_mul(1_000);
                 for push in pushes {
@@ -984,15 +1010,22 @@ impl<'a> AppHost<'a> {
 
         // --- Desktop pairing surface (Settings → Remote): start an offer, keep
         //     the overlay in sync with the pairing session, and handle unpair. ---
-        drive_pairing_overlay(
-            ui,
-            &mut self.pairing_session,
-            remote_bridge.as_mut(),
-            self.remote_setup.as_ref(),
-            remote_out_tx,
-            self.autopair_hint.as_deref(),
-            now_ms,
-        );
+        //     A worker has no screen for that overlay: `worker pair --phone`
+        //     drives its session over the control socket instead, and the
+        //     session lives until it is paired, fails or runs out. ---
+        if is_worker {
+            crate::host::worker::phone::expire_worker_pairing(&mut self.pairing_session, now_ms);
+        } else {
+            drive_pairing_overlay(
+                ui,
+                &mut self.pairing_session,
+                remote_bridge.as_mut(),
+                self.remote_setup.as_ref(),
+                remote_out_tx,
+                self.autopair_hint.as_deref(),
+                now_ms,
+            );
+        }
 
         // --- Refresh the git-status cache for the ACTIVE project only (it is
         //     the only one whose sidebar/info bar is on screen). ---

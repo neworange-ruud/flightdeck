@@ -37,6 +37,11 @@ pub struct WorkerPaths {
     /// Paired Desktops' tokens (`devices.json`), separate from the web
     /// interface's `~/.flightdeck/web.json`.
     pub credentials: PathBuf,
+    /// The worker's FlightDeck Remote state (`remote.json`): its own relay
+    /// identity and phone pairings, separate from the TUI's
+    /// `~/.flightdeck/remote.json`. Its lock (`remote.lock`) and the direct
+    /// link's outboxes (`remote-direct/`) sit beside it.
+    pub phone_state: PathBuf,
     /// `~/.flightdeck/logs`.
     pub logs_dir: PathBuf,
     /// `~/.flightdeck/logs/worker.log` (rotated by the supervisor).
@@ -60,6 +65,7 @@ impl WorkerPaths {
             restart_marker: dir.join("restart.marker"),
             workspace: dir.join("workspace.json"),
             credentials: dir.join("devices.json"),
+            phone_state: dir.join("remote.json"),
             log_file: logs_dir.join("worker.log"),
             logs_dir,
             dir,
@@ -106,6 +112,12 @@ mod tests {
         assert_eq!(p.restart_marker, dir.join("restart.marker"));
         assert_eq!(p.workspace, dir.join("workspace.json"));
         assert_eq!(p.credentials, dir.join("devices.json"));
+        assert_eq!(p.phone_state, dir.join("remote.json"));
+        assert_ne!(
+            p.phone_state,
+            home.join(".flightdeck").join("remote.json"),
+            "never the TUI's phone state"
+        );
         assert_eq!(p.logs_dir, home.join(".flightdeck").join("logs"));
         assert_eq!(p.log_file, p.logs_dir.join("worker.log"));
     }

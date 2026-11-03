@@ -259,6 +259,10 @@ pub struct ClientOptions {
     /// HTTPS (spec §5.5.1). `None` = the shared-runtime [`RuntimePoster`];
     /// tests substitute a recorder.
     pub push_poster: Option<Arc<dyn PushPoster>>,
+    /// The name announced on `auth_response` instead of this machine's own
+    /// ([`machine_name`]): a worker calls itself "<host> (worker)" so the
+    /// phone tells it apart from a TUI on the same machine.
+    pub machine_name: Option<String>,
 }
 
 impl ClientOptions {
@@ -1311,9 +1315,12 @@ async fn run_session(
     // Resolved once per connect — which is exactly the "computed fresh each
     // connect, never cached" rule — and on the blocking pool, because it may
     // spawn `hostname` and a runtime worker must not be parked on a subprocess.
-    let machine = tokio::task::spawn_blocking(machine_name)
-        .await
-        .unwrap_or(None);
+    let machine = match tuning.options.machine_name.clone() {
+        Some(name) => Some(name),
+        None => tokio::task::spawn_blocking(machine_name)
+            .await
+            .unwrap_or(None),
+    };
 
     // hello.
     let hello = RelayFrame::Hello {

@@ -698,6 +698,18 @@ mod tests {
         assert_eq!(cfg.worker.projects_root, "~/flightdeck");
         assert_eq!(cfg.worker.default_cols, 200);
         assert_eq!(cfg.worker.default_rows, 50);
+        assert!(!cfg.worker.phone, "the phone stays off unless asked for");
+    }
+
+    #[test]
+    fn worker_phone_opt_in_parses_alone() {
+        let cfg: Config = "[worker]\nphone = true\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(cfg.worker.phone);
+        assert_eq!(cfg.worker.port, 7420);
     }
 
     #[test]

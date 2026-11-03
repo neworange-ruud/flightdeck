@@ -18,6 +18,11 @@ fn request_wire_shapes() {
             ControlRequest::PrepareShutdown { restarting: true },
             json!({"op": "prepare_shutdown", "restarting": true}),
         ),
+        (ControlRequest::PairPhone, json!({"op": "pair_phone"})),
+        (
+            ControlRequest::PhonePairingStatus,
+            json!({"op": "phone_pairing_status"}),
+        ),
     ];
     for (req, wire) in cases {
         assert_eq!(serde_json::to_value(&req).unwrap(), wire);
@@ -40,6 +45,12 @@ fn response_wire_shapes() {
         "id": "tok1", "label": "mbp", "address": null, "paired_at": 10,
         "last_seen": 20, "state": "background", "revoked": false
     });
+    let phone = PhoneReport {
+        id: "pair_1".to_string(),
+        transport: "direct".to_string(),
+        connected: true,
+    };
+    let phone_json = json!({"id": "pair_1", "transport": "direct", "connected": true});
     let cases = [
         (
             ControlResponse::Pong {
@@ -65,8 +76,27 @@ fn response_wire_shapes() {
         (
             ControlResponse::Devices {
                 devices: vec![device.clone()],
+                phones: vec![phone.clone()],
             },
-            json!({"result": "devices", "devices": [device_json.clone()]}),
+            json!({"result": "devices", "devices": [device_json.clone()],
+                   "phones": [phone_json.clone()]}),
+        ),
+        (
+            ControlResponse::PhoneRevoked {
+                phone: phone.clone(),
+            },
+            json!({"result": "phone_revoked", "phone": phone_json}),
+        ),
+        (
+            ControlResponse::PhonePairing(PhonePairingReport {
+                state: PhonePairingState::Waiting,
+                code: Some("4729".to_string()),
+                qr_payload: Some("fdr1:x".to_string()),
+                seconds_remaining: Some(110),
+                message: "waiting".to_string(),
+            }),
+            json!({"result": "phone_pairing", "state": "waiting", "code": "4729",
+                   "qr_payload": "fdr1:x", "seconds_remaining": 110, "message": "waiting"}),
         ),
         (
             ControlResponse::Revoked {
@@ -90,6 +120,27 @@ fn response_wire_shapes() {
             resp
         );
     }
+}
+
+/// A worker from before phone support answers `devices` without `phones`.
+#[test]
+fn a_devices_answer_without_phones_still_reads() {
+    let wire = json!({"result": "devices", "devices": []});
+    assert_eq!(
+        serde_json::from_value::<ControlResponse>(wire).unwrap(),
+        ControlResponse::Devices {
+            devices: Vec::new(),
+            phones: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn only_paired_failed_and_off_end_a_phone_pairing() {
+    use PhonePairingState::*;
+    assert!(!Requesting.is_final());
+    assert!(!Waiting.is_final());
+    assert!(Paired.is_final() && Failed.is_final() && Off.is_final());
 }
 
 #[test]

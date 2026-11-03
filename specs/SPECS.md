@@ -1608,8 +1608,9 @@ the Desktop opens a remote window onto them. Requirements are in
 | `flightdeck worker restart` | Stop, then start. This is how `flightdeck update` takes effect; the supervisor is re-executed too, so both run the new binary. |
 | `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
 | `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port). |
-| `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. |
-| `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. |
+| `flightdeck worker pair --phone [--json]` | Pairs the FlightDeck iPhone app (needs `[worker] phone = true`): asks the relay for a code, prints the QR and the 4-digit code, and waits until the phone has paired (exit 0), or the code expired or the attempt failed (exit 1). `--json` prints one JSON object per step. See "The phone" below. |
+| `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
+| `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. A selector no Desktop matches is tried against the paired phones' pairing ids (exact or unique prefix), and a match is unpaired. |
 | `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
 | `flightdeck worker run` | The worker in the foreground, logging to stderr. What the supervisor runs; also for debugging. |
 
@@ -1666,6 +1667,7 @@ not create `~/.flightdeck/worker/` on a machine that never ran a worker.
 | `~/.flightdeck/worker/restart.marker` | Left by `worker restart` for the next worker. |
 | `~/.flightdeck/worker/workspace.json` | The worker's open projects, separate from the TUI's `~/.flightdeck/workspace.json`. Each project's `state.json` stays in its repository, as for the TUI. |
 | `~/.flightdeck/worker/devices.json` | Paired Desktops' tokens, in the web interface's credential format but separate from `~/.flightdeck/web.json`: a browser token for a TUI's web interface never grants a worker shell. |
+| `~/.flightdeck/worker/remote.json`, `remote.lock`, `remote-direct/` | With `[worker] phone` on: the worker's own FlightDeck Remote identity and phone pairings, its lock, and the direct link's outboxes. Separate from the TUI's `~/.flightdeck/remote.json`, so the phone sees the worker as a machine of its own. |
 | `~/.flightdeck/logs/worker.log` | The log, rotated at 10 MiB, 5 files kept (`worker.log`, `.1` … `.4`). The supervisor's own lines go to the same file. |
 
 ### `[worker]` section
@@ -1680,6 +1682,7 @@ port = 7420
 projects_root = "~/flightdeck"
 default_cols = 200
 default_rows = 50
+phone = false
 ```
 
 - **`port`** (integer, default `7420`) — the TCP port served on each Tailscale
@@ -1692,6 +1695,10 @@ default_rows = 50
   the PTY size of an agent started while no window has reported a size. An
   attached window resizes PTYs to its panes. Columns must be 20–1000 and rows
   4–500.
+- **`phone`** (boolean, default `false`) — let the FlightDeck iPhone app pair
+  with this worker (see "The phone"). Off by default because a paired phone can
+  type into agents and open a shell. Read at start: restart the worker after
+  changing it.
 
 An invalid `[worker]` table makes `worker run` exit 78. It is not in the
 configuration manager (numbers and a path, not toggles): edit the file.
@@ -1706,6 +1713,35 @@ every 5 s and binds when one appears. Pairing uses the web interface's
 single-use bootstrap codes, minted by `worker pair` over the control socket.
 One remote window is attached at a time (a second takes over; the first's token
 stays valid); any number of status-only background links may be held.
+
+### The phone
+
+With `[worker] phone = true` the worker runs FlightDeck Remote (§8's `[remote]`
+section, `specs/REMOTE_PROTOCOL.md`) alongside
+the web protocol, whatever `[remote] enabled` says. It is the TUI's phone bridge
+with these differences:
+
+- **Its own identity and pairings** (`~/.flightdeck/worker/remote.json`), so a
+  phone lists the worker separately from a TUI on the same machine, and never
+  reaches a TUI's pairings through it.
+- **Always the direct link** (§8's "Direct link"), on the same Tailscale
+  addresses as the web protocol and on `[remote] direct_port`, whatever
+  `[remote] direct_enabled` says. `[remote] relay_url`, `relay_password` and
+  `direct_host` apply as for a TUI. The relay carries the pairing handshake,
+  push registration and pushes; a phone too old for the direct link pairs in
+  relay mode on a relay that allows it.
+- **Named "<host> (worker)"** to the phone (`FLIGHTDECK_MACHINE_NAME`, when
+  set, is used as is).
+- **Paired from the worker's shell** with `worker pair --phone`, which drives
+  the pairing over the control socket; a Desktop window's Pair Phone and Unpair
+  Phone say to use `worker pair --phone` and `worker revoke`.
+- **No phone pushes while a Desktop window is attached**: the window shows the
+  agents. Once it detaches, the phone gets pushes again (and the Desktop's
+  background link raises its own notifications).
+
+When FlightDeck Remote cannot start (the identity is unreadable, another
+process holds `remote.lock`), the worker keeps running without it and logs why;
+`worker status` shows `Phone: not running`.
 
 ### `worker status --json` (schema 1)
 
@@ -1762,6 +1798,11 @@ never missing.
   link), `offline`. `id` is what `worker revoke` takes.
 - `projects[].agents[].status` is the interpreted status label (`working`,
   `needs_input`, …); `running` is whether its process is alive.
+- `phone` is `null` unless the worker runs with `[worker] phone` on. Then
+  `running` says whether FlightDeck Remote started, `direct` is the `host:port`
+  new pairings dial (`null` while the direct link is not listening), and
+  `phones[]` lists the paired phones: `id` (the pairing id, what `worker
+  revoke` takes), `transport` (`direct` or `relay`) and `connected`.
 - `restarts`, `last_exit` and `gave_up_reason` come from `supervisor.json` and
   are reported even when stopped.
 
@@ -1769,6 +1810,12 @@ never missing.
 
 - **Pairing a Desktop with a worker gives it the worker account's full power**:
   a shell and the whole home directory.
+- **Pairing a phone** (`[worker] phone`, off by default) gives it what a phone
+  paired with a TUI has: typing into agents, starting and closing them, and a
+  shell in an agent's worktree. Its code is the TUI's single-use 4-digit
+  pairing code, handed out by the relay and printed only by `worker pair
+  --phone` in the worker's own shell, and the channel is end-to-end encrypted
+  (`specs/REMOTE_PROTOCOL.md` §7).
 - The outer boundary is the tailnet: the worker listens nowhere else, so
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket only the account can

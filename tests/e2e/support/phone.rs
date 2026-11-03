@@ -51,6 +51,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use flightdeck::remote::crypto::E2eChannel;
+use flightdeck_remote_protocol::relay::{direct_auth_message, DirectEndpoint};
 use flightdeck_remote_protocol::{
     ClientInfo, CommandBody, CommandId, DesktopToPhone, DeviceId, EncryptedEnvelope, PairingId,
     PhoneCommand, RelayErrorCode, RelayFrame, Role, PROTOCOL_VERSION,
@@ -234,6 +235,12 @@ pub struct PhoneDriver {
     /// (remote-control-bbf). Lets a test assert that recovery path actually ran
     /// rather than inferring it from a cursor value that later traffic moves.
     stream_resets: u32,
+    /// The phone-bound `pairing_claimed.direct_endpoint`: `Some` for a
+    /// direct-mode pairing ([`Self::switch_to_direct`]).
+    direct_endpoint: Option<DirectEndpoint>,
+    /// The last `machine_name` the desktop announced, seen while reading the
+    /// feed.
+    machine_name: Option<String>,
 }
 
 impl PhoneDriver {
@@ -291,21 +298,24 @@ impl PhoneDriver {
             key_agreement_public_key: public_key_b64(&ka),
             role: Role::Phone,
         });
-        let (pairing_id, desktop_ka_b64) = match conn.recv_expect(deadline, "pairing_claimed") {
-            RelayFrame::PairingClaimed {
-                pairing_id,
-                peer_key_agreement_public_key,
-                ..
-            } => (
-                pairing_id,
-                peer_key_agreement_public_key
-                    .expect("relay must return the desktop's key-agreement public key"),
-            ),
-            RelayFrame::Error { code, message, .. } => {
-                panic!("pairing claim rejected: {code:?} — {message}")
-            }
-            other => panic!("expected pairing_claimed, got {other:?}"),
-        };
+        let (pairing_id, desktop_ka_b64, direct_endpoint) =
+            match conn.recv_expect(deadline, "pairing_claimed") {
+                RelayFrame::PairingClaimed {
+                    pairing_id,
+                    peer_key_agreement_public_key,
+                    direct_endpoint,
+                    ..
+                } => (
+                    pairing_id,
+                    peer_key_agreement_public_key
+                        .expect("relay must return the desktop's key-agreement public key"),
+                    direct_endpoint,
+                ),
+                RelayFrame::Error { code, message, .. } => {
+                    panic!("pairing claim rejected: {code:?} — {message}")
+                }
+                other => panic!("expected pairing_claimed, got {other:?}"),
+            };
 
         // 3. auth_response over the challenge -> auth_ok (mirror authenticate).
         let signature: Signature = identity.sign(&nonce);
@@ -350,7 +360,74 @@ impl PhoneDriver {
             device_id,
             last_received_seq: 0,
             stream_resets: 0,
+            direct_endpoint,
+            machine_name: None,
         }
+    }
+
+    /// The machine name the desktop last announced, if the feed carried one.
+    pub fn machine_name(&self) -> Option<&str> {
+        self.machine_name.as_deref()
+    }
+
+    /// The desktop's direct-link endpoint, when the pairing is in direct mode
+    /// (the offer carried one and this driver negotiated v4).
+    pub fn direct_endpoint(&self) -> Option<&DirectEndpoint> {
+        self.direct_endpoint.as_ref()
+    }
+
+    /// Move the data plane to the desktop's direct link, as the iOS app does
+    /// for a direct-mode pairing (spec §5.10): dial the endpoint from
+    /// `pairing_claimed`, authenticate with the same identity key over
+    /// [`direct_auth_message`], and resume from the persisted cursor. Panics
+    /// when the pairing is not in direct mode.
+    pub fn switch_to_direct(&mut self) {
+        let endpoint = self
+            .direct_endpoint
+            .clone()
+            .expect("a direct-mode pairing (pairing_claimed carried no endpoint)");
+        let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+        let mut conn = Conn::connect(&endpoint.ws_url());
+        conn.send(&RelayFrame::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            role: Role::Phone,
+            device_id: self.device_id.clone(),
+            client: ClientInfo {
+                app_version: "e2e-phone".into(),
+                platform: "test".into(),
+                os_version: None,
+            },
+            relay_password: None,
+        });
+        match conn.recv_expect(deadline, "hello_ok (direct)") {
+            RelayFrame::HelloOk { .. } => {}
+            other => panic!("expected hello_ok on the direct link, got {other:?}"),
+        }
+        let nonce = match conn.recv_expect(deadline, "auth_challenge (direct)") {
+            RelayFrame::AuthChallenge { nonce, .. } => STANDARD
+                .decode(&nonce)
+                .unwrap_or_else(|e| panic!("challenge nonce not base64: {e}")),
+            other => panic!("expected auth_challenge on the direct link, got {other:?}"),
+        };
+        let signature: Signature = self.identity.sign(&direct_auth_message(&nonce));
+        conn.send(&RelayFrame::AuthResponse {
+            device_id: self.device_id.clone(),
+            signature: STANDARD.encode(signature.to_bytes()),
+            pairing_ids: vec![self.pairing_id.clone()],
+            machine_name: None,
+        });
+        match conn.recv_expect(deadline, "auth_ok (direct)") {
+            RelayFrame::AuthOk { pairing_ids } => assert!(
+                pairing_ids.contains(&self.pairing_id),
+                "the direct link did not activate our pairing (got {pairing_ids:?})"
+            ),
+            other => panic!("expected auth_ok on the direct link, got {other:?}"),
+        }
+        conn.send(&RelayFrame::Resume {
+            pairing_id: self.pairing_id.clone(),
+            from_seq: self.last_received_seq,
+        });
+        self.conn = conn;
     }
 
     /// The pairing id shared with the desktop.
@@ -536,7 +613,9 @@ impl PhoneDriver {
                 RelayFrame::Ack { .. } => {}
                 // The desktop announces its machine name on connect (spec §5.7);
                 // it is relay-plane metadata, not an application message — skip it.
-                RelayFrame::MachineName { .. } => {}
+                RelayFrame::MachineName { machine_name, .. } => {
+                    self.machine_name = Some(machine_name);
+                }
                 // The answer to `register_push_token` (spec §5.5): relay-plane.
                 RelayFrame::PushTokenAck { .. } => {}
                 // A `seq_violation` WITHOUT `expected_seq` is the receiver-side

@@ -55,6 +55,8 @@ give you a shell, and tell you something went wrong.
 - Init-system integration and start on boot (W3, W11). After a reboot you run
   `flightdeck worker start` yourself.
 - The phone. No relay pairing, no direct link, no pushes from a worker (W6, W18).
+  *Since added as an opt-in, `[worker] phone` (remote-control-qlyd.28; SPECS
+  §33 "The phone").*
 - More than one person. One user, one attached window at a time (W10).
 - FlightDeck managing agent or git credentials (W12, W13).
 - Updating a worker from the Desktop (W20 → deferred by W25; follow-up issue).
@@ -292,7 +294,8 @@ releases must both ship v7.
 ## 9. After v1
 
 - Update from the Desktop (W20): one click, self-update, supervisor restart, agents resume.
-- Phone pushes from a worker through the push-only relay.
+- Phone pushes from a worker through the push-only relay. *Done, with the
+  whole phone link, as `[worker] phone` (remote-control-qlyd.28).*
 - Start on boot (`worker enable` writing a systemd user unit / launchd agent).
 - A TUI attaching to a running worker as a client.
 

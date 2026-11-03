@@ -1,6 +1,6 @@
 use super::*;
 use crate::testing::FakeFs;
-use crate::worker::control::DeviceState;
+use crate::worker::control::{DeviceState, PhonePairingState};
 use crate::worker::status::ListenReport;
 
 fn home() -> &'static Path {
@@ -106,6 +106,7 @@ fn restart_messages() {
 #[derive(Default)]
 struct FakeTarget {
     pairs: u32,
+    phone_pairs: u32,
     revoked: Vec<String>,
     shutdown_intent: Option<bool>,
 }
@@ -140,6 +141,7 @@ impl ControlTarget for FakeTarget {
             background_links: 0,
             projects: Vec::new(),
             unread_messages: 0,
+            phone: None,
         }
     }
     fn pair(&mut self) -> PairingCode {
@@ -166,6 +168,102 @@ impl ControlTarget for FakeTarget {
     fn prepare_shutdown(&mut self, restarting: bool) {
         self.shutdown_intent = Some(restarting);
     }
+    fn pair_phone(&mut self) -> PhonePairingReport {
+        self.phone_pairs += 1;
+        phone_report(PhonePairingState::Requesting)
+    }
+    fn phone_pairing(&self) -> PhonePairingReport {
+        phone_report(PhonePairingState::Waiting)
+    }
+    fn phones(&self) -> Vec<PhoneReport> {
+        vec![phone("pair_abc")]
+    }
+    fn revoke_phone(&mut self, selector: &str) -> Option<Result<PhoneReport, String>> {
+        match selector {
+            "pair_abc" | "pair_a" => {
+                self.revoked.push(selector.to_string());
+                Some(Ok(phone("pair_abc")))
+            }
+            "pair" => Some(Err("'pair' matches several phones".to_string())),
+            _ => None,
+        }
+    }
+}
+
+fn phone(id: &str) -> PhoneReport {
+    PhoneReport {
+        id: id.to_string(),
+        transport: "direct".to_string(),
+        connected: false,
+    }
+}
+
+fn phone_report(state: PhonePairingState) -> PhonePairingReport {
+    PhonePairingReport {
+        state,
+        code: (state == PhonePairingState::Waiting).then(|| "4729".to_string()),
+        qr_payload: None,
+        seconds_remaining: None,
+        message: String::new(),
+    }
+}
+
+#[test]
+fn pair_phone_starts_once_and_status_polls() {
+    let mut t = FakeTarget::default();
+    let (response, line) = answer(&mut t, &ControlRequest::PairPhone);
+    assert_eq!(t.phone_pairs, 1);
+    assert_eq!(
+        response,
+        ControlResponse::PhonePairing(phone_report(PhonePairingState::Requesting))
+    );
+    assert_eq!(
+        line, None,
+        "the host logs the attempt itself, never the code"
+    );
+    let (response, _) = answer(&mut t, &ControlRequest::PhonePairingStatus);
+    assert_eq!(t.phone_pairs, 1, "polling starts nothing");
+    assert_eq!(
+        response,
+        ControlResponse::PhonePairing(phone_report(PhonePairingState::Waiting))
+    );
+}
+
+#[test]
+fn revoke_falls_back_to_a_phone_when_no_desktop_matches() {
+    let mut t = FakeTarget::default();
+    let revoke = |t: &mut FakeTarget, device: &str| {
+        answer(
+            t,
+            &ControlRequest::Revoke {
+                device: device.to_string(),
+            },
+        )
+    };
+    let (response, line) = revoke(&mut t, "pair_a");
+    assert_eq!(
+        response,
+        ControlResponse::PhoneRevoked {
+            phone: phone("pair_abc")
+        }
+    );
+    assert_eq!(line.as_deref(), Some("unpaired phone pair_abc"));
+    // Several phones match: their refusal, not the Desktop's.
+    let (response, _) = revoke(&mut t, "pair");
+    assert_eq!(
+        response,
+        ControlResponse::Error {
+            message: "'pair' matches several phones".to_string()
+        }
+    );
+    // Neither matches: the Desktop refusal stands.
+    let (response, _) = revoke(&mut t, "nope");
+    assert_eq!(
+        response,
+        ControlResponse::Error {
+            message: "no paired Desktop matches 'nope'".to_string()
+        }
+    );
 }
 
 #[test]
@@ -193,7 +291,8 @@ fn status_and_devices_come_from_the_host() {
         answer(&mut t, &ControlRequest::Devices),
         (
             ControlResponse::Devices {
-                devices: vec![device("tok1", "mbp")]
+                devices: vec![device("tok1", "mbp")],
+                phones: vec![phone("pair_abc")],
             },
             None
         )

@@ -29,7 +29,9 @@ use crate::host::AppHost;
 #[cfg(unix)]
 use crate::web::server::ListenPlan;
 #[cfg(unix)]
-use crate::worker::control::{ControlRequest, ControlResponse, DeviceReport, PairingCode};
+use crate::worker::control::{
+    ControlRequest, ControlResponse, DeviceReport, PairingCode, PhonePairingReport, PhoneReport,
+};
 use crate::worker::log::log_line;
 use crate::worker::paths::WorkerPaths;
 #[cfg(unix)]
@@ -421,6 +423,11 @@ trait ControlTarget {
     fn paired_devices(&self) -> Vec<DeviceReport>;
     fn revoke(&mut self, selector: &str) -> Result<(DeviceReport, u32), String>;
     fn prepare_shutdown(&mut self, restarting: bool);
+    fn pair_phone(&mut self) -> PhonePairingReport;
+    fn phone_pairing(&self) -> PhonePairingReport;
+    fn phones(&self) -> Vec<PhoneReport>;
+    /// `None` when no phone matches `selector`.
+    fn revoke_phone(&mut self, selector: &str) -> Option<Result<PhoneReport, String>>;
 }
 
 #[cfg(unix)]
@@ -439,6 +446,18 @@ impl ControlTarget for AppHost<'_> {
     }
     fn prepare_shutdown(&mut self, restarting: bool) {
         self.set_shutdown_intent(restarting)
+    }
+    fn pair_phone(&mut self) -> PhonePairingReport {
+        self.begin_phone_pairing()
+    }
+    fn phone_pairing(&self) -> PhonePairingReport {
+        self.phone_pairing_report()
+    }
+    fn phones(&self) -> Vec<PhoneReport> {
+        AppHost::phones(self)
+    }
+    fn revoke_phone(&mut self, selector: &str) -> Option<Result<PhoneReport, String>> {
+        AppHost::revoke_phone(self, selector)
     }
 }
 
@@ -469,9 +488,17 @@ fn answer(
         ControlRequest::Devices => (
             ControlResponse::Devices {
                 devices: target.paired_devices(),
+                phones: target.phones(),
             },
             None,
         ),
+        ControlRequest::PairPhone => {
+            let report = target.pair_phone();
+            (ControlResponse::PhonePairing(report), None)
+        }
+        ControlRequest::PhonePairingStatus => {
+            (ControlResponse::PhonePairing(target.phone_pairing()), None)
+        }
         ControlRequest::Revoke { device } => match target.revoke(device) {
             Ok((device, closed_connections)) => {
                 let line = format!(
@@ -486,7 +513,15 @@ fn answer(
                     Some(line),
                 )
             }
-            Err(message) => (ControlResponse::Error { message }, None),
+            // No Desktop by that name: it may be a phone.
+            Err(message) => match target.revoke_phone(device.trim()) {
+                Some(Ok(phone)) => {
+                    let line = format!("unpaired phone {}", phone.id);
+                    (ControlResponse::PhoneRevoked { phone }, Some(line))
+                }
+                Some(Err(message)) => (ControlResponse::Error { message }, None),
+                None => (ControlResponse::Error { message }, None),
+            },
         },
         ControlRequest::PrepareShutdown { restarting } => {
             target.prepare_shutdown(*restarting);

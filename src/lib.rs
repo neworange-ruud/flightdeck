@@ -3127,7 +3127,7 @@ const REMOTE_HELD_ELSEWHERE: &str = "FlightDeck Remote is running in another Fli
      computer. Pair the phone from that one, or quit it and restart this one.";
 
 /// What [`start_remote`] did.
-enum RemoteStart {
+pub(crate) enum RemoteStart {
     /// `[remote]` is off, or not configured, or the identity is unreadable.
     Off,
     /// Another FlightDeck on this machine is the relay client.
@@ -3153,15 +3153,38 @@ fn start_remote(
     let Some(path) = remote_state_path() else {
         return RemoteStart::Off;
     };
-    start_remote_at(env, &path, cfg, inbound_tx, outbound_rx)
+    let flavor = RemoteFlavor::for_config(&cfg, &path);
+    start_remote_at(env, &path, cfg, flavor, inbound_tx, outbound_rx)
+}
+
+/// How one host's FlightDeck Remote differs from another's: where its direct
+/// link listens and what it calls itself to the phone. A TUI or Desktop uses
+/// [`RemoteFlavor::for_config`]; a worker builds its own (Tailscale only, or
+/// the tests' loopback, and a "(worker)" name).
+pub(crate) struct RemoteFlavor {
+    pub direct: crate::remote::direct::DirectOptions,
+    /// Announced to the phone instead of this machine's resolved name.
+    pub machine_name: Option<String>,
+}
+
+impl RemoteFlavor {
+    /// The TUI's and Desktop's: `[remote]`'s direct-link settings, the
+    /// machine's own name.
+    fn for_config(cfg: &crate::contracts::RemoteConfig, path: &Path) -> Self {
+        RemoteFlavor {
+            direct: crate::remote::direct::DirectOptions::for_config(cfg, path),
+            machine_name: None,
+        }
+    }
 }
 
 /// [`start_remote`] for the state file at `path`, once `[remote]` is known to
-/// be on.
-fn start_remote_at(
+/// be on. A worker calls this directly with its own state file and flavor.
+pub(crate) fn start_remote_at(
     env: &Env,
     path: &Path,
     cfg: crate::contracts::RemoteConfig,
+    flavor: RemoteFlavor,
     inbound_tx: Sender<RemoteInbound>,
     outbound_rx: Receiver<RemoteOutbound>,
 ) -> RemoteStart {
@@ -3190,7 +3213,10 @@ fn start_remote_at(
     // exists, because such a pairing's envelopes must never go to the relay.
     let direct = if crate::remote::direct::needed(&cfg, &state) {
         crate::remote::direct::DirectLink::start(
-            crate::remote::direct::DirectOptions::for_config(&cfg, path),
+            crate::remote::direct::DirectOptions {
+                machine_name: flavor.machine_name.clone(),
+                ..flavor.direct
+            },
             &state,
             inbound_tx.clone(),
         )
@@ -3250,9 +3276,20 @@ fn start_remote_at(
                 direct_advert: Some(d.advert()),
                 router: Some(d.router()),
                 push_poster: None,
+                machine_name: flavor.machine_name,
             },
         ),
-        None => RemoteHandle::start_with_store(cfg, identity, store, inbound_tx, outbound_rx),
+        None => RemoteHandle::start_with_options(
+            cfg,
+            identity,
+            store,
+            inbound_tx,
+            outbound_rx,
+            crate::remote::client::ClientOptions {
+                machine_name: flavor.machine_name,
+                ..Default::default()
+            },
+        ),
     };
     let push = crate::remote::push::PushSender::new(
         handle.push_link(),
@@ -3339,13 +3376,9 @@ mod relay_owner_tests {
 
         let (in_tx, _in_rx) = std::sync::mpsc::channel();
         let (_out_tx, out_rx) = std::sync::mpsc::channel();
-        let started = start_remote_at(
-            &env,
-            state,
-            crate::contracts::RemoteConfig::default(),
-            in_tx,
-            out_rx,
-        );
+        let cfg = crate::contracts::RemoteConfig::default();
+        let flavor = RemoteFlavor::for_config(&cfg, state);
+        let started = start_remote_at(&env, state, cfg, flavor, in_tx, out_rx);
         assert!(matches!(started, RemoteStart::HeldElsewhere));
         assert!(
             fs.file_contents(state).is_none(),

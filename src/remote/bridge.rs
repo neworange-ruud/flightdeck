@@ -776,6 +776,11 @@ impl RemoteBridge {
         self.pairing.is_some()
     }
 
+    /// The pairing this bridge feeds, if any.
+    pub fn active_pairing(&self) -> Option<&PairingId> {
+        self.pairing.as_ref()
+    }
+
     /// Whether the active pairing's data plane is the direct link
     /// ([`RemoteInbound::DirectTransport`]); `None` with no active pairing.
     pub fn active_is_direct(&self) -> Option<bool> {

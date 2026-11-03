@@ -174,6 +174,71 @@ fn revoke_text_counts_the_closed_connections() {
     assert!(render_revoked(&d, 2).contains("Closed its 2 open connections."));
 }
 
+fn phone(id: &str, connected: bool) -> PhoneReport {
+    PhoneReport {
+        id: id.to_string(),
+        transport: "direct".to_string(),
+        connected,
+    }
+}
+
+fn phone_step(state: PhonePairingState) -> PhonePairingReport {
+    let waiting = state == PhonePairingState::Waiting;
+    PhonePairingReport {
+        state,
+        code: waiting.then(|| "4729".to_string()),
+        qr_payload: waiting.then(|| "fdr1:4729.c2VjcmV0.wss%3A%2F%2Frelay.test%2Fws".to_string()),
+        seconds_remaining: waiting.then_some(118),
+        message: match state {
+            PhonePairingState::Requesting => "Requesting a pairing code from the relay…",
+            PhonePairingState::Waiting => "waiting",
+            PhonePairingState::Paired => "Phone paired. End-to-end encrypted.",
+            PhonePairingState::Failed => "The pairing code expired.",
+            PhonePairingState::Off => "Phone pairing is off on this worker.",
+        }
+        .to_string(),
+    }
+}
+
+#[test]
+fn a_waiting_phone_pairing_shows_the_qr_and_the_code() {
+    let text = render_phone_pairing(&phone_step(PhonePairingState::Waiting));
+    assert!(text.contains("scan this QR code"), "{text}");
+    assert!(
+        text.contains("Code: 4729   (valid for 118 s, single use)"),
+        "{text}"
+    );
+    // The QR itself: half-block rows, all one width, before the code.
+    let qr: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains('█') || l.contains('▀') || l.contains('▄'))
+        .collect();
+    assert!(qr.len() > 10, "a QR is drawn: {text}");
+    let width = qr[0].chars().count();
+    assert!(qr.iter().all(|r| r.chars().count() == width), "{text}");
+    assert!(text.find(qr[0]).unwrap() < text.find("Code: 4729").unwrap());
+}
+
+#[test]
+fn a_paired_phone_says_where_to_find_it() {
+    let text = render_phone_pairing(&phone_step(PhonePairingState::Paired));
+    assert!(text.starts_with("Phone paired."), "{text}");
+    assert!(text.contains("flightdeck worker devices"), "{text}");
+}
+
+#[test]
+fn phones_render_as_a_table() {
+    let text = render_phones(&[phone("pair_1", true), phone("pair_22", false)]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "PHONE    LINK    STATE");
+    assert_eq!(lines[1], "pair_1   direct  connected");
+    assert_eq!(lines[2], "pair_22  direct  offline");
+    assert!(
+        text.contains("flightdeck worker revoke <phone id>"),
+        "{text}"
+    );
+}
+
 /// Against a real socket: a fake run loop answering on a short temp path.
 #[cfg(unix)]
 mod over_the_socket {
@@ -291,9 +356,12 @@ mod over_the_socket {
         let h = home();
         let _server = answering(&h.paths, |_| ControlResponse::Devices {
             devices: vec![device("tok1", "mbp", DeviceState::Background)],
+            phones: vec![phone("pair_1", true)],
         });
         let (status, out, _) = run(|o, e| devices_to(&h.paths, true, 0, o, e));
         assert_eq!(status, 0);
+        // Still the Desktops array: the phones are text-only here (and in
+        // `worker status --json`).
         let back: Vec<DeviceReport> = serde_json::from_str(&out).unwrap();
         assert_eq!(back, vec![device("tok1", "mbp", DeviceState::Background)]);
     }
@@ -319,6 +387,121 @@ mod over_the_socket {
             err.trim_end(),
             "'m' matches more than one Desktop: mbp, mini"
         );
+    }
+
+    /// A fake worker whose phone pairing goes through `steps`, one per
+    /// request, staying on the last.
+    fn phone_worker(paths: &WorkerPaths, steps: Vec<PhonePairingState>) -> ControlServer {
+        let at = std::sync::atomic::AtomicUsize::new(0);
+        answering(paths, move |req| match req {
+            ControlRequest::PairPhone | ControlRequest::PhonePairingStatus => {
+                let i = at.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ControlResponse::PhonePairing(phone_step(steps[i.min(steps.len() - 1)]))
+            }
+            other => ControlResponse::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        })
+    }
+
+    #[test]
+    fn pair_phone_waits_until_the_phone_has_paired() {
+        use PhonePairingState::*;
+        let h = home();
+        let _server = phone_worker(
+            &h.paths,
+            vec![Requesting, Waiting, Waiting, Waiting, Paired],
+        );
+        let mut pauses = 0;
+        let (status, out, err) = run(|o, e| {
+            pair_phone_to(
+                &h.paths,
+                false,
+                Duration::from_secs(60),
+                &mut || pauses += 1,
+                o,
+                e,
+            )
+        });
+        assert_eq!((status, err.as_str()), (0, ""), "{out}");
+        assert_eq!(pauses, 4);
+        assert_eq!(
+            out.matches("Code: 4729").count(),
+            1,
+            "the QR is printed once, not on every poll: {out}"
+        );
+        assert!(out.contains("Requesting a pairing code"), "{out}");
+        assert!(out.trim_end().contains("Phone paired."), "{out}");
+    }
+
+    #[test]
+    fn pair_phone_json_is_one_line_per_step() {
+        use PhonePairingState::*;
+        let h = home();
+        let _server = phone_worker(&h.paths, vec![Waiting, Waiting, Paired]);
+        let (status, out, _) =
+            run(|o, e| pair_phone_to(&h.paths, true, Duration::from_secs(60), &mut || {}, o, e));
+        assert_eq!(status, 0);
+        let steps: Vec<PhonePairingReport> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            steps.iter().map(|s| s.state).collect::<Vec<_>>(),
+            vec![Waiting, Paired]
+        );
+        assert_eq!(steps[0].code.as_deref(), Some("4729"));
+    }
+
+    #[test]
+    fn pair_phone_fails_with_the_workers_reason() {
+        use PhonePairingState::*;
+        for (steps, reason) in [
+            (vec![Off], "Phone pairing is off on this worker."),
+            (vec![Waiting, Failed], "The pairing code expired."),
+        ] {
+            let h = home();
+            let _server = phone_worker(&h.paths, steps);
+            let (status, _, err) = run(|o, e| {
+                pair_phone_to(&h.paths, false, Duration::from_secs(60), &mut || {}, o, e)
+            });
+            assert_eq!((status, err.trim_end()), (1, reason));
+        }
+    }
+
+    #[test]
+    fn pair_phone_gives_up_on_a_relay_that_hands_out_no_code() {
+        let h = home();
+        let _server = phone_worker(&h.paths, vec![PhonePairingState::Requesting]);
+        let (status, _, err) =
+            run(|o, e| pair_phone_to(&h.paths, false, Duration::ZERO, &mut || {}, o, e));
+        assert_eq!(status, 1);
+        assert!(err.contains("did not hand out a pairing code"), "{err}");
+    }
+
+    #[test]
+    fn devices_text_lists_phones_after_the_desktops() {
+        let h = home();
+        let _server = answering(&h.paths, |_| ControlResponse::Devices {
+            devices: Vec::new(),
+            phones: vec![phone("pair_1", false)],
+        });
+        let (status, out, _) = run(|o, e| devices_to(&h.paths, false, 0, o, e));
+        assert_eq!(status, 0);
+        assert!(out.starts_with("No paired Desktops."), "{out}");
+        assert!(out.contains("pair_1  direct  offline"), "{out}");
+    }
+
+    #[test]
+    fn revoking_a_phone_says_how_to_pair_it_again() {
+        let h = home();
+        let _server = answering(&h.paths, |_| ControlResponse::PhoneRevoked {
+            phone: phone("pair_1", false),
+        });
+        let (status, out, _) = run(|o, e| revoke_to(&h.paths, "pair_1", o, e));
+        assert_eq!(status, 0);
+        assert!(out.starts_with("Unpaired phone pair_1."), "{out}");
+        assert!(out.contains("worker pair --phone"), "{out}");
     }
 
     #[test]
