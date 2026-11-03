@@ -39,8 +39,11 @@ COMMANDS:
     restart              Stop, then start (how `flightdeck update` takes effect)
     status [--json]      Running or stopped, listen addresses, devices, projects, agents
     pair [--json]        Mint a one-time code to pair FlightDeck Desktop
-    devices [--json]     List paired Desktops
-    revoke <device>      Revoke a Desktop's access and close its connections
+    pair --phone [--json]
+                         Pair the FlightDeck iPhone app (needs `phone = true`
+                         under [worker]); waits until the phone has paired
+    devices [--json]     List paired Desktops (and, as text, paired phones)
+    revoke <device>      Revoke a Desktop's access, or unpair a phone
     logs [-f] [-n N]     Print (or follow) the worker log
     run                  Run the worker in the foreground, logging to stderr
 
@@ -71,6 +74,8 @@ enum Command {
     },
     Pair {
         json: bool,
+        /// `--phone`: pair the iPhone app, not a Desktop.
+        phone: bool,
     },
     Devices {
         json: bool,
@@ -132,7 +137,7 @@ fn parse(args: &[String]) -> Result<Command, ParseError> {
         "run" => no_args(Command::Run),
         "supervise" => no_args(Command::Supervise),
         "status" => json_only(|json| Command::Status { json }),
-        "pair" => json_only(|json| Command::Pair { json }),
+        "pair" => parse_pair(rest),
         "devices" => json_only(|json| Command::Devices { json }),
         "revoke" => match rest {
             [device] if !device.trim().is_empty() => Ok(Command::Revoke {
@@ -147,6 +152,24 @@ fn parse(args: &[String]) -> Result<Command, ParseError> {
         "logs" => parse_logs(rest),
         other => Err(ParseError::Unknown(other.to_string())),
     }
+}
+
+/// `pair [--phone] [--json]`, flags in either order, each at most once.
+fn parse_pair(rest: &[String]) -> Result<Command, ParseError> {
+    let (mut json, mut phone) = (false, false);
+    for arg in rest {
+        let seen = match arg.as_str() {
+            "--json" => std::mem::replace(&mut json, true),
+            "--phone" => std::mem::replace(&mut phone, true),
+            _ => true,
+        };
+        if seen {
+            return Err(ParseError::Usage(
+                "`flightdeck worker pair` takes only `--phone` and `--json`.".to_string(),
+            ));
+        }
+    }
+    Ok(Command::Pair { json, phone })
 }
 
 fn parse_logs(rest: &[String]) -> Result<Command, ParseError> {
@@ -209,7 +232,8 @@ fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     match command {
         Command::Status { json } => return status_cli::run_status(json),
-        Command::Pair { json } => return status_cli::run_pair(json),
+        Command::Pair { json, phone: false } => return status_cli::run_pair(json),
+        Command::Pair { json, phone: true } => return status_cli::run_pair_phone(json),
         Command::Devices { json } => return status_cli::run_devices(json),
         Command::Revoke { device } => return status_cli::run_revoke(&device),
         _ => {}

@@ -584,7 +584,13 @@ fn the_worker_refusals_say_where_to_go_instead() {
     );
     assert_eq!(
         worker_refusal(names::PAIR_PHONE),
-        Some("Workers do not pair with the phone in v1.")
+        Some("Pair a phone on the worker: run `flightdeck worker pair --phone` in its shell.")
+    );
+    assert_eq!(
+        worker_refusal(names::UNPAIR_PHONE),
+        Some(
+            "Unpair a phone on the worker: run `flightdeck worker revoke <phone id>` in its shell."
+        )
     );
     assert_eq!(
         worker_refusal(names::SHOW_WEB_ACCESS),

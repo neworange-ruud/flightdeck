@@ -1,5 +1,5 @@
-//! The CLI side of the control socket: `worker status`, `pair`, `devices`
-//! and `revoke` (SPECS §33). Each returns the process exit code.
+//! The CLI side of the control socket: `worker status`, `pair` (and
+//! `pair --phone`), `devices` and `revoke` (SPECS §33). Each returns the process exit code.
 //!
 //! Each command asks the running worker over [`control::request`] and prints
 //! the answer. `status` also works with nothing running: it merges whatever
@@ -15,6 +15,7 @@ use std::time::Duration;
 use crate::contracts::{Clock, FileSystem, RealClock, RealFs};
 use crate::worker::control::{
     self, ControlError, ControlRequest, ControlResponse, DeviceReport, DeviceState, PairingCode,
+    PhonePairingReport, PhonePairingState, PhoneReport,
 };
 use crate::worker::paths::WorkerPaths;
 use crate::worker::state;
@@ -36,6 +37,15 @@ pub fn run_status(json: bool) -> i32 {
 /// `flightdeck worker pair [--json]`: mint a pairing code in the running worker.
 pub fn run_pair(json: bool) -> i32 {
     with_paths(|paths, out, err| pair_to(paths, json, out, err))
+}
+
+/// `flightdeck worker pair --phone [--json]`: pair the iPhone app, waiting
+/// until it has paired, failed, or the code ran out.
+pub fn run_pair_phone(json: bool) -> i32 {
+    with_paths(|paths, out, err| {
+        let mut pause = || std::thread::sleep(PHONE_POLL);
+        pair_phone_to(paths, json, PHONE_REQUEST_LIMIT, &mut pause, out, err)
+    })
 }
 
 /// `flightdeck worker devices [--json]`: the paired Desktops.
@@ -204,6 +214,125 @@ fn render_pair(code: &PairingCode) -> String {
     out
 }
 
+/// How often `pair --phone` asks the worker how the pairing is going.
+const PHONE_POLL: Duration = Duration::from_millis(250);
+/// How long `pair --phone` waits for the relay to hand out a code before it
+/// gives up (the worker keeps asking; a later `pair --phone` picks it up).
+const PHONE_REQUEST_LIMIT: Duration = Duration::from_secs(60);
+
+/// `worker pair --phone` over explicit streams. `pause` runs between polls;
+/// `request_limit` bounds the wait for a code.
+fn pair_phone_to(
+    paths: &WorkerPaths,
+    json: bool,
+    request_limit: Duration,
+    pause: &mut dyn FnMut(),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let ask_phone = |request: &ControlRequest, err: &mut dyn Write| match ask(paths, request, err) {
+        Ok(ControlResponse::PhonePairing(report)) => Ok(report),
+        Ok(other) => Err(unexpected(&other, err)),
+        Err(code) => Err(code),
+    };
+    let mut report = match ask_phone(&ControlRequest::PairPhone, err) {
+        Ok(report) => report,
+        Err(code) => return code,
+    };
+    let started = std::time::Instant::now();
+    // What was last printed: the countdown alone changing prints nothing.
+    let mut shown: Option<(PhonePairingState, Option<String>, String)> = None;
+    loop {
+        let key = (report.state, report.code.clone(), report.message.clone());
+        if shown.as_ref() != Some(&key) {
+            if json {
+                match serde_json::to_string(&report) {
+                    Ok(line) => {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(err, "flightdeck worker: {e}");
+                        return 1;
+                    }
+                }
+            } else {
+                match report.state {
+                    PhonePairingState::Failed | PhonePairingState::Off => {
+                        let _ = writeln!(err, "{}", report.message);
+                    }
+                    _ => {
+                        let _ = write!(out, "{}", render_phone_pairing(&report));
+                    }
+                }
+            }
+            let _ = out.flush();
+            shown = Some(key);
+        }
+        match report.state {
+            PhonePairingState::Paired => return 0,
+            PhonePairingState::Failed | PhonePairingState::Off => return 1,
+            PhonePairingState::Requesting if started.elapsed() >= request_limit => {
+                let _ = writeln!(
+                    err,
+                    "The relay did not hand out a pairing code within {} s ({}). \
+                     See `flightdeck worker logs`, then try again.",
+                    request_limit.as_secs(),
+                    report.message
+                );
+                return 1;
+            }
+            _ => {}
+        }
+        pause();
+        report = match ask_phone(&ControlRequest::PhonePairingStatus, err) {
+            Ok(report) => report,
+            Err(code) => return code,
+        };
+    }
+}
+
+/// One step of `worker pair --phone` for a person: the wait for a code, the
+/// QR and code to scan or type, or the success.
+fn render_phone_pairing(report: &PhonePairingReport) -> String {
+    match report.state {
+        PhonePairingState::Waiting => {
+            let mut out = String::from(
+                "Open the FlightDeck app on your iPhone, choose Pair, and scan this QR code \
+                 (or type the code).\n\n",
+            );
+            if let Some(art) = report
+                .qr_payload
+                .as_deref()
+                .and_then(crate::remote::pairing::qr_art)
+            {
+                for row in &art.rows {
+                    out.push_str(row);
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "Code: {}",
+                report.code.as_deref().unwrap_or("(none)")
+            ));
+            if let Some(secs) = report.seconds_remaining {
+                out.push_str(&format!("   (valid for {secs} s, single use)"));
+            }
+            out.push_str(
+                "\n\nWaiting for the phone… Ctrl-C stops waiting; the code stays valid until it \
+                 runs out.\n",
+            );
+            out
+        }
+        PhonePairingState::Paired => format!(
+            "{}\nIt is listed by `flightdeck worker devices`; unpair it with \
+             `flightdeck worker revoke <id>`.\n",
+            report.message
+        ),
+        _ => format!("{}\n", report.message),
+    }
+}
+
 /// `worker devices` over explicit streams; `now` (unix seconds) dates the
 /// "ago" columns.
 fn devices_to(
@@ -213,16 +342,55 @@ fn devices_to(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let devices = match ask(paths, &ControlRequest::Devices, err) {
-        Ok(ControlResponse::Devices { devices }) => devices,
+    let (devices, phones) = match ask(paths, &ControlRequest::Devices, err) {
+        Ok(ControlResponse::Devices { devices, phones }) => (devices, phones),
         Ok(other) => return unexpected(&other, err),
         Err(code) => return code,
     };
+    // The JSON stays the Desktops array it has always been.
     if json {
         return print_json(&devices, out, err);
     }
-    let _ = write!(out, "{}", render_devices(&devices, now));
+    let mut text = render_devices(&devices, now);
+    if !phones.is_empty() {
+        text.push('\n');
+        text.push_str(&render_phones(&phones));
+    }
+    let _ = write!(out, "{text}");
     0
+}
+
+/// The paired phones for a person, as a table.
+fn render_phones(phones: &[PhoneReport]) -> String {
+    let header = ["PHONE", "LINK", "STATE"].map(String::from);
+    let rows: Vec<[String; 3]> = phones
+        .iter()
+        .map(|p| {
+            [
+                p.id.clone(),
+                p.transport.clone(),
+                if p.connected { "connected" } else { "offline" }.to_string(),
+            ]
+        })
+        .collect();
+    let mut widths = [0usize; 3];
+    for row in std::iter::once(&header).chain(rows.iter()) {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in std::iter::once(&header).chain(rows.iter()) {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, w)| format!("{cell:<w$}"))
+            .collect();
+        out.push_str(cells.join("  ").trim_end());
+        out.push('\n');
+    }
+    out.push_str("\nUnpair one with `flightdeck worker revoke <phone id>`.\n");
+    out
 }
 
 /// `worker devices` for a person: a table, or how to pair one.
@@ -301,6 +469,15 @@ fn revoke_to(paths: &WorkerPaths, device: &str, out: &mut dyn Write, err: &mut d
             closed_connections,
         }) => {
             let _ = write!(out, "{}", render_revoked(&device, closed_connections));
+            0
+        }
+        Ok(ControlResponse::PhoneRevoked { phone }) => {
+            let _ = writeln!(
+                out,
+                "Unpaired phone {}. It must pair again (`flightdeck worker pair --phone`) \
+                 to reconnect.",
+                phone.id
+            );
             0
         }
         Ok(other) => unexpected(&other, err),

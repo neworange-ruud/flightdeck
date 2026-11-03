@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::worker::control::{DeviceReport, DeviceState};
+use crate::worker::control::{DeviceReport, DeviceState, PhoneReport};
 use crate::worker::state::{ExitReport, SupervisorPhase, SupervisorState};
 
 /// The `schema` of the `worker status --json` document.
@@ -40,6 +40,9 @@ pub struct WorkerStatusReport {
     pub background_links: u32,
     pub projects: Vec<ProjectReport>,
     pub unread_messages: u32,
+    /// The phone link, while the worker runs with `[worker] phone` on.
+    #[serde(default)]
+    pub phone: Option<PhoneStatusReport>,
     /// Crash restarts since the supervisor started.
     pub restarts: u32,
     pub last_exit: Option<ExitReport>,
@@ -86,6 +89,20 @@ pub struct WorkerRuntimeReport {
     pub background_links: u32,
     pub projects: Vec<ProjectReport>,
     pub unread_messages: u32,
+    /// The phone link; `None` while `[worker] phone` is off.
+    #[serde(default)]
+    pub phone: Option<PhoneStatusReport>,
+}
+
+/// The worker's phone link (`[worker] phone = true`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneStatusReport {
+    /// Whether FlightDeck Remote started (see the log when it did not).
+    pub running: bool,
+    /// The `host:port` new phone pairings dial over Tailscale, while the
+    /// direct link is listening.
+    pub direct: Option<String>,
+    pub phones: Vec<PhoneReport>,
 }
 
 /// Where the worker listens, or why it does not.
@@ -196,6 +213,7 @@ pub fn merge(
         background_links: 0,
         projects: Vec::new(),
         unread_messages: 0,
+        phone: None,
         restarts,
         last_exit,
         gave_up_reason,
@@ -211,6 +229,7 @@ pub fn merge(
             report.background_links = rt.background_links;
             report.projects = rt.projects;
             report.unread_messages = rt.unread_messages;
+            report.phone = rt.phone;
         }
         None => {
             // A supervised worker that has not answered yet still has a pid.
@@ -297,6 +316,23 @@ pub fn render_text(r: &WorkerStatusReport) -> String {
                 }
             }
         }
+        if let Some(phone) = &r.phone {
+            let link = match (phone.running, &phone.direct) {
+                (false, _) => "not running (see `flightdeck worker logs`)".to_string(),
+                (true, Some(direct)) => format!("direct link on {direct}"),
+                (true, None) => "direct link not listening yet (no Tailscale address)".to_string(),
+            };
+            line(format!("Phone: {link}"));
+            if phone.phones.is_empty() {
+                line("Paired phones: none (run `flightdeck worker pair --phone`)".to_string());
+            } else {
+                line(format!("Paired phones: {}", phone.phones.len()));
+                for p in &phone.phones {
+                    let state = if p.connected { "connected" } else { "offline" };
+                    line(format!("  {} [{}] {state}", p.id, p.transport));
+                }
+            }
+        }
         if r.unread_messages > 0 {
             line(format!("Unread messages: {}", r.unread_messages));
         }
@@ -373,6 +409,7 @@ pub(crate) mod tests {
                 }],
             }],
             unread_messages: 0,
+            phone: None,
         }
     }
 
@@ -527,6 +564,7 @@ pub(crate) mod tests {
                 }]
             }],
             "unread_messages": 0,
+            "phone": null,
             "restarts": 1,
             "last_exit": {
                 "at": 1_700_000_600u64,
@@ -537,9 +575,46 @@ pub(crate) mod tests {
             "gave_up_reason": null
         });
         assert_eq!(serde_json::to_value(&r).unwrap(), expected);
-        // And it reads back.
-        let back: WorkerStatusReport = serde_json::from_value(expected).unwrap();
+        // And it reads back, as does the shape from before `phone` existed.
+        let back: WorkerStatusReport = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(back, r);
+        let mut before_phone = expected;
+        before_phone.as_object_mut().unwrap().remove("phone");
+        let back: WorkerStatusReport = serde_json::from_value(before_phone).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn status_text_shows_the_phone_link_when_it_is_on() {
+        let mut rt = sample_runtime();
+        let off = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(!off.contains("Phone"), "{off}");
+
+        rt.phone = Some(PhoneStatusReport {
+            running: true,
+            direct: Some("box.tail1234.ts.net:47800".to_string()),
+            phones: vec![PhoneReport {
+                id: "pair_1".to_string(),
+                transport: "direct".to_string(),
+                connected: true,
+            }],
+        });
+        let on = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(
+            on.contains("Phone: direct link on box.tail1234.ts.net:47800"),
+            "{on}"
+        );
+        assert!(on.contains("Paired phones: 1"), "{on}");
+        assert!(on.contains("  pair_1 [direct] connected"), "{on}");
+
+        rt.phone = Some(PhoneStatusReport {
+            running: false,
+            direct: None,
+            phones: Vec::new(),
+        });
+        let broken = render_text(&merge(Some(rt), None, true, false));
+        assert!(broken.contains("Phone: not running"), "{broken}");
+        assert!(broken.contains("worker pair --phone"), "{broken}");
     }
 
     #[test]

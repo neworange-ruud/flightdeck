@@ -18,7 +18,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **Pair Phone in a worker's window now says how to pair a phone with that worker.** Workers can now pair the iPhone app themselves (`flightdeck worker pair --phone` in the worker's shell, with `phone = true` under `[worker]`). The palette's Pair Phone and Unpair Phone rows in a worker's window point there instead of saying workers don't pair with the phone.
 
 ### Bug fixes
 

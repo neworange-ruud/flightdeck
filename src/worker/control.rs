@@ -32,9 +32,16 @@ pub enum ControlRequest {
     Pair,
     /// Paired Desktops (`worker devices`).
     Devices,
-    /// Revoke a Desktop's token and close its connections (`worker revoke`).
-    /// `device` is an id, a label or a unique id prefix.
+    /// Revoke a Desktop's token and close its connections, or unpair a
+    /// phone (`worker revoke`). `device` is an id, a label or a unique id
+    /// prefix.
     Revoke { device: String },
+    /// Start pairing a phone (`worker pair --phone`), or report the attempt
+    /// already running. Answered at once; the CLI then polls
+    /// [`ControlRequest::PhonePairingStatus`].
+    PairPhone,
+    /// How the attempt [`ControlRequest::PairPhone`] started is going.
+    PhonePairingStatus,
     /// Sent by `worker restart` before stopping, so connections close with
     /// "restarting" rather than "stopped".
     PrepareShutdown { restarting: bool },
@@ -52,12 +59,20 @@ pub enum ControlResponse {
     Paired(PairingCode),
     Devices {
         devices: Vec<DeviceReport>,
+        /// Paired phones (absent from a worker that predates phone support).
+        #[serde(default)]
+        phones: Vec<PhoneReport>,
     },
     Revoked {
         device: DeviceReport,
         /// How many live connections (window and background) were closed.
         closed_connections: u32,
     },
+    /// `worker revoke` named a phone: it is unpaired.
+    PhoneRevoked {
+        phone: PhoneReport,
+    },
+    PhonePairing(PhonePairingReport),
     /// Done, nothing to report (`PrepareShutdown`).
     Ok,
     /// The request was refused or failed; `message` is for a person.
@@ -105,6 +120,57 @@ pub enum DeviceState {
     /// It holds a status-only background link.
     Background,
     Offline,
+}
+
+/// A phone pairing attempt, as `worker pair --phone` shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhonePairingReport {
+    pub state: PhonePairingState,
+    /// The 4-digit code to type in the phone app, while
+    /// [`PhonePairingState::Waiting`].
+    pub code: Option<String>,
+    /// What the QR encodes (`fdr1:…`), while waiting: the CLI draws it.
+    pub qr_payload: Option<String>,
+    /// Seconds until the code expires, while waiting.
+    pub seconds_remaining: Option<i64>,
+    /// What is happening, or why it failed, for a person.
+    pub message: String,
+}
+
+/// Where a phone pairing attempt is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhonePairingState {
+    /// Asking the relay for a code.
+    Requesting,
+    /// The code and QR are ready; waiting for the phone to claim them.
+    Waiting,
+    Paired,
+    /// Expired, refused, or the relay could not be reached.
+    Failed,
+    /// `[worker] phone` is off, or FlightDeck Remote did not start.
+    Off,
+}
+
+impl PhonePairingState {
+    /// Whether the attempt is over (the CLI stops polling).
+    pub fn is_final(self) -> bool {
+        matches!(
+            self,
+            PhonePairingState::Paired | PhonePairingState::Failed | PhonePairingState::Off
+        )
+    }
+}
+
+/// One paired phone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneReport {
+    /// The pairing id: what `worker revoke` takes.
+    pub id: String,
+    /// Which data plane carries it: `direct` (Tailscale) or `relay`.
+    pub transport: String,
+    /// Whether it is connected right now.
+    pub connected: bool,
 }
 
 /// Why a control request got no answer.

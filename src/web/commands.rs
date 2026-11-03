@@ -974,8 +974,14 @@ pub const WORKER_QUIT_REFUSAL: &str = "Stop the worker with `flightdeck worker s
 pub const WORKER_WEB_ACCESS_REFUSAL: &str =
     "A worker's network access is managed by the worker itself.";
 
-/// Why a worker has no phone pairing.
-pub const WORKER_PHONE_REFUSAL: &str = "Workers do not pair with the phone in v1.";
+/// Why a worker's window cannot pair a phone: the worker pairs its phones
+/// itself, from its own shell (`[worker] phone`).
+pub const WORKER_PHONE_REFUSAL: &str =
+    "Pair a phone on the worker: run `flightdeck worker pair --phone` in its shell.";
+
+/// Why a worker's window cannot unpair a phone.
+pub const WORKER_UNPAIR_PHONE_REFUSAL: &str =
+    "Unpair a phone on the worker: run `flightdeck worker revoke <phone id>` in its shell.";
 
 /// Why a worker's window does not get the TUI's folder browser: it would step
 /// outside the `$HOME` confinement the worker's own picker enforces.
@@ -996,7 +1002,8 @@ pub fn worker_refusal(name: &str) -> Option<&'static str> {
         names::START_WEB_INTERFACE | names::STOP_WEB_INTERFACE | names::SHOW_WEB_ACCESS => {
             Some(WORKER_WEB_ACCESS_REFUSAL)
         }
-        names::PAIR_PHONE | names::UNPAIR_PHONE => Some(WORKER_PHONE_REFUSAL),
+        names::PAIR_PHONE => Some(WORKER_PHONE_REFUSAL),
+        names::UNPAIR_PHONE => Some(WORKER_UNPAIR_PHONE_REFUSAL),
         names::OPEN_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
         _ => None,
     }

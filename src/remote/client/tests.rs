@@ -1318,6 +1318,32 @@ fn a_peers_restarted_stream_is_accepted_not_deduped_away() {
 /// connect. The mock captures the field and asserts it is present and bounded.
 #[test]
 fn desktop_announces_machine_name_on_auth() {
+    let name = announced_machine_name(ClientOptions::default())
+        .expect("desktop must announce a machine name (system hostname)");
+    assert!(!name.is_empty(), "machine name must not be empty");
+    assert!(
+        name.chars().count() <= 64,
+        "machine name must be length-bounded to 64 chars, got {}",
+        name.chars().count()
+    );
+}
+
+/// A worker's override replaces the resolved host name on `auth_response`.
+#[test]
+fn a_machine_name_override_is_announced_verbatim() {
+    let options = ClientOptions {
+        machine_name: Some("buildbox (worker)".to_string()),
+        ..ClientOptions::default()
+    };
+    assert_eq!(
+        announced_machine_name(options).as_deref(),
+        Some("buildbox (worker)")
+    );
+}
+
+/// Run one handshake against a mock relay and return the `machine_name` the
+/// client put on its `auth_response`.
+fn announced_machine_name(options: ClientOptions) -> Option<String> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1377,18 +1403,11 @@ fn desktop_announces_machine_name_on_auth() {
     let store = Box::new(MemStore(Mutex::new(RemoteState::default())));
     let (in_tx, _in_rx) = channel();
     let (_out_tx, out_rx) = channel();
-    let handle = RemoteHandle::start_with_store(cfg, identity, store, in_tx, out_rx);
+    let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
 
     let captured = mock.join().unwrap();
     handle.stop();
-
-    let name = captured.expect("desktop must announce a machine name (system hostname)");
-    assert!(!name.is_empty(), "machine name must not be empty");
-    assert!(
-        name.chars().count() <= 64,
-        "machine name must be length-bounded to 64 chars, got {}",
-        name.chars().count()
-    );
+    captured
 }
 
 // --- Phone-initiated revoke (spec §10.2) -----------------------------------
@@ -3096,6 +3115,7 @@ fn direct_offer_drill(echo: bool) -> (RemoteState, Vec<RemoteInbound>, Vec<Relay
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
         router: None,
         push_poster: None,
+        machine_name: None,
     };
     let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
 
@@ -3400,6 +3420,7 @@ fn push_only_refusal_drill(direct_enabled: bool, expected: &str) {
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(None))),
         router: None,
         push_poster: None,
+        machine_name: None,
     };
     let handle = RemoteHandle::start_with_options(cfg, identity, store, in_tx, out_rx, options);
     let mut refusal = None;
@@ -3605,6 +3626,7 @@ fn push_only_claim_drill(then: RelayFrame) -> (RemoteState, Vec<RemoteInbound>, 
         direct_advert: Some(std::sync::Arc::new(std::sync::RwLock::new(Some(endpoint)))),
         router: None,
         push_poster: None,
+        machine_name: None,
     };
     let handle = RemoteHandle::start_with_options(
         cfg,

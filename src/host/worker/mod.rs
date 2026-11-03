@@ -56,6 +56,7 @@ pub mod clone;
 pub mod health;
 pub mod messages;
 pub mod notify;
+pub mod phone;
 pub mod projects;
 pub mod shell;
 
@@ -152,6 +153,8 @@ pub(crate) struct WorkerExt {
     /// `[worker] projects_root`, resolved against the canonical home.
     projects_root: PathBuf,
     listen: ListenPlan,
+    /// The phone link's setup, when `[worker] phone` is on.
+    phone: Option<phone::PhoneSetup>,
     /// Whether the once-a-day update check is on (`[update] check`, global).
     update_check: bool,
     probe: Box<dyn HealthProbe + Send>,
@@ -315,8 +318,9 @@ fn ambiguous(selector: &str, candidates: &[&DeviceReport]) -> String {
 impl<'a> AppHost<'a> {
     /// Open the worker workspace (it may be empty): reopen the projects
     /// remembered in `opts.paths.workspace`, seed every project's PTY size
-    /// to `default_cols`×`default_rows`, never start FlightDeck Remote, and
-    /// capture what the TUI would show in its status line as host messages.
+    /// to `default_cols`×`default_rows`, start FlightDeck Remote only when
+    /// `[worker] phone` is on, and capture what the TUI would show in its
+    /// status line as host messages.
     pub fn open_worker(
         env: Env<'a>,
         notifier: &'a WorkerNotifier,
@@ -385,9 +389,16 @@ impl<'a> AppHost<'a> {
         let started_ms = env.clock.now_millis();
         let mut host = AppHost::from_parts(env, notifier, workspace, web_surface, false);
         host.kind = HostKind::Worker;
-        // W6/W18: a worker never starts FlightDeck Remote, whatever `[remote]`
-        // says. Without the relay channels `start` has nothing to start.
-        host.remote_wiring = None;
+        // FlightDeck Remote runs only when `[worker] phone` opted in, whatever
+        // `[remote] enabled` says, and then on the worker's own state and
+        // addresses (`phone::start_phone`). Without the relay channels
+        // `start_worker` has nothing to start.
+        let phone = opts.config.phone.then(|| {
+            phone::PhoneSetup::new(&opts.global_config.remote, opts.paths.phone_state.clone())
+        });
+        if phone.is_none() {
+            host.remote_wiring = None;
+        }
         host.ui.capture_messages = true;
         for p in host.workspace.projects.iter_mut() {
             p.state.set_pty_size(size);
@@ -397,6 +408,7 @@ impl<'a> AppHost<'a> {
             home: opts.home,
             projects_root,
             listen: opts.listen,
+            phone,
             update_check: opts.global_config.update.check,
             config: opts.config,
             probe: opts.health,
@@ -464,6 +476,7 @@ impl<'a> AppHost<'a> {
         }
 
         self.start_listening(now0);
+        self.start_phone(now0);
 
         let pty = self.env.pty;
         if let Some(w) = self.worker.as_mut() {
@@ -1110,6 +1123,7 @@ impl<'a> AppHost<'a> {
             background_links,
             projects,
             unread_messages,
+            phone: self.phone_status(),
         }
     }
 
@@ -1286,6 +1300,12 @@ impl<'a> AppHost<'a> {
             "stopping"
         });
         self.web_surface.stop(notice);
+        // The phone link, as `stop_services` stops a TUI's: the relay client
+        // joins, and the direct link writes its outboxes while this process
+        // still holds `remote.lock`.
+        if let Some(setup) = self.remote_setup.take() {
+            setup.handle.stop();
+        }
     }
 
     /// Lines for the worker log since the last call: listen changes,

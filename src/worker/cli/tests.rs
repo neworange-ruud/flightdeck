@@ -30,7 +30,27 @@ fn parse_table() {
         (vec!["supervise"], Ok(Command::Supervise)),
         (vec!["status"], Ok(Command::Status { json: false })),
         (vec!["status", "--json"], Ok(Command::Status { json: true })),
-        (vec!["pair", "--json"], Ok(Command::Pair { json: true })),
+        (
+            vec!["pair", "--json"],
+            Ok(Command::Pair {
+                json: true,
+                phone: false,
+            }),
+        ),
+        (
+            vec!["pair", "--phone"],
+            Ok(Command::Pair {
+                json: false,
+                phone: true,
+            }),
+        ),
+        (
+            vec!["pair", "--json", "--phone"],
+            Ok(Command::Pair {
+                json: true,
+                phone: true,
+            }),
+        ),
         (vec!["devices"], Ok(Command::Devices { json: false })),
         (
             vec!["revoke", "mbp"],
@@ -63,6 +83,8 @@ fn misused_commands_are_usage_errors() {
         &["stop", "--json"],
         &["status", "--yaml"],
         &["status", "--json", "--json"],
+        &["pair", "--phone", "--phone"],
+        &["pair", "--qr"],
         &["revoke"],
         &["revoke", "a", "b"],
         &["revoke", " "],

@@ -16,6 +16,15 @@
 
 #![cfg(unix)]
 
+// The remote harness's phone driver and relay, not its TUI launcher (whose
+// own tests would only run twice). At the root, as `phone`'s tests expect
+// `relay` beside it.
+#[path = "e2e/support/phone.rs"]
+mod phone;
+#[path = "e2e/support/relay.rs"]
+mod relay;
+
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -79,13 +88,18 @@ impl Worker {
 
     /// A fresh home with a config, nothing running yet.
     fn prepare() -> Worker {
+        Worker::prepare_with(|_| {})
+    }
+
+    /// [`Worker::prepare`] with `edit` applied to the global config first.
+    fn prepare_with(edit: impl FnOnce(&mut flightdeck::contracts::Config)) -> Worker {
         let home = tempfile::Builder::new()
             .prefix("fdw")
             .tempdir_in("/tmp")
             .expect("a temp home under /tmp");
         let dir = home.path().join(".flightdeck");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), config_toml()).unwrap();
+        std::fs::write(dir.join("config.toml"), config_toml(edit)).unwrap();
         Worker {
             home,
             child: None,
@@ -413,7 +427,7 @@ impl Drop for Worker {
 /// The global config a test worker reads: the shipping defaults, with no
 /// update check, the fake agent as the default, and `~/flightdeck` as the
 /// projects root.
-fn config_toml() -> String {
+fn config_toml(edit: impl FnOnce(&mut flightdeck::contracts::Config)) -> String {
     use flightdeck::contracts::domain::AgentDef;
     let mut config = flightdeck::config::schema::default_global_config();
     config.update.check = false;
@@ -432,6 +446,7 @@ fn config_toml() -> String {
             status_patterns: Default::default(),
         },
     );
+    edit(&mut config);
     flightdeck::config::load::serialize_global_config(&config).expect("the config serializes")
 }
 
@@ -1338,4 +1353,173 @@ fn a_worker_starts_while_its_lock_is_being_probed() {
     }
     stop.store(true, Ordering::Relaxed);
     assert!(probe.join().unwrap() > 0, "the probe ran");
+}
+
+// ---------------------------------------------------------------------------
+// The phone (`[worker] phone = true`, remote-control-qlyd.28)
+// ---------------------------------------------------------------------------
+
+/// A worker with the phone link on, pointed at `relay`.
+fn phone_worker(relay: &relay::RelayHandle) -> Worker {
+    let relay_url = relay.ws_url();
+    let mut worker = Worker::prepare_with(move |config| {
+        config.worker.phone = true;
+        config.remote.relay_url = relay_url;
+        config.remote.relay_password = String::new();
+    });
+    worker.run();
+    worker
+}
+
+/// The phone simulator pairs through `worker pair --phone --json` exactly as
+/// a person would with the app, is fed the worker's agents, shows up in
+/// `worker status`, and is gone after `worker revoke`.
+#[test]
+fn a_phone_pairs_with_a_worker_from_its_shell_and_sees_its_agents() {
+    use flightdeck::worker::control::{PhonePairingReport, PhonePairingState};
+    use flightdeck_remote_protocol::{CommandBody, DesktopToPhone};
+
+    let relay = relay::RelayHandle::spawn();
+    let worker = phone_worker(&relay);
+    let phone_link = worker.status().phone.expect("the phone link is on");
+    assert!(phone_link.running, "{phone_link:?}\n{}", worker.log_tail());
+    assert!(phone_link.phones.is_empty());
+    assert!(
+        phone_link
+            .direct
+            .as_deref()
+            .is_some_and(|d| d.starts_with("127.0.0.1:")),
+        "the direct link listens where the worker does: {phone_link:?}"
+    );
+
+    // An agent for the phone to see, started from a Desktop window.
+    let repo = worker.home().join("code").join("app");
+    make_repo(worker.home(), &repo);
+    let (_token, mut client) = worker.window("laptop");
+    let project = worker.open_project(&mut client, &repo);
+    worker.spawn_agent(&mut client, &project, "phone-agent");
+
+    // `pair --phone` prints one JSON line per step and waits for the phone.
+    let mut pair = worker
+        .command()
+        .env_remove("FLIGHTDECK_RELAY_PASSWORD")
+        .args(["worker", "pair", "--phone", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("`worker pair --phone` starts");
+    let mut lines = BufReader::new(pair.stdout.take().unwrap()).lines();
+    let mut next_step = || -> PhonePairingReport {
+        let line = lines
+            .next()
+            .expect("another step before `pair --phone` exits")
+            .expect("readable output");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not a step ({e}): {line}"))
+    };
+    let waiting = loop {
+        let step = next_step();
+        match step.state {
+            PhonePairingState::Requesting => continue,
+            PhonePairingState::Waiting => break step,
+            _ => panic!("expected a code, got {step:?}\n{}", worker.log_tail()),
+        }
+    };
+    let code = waiting.code.expect("a code to type");
+    assert!(
+        waiting
+            .qr_payload
+            .as_deref()
+            .is_some_and(|p| p.starts_with("fdr1:")),
+        "{:?}",
+        waiting.qr_payload
+    );
+
+    let mut phone = phone::PhoneDriver::pair(&relay.ws_url(), &code);
+    let done = next_step();
+    assert_eq!(done.state, PhonePairingState::Paired, "{done:?}");
+    let exit = pair.wait().unwrap();
+    assert!(exit.success(), "`worker pair --phone` exited {exit}");
+
+    // A v4 phone gets the worker's direct endpoint and moves its data plane
+    // there, as the iPhone does over Tailscale.
+    let endpoint = phone
+        .direct_endpoint()
+        .cloned()
+        .expect("a direct-mode pairing");
+    assert_eq!(
+        format!("{}:{}", endpoint.host, endpoint.port),
+        phone_link.direct.clone().unwrap()
+    );
+    phone.switch_to_direct();
+
+    // The worker feeds the phone its projects and agents.
+    let deadline = Instant::now() + WAIT;
+    let snapshot = loop {
+        assert!(Instant::now() < deadline, "no snapshot with the agent");
+        phone.command(CommandBody::RequestSnapshot { project_id: None });
+        let msg = phone.recv_until(WAIT, |m| matches!(m, DesktopToPhone::Snapshot(_)));
+        let DesktopToPhone::Snapshot(snap) = msg else {
+            unreachable!()
+        };
+        if snap.projects.iter().any(|p| !p.sessions.is_empty()) {
+            break snap;
+        }
+        std::thread::sleep(STEP * 10);
+    };
+    assert!(
+        snapshot.projects.iter().any(|p| p.name == "app"),
+        "{snapshot:?}"
+    );
+    assert!(
+        phone
+            .machine_name()
+            .is_some_and(|n| n.ends_with(" (worker)")),
+        "the phone tells the worker apart from a TUI: {:?}",
+        phone.machine_name()
+    );
+    let phones = worker.status().phone.unwrap().phones;
+    assert!(
+        phones
+            .iter()
+            .all(|p| p.transport == "direct" && p.connected),
+        "{phones:?}"
+    );
+
+    // Listed by the worker, and unpaired by `worker revoke`.
+    let phones = worker.status().phone.unwrap().phones;
+    assert_eq!(phones.len(), 1, "{phones:?}");
+    assert_eq!(phones[0].id, phone.pairing_id().as_str());
+    let devices = worker.cli(&["worker", "devices"]);
+    assert!(
+        String::from_utf8_lossy(&devices.stdout).contains(phone.pairing_id().as_str()),
+        "{}",
+        String::from_utf8_lossy(&devices.stdout)
+    );
+    let revoke = worker.cli(&["worker", "revoke", phone.pairing_id().as_str()]);
+    assert!(
+        revoke.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&revoke.stderr),
+        worker.log_tail()
+    );
+    assert!(String::from_utf8_lossy(&revoke.stdout).starts_with("Unpaired phone"));
+    worker.wait("the phone to be unpaired", || {
+        worker.status().phone.is_some_and(|p| p.phones.is_empty())
+    });
+}
+
+/// With `[worker] phone` off (the default) there is no phone link, and
+/// `pair --phone` says how to switch it on.
+#[test]
+fn pair_phone_on_a_worker_without_the_phone_link_says_how_to_turn_it_on() {
+    let worker = Worker::start();
+    assert_eq!(worker.status().phone, None);
+    let out = worker.cli(&["worker", "pair", "--phone"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("phone = true"), "{err}");
+    assert!(
+        !worker.paths().phone_state.exists(),
+        "no phone identity was made"
+    );
 }

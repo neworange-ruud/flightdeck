@@ -156,6 +156,10 @@ const WORKER_SECTION_COMMENT: &str = "\
 # where clones land. \"~\" is your home folder.
 # default_cols / default_rows: terminal size for an agent started while no
 # Desktop window is attached; an attached window resizes them to its panes.
+# phone: let the FlightDeck iPhone app pair with this worker (`flightdeck worker
+# pair --phone`). Off by default: a paired phone can type into agents and open a
+# shell. Uses [remote]'s relay and direct_port, and always the direct link over
+# Tailscale, whatever [remote] enabled says. Restart the worker after changing it.
 ";
 
 /// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]`, [`WEB_SECTION_COMMENT`]

@@ -689,6 +689,14 @@ pub struct WorkerConfig {
     /// PTY height for an agent started while no window has reported a size.
     #[serde(default = "default_worker_rows")]
     pub default_rows: u16,
+    /// Let the FlightDeck iPhone app pair with this worker (SPECS §33). Off
+    /// by default: a paired phone can type into agents and open a shell. When
+    /// on, the worker runs FlightDeck Remote whatever `[remote] enabled` says,
+    /// always serving the direct link on its Tailscale address(es), with
+    /// `[remote]`'s relay, password, `direct_port` and `direct_host`. Pair with
+    /// `flightdeck worker pair --phone`.
+    #[serde(default)]
+    pub phone: bool,
 }
 
 impl Default for WorkerConfig {
@@ -698,6 +706,7 @@ impl Default for WorkerConfig {
             projects_root: default_worker_projects_root(),
             default_cols: default_worker_cols(),
             default_rows: default_worker_rows(),
+            phone: false,
         }
     }
 }

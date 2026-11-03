@@ -8,7 +8,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Pair the iPhone app with a FlightDeck worker.** Set `phone = true` under `[worker]` in `~/.flightdeck/config.toml`, restart the worker, and run `flightdeck worker pair --phone` in its shell: it prints the QR code and the 4-digit code, and waits until the phone has paired. The phone then shows the worker's projects and agents like any paired Mac, over the direct link on the worker's Tailscale address. It is listed separately as "<host> (worker)". `flightdeck worker devices` and `flightdeck worker status` list paired phones, and `flightdeck worker revoke <pairing id>` unpairs one. The worker keeps its own phone pairings in `~/.flightdeck/worker/remote.json`, apart from the TUI's, and sends the phone no pushes while a Desktop window is attached. Phone pairing is off by default, because a paired phone can type into agents and open a shell.
 
 ### Improvements
 
