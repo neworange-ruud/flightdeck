@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Rename a saved remote.** In Connect to remote…, each saved remote has a Rename button. In a remote window, the command palette has **Rename Remote** for the remote that window is on. Type the new name and press Enter or Save; press Escape or Cancel to keep the old one. The name is saved in `~/.flightdeck/remotes.json` and is kept if you pair with that host again. A remote window already open on that host switches to the new name right away: the name in its top-left corner, its window title, and the title of its notifications.
 
 ### Improvements
 

@@ -82,7 +82,7 @@ use flightdeck::web::protocol::{
     NotificationSoundView, NotificationView, ProjectId, SeatRequest, TerminalId, TerminalRole,
     WORKER_SHELL_TERMINAL_ID,
 };
-use gpui::{App, AppContext, Context, Task};
+use gpui::{App, AppContext, Context, Global, Subscription, Task};
 
 use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
@@ -95,6 +95,25 @@ pub mod window;
 
 #[cfg(test)]
 mod tests;
+
+/// The saved remote last renamed in this process (Connect to remote…), set as
+/// a global so every open window on that address takes the new name at once
+/// ([`RemoteModel::follow_renames`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteRenamed {
+    pub address: String,
+    pub label: String,
+}
+
+impl Global for RemoteRenamed {}
+
+/// Tell the open remote windows that the remote at `address` is now `label`.
+pub fn announce_rename(address: &str, label: &str, cx: &mut App) {
+    cx.set_global(RemoteRenamed {
+        address: address.to_string(),
+        label: label.to_string(),
+    });
+}
 
 /// One mirrored terminal.
 struct Mirror {
@@ -213,6 +232,12 @@ pub struct RemoteModel {
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
     _ticker: Option<Task<()>>,
+    /// Takes a new name when the saved remote is renamed.
+    _renames: Option<Subscription>,
+    /// Rename Remote's name dialog is open; the window draws its field.
+    renaming: bool,
+    /// Why the name typed there was refused.
+    rename_error: Option<String>,
 }
 
 impl RemoteModel {
@@ -253,6 +278,9 @@ impl RemoteModel {
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
+            _renames: None,
+            renaming: false,
+            rename_error: None,
         }
     }
 
@@ -303,6 +331,72 @@ impl RemoteModel {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Take `label` as this window's name if the remote renamed is this
+    /// window's. Returns whether the name changed.
+    pub fn rename(&mut self, address: &str, label: &str) -> bool {
+        if address != self.address || label == self.label {
+            return false;
+        }
+        self.label = label.to_string();
+        true
+    }
+
+    /// Whether Rename Remote's name dialog is open.
+    pub fn renaming(&self) -> bool {
+        self.renaming
+    }
+
+    /// Why the name typed in Rename Remote was refused, while it is open.
+    pub fn rename_error(&self) -> Option<&str> {
+        self.rename_error.as_deref()
+    }
+
+    /// Open Rename Remote's name dialog (the palette row).
+    pub fn open_rename(&mut self) {
+        self.renaming = true;
+        self.rename_error = None;
+    }
+
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = false;
+        self.rename_error = None;
+        cx.notify();
+    }
+
+    /// Call this remote `typed`: saved in the remotes file, then announced so
+    /// every window on it (this one included) and Connect to remote… take
+    /// it. A blank name is refused and the dialog stays open. A remote no
+    /// longer saved (forgotten while this window was open) is renamed in this
+    /// window only.
+    pub fn commit_rename(&mut self, typed: &str, cx: &mut Context<Self>) {
+        let label = typed.trim();
+        if label.is_empty() {
+            self.rename_error = Some("Type a name for this remote.".to_string());
+            cx.notify();
+            return;
+        }
+        let mut file = self.remotes.load();
+        if file.rename(&self.address, label).is_some() {
+            self.remotes.save(&file);
+        }
+        self.label = label.to_string();
+        self.renaming = false;
+        self.rename_error = None;
+        announce_rename(&self.address, label, cx);
+        cx.notify();
+    }
+
+    /// Follow renames of this remote ([`announce_rename`]) for as long as
+    /// the model lives.
+    pub fn follow_renames(&mut self, cx: &mut Context<Self>) {
+        self._renames = Some(cx.observe_global::<RemoteRenamed>(|model, cx| {
+            let renamed = cx.global::<RemoteRenamed>().clone();
+            if model.rename(&renamed.address, &renamed.label) {
+                cx.notify();
+            }
+        }));
     }
 
     pub fn address(&self) -> &str {
@@ -1174,6 +1268,9 @@ impl RemoteModel {
             RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::OpenInVsCode)) => {
                 self.open_in_vscode()
             }
+            RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::RenameRemote)) => {
+                self.open_rename()
+            }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
             RemoteAction::Local(LocalAction::Configuration) => self.open_configuration(),
             RemoteAction::Local(LocalAction::ProjectPicker) => self.open_picker(),
@@ -1406,6 +1503,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
         model.set_font_size(font_size);
         model.set_remotes(connect::Store::real());
         model.set_dialer(Rc::new(move || RemoteClient::connect(config.clone())));
+        model.follow_renames(cx);
         model.start_ticking(cx);
         model
     });
@@ -1445,7 +1543,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
     .detach();
     let mut options = crate::app::window_options(cx);
     if let Some(titlebar) = options.titlebar.as_mut() {
-        titlebar.title = Some(format!("FlightDeck — {}", remote.label).into());
+        titlebar.title = Some(window::window_title(&remote.label).into());
     }
     let opened = cx.open_window(options, |window, cx| {
         let view = cx.new(|cx| window::RemoteWindow::new(model, cx));

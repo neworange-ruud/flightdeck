@@ -10,7 +10,8 @@
 //!   `~/.flightdeck/remotes.json` (R6), so the next connect needs no code.
 //! - **Seat:** Control (R5's default — attach as a writer, the input lock keeps
 //!   two people from typing over each other) or Observe.
-//! - **Saved remotes:** connect again, or forget one.
+//! - **Saved remotes:** connect again, rename one, or forget one. A rename is
+//!   saved and reaches any open window on that remote at once.
 //! - **The plain-WebSocket warning**, once per remote, unless the address is
 //!   loopback or Tailscale (plan §4). Nothing connects on launch by itself:
 //!   every connect is a click here.
@@ -34,7 +35,7 @@ use gpui::{
     div, px, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement,
     ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 
 use crate::fonts::MONO_FAMILY;
@@ -123,6 +124,12 @@ enum Pending {
     Saved { address: String },
 }
 
+/// A saved remote's name being edited in place.
+struct Renaming {
+    address: String,
+    input: Entity<InputState>,
+}
+
 pub struct ConnectView {
     address: Entity<InputState>,
     code: Entity<InputState>,
@@ -132,6 +139,7 @@ pub struct ConnectView {
     busy: bool,
     error: Option<String>,
     warning: Option<Pending>,
+    renaming: Option<Renaming>,
     exchange: Exchange,
     open: OpenRemote,
     /// Close the window on the next frame (a remote window opened).
@@ -165,6 +173,7 @@ impl ConnectView {
             busy: false,
             error: None,
             warning: None,
+            renaming: None,
             exchange,
             open,
             done: false,
@@ -259,10 +268,81 @@ impl ConnectView {
 
     /// Forget a saved remote and its token.
     pub fn forget(&mut self, address: &str, cx: &mut Context<Self>) {
+        if self.renaming.as_ref().is_some_and(|r| r.address == address) {
+            self.renaming = None;
+        }
         if self.saved.forget(address) {
             self.store.save(&self.saved);
         }
         cx.notify();
+    }
+
+    /// Edit a saved remote's name in place: a field with its name, selected.
+    pub fn start_rename(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(remote) = self.saved.get(address) else {
+            return;
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Name")
+                .default_value(remote.label.clone())
+        });
+        cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.commit_rename(cx);
+            }
+        })
+        .detach();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.error = None;
+        self.renaming = Some(Renaming {
+            address: address.to_string(),
+            input,
+        });
+        cx.notify();
+    }
+
+    /// Save the name typed for the remote being renamed, and tell its open
+    /// windows. A blank name is refused and the field stays open.
+    pub fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(renaming) = &self.renaming else {
+            return;
+        };
+        let address = renaming.address.clone();
+        let typed = renaming.input.read(cx).value().to_string();
+        match self.saved.rename(&address, &typed) {
+            Some(label) => {
+                self.store.save(&self.saved);
+                super::announce_rename(&address, &label, cx);
+                self.renaming = None;
+                self.error = None;
+            }
+            None if self.saved.get(&address).is_none() => self.renaming = None,
+            None => self.error = Some("Type a name for this remote.".to_string()),
+        }
+        cx.notify();
+    }
+
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Whether a name is being edited.
+    #[cfg(test)]
+    pub fn renaming(&self) -> bool {
+        self.renaming.is_some()
+    }
+
+    /// Type into the rename field, as a person would (tests).
+    #[cfg(test)]
+    pub fn type_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(renaming) = &self.renaming {
+            renaming
+                .input
+                .update(cx, |s, cx| s.set_value(name.to_string(), window, cx));
+        }
     }
 
     /// The warning was read: carry on with what was waiting for it.
@@ -420,6 +500,30 @@ impl Render for ConnectView {
                         .child("SAVED REMOTES"),
                 )
                 .children(saved.into_iter().enumerate().map(|(i, remote)| {
+                    let editing = self
+                        .renaming
+                        .as_ref()
+                        .filter(|r| r.address == remote.address)
+                        .map(|r| r.input.clone());
+                    if let Some(input) = editing {
+                        return renaming_row(&p, i, input, &this).into_any_element();
+                    }
+                    let rename = {
+                        let this = this.clone();
+                        let address = remote.address.clone();
+                        div()
+                            .id(("connect-rename", i))
+                            .debug_selector(move || format!("connect-rename-{i}"))
+                            .px_2()
+                            .py(px(2.))
+                            .rounded(px(5.))
+                            .text_color(p.muted.hsla())
+                            .cursor_pointer()
+                            .child("Rename")
+                            .on_click(move |_, window, cx| {
+                                this.update(cx, |view, cx| view.start_rename(&address, window, cx))
+                            })
+                    };
                     let connect = {
                         let this = this.clone();
                         let address = remote.address.clone();
@@ -462,6 +566,10 @@ impl Render for ConnectView {
                         .text_size(px(12.5))
                         .child(
                             div()
+                                .debug_selector(move || format!("connect-saved-name-{i}"))
+                                .flex_none()
+                                .max_w(px(200.))
+                                .truncate()
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(remote.label.clone()),
                         )
@@ -476,7 +584,9 @@ impl Render for ConnectView {
                                 .child(remote.address.clone()),
                         )
                         .child(connect)
+                        .child(rename)
                         .child(forget)
+                        .into_any_element()
                 }))
         });
 
@@ -587,6 +697,56 @@ impl Render for ConnectView {
             .child(h_flex().gap_3().child(pair_button).children(error))
             .children(saved_list.map(|list| div().mt_3().w_full().child(list)))
     }
+}
+
+/// A saved remote's row while its name is edited: the field, Save, Cancel.
+/// Enter saves, Escape cancels.
+fn renaming_row(
+    p: &Palette,
+    i: usize,
+    input: Entity<InputState>,
+    this: &Entity<ConnectView>,
+) -> impl IntoElement {
+    let save = {
+        let this = this.clone();
+        div()
+            .id(("connect-rename-save", i))
+            .debug_selector(move || format!("connect-rename-save-{i}"))
+            .px_2()
+            .py(px(2.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(p.border.hsla())
+            .cursor_pointer()
+            .child("Save")
+            .on_click(move |_, _, cx| this.update(cx, |view, cx| view.commit_rename(cx)))
+    };
+    let cancel = {
+        let this = this.clone();
+        div()
+            .id(("connect-rename-cancel", i))
+            .debug_selector(move || format!("connect-rename-cancel-{i}"))
+            .px_2()
+            .py(px(2.))
+            .rounded(px(5.))
+            .text_color(p.muted.hsla())
+            .cursor_pointer()
+            .child("Cancel")
+            .on_click(move |_, _, cx| this.update(cx, |view, cx| view.cancel_rename(cx)))
+    };
+    let on_escape = this.clone();
+    h_flex()
+        .id(("connect-renaming", i))
+        .w_full()
+        .gap_3()
+        .px_2()
+        .py_1()
+        .rounded(px(6.))
+        .text_size(px(12.5))
+        .on_action(move |_: &Escape, _, cx| on_escape.update(cx, |view, cx| view.cancel_rename(cx)))
+        .child(div().flex_1().min_w_0().child(Input::new(&input)))
+        .child(save)
+        .child(cancel)
 }
 
 fn field(p: &Palette, label: &'static str, input: Input) -> impl IntoElement {

@@ -417,9 +417,10 @@ pub fn target(ws: &RemoteWorkspace, scope: Scope) -> Option<Target> {
 
 /// The palette rows a remote window offers: this build's own rows, kept to the
 /// ones the host's inventory forwards and a remote window can use, plus the
-/// desktop's own front-end rows (a remote window only exists in the desktop).
+/// desktop's own front-end rows and the remote window's own (Rename Remote): a
+/// remote window only exists in the desktop.
 pub fn palette_entries(ws: &RemoteWorkspace) -> Vec<&'static PaletteEntry> {
-    crate::tui::palette::rows(true)
+    crate::tui::palette::remote_window_rows()
         .filter(|entry| match route_palette_for(ws, &entry.action) {
             RemoteAction::Local(_) => true,
             RemoteAction::Unavailable(_) => false,
