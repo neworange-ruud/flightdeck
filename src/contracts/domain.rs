@@ -878,6 +878,84 @@ pub struct Config {
 // Runtime state model (SPECS §9) — ignored, not committed `state.json`.
 // ---------------------------------------------------------------------------
 
+/// A path as `state.json` stores it: relative to the repo root (or absolute
+/// when it lies outside it) and always `/`-separated, so the same worktree
+/// reads identically however the path was assembled.
+///
+/// The only way to a filesystem path is [`StoredPath::resolve`], which yields
+/// the platform's own separators. Programs that parse their own command line
+/// (`explorer.exe`, `cmd /c`) misread a `/` — Explorer silently opens
+/// Documents — so the stored form must never reach one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct StoredPath(String);
+
+impl StoredPath {
+    /// The stored form of `path`. On Windows every `\` becomes `/`; elsewhere
+    /// a `\` is an ordinary file-name character and is kept.
+    pub fn from_path(path: &Path) -> Self {
+        Self::from(path.to_string_lossy().into_owned())
+    }
+
+    /// The stored form, for display and for the wire.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The runtime path: `root` joined with this path (or this path alone
+    /// when it is absolute), with native separators throughout.
+    pub fn resolve(&self, root: &Path) -> PathBuf {
+        let joined = root.join(&self.0);
+        if cfg!(windows) {
+            PathBuf::from(joined.to_string_lossy().replace('/', "\\"))
+        } else {
+            joined
+        }
+    }
+}
+
+impl From<String> for StoredPath {
+    fn from(s: String) -> Self {
+        // Also normalises a `state.json` written before paths were stored
+        // `/`-separated.
+        if cfg!(windows) {
+            Self(s.replace('\\', "/"))
+        } else {
+            Self(s)
+        }
+    }
+}
+
+impl From<&str> for StoredPath {
+    fn from(s: &str) -> Self {
+        Self::from(s.to_string())
+    }
+}
+
+impl From<StoredPath> for String {
+    fn from(p: StoredPath) -> Self {
+        p.0
+    }
+}
+
+impl PartialEq<str> for StoredPath {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for StoredPath {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for StoredPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Persisted state for a single Agent Tab (SPECS §9). Stores **relative** paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
@@ -886,7 +964,7 @@ pub struct TabState {
     pub slug: String,
     pub agent: String,
     pub branch: String,
-    pub worktree_path_relative: String,
+    pub worktree_path_relative: StoredPath,
     pub base_branch: String,
     pub base_commit_sha: String,
     pub created_at: String,
@@ -1039,4 +1117,73 @@ pub enum ContainerState {
     Exited,
     /// No container with that name exists (never created, or already removed).
     Absent,
+}
+
+#[cfg(test)]
+mod stored_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_joined_path_is_stored_with_forward_slashes() {
+        let rel = Path::new(".flightdeck/worktrees").join("my-task");
+        assert_eq!(StoredPath::from_path(&rel), ".flightdeck/worktrees/my-task");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslashes_are_stored_as_forward_slashes() {
+        let stored = StoredPath::from_path(Path::new(r".flightdeck\worktrees/my-task"));
+        assert_eq!(stored, ".flightdeck/worktrees/my-task");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolving_on_windows_yields_backslashes_only() {
+        // Explorer reads a `/` as a switch and opens Documents instead.
+        let stored = StoredPath::from(".flightdeck/worktrees/my-task");
+        assert_eq!(
+            stored.resolve(Path::new(r"D:\repo")),
+            Path::new(r"D:\repo\.flightdeck\worktrees\my-task")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolving_elsewhere_joins_onto_the_root() {
+        let stored = StoredPath::from(".flightdeck/worktrees/my-task");
+        assert_eq!(
+            stored.resolve(Path::new("/repo")),
+            Path::new("/repo/.flightdeck/worktrees/my-task")
+        );
+    }
+
+    #[test]
+    fn an_absolute_stored_path_ignores_the_root() {
+        let outside = std::env::temp_dir().join("elsewhere");
+        let stored = StoredPath::from_path(&outside);
+        assert_eq!(
+            stored.resolve(Path::new("unused-root")),
+            PathBuf::from(
+                outside
+                    .to_string_lossy()
+                    .replace('/', std::path::MAIN_SEPARATOR_STR)
+            )
+        );
+    }
+
+    #[test]
+    fn serialises_as_a_plain_string() {
+        let stored = StoredPath::from(".flightdeck/worktrees/my-task");
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(json, r#"".flightdeck/worktrees/my-task""#);
+        let back: StoredPath = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, stored);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_old_state_file_with_backslashes_is_normalised_on_read() {
+        let back: StoredPath = serde_json::from_str(r#"".flightdeck/worktrees\\my-task""#).unwrap();
+        assert_eq!(back, ".flightdeck/worktrees/my-task");
+    }
 }

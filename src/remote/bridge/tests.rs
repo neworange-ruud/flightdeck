@@ -55,7 +55,7 @@ fn tab_state(id: &str, name: &str, agent: &str) -> TabState {
         slug: name.to_string(),
         agent: agent.to_string(),
         branch: format!("{name}-branch"),
-        worktree_path_relative: format!("worktrees/{name}"),
+        worktree_path_relative: format!("worktrees/{name}").into(),
         base_branch: "main".to_string(),
         base_commit_sha: "abc123".to_string(),
         created_at: "2026-01-01T00:00:00Z".to_string(),

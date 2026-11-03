@@ -46,7 +46,7 @@ mod tests {
             slug: "my-task".to_string(),
             agent: "opencode".to_string(),
             branch: "flightdeck/my-task".to_string(),
-            worktree_path_relative: ".flightdeck/worktrees/my-task".to_string(),
+            worktree_path_relative: ".flightdeck/worktrees/my-task".to_string().into(),
             base_branch: "main".to_string(),
             base_commit_sha: "abc123".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

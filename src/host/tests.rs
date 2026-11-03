@@ -775,10 +775,10 @@ mod overlays {
     /// The selected tab's absolute worktree path, as the guards compute it.
     fn worktree(host: &AppHost) -> PathBuf {
         let state = host.active_state();
-        crate::fs::paths::to_absolute(
-            &state.repo_root,
-            Path::new(&state.tabs[0].meta.worktree_path_relative),
-        )
+        state.tabs[0]
+            .meta
+            .worktree_path_relative
+            .resolve(&state.repo_root)
     }
 
     fn branch(host: &AppHost) -> String {

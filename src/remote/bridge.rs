@@ -963,7 +963,7 @@ impl RemoteBridge {
                 // here, before the pairing gate below, so a phone that pairs
                 // later still receives the accumulated history (remote-control-72k).
                 // Throttled while unpaired; see `sync_transcripts_this_tick` above.
-                let worktree = pv.state.repo_root.join(&tab.meta.worktree_path_relative);
+                let worktree = tab.meta.worktree_path_relative.resolve(&pv.state.repo_root);
                 if sync_transcripts_this_tick {
                     self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_i64);
                 }

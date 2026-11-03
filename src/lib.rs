@@ -82,7 +82,6 @@ use crate::contracts::{
     ManualStatus, ProcessState, PtyBackend, PtySize, STATE_VERSION,
 };
 use crate::fs::ignore::ensure_flightdeck_gitignore;
-use crate::fs::paths::to_absolute;
 use crate::git::repo::{detect_base_branch, GitCli, ProjectGit};
 use crate::git::status::{collect_status, WorktreeStatus};
 use crate::host::{AppHost, HostEvent};
@@ -1983,10 +1982,9 @@ fn record_web_transitions(
             .iter()
             .find(|t| t.meta.id == change.tab_id.0 && t.phase == TabPhase::Ready)
             .map(|t| {
-                to_absolute(
-                    &project.state.repo_root,
-                    Path::new(&t.meta.worktree_path_relative),
-                )
+                t.meta
+                    .worktree_path_relative
+                    .resolve(&project.state.repo_root)
             });
         if let Some(request) = web.record_transition(
             clock,
@@ -2625,15 +2623,15 @@ fn build_web_host_state(
                     attached_existing_branch: tab.meta.attached_existing_branch,
                     // A base-branch session's relative path is `.`, which
                     // must not reach a remote editor as `<root>/.`.
-                    worktree_path: to_absolute(
-                        &project.state.repo_root,
-                        Path::new(&tab.meta.worktree_path_relative),
-                    )
-                    .components()
-                    .filter(|c| !matches!(c, std::path::Component::CurDir))
-                    .collect::<std::path::PathBuf>()
-                    .display()
-                    .to_string(),
+                    worktree_path: tab
+                        .meta
+                        .worktree_path_relative
+                        .resolve(&project.state.repo_root)
+                        .components()
+                        .filter(|c| !matches!(c, std::path::Component::CurDir))
+                        .collect::<std::path::PathBuf>()
+                        .display()
+                        .to_string(),
                     terminals,
                 },
                 streams,
@@ -3962,7 +3960,7 @@ fn execute_remote_translation(
                 .as_deref()
                 .and_then(|f| f.parent()?.parent())
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| p.state.repo_root.join(&t.meta.worktree_path_relative));
+                .unwrap_or_else(|| t.meta.worktree_path_relative.resolve(&p.state.repo_root));
             let body = serde_json::json!({ "requestID": request_id, "reply": reply }).to_string();
             match env.fs.write(
                 &crate::remote::bridge::agent_reply_path(&status_root),
@@ -4509,7 +4507,7 @@ fn spawn_status_refresh(
             branch: t.meta.branch.clone(),
             base_branch: t.meta.base_branch.clone(),
             base_commit_sha: t.meta.base_commit_sha.clone(),
-            worktree_abs: to_absolute(&state.repo_root, Path::new(&t.meta.worktree_path_relative)),
+            worktree_abs: t.meta.worktree_path_relative.resolve(&state.repo_root),
         })
         .collect();
 
@@ -10573,7 +10571,7 @@ mod tests {
             slug: "existing".to_string(),
             agent: "opencode".to_string(),
             branch: "flightdeck/existing".to_string(),
-            worktree_path_relative: ".flightdeck/worktrees/existing".to_string(),
+            worktree_path_relative: ".flightdeck/worktrees/existing".to_string().into(),
             base_branch: "main".to_string(),
             base_commit_sha: "abc123".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -11089,7 +11087,7 @@ mod tests {
                 slug: "task".to_string(),
                 agent: "opencode".to_string(),
                 branch: "flightdeck/task".to_string(),
-                worktree_path_relative: ".flightdeck/worktrees/task".to_string(),
+                worktree_path_relative: ".flightdeck/worktrees/task".to_string().into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -11193,7 +11191,7 @@ mod tests {
                 slug: "task".to_string(),
                 agent: "opencode".to_string(),
                 branch: "flightdeck/task".to_string(),
-                worktree_path_relative: ".flightdeck/worktrees/task".to_string(),
+                worktree_path_relative: ".flightdeck/worktrees/task".to_string().into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -11297,7 +11295,7 @@ mod tests {
                 slug: name.to_string(),
                 agent: agent.to_string(),
                 branch: format!("{name}-branch"),
-                worktree_path_relative: format!("worktrees/{name}"),
+                worktree_path_relative: format!("worktrees/{name}").into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -12415,7 +12413,7 @@ mod tests {
                 slug: name.to_string(),
                 agent: agent.to_string(),
                 branch: format!("{name}-branch"),
-                worktree_path_relative: format!("worktrees/{name}"),
+                worktree_path_relative: format!("worktrees/{name}").into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -13672,10 +13670,10 @@ mod tests {
             let mut ws = workspace_with_two_tabs(&dir, &git, &pty);
             let mut ui = Ui::default();
             let one = session_args(&ws, 0);
-            let one_worktree = to_absolute(
-                Path::new("/repo"),
-                Path::new(&ws.projects[0].state.tabs[0].meta.worktree_path_relative),
-            );
+            let one_worktree = ws.projects[0].state.tabs[0]
+                .meta
+                .worktree_path_relative
+                .resolve(Path::new("/repo"));
 
             let fs = FakeFs::new().with_dir(one_worktree.clone());
             let restart_pty = FakePty::new();
@@ -15595,7 +15593,7 @@ mod tests {
                 slug: id.to_string(),
                 agent: "codex".to_string(),
                 branch: format!("flightdeck/{id}"),
-                worktree_path_relative: rel.to_string(),
+                worktree_path_relative: rel.to_string().into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -16035,10 +16033,10 @@ mod tests {
 
         /// The absolute path of the one tab's worktree, as the guards see it.
         fn worktree(state: &AppState) -> PathBuf {
-            to_absolute(
-                Path::new(REPO),
-                Path::new(&state.tabs[0].meta.worktree_path_relative),
-            )
+            state.tabs[0]
+                .meta
+                .worktree_path_relative
+                .resolve(Path::new(REPO))
         }
 
         /// One browser dispatch: the command the table would forward, run
@@ -16384,7 +16382,7 @@ mod tests {
                 slug: slug.to_string(),
                 agent: "claude".to_string(),
                 branch: format!("{slug}-branch"),
-                worktree_path_relative: format!("worktrees/{slug}"),
+                worktree_path_relative: format!("worktrees/{slug}").into(),
                 base_branch: "main".to_string(),
                 base_commit_sha: "abc123".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
