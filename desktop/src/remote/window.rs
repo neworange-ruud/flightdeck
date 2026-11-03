@@ -44,8 +44,9 @@ use flightdeck_desktop::overlays::{Emit, OverlayContext, OverlayLayer};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
+use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 
 use super::projects::ProjectPickerView;
@@ -86,6 +87,8 @@ pub struct RemoteWindow {
     picker: Option<Entity<ProjectPickerView>>,
     /// The name the OS window title was last given, so a rename retitles it.
     titled: String,
+    /// Rename Remote's name field, while the model has the dialog open.
+    rename: Option<Entity<InputState>>,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -114,9 +117,149 @@ impl RemoteWindow {
             shell_pty: Rc::new(PortablePtyBackend),
             picker: None,
             titled,
+            rename: None,
             #[cfg(target_os = "macos")]
             drag_pending: false,
         }
+    }
+
+    /// Build Rename Remote's field, filled with the current name and focused,
+    /// when the model opened the dialog; drop it when it closed.
+    fn sync_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.remote.read(cx).renaming();
+        match (open, &self.rename) {
+            (true, None) => {
+                let label = self.remote.read(cx).label().to_string();
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Name")
+                        .default_value(label)
+                });
+                cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.save_rename(input.read(cx).value().to_string(), cx);
+                    }
+                })
+                .detach();
+                input.update(cx, |state, cx| state.focus(window, cx));
+                self.rename = Some(input);
+            }
+            (false, Some(_)) => self.rename = None,
+            _ => {}
+        }
+    }
+
+    fn save_rename(&mut self, typed: String, cx: &mut Context<Self>) {
+        self.remote
+            .update(cx, |model, cx| model.commit_rename(&typed, cx));
+    }
+
+    /// Type into Rename Remote's field, as a person would (tests).
+    #[cfg(test)]
+    pub(crate) fn type_rename(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = &self.rename {
+            input.update(cx, |s, cx| s.set_value(name.to_string(), window, cx));
+        }
+    }
+
+    /// Rename Remote's dialog: the name field, Save and Cancel, over a scrim.
+    /// Enter saves; Escape, Cancel or a click on the scrim keeps the name.
+    fn rename_dialog(
+        &self,
+        input: &Entity<InputState>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let model = self.remote.read(cx);
+        let address = model.address().to_string();
+        let error = model.rename_error().map(str::to_string);
+        let mut scrim = p.scrim.hsla();
+        scrim.a = crate::theme::SCRIM_ALPHA;
+        let save = {
+            let input = input.clone();
+            div()
+                .id("remote-rename-save")
+                .debug_selector(|| "remote-rename-save".into())
+                .h(px(30.))
+                .px_4()
+                .flex()
+                .items_center()
+                .rounded(px(7.))
+                .bg(p.button_primary_bg.hsla())
+                .text_color(p.button_primary_ink.hsla())
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .child("Save")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let typed = input.read(cx).value().to_string();
+                    this.save_rename(typed, cx);
+                }))
+        };
+        let cancel = div()
+            .id("remote-rename-cancel")
+            .debug_selector(|| "remote-rename-cancel".into())
+            .h(px(30.))
+            .px_4()
+            .flex()
+            .items_center()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(p.border.hsla())
+            .cursor_pointer()
+            .child("Cancel")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.remote.update(cx, |model, cx| model.cancel_rename(cx))
+            }));
+        div()
+            .id("remote-rename")
+            .debug_selector(|| "remote-rename".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(scrim)
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.remote.update(cx, |model, cx| model.cancel_rename(cx))
+                }),
+            )
+            .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                this.remote.update(cx, |model, cx| model.cancel_rename(cx))
+            }))
+            .child(
+                v_flex()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .w(px(380.))
+                    .gap_3()
+                    .p_5()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(p.border.hsla())
+                    .bg(p.surface_raised.hsla())
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Rename remote"),
+                    )
+                    .child(div().text_color(p.ink_2.hsla()).child(format!(
+                        "The name this machine shows for {address}. The host is not told."
+                    )))
+                    .child(Input::new(input))
+                    .children(error.map(|message| {
+                        div()
+                            .debug_selector(|| "remote-rename-error".into())
+                            .text_color(p.danger.hsla())
+                            .child(message)
+                    }))
+                    .child(h_flex().justify_end().gap_2().child(cancel).child(save)),
+            )
     }
 
     /// Retitle the OS window after a rename of this remote.
@@ -199,7 +342,7 @@ impl RemoteWindow {
     }
 
     fn on_keymap_action(&mut self, action: &KeymapAction, _: &mut Window, cx: &mut Context<Self>) {
-        if self.remote.read(cx).overlay().is_some() {
+        if self.remote.read(cx).overlay().is_some() || self.rename.is_some() {
             cx.propagate();
             return;
         }
@@ -676,6 +819,7 @@ impl Render for RemoteWindow {
         let p = *Palette::global(cx);
         self.ensure_shell(cx);
         self.sync_picker(window, cx);
+        self.sync_rename(window, cx);
         self.sync_title(window, cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
@@ -706,8 +850,9 @@ impl Render for RemoteWindow {
             layer.set_context(context, cx);
             layer.set_view(overlay, window, cx);
         });
-        // The picker's fields take the keyboard where they are clicked.
-        if !overlay_open && picker.is_none() {
+        // The picker's fields take the keyboard where they are clicked, and
+        // Rename Remote's field keeps it while the dialog is up.
+        if !overlay_open && picker.is_none() && self.rename.is_none() {
             let shell_focus = self
                 .shell
                 .as_ref()
@@ -747,6 +892,10 @@ impl Render for RemoteWindow {
             .child(self.main_area(&p, cx));
         let titlebar = self.titlebar(&p, cx).into_any_element();
         let status = self.status_bar(&p, cx).into_any_element();
+        let rename = self
+            .rename
+            .clone()
+            .map(|input| self.rename_dialog(&input, &p, cx).into_any_element());
 
         v_flex()
             .key_context(flightdeck::app::keymap::Context::Global.name())
@@ -774,6 +923,7 @@ impl Render for RemoteWindow {
                     .into_any_element(),
             })
             .child(status)
+            .children(rename)
             .child(self.layer.clone())
     }
 }

@@ -276,6 +276,147 @@ fn a_rename_of_this_remote_retitles_the_open_window(app: &mut TestAppContext) {
     );
 }
 
+/// The remote window on a FakeFs remotes file holding this remote as
+/// "studio", for Rename Remote; with the palette row already run.
+fn open_rename(
+    app: &mut TestAppContext,
+) -> (
+    Entity<RemoteModel>,
+    Script,
+    Entity<RemoteWindow>,
+    std::rc::Rc<flightdeck::testing::FakeFs>,
+    &mut VisualTestContext,
+) {
+    use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
+    use flightdeck::web::client::store::{save_remotes, RemotesFile, SavedRemote};
+    let (model, mut script, window_view, cx) = open_on(app, snapshot());
+    let fs = std::rc::Rc::new(flightdeck::testing::FakeFs::new());
+    let path = std::path::PathBuf::from(REMOTES_PATH);
+    let mut file = RemotesFile::default();
+    file.upsert(SavedRemote {
+        label: "studio".to_string(),
+        address: "192.168.2.20:7420".to_string(),
+        token: "t".to_string(),
+        last_seen: None,
+        viewer_id: None,
+        host_version: None,
+        warned_unencrypted: true,
+        ssh_target: None,
+        host_kind: None,
+    });
+    save_remotes(fs.as_ref(), &path, &file).unwrap();
+    model.update(cx, |m, cx| {
+        m.set_remotes(super::connect::Store {
+            fs: fs.clone(),
+            path: Some(path),
+        });
+        m.follow_renames(cx);
+        m.apply(HostEvent::OpenPalette);
+        m.apply(HostEvent::Overlay(OverlayInput::PaletteRun(
+            PaletteAction::FrontEnd(FrontEndAction::RenameRemote),
+        )));
+        cx.notify();
+    });
+    cx.run_until_parked();
+    script.sent();
+    (model, script, window_view, fs, cx)
+}
+
+const REMOTES_PATH: &str = "/home/u/.flightdeck/remotes.json";
+
+fn saved_label(fs: &flightdeck::testing::FakeFs) -> String {
+    flightdeck::web::client::store::load_remotes(fs, std::path::Path::new(REMOTES_PATH))
+        .get("192.168.2.20:7420")
+        .unwrap()
+        .label
+        .clone()
+}
+
+fn type_rename(window_view: &Entity<RemoteWindow>, cx: &mut VisualTestContext, name: &str) {
+    cx.update(|window, cx| window_view.update(cx, |v, cx| v.type_rename(name, window, cx)));
+    cx.run_until_parked();
+}
+
+/// Rename Remote, from the remote window's palette: a name dialog over the
+/// window that saves the name, retitles the window and tells the host
+/// nothing.
+#[gpui::test]
+fn rename_remote_in_the_palette_renames_this_window(app: &mut TestAppContext) {
+    let (model, mut script, window_view, fs, cx) = open_rename(app);
+    assert!(
+        model.read_with(cx, |m, _| m.overlay()).is_none(),
+        "the palette closed"
+    );
+    assert!(
+        cx.debug_bounds("remote-rename").is_some(),
+        "the dialog is up"
+    );
+
+    type_rename(&window_view, cx, " Studio Mac  ");
+    click(cx, "remote-rename-save");
+    assert!(
+        cx.debug_bounds("remote-rename").is_none(),
+        "the dialog closed"
+    );
+    assert_eq!(
+        model.read_with(cx, |m, _| m.label().to_string()),
+        "Studio Mac"
+    );
+    assert_eq!(saved_label(&fs), "Studio Mac");
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some("FlightDeck — Studio Mac")
+    );
+    assert_eq!(
+        cx.update(|_, cx| cx.try_global::<super::RemoteRenamed>().cloned()),
+        Some(super::RemoteRenamed {
+            address: "192.168.2.20:7420".to_string(),
+            label: "Studio Mac".to_string(),
+        }),
+        "other windows on this remote are told"
+    );
+    assert!(commands(&mut script).is_empty(), "nothing went to the host");
+}
+
+#[gpui::test]
+fn rename_remote_refuses_a_blank_name_and_escape_keeps_the_old_one(app: &mut TestAppContext) {
+    let (model, _script, window_view, fs, cx) = open_rename(app);
+    type_rename(&window_view, cx, "   ");
+    click(cx, "remote-rename-save");
+    assert!(cx.debug_bounds("remote-rename-error").is_some());
+    assert!(model.read_with(cx, |m, _| m.renaming()), "still open");
+
+    type_rename(&window_view, cx, "Something else");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("remote-rename").is_none(),
+        "the dialog closed"
+    );
+    assert_eq!(model.read_with(cx, |m, _| m.label().to_string()), "studio");
+    assert_eq!(saved_label(&fs), "studio");
+}
+
+#[gpui::test]
+fn enter_saves_and_cancel_keeps_the_name(app: &mut TestAppContext) {
+    let (model, _script, window_view, fs, cx) = open_rename(app);
+    type_rename(&window_view, cx, "Build box");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(saved_label(&fs), "Build box");
+    assert!(!model.read_with(cx, |m, _| m.renaming()));
+
+    model.update(cx, |m, cx| {
+        m.open_rename();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    type_rename(&window_view, cx, "Nope");
+    click(cx, "remote-rename-cancel");
+    assert!(cx.debug_bounds("remote-rename").is_none());
+    assert_eq!(saved_label(&fs), "Build box");
+}
+
 #[gpui::test]
 fn the_sidebar_git_strip_and_host_marker_draw_from_the_snapshot(app: &mut TestAppContext) {
     let (model, _script, cx) = open(app);

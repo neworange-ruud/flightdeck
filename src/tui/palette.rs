@@ -109,6 +109,9 @@ pub enum FrontEndAction {
     /// Open the selected session's folder in VS Code on this machine — over
     /// SSH when the session is on a remote host ([`crate::host::vscode`]).
     OpenInVsCode,
+    /// Rename the saved remote a remote window is on. A remote window's row
+    /// alone ([`remote_window_rows`]).
+    RenameRemote,
 }
 
 impl PaletteAction {
@@ -364,22 +367,46 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
     },
 ];
 
+/// The rows only a desktop remote window adds, after the front-end rows: they
+/// act on the remote the window is on, which a local window does not have.
+const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[PaletteEntry {
+    group: "Remote",
+    label: "Rename Remote",
+    action: PaletteAction::FrontEnd(FrontEndAction::RenameRemote),
+}];
+
 /// The front-end rows, for the tests and for a front-end that lists them.
 pub fn front_end_entries() -> &'static [PaletteEntry] {
     FRONT_END_ENTRIES
 }
 
 /// Every palette row in display order: the §22 inventory, with the front-end
-/// rows (when `front_end` is set) at the end of their groups. The one ordering
-/// the desktop's palette and a remote window's both draw.
+/// rows (when `front_end` is set) at the end of their groups. The desktop's
+/// palette draws this; a remote window's draws [`remote_window_rows`].
 pub fn rows(front_end: bool) -> impl Iterator<Item = &'static PaletteEntry> {
-    let extras: &'static [PaletteEntry] = if front_end { FRONT_END_ENTRIES } else { &[] };
+    const NONE: &[&[PaletteEntry]] = &[];
+    const LOCAL: &[&[PaletteEntry]] = &[FRONT_END_ENTRIES];
+    rows_with(if front_end { LOCAL } else { NONE })
+}
+
+/// A remote window's rows: [`rows`] with the front-end rows, plus the
+/// remote window's own ([`REMOTE_WINDOW_ENTRIES`]), each at the end of its
+/// group.
+pub fn remote_window_rows() -> impl Iterator<Item = &'static PaletteEntry> {
+    const REMOTE: &[&[PaletteEntry]] = &[FRONT_END_ENTRIES, REMOTE_WINDOW_ENTRIES];
+    rows_with(REMOTE)
+}
+
+fn rows_with(
+    extras: &'static [&'static [PaletteEntry]],
+) -> impl Iterator<Item = &'static PaletteEntry> {
     ALL_ENTRIES.iter().enumerate().flat_map(move |(i, entry)| {
         let ends_group = ALL_ENTRIES
             .get(i + 1)
             .is_none_or(|next| next.group != entry.group);
         let tail = extras
             .iter()
+            .flat_map(|list| list.iter())
             .filter(move |extra| ends_group && extra.group == entry.group);
         std::iter::once(entry).chain(tail)
     })
@@ -749,6 +776,24 @@ mod tests {
         );
         // Not part of the browser-mirrored §22 inventory.
         assert!(!all_entries().iter().any(|e| is_front_end(&e)));
+    }
+
+    /// Rename Remote acts on the remote a window is on: a remote window offers
+    /// it, after Connect to Remote, and the local desktop palette never does.
+    #[test]
+    fn rename_remote_is_a_remote_window_row_only() {
+        let is_rename =
+            |e: &&PaletteEntry| e.action == PaletteAction::FrontEnd(FrontEndAction::RenameRemote);
+        assert!(!rows(true).any(|e| is_rename(&e)));
+        let remote: Vec<&str> = remote_window_rows()
+            .filter(|e| e.group == "Remote")
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(remote.last().copied(), Some("Rename Remote"), "{remote:?}");
+        assert_eq!(
+            remote_window_rows().count(),
+            rows(true).count() + REMOTE_WINDOW_ENTRIES.len()
+        );
     }
 
     /// Each front-end row joins the end of a group the palette already has, so

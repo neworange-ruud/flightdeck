@@ -234,6 +234,10 @@ pub struct RemoteModel {
     _ticker: Option<Task<()>>,
     /// Takes a new name when the saved remote is renamed.
     _renames: Option<Subscription>,
+    /// Rename Remote's name dialog is open; the window draws its field.
+    renaming: bool,
+    /// Why the name typed there was refused.
+    rename_error: Option<String>,
 }
 
 impl RemoteModel {
@@ -275,6 +279,8 @@ impl RemoteModel {
             dispatched: Vec::new(),
             _ticker: None,
             _renames: None,
+            renaming: false,
+            rename_error: None,
         }
     }
 
@@ -335,6 +341,51 @@ impl RemoteModel {
         }
         self.label = label.to_string();
         true
+    }
+
+    /// Whether Rename Remote's name dialog is open.
+    pub fn renaming(&self) -> bool {
+        self.renaming
+    }
+
+    /// Why the name typed in Rename Remote was refused, while it is open.
+    pub fn rename_error(&self) -> Option<&str> {
+        self.rename_error.as_deref()
+    }
+
+    /// Open Rename Remote's name dialog (the palette row).
+    pub fn open_rename(&mut self) {
+        self.renaming = true;
+        self.rename_error = None;
+    }
+
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = false;
+        self.rename_error = None;
+        cx.notify();
+    }
+
+    /// Call this remote `typed`: saved in the remotes file, then announced so
+    /// every window on it (this one included) and Connect to remote… take
+    /// it. A blank name is refused and the dialog stays open. A remote no
+    /// longer saved (forgotten while this window was open) is renamed in this
+    /// window only.
+    pub fn commit_rename(&mut self, typed: &str, cx: &mut Context<Self>) {
+        let label = typed.trim();
+        if label.is_empty() {
+            self.rename_error = Some("Type a name for this remote.".to_string());
+            cx.notify();
+            return;
+        }
+        let mut file = self.remotes.load();
+        if file.rename(&self.address, label).is_some() {
+            self.remotes.save(&file);
+        }
+        self.label = label.to_string();
+        self.renaming = false;
+        self.rename_error = None;
+        announce_rename(&self.address, label, cx);
+        cx.notify();
     }
 
     /// Follow renames of this remote ([`announce_rename`]) for as long as
@@ -1216,6 +1267,9 @@ impl RemoteModel {
             RemoteAction::Local(LocalAction::About) => self.local = Local::About,
             RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::OpenInVsCode)) => {
                 self.open_in_vscode()
+            }
+            RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::RenameRemote)) => {
+                self.open_rename()
             }
             RemoteAction::Local(LocalAction::FrontEnd(action)) => self.front_end.push(action),
             RemoteAction::Local(LocalAction::Configuration) => self.open_configuration(),
