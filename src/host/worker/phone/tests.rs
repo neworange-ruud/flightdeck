@@ -269,3 +269,13 @@ fn the_direct_link_listens_where_the_worker_does() {
     };
     assert!(matches!(direct_bind(&configured, &remote), BindPlan::None));
 }
+
+#[test]
+fn a_long_host_name_is_shortened_but_keeps_the_worker_mark() {
+    assert_eq!(mark_worker("buildbox"), "buildbox (worker)");
+    let long = "sat12-dp155-e321dded-3d78-45e8-bce3-b1e861108fdd-9259480AC71B.local";
+    let marked = mark_worker(long);
+    assert!(marked.ends_with(" (worker)"), "{marked}");
+    assert_eq!(marked.chars().count(), MAX_MACHINE_NAME_CHARS);
+    assert!(marked.starts_with("sat12-dp155-"), "{marked}");
+}

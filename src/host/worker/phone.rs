@@ -80,10 +80,21 @@ pub(crate) fn worker_machine_name() -> Option<String> {
     if std::env::var_os("FLIGHTDECK_MACHINE_NAME").is_some() {
         return None;
     }
-    crate::remote::client::machine_name().map(|name| {
-        let marked = format!("{name} (worker)");
-        marked.chars().take(64).collect()
-    })
+    crate::remote::client::machine_name().map(|name| mark_worker(&name))
+}
+
+/// The suffix that tells the phone a machine is a worker.
+const WORKER_SUFFIX: &str = " (worker)";
+
+/// The longest machine name the phone protocol carries, in characters.
+const MAX_MACHINE_NAME_CHARS: usize = 64;
+
+/// `name` with [`WORKER_SUFFIX`], within [`MAX_MACHINE_NAME_CHARS`]: a long
+/// host name is shortened, never the suffix.
+fn mark_worker(name: &str) -> String {
+    let room = MAX_MACHINE_NAME_CHARS - WORKER_SUFFIX.chars().count();
+    let host: String = name.trim().chars().take(room).collect();
+    format!("{}{WORKER_SUFFIX}", host.trim_end())
 }
 
 /// Turn a pairing code that ran out into a failure the CLI can report:
@@ -358,5 +369,6 @@ impl AppHost<'_> {
     }
 }
 
-#[cfg(test)]
+// The worker is Linux and macOS only (W2); its tests use unix paths.
+#[cfg(all(test, unix))]
 mod tests;
