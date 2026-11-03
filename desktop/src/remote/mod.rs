@@ -82,7 +82,7 @@ use flightdeck::web::protocol::{
     NotificationSoundView, NotificationView, ProjectId, SeatRequest, TerminalId, TerminalRole,
     WORKER_SHELL_TERMINAL_ID,
 };
-use gpui::{App, AppContext, Context, Task};
+use gpui::{App, AppContext, Context, Global, Subscription, Task};
 
 use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
@@ -95,6 +95,25 @@ pub mod window;
 
 #[cfg(test)]
 mod tests;
+
+/// The saved remote last renamed in this process (Connect to remote…), set as
+/// a global so every open window on that address takes the new name at once
+/// ([`RemoteModel::follow_renames`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteRenamed {
+    pub address: String,
+    pub label: String,
+}
+
+impl Global for RemoteRenamed {}
+
+/// Tell the open remote windows that the remote at `address` is now `label`.
+pub fn announce_rename(address: &str, label: &str, cx: &mut App) {
+    cx.set_global(RemoteRenamed {
+        address: address.to_string(),
+        label: label.to_string(),
+    });
+}
 
 /// One mirrored terminal.
 struct Mirror {
@@ -213,6 +232,8 @@ pub struct RemoteModel {
     #[cfg(test)]
     pub dispatched: Vec<HostEvent>,
     _ticker: Option<Task<()>>,
+    /// Takes a new name when the saved remote is renamed.
+    _renames: Option<Subscription>,
 }
 
 impl RemoteModel {
@@ -253,6 +274,7 @@ impl RemoteModel {
             #[cfg(test)]
             dispatched: Vec::new(),
             _ticker: None,
+            _renames: None,
         }
     }
 
@@ -303,6 +325,27 @@ impl RemoteModel {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Take `label` as this window's name if the remote renamed is this
+    /// window's. Returns whether the name changed.
+    pub fn rename(&mut self, address: &str, label: &str) -> bool {
+        if address != self.address || label == self.label {
+            return false;
+        }
+        self.label = label.to_string();
+        true
+    }
+
+    /// Follow renames of this remote ([`announce_rename`]) for as long as
+    /// the model lives.
+    pub fn follow_renames(&mut self, cx: &mut Context<Self>) {
+        self._renames = Some(cx.observe_global::<RemoteRenamed>(|model, cx| {
+            let renamed = cx.global::<RemoteRenamed>().clone();
+            if model.rename(&renamed.address, &renamed.label) {
+                cx.notify();
+            }
+        }));
     }
 
     pub fn address(&self) -> &str {
@@ -1406,6 +1449,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
         model.set_font_size(font_size);
         model.set_remotes(connect::Store::real());
         model.set_dialer(Rc::new(move || RemoteClient::connect(config.clone())));
+        model.follow_renames(cx);
         model.start_ticking(cx);
         model
     });
@@ -1445,7 +1489,7 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
     .detach();
     let mut options = crate::app::window_options(cx);
     if let Some(titlebar) = options.titlebar.as_mut() {
-        titlebar.title = Some(format!("FlightDeck — {}", remote.label).into());
+        titlebar.title = Some(window::window_title(&remote.label).into());
     }
     let opened = cx.open_window(options, |window, cx| {
         let view = cx.new(|cx| window::RemoteWindow::new(model, cx));

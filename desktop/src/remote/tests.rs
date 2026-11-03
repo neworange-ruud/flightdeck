@@ -250,6 +250,32 @@ fn open_in_vscode_uses_the_ssh_target_saved_for_the_remote(app: &mut TestAppCont
     );
 }
 
+/// Renaming the saved remote in Connect to remote… renames the open window
+/// on it at once: the name in its top-left corner and its OS title. A rename
+/// of another remote leaves it alone.
+#[gpui::test]
+fn a_rename_of_this_remote_retitles_the_open_window(app: &mut TestAppContext) {
+    let (model, _script, cx) = open(app);
+    model.update(cx, |m, cx| m.follow_renames(cx));
+    cx.run_until_parked();
+
+    cx.update(|_, cx| super::announce_rename("10.0.0.9:7420", "Build box", cx));
+    cx.run_until_parked();
+    assert_eq!(model.read_with(cx, |m, _| m.label().to_string()), "studio");
+
+    cx.update(|_, cx| super::announce_rename("192.168.2.20:7420", "Studio Mac", cx));
+    cx.run_until_parked();
+    assert_eq!(
+        model.read_with(cx, |m, _| m.label().to_string()),
+        "Studio Mac"
+    );
+    assert!(cx.debug_bounds("remote-name").is_some());
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some("FlightDeck — Studio Mac")
+    );
+}
+
 #[gpui::test]
 fn the_sidebar_git_strip_and_host_marker_draw_from_the_snapshot(app: &mut TestAppContext) {
     let (model, _script, cx) = open(app);
@@ -726,6 +752,82 @@ mod connect {
         assert!(view.read_with(cx, |v, _| v.warning_open()));
         click(cx, "connect-warning-back");
         assert!(h.opened.borrow().is_empty(), "Back connects nothing");
+    }
+
+    fn type_name(view: &Entity<ConnectView>, cx: &mut VisualTestContext, name: &str) {
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.type_name(name, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn renaming_a_remote_saves_the_name_and_tells_its_windows(app: &mut TestAppContext) {
+        let mut seed = RemotesFile::default();
+        seed.upsert(saved("192.168.2.20:7420", true));
+        let (h, view, cx) = open_with(app, seed, false);
+        click(cx, "connect-rename-0");
+        assert!(view.read_with(cx, |v, _| v.renaming()));
+        assert!(
+            cx.debug_bounds("connect-saved-0").is_none(),
+            "the row is the name field while it is edited"
+        );
+
+        type_name(&view, cx, "  Studio Mac ");
+        click(cx, "connect-rename-save-0");
+        assert!(!view.read_with(cx, |v, _| v.renaming()));
+        let saved = h.saved();
+        let remote = saved.get("192.168.2.20:7420").unwrap();
+        assert_eq!(remote.label, "Studio Mac");
+        assert_eq!(remote.token, "stored-token", "only the name changes");
+        let renamed = cx.update(|_, cx| cx.try_global::<crate::remote::RemoteRenamed>().cloned());
+        assert_eq!(
+            renamed,
+            Some(crate::remote::RemoteRenamed {
+                address: "192.168.2.20:7420".to_string(),
+                label: "Studio Mac".to_string(),
+            })
+        );
+
+        // Connecting opens the window under the new name.
+        click(cx, "connect-saved-0");
+        assert_eq!(h.opened.borrow()[0].0.label, "Studio Mac");
+    }
+
+    #[gpui::test]
+    fn a_blank_name_is_refused_and_cancel_keeps_the_old_one(app: &mut TestAppContext) {
+        let mut seed = RemotesFile::default();
+        seed.upsert(saved("192.168.2.20:7420", true));
+        let (h, view, cx) = open_with(app, seed, false);
+        click(cx, "connect-rename-0");
+        type_name(&view, cx, "   ");
+        click(cx, "connect-rename-save-0");
+        assert!(view.read_with(cx, |v, _| v.renaming()), "still editing");
+        assert!(view
+            .read_with(cx, |v, _| v.error().map(str::to_string))
+            .unwrap()
+            .contains("Type a name"));
+
+        type_name(&view, cx, "Something else");
+        click(cx, "connect-rename-cancel-0");
+        assert!(!view.read_with(cx, |v, _| v.renaming()));
+        assert_eq!(h.saved().get("192.168.2.20:7420").unwrap().label, "studio");
+        assert!(cx
+            .update(|_, cx| cx.try_global::<crate::remote::RemoteRenamed>().cloned())
+            .is_none());
+    }
+
+    #[gpui::test]
+    fn escape_cancels_a_rename(app: &mut TestAppContext) {
+        let mut seed = RemotesFile::default();
+        seed.upsert(saved("192.168.2.20:7420", true));
+        let (h, view, cx) = open_with(app, seed, false);
+        click(cx, "connect-rename-0");
+        type_name(&view, cx, "Something else");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.renaming()));
+        assert_eq!(h.saved().get("192.168.2.20:7420").unwrap().label, "studio");
     }
 
     #[gpui::test]

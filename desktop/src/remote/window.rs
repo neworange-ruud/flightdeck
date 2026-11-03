@@ -84,6 +84,8 @@ pub struct RemoteWindow {
     shell_pty: Rc<dyn PtyBackend>,
     /// A worker's project picker, while the model has it open.
     picker: Option<Entity<ProjectPickerView>>,
+    /// The name the OS window title was last given, so a rename retitles it.
+    titled: String,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -99,6 +101,8 @@ impl RemoteWindow {
         };
         let terminal = cx.new(|cx| TerminalView::for_remote(remote.clone(), cx));
         let layer = cx.new(|cx| OverlayLayer::new(emit, cx));
+        // `open_remote_window` titles the window with the name it opened on.
+        let titled = remote.read(cx).label().to_string();
         Self {
             remote,
             terminal,
@@ -109,8 +113,18 @@ impl RemoteWindow {
             shell_error: None,
             shell_pty: Rc::new(PortablePtyBackend),
             picker: None,
+            titled,
             #[cfg(target_os = "macos")]
             drag_pending: false,
+        }
+    }
+
+    /// Retitle the OS window after a rename of this remote.
+    fn sync_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let label = self.remote.read(cx).label();
+        if label != self.titled {
+            self.titled = label.to_string();
+            window.set_window_title(&window_title(label));
         }
     }
 
@@ -287,6 +301,7 @@ impl RemoteWindow {
             )
             .child(
                 div()
+                    .debug_selector(|| "remote-name".into())
                     .text_size(px(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.ink.hsla())
@@ -661,6 +676,7 @@ impl Render for RemoteWindow {
         let p = *Palette::global(cx);
         self.ensure_shell(cx);
         self.sync_picker(window, cx);
+        self.sync_title(window, cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
             window.remove_window();
@@ -883,6 +899,11 @@ fn skew_banner(p: &Palette, text: String) -> impl IntoElement {
 }
 
 /// One clickable hint: its keycap and word.
+/// The OS window title of a remote window named `label`.
+pub fn window_title(label: &str) -> String {
+    format!("FlightDeck — {label}")
+}
+
 fn hint(p: &Palette, entry: &'static str, label: &'static str) -> impl IntoElement {
     h_flex()
         .flex_none()

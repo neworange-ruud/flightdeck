@@ -27,7 +27,8 @@ pub const REMOTES_FILE_VERSION: u32 = 1;
 /// One paired instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedRemote {
-    /// What the window calls it.
+    /// What the window calls it: the host's name or address when paired,
+    /// until it is renamed ([`RemotesFile::rename`]).
     pub label: String,
     /// `host:port`, normalised ([`super::normalize_address`]).
     pub address: String,
@@ -88,8 +89,8 @@ impl RemotesFile {
     }
 
     /// Save `remote`, replacing any record for the same address (a re-pair
-    /// keeps the warning already accepted, a hand-set SSH target, and the
-    /// host kind until the next attach says otherwise).
+    /// keeps the name it was given, the warning already accepted, a hand-set
+    /// SSH target, and the host kind until the next attach says otherwise).
     pub fn upsert(&mut self, mut remote: SavedRemote) {
         match self
             .remotes
@@ -97,6 +98,7 @@ impl RemotesFile {
             .find(|r| r.address == remote.address)
         {
             Some(existing) => {
+                remote.label = std::mem::take(&mut existing.label);
                 remote.warned_unencrypted |= existing.warned_unencrypted;
                 if remote.ssh_target.is_none() {
                     remote.ssh_target = existing.ssh_target.take();
@@ -108,6 +110,19 @@ impl RemotesFile {
             }
             None => self.remotes.push(remote),
         }
+    }
+
+    /// Call the remote at `address` `label`, trimmed. A blank name is refused.
+    /// Returns the name it now has, or `None` when nothing is saved there or
+    /// the name is blank.
+    pub fn rename(&mut self, address: &str, label: &str) -> Option<String> {
+        let label = label.trim();
+        if label.is_empty() {
+            return None;
+        }
+        let remote = self.remotes.iter_mut().find(|r| r.address == address)?;
+        remote.label = label.to_string();
+        Some(remote.label.clone())
     }
 
     /// Forget `address`. Returns whether a record went.
@@ -241,6 +256,28 @@ mod tests {
         // Absent from the file when unset, and an old file still loads.
         let json = serde_json::to_string(&remote("h:1")).unwrap();
         assert!(!json.contains("ssh_target"), "{json}");
+    }
+
+    #[test]
+    fn a_rename_is_trimmed_refuses_a_blank_name_and_survives_a_re_pair() {
+        let mut file = RemotesFile::default();
+        file.upsert(remote("10.0.0.2:7420"));
+        assert_eq!(
+            file.rename("10.0.0.2:7420", "  Build box "),
+            Some("Build box".to_string())
+        );
+        assert_eq!(file.rename("10.0.0.2:7420", "   "), None);
+        assert_eq!(file.rename("nowhere:7420", "x"), None);
+        assert_eq!(file.get("10.0.0.2:7420").unwrap().label, "Build box");
+
+        // Pairing again replaces the token, not the name.
+        file.upsert(SavedRemote {
+            token: "new".to_string(),
+            ..remote("10.0.0.2:7420")
+        });
+        let saved = file.get("10.0.0.2:7420").unwrap();
+        assert_eq!(saved.token, "new");
+        assert_eq!(saved.label, "Build box");
     }
 
     #[test]
