@@ -2010,6 +2010,17 @@ mod worker {
     }
 
     #[gpui::test]
+    fn a_newer_worker_says_to_update_the_app(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        snapshot.host_version = "999.0.0".to_string();
+        let (model, _script, _window, cx) = open_on(app, snapshot);
+        assert!(cx.debug_bounds("remote-version-skew").is_some());
+        let warning = model.read_with(cx, |m, _| m.skew_warning()).unwrap();
+        assert!(warning.starts_with("This worker runs FlightDeck 999.0.0;"));
+        assert!(warning.ends_with(crate::remote::messages::APP_UPDATE_ADVICE));
+    }
+
+    #[gpui::test]
     fn the_same_version_or_another_host_kind_shows_no_banner(app: &mut TestAppContext) {
         let (_model, _script, _window, cx) = open_on(app, worker_snapshot());
         assert!(cx.debug_bounds("remote-version-skew").is_none());

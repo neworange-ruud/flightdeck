@@ -135,6 +135,35 @@ if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; t
   exit 1
 fi
 
+# The app reports the core version it was built with (`flightdeck::VERSION`,
+# from the root Cargo.toml) and compares it with a worker's. A desktop release
+# cut while the core has unreleased changes carries the old number for the new
+# code, so a worker on the CLI release that follows shows a false skew banner
+# (desktop-v0.11.1 said 1.31.0 against worker 1.32.0). Release the CLI first.
+# FLIGHTDECK_ALLOW_UNRELEASED_CORE=1 overrides, for a desktop-only hotfix.
+core_paths="src webui Cargo.toml"
+last_core_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)
+if [ "$last_core_tag" = "" ]; then
+  printf 'No v<x.y.z> tag reachable from HEAD; cannot tell whether the core is released.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC2086 # core_paths is a word list on purpose
+if ! git diff --quiet "$last_core_tag" HEAD -- $core_paths; then
+  if [ "${FLIGHTDECK_ALLOW_UNRELEASED_CORE:-}" = "1" ]; then
+    printf 'Warning: the core changed since %s; releasing anyway (FLIGHTDECK_ALLOW_UNRELEASED_CORE=1).\n' \
+      "$last_core_tag" >&2
+  else
+    printf 'The shared core changed since %s, so this app would report that version for newer code:\n' \
+      "$last_core_tag" >&2
+    # shellcheck disable=SC2086
+    git --no-pager log --oneline "$last_core_tag"..HEAD -- $core_paths >&2
+    printf 'Release the CLI first (scripts/release <x.y.z>), then re-run this.\n' >&2
+    printf 'For a desktop-only release anyway: FLIGHTDECK_ALLOW_UNRELEASED_CORE=1 %s %s\n' \
+      "$0" "$version" >&2
+    exit 1
+  fi
+fi
+
 # Refuse before touching any file when there is nothing to release (the same
 # rule update_changelog applies, read-only), unless the version is already
 # rolled (a re-run after a failed push).
