@@ -160,11 +160,18 @@ scripts/release-desktop 0.2.0         # offered by the self-updater
 scripts/release-desktop 0.2.0-beta.1  # a pre-release, ignored by the self-updater
 ```
 
-It refuses a dirty tree, a branch behind its upstream, an existing tag, or an empty
-`Unreleased`; then sets the version (and `Cargo.lock`), rolls `Unreleased` into the
+It refuses a dirty tree, a branch behind its upstream, an existing tag, an empty
+`Unreleased`, or a shared core (`src/`, `webui/`, the root `Cargo.toml`) that changed
+since the last `v<x.y.z>` tag; then sets the version (and `Cargo.lock`), rolls `Unreleased` into the
 version, commits `Release desktop-v<x.y.z>`, tags and pushes. The tag runs the release
 job above. A change to the shared core (`src/`) ships in whichever app is released next;
 note it in both changelogs.
+
+**Release the CLI before the desktop app.** The app reports the core version it was
+built with and compares it with each worker's, so a desktop release cut before the
+core's version bump carries the old number for the new code, and every worker on the
+CLI release that follows shows a version-skew banner. The script refuses that order;
+`FLIGHTDECK_ALLOW_UNRELEASED_CORE=1` overrides it for a desktop-only hotfix.
 
 ### Asset name check
 

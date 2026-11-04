@@ -22,7 +22,13 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- The version-skew banner on a worker newer than the app now says to update
+  FlightDeck Desktop, instead of telling you to update a worker that is already
+  the newer one. A link that ends on a protocol mismatch before the worker said
+  its version now says to update whichever side is older.
+- Desktop releases can no longer be cut ahead of an unreleased core change.
+  0.11.1 was tagged just before the core's 1.32.0 bump, so it reports 1.31.0
+  and warns about every 1.32.0 worker, although the code is the same.
 
 ## [0.11.1] - 2026-11-04
 

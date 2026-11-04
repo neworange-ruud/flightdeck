@@ -39,23 +39,58 @@ pub fn away_text(messages: &[HostMessage]) -> String {
 pub const UPDATE_ADVICE: &str =
     "Update it from the worker shell: `flightdeck update`, then `flightdeck worker restart`.";
 
+/// How to bring this app to the worker's version, when the worker is the
+/// newer one: updating the worker would change nothing.
+pub const APP_UPDATE_ADVICE: &str =
+    "Update FlightDeck Desktop; it offers a new release when one is out.";
+
+/// The advice when it is not known which side is older (a link that ended on
+/// a protocol mismatch before the worker said its version).
+pub const EITHER_UPDATE_ADVICE: &str = "Update whichever is older: FlightDeck Desktop, or the \
+     worker from its shell with `flightdeck update`, then `flightdeck worker restart`.";
+
+/// `major.minor.patch` of a version, ignoring a pre-release or build suffix;
+/// `None` when it does not parse.
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let core = s.trim().trim_start_matches('v').split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let version = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(version)
+}
+
+/// What to update, given the worker's version (`host`) and this app's
+/// (`app`): the app when the worker is newer, else the worker. A version
+/// that does not parse keeps the worker advice, as before.
+fn advice(host: &str, app: &str) -> &'static str {
+    match (parse_version(host), parse_version(app)) {
+        (Some(host), Some(app)) if host > app => APP_UPDATE_ADVICE,
+        _ => UPDATE_ADVICE,
+    }
+}
+
 /// The version-skew banner, when the worker's FlightDeck (`host`) is not the
 /// core this app was built with (`app`). `None` when they match, or the
-/// worker has not said.
+/// worker has not said. The advice names the older side.
 pub fn skew_warning(host: &str, app: &str) -> Option<String> {
     if host.is_empty() || host == app {
         return None;
     }
     Some(format!(
-        "This worker runs FlightDeck {host}; this app was built with {app}. {UPDATE_ADVICE}"
+        "This worker runs FlightDeck {host}; this app was built with {app}. {}",
+        advice(host, app)
     ))
 }
 
 /// What a worker link that ended on a protocol mismatch says: the link's own
 /// reason, then the same advice as the banner (with the versions, when the
-/// worker said its version before the mismatch).
+/// worker said its version before the mismatch; without them, which side is
+/// older is not known).
 pub fn mismatch_advice(reason: &str, host: &str, app: &str) -> String {
-    let advice = skew_warning(host, app).unwrap_or_else(|| UPDATE_ADVICE.to_string());
+    let advice = skew_warning(host, app).unwrap_or_else(|| EITHER_UPDATE_ADVICE.to_string());
     if reason.is_empty() {
         advice
     } else {
@@ -105,12 +140,45 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_worker_is_told_to_update_the_app_not_the_worker() {
+        // Desktop 0.11.1 was cut before the core's 1.32.0 bump: the worker on
+        // 1.32.0 is the newer side, and updating it changes nothing.
+        let warning = skew_warning("1.32.0", "1.31.0").unwrap();
+        assert_eq!(
+            warning,
+            format!(
+                "This worker runs FlightDeck 1.32.0; this app was built with 1.31.0. \
+                 {APP_UPDATE_ADVICE}"
+            )
+        );
+        assert!(!warning.contains("flightdeck update"));
+        // Compared as numbers, not text: 1.10.0 is newer than 1.9.0.
+        assert!(skew_warning("1.10.0", "1.9.0")
+            .unwrap()
+            .ends_with(APP_UPDATE_ADVICE));
+        assert!(skew_warning("1.9.0", "1.10.0")
+            .unwrap()
+            .ends_with(UPDATE_ADVICE));
+    }
+
+    #[test]
+    fn an_unreadable_version_keeps_the_worker_advice_and_a_suffix_is_ignored() {
+        assert!(skew_warning("nightly", "1.4.0")
+            .unwrap()
+            .ends_with(UPDATE_ADVICE));
+        assert!(skew_warning("1.5.0-beta.1", "1.4.0")
+            .unwrap()
+            .ends_with(APP_UPDATE_ADVICE));
+    }
+
+    #[test]
     fn a_mismatch_ends_with_the_same_advice() {
         let text = mismatch_advice("The host speaks web protocol v8.", "", "1.4.0");
         assert_eq!(
             text,
-            format!("The host speaks web protocol v8. {UPDATE_ADVICE}")
+            format!("The host speaks web protocol v8. {EITHER_UPDATE_ADVICE}")
         );
         assert!(mismatch_advice("", "1.3.0", "1.4.0").starts_with("This worker runs"));
+        assert!(mismatch_advice("v9.", "1.5.0", "1.4.0").ends_with(APP_UPDATE_ADVICE));
     }
 }
