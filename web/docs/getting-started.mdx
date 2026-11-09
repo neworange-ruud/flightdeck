@@ -1,103 +1,173 @@
 ---
-label: Install & First Run
-section: Get Started
-order: 10
+label: "Quickstart: Desktop"
+section: Start Here
+order: 2
 icon: rocket
 ---
 
-# Install & First Run
+# Quickstart: Desktop
 
-Get FlightDeck installed and launch your first agent in a couple of minutes.
+Install FlightDeck Desktop, open a repository and start your first two agents.
+This takes about five minutes. The agents run on your own computer. To run
+them on a separate machine, follow this page up to step 1, then continue with
+[Quickstart: Worker](/worker).
 
-## Install
+## Before you start
 
-### macOS (Homebrew)
+- **Git** on your `PATH`.
+- **At least one agent CLI**, installed and logged in: Claude Code (`claude`),
+  Codex (`codex`), OpenCode (`opencode`) or the Cursor CLI (`cursor-agent`).
+  Run it once in a terminal and finish its login. FlightDeck starts these
+  tools for you, using your normal login.
+
+## 1. Install the app
+
+Download the latest **FlightDeck Desktop** release from
+[GitHub Releases](https://github.com/neworange-ruud/flightdeck/releases?q=desktop&expanded=true).
+Releases named "FlightDeck Desktop" are the app. The others are the
+command-line tool.
+
+| System | File to download |
+| --- | --- |
+| macOS, Apple silicon | `FlightDeck-<version>-macos-aarch64.zip` |
+| macOS, Intel | `FlightDeck-<version>-macos-x86_64.zip` |
+| Windows | `FlightDeck-windows-x64.msi` |
+| Linux | `.deb`, `.rpm` or `.AppImage` |
+
+On macOS, unzip the file and drag **FlightDeck.app** into **Applications**.
+
+<Callout type="warning">
+  **First launch on macOS.** The app is not notarized by Apple yet, so macOS
+  refuses to open it the first time. Open **System Settings → Privacy &
+  Security**, scroll down and click **Open Anyway**. Or run this once in a
+  terminal:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/FlightDeck.app
+  ```
+
+  On Windows, SmartScreen may warn the same way: choose **More info → Run
+  anyway**.
+</Callout>
+
+The app checks for new releases once a day and shows a banner with **Update
+now** when one is out.
+
+## 2. Open a repository
+
+Start FlightDeck. The launcher lists your recent projects. Choose **Open
+project…** (`Cmd-O` on macOS) and pick any folder that is a Git repository.
+
+![The FlightDeck launcher: Open project…, Connect to remote…, recent projects and saved workers.](/screenshots/desktop-app/launcher.png)
+
+The first time you open a repository, FlightDeck creates a `.flightdeck/` folder
+in it and adds a few lines to `.gitignore`. It changes nothing else.
+
+## 3. Start an agent
+
+1. Press **`Ctrl-n`**, or click **New agent** in the sidebar.
+2. Pick an agent, for example Claude Code.
+3. Name the task, for example `fix-login`, and press `Enter`.
+
+![The New Agent dialog: choose the agent and name the task.](/screenshots/desktop-app/new-agent.png)
+
+FlightDeck creates the branch `flightdeck/fix-login`, checks it out in its own
+folder under `.flightdeck/worktrees/`, starts the agent there and puts your
+cursor in its terminal. Type your prompt as you normally would.
+
+Press `Ctrl-n` again and start a second task straight away. The two agents work
+on different branches in different folders, so they can't get in each other's
+way.
+
+## 4. Keep an eye on them
+
+Each agent has a row in the sidebar that says what it is doing:
+
+- **working**: the agent is busy,
+- **waiting**: it asked a question or wants permission,
+- **done** or **idle**: it finished its turn and waits for your next prompt.
+
+You get a system notification when an agent needs you or finishes, so you can
+work on something else in the meantime. Click a row to switch to that agent, or
+press **`Alt-m`** for **Mission control**: every running agent as a tile, the
+ones that need you first.
+
+![Mission control: every agent as a tile, the ones that need you first.](/screenshots/desktop-app/mission-control.png)
+
+## 5. Ship the work
+
+You and your agent make the commits, the way you always do. When a branch is
+ready:
+
+1. Click **Push** in the git strip at the bottom (or press `Ctrl-p`).
+   FlightDeck pushes the branch and, for a GitHub remote, shows the link to open
+   the pull request.
+2. Open the pull request in your browser.
+3. After it merges, click **Pull base** (`Ctrl-u`) to update your main branch,
+   and close the agent with `Ctrl-k`.
+
+The [Git Workflow](/desktop/git) page covers rebasing, merging locally without a
+pull request, and cleaning up worktrees.
+
+## Two things worth knowing
+
+<Callout type="info">
+  **Typing goes to the terminal or to FlightDeck, never both.** While a terminal
+  has focus, every key goes to the agent. Press **`Alt-Esc`** (macOS) or
+  **`Shift-Esc`** (Windows, Linux) to give the keys back to FlightDeck, and
+  `Enter` to return to the terminal. Shortcuts with `Alt` work in both.
+</Callout>
+
+**`Ctrl-g` opens the command palette**, a searchable list of every action. If
+you forget a shortcut, use the palette.
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl-n` | New agent |
+| `Alt-↑` / `Alt-↓` | Previous / next agent |
+| `Alt-m` | Projects ↔ Mission control |
+| `Ctrl-t` | Extra shell in this agent's folder |
+| `Ctrl-p` | Push the branch |
+| `Ctrl-g` | Command palette |
+
+## Next
+
+<CardGrid>
+  <Card href="/worker" title="Add a worker">
+    Move the agents to an always-on machine and keep the Desktop as your
+    screen.
+  </Card>
+  <Card href="/desktop-app" title="The Desktop App">
+    A tour of the window: projects, Mission control, terminals and the git
+    strip.
+  </Card>
+  <Card href="/desktop/agent-tabs" title="Agent Tabs & Worktrees">
+    Start from an existing branch, rename, restart and close agents.
+  </Card>
+  <Card href="/desktop/git" title="Git Workflow">
+    Push, pull base, rebase, merge back, and what FlightDeck will never do.
+  </Card>
+</CardGrid>
+
+## Prefer the terminal?
+
+The same workspace runs as a terminal UI. Install the `flightdeck` command:
 
 ```bash
 brew install neworange-ruud/tap/flightdeck
 ```
 
-### macOS / Linux (installer script)
+Or, without Homebrew, on macOS and Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.sh | sh
 ```
 
-### Windows (PowerShell)
+On Windows, in PowerShell:
 
 ```powershell
 irm https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.ps1 | iex
 ```
 
-<Callout type="note">
-  FlightDeck needs Git on your `PATH`. The agents themselves (OpenCode, Claude
-  Code, Codex CLI, Cursor CLI, …) are separate tools — install whichever ones you plan to
-  use so FlightDeck can launch them.
-</Callout>
-
-## Launch
-
-Run FlightDeck from inside any Git repository:
-
-```bash
-cd path/to/your-repository
-flightdeck
-```
-
-On its **first run in a repo**, FlightDeck initializes itself automatically —
-there is no `flightdeck init` step. It creates a `.flightdeck/` directory and
-appends a few entries to your `.gitignore` (append-only; your existing content
-is preserved):
-
-```text
-your-repo/
-  .flightdeck/
-    config.toml        # committed, human-editable
-    state.json         # ignored (runtime state)
-    worktrees/         # ignored (managed worktrees)
-```
-
-## Create your first agent
-
-1. Press **`Ctrl-n`** to create a new agent session tab.
-2. **Pick an agent** from the menu (for example, Claude Code). The menu is
-   skipped if only one agent is configured.
-3. **Name the task** — something like `fix-login`. FlightDeck turns it into a
-   branch, `flightdeck/fix-login`.
-
-FlightDeck then creates the branch and a worktree under
-`.flightdeck/worktrees/fix-login`, launches your chosen agent inside it, and
-focuses the terminal so you can start prompting.
-
-<Callout type="success">
-  Each agent tab gets its own branch and worktree, so you can press `Ctrl-n`
-  again and start a second task immediately — the two agents never share files.
-</Callout>
-
-## A first lap around the app
-
-- **Switch agents** — `Alt-↑` / `Alt-↓`, or `Alt-1..9` to jump by number.
-- **Open a shell** in the current worktree — `Ctrl-t`.
-- **See Git status** — open the command palette (`Ctrl-g`) and choose *Show Git
-  Status*.
-- **Push a branch** — `Ctrl-p` (you'll get a PR compare URL if your remote is
-  GitHub).
-- **Everything else** — press `Ctrl-g` for the command palette, or `?` for the
-  keybindings help.
-
-## Next steps
-
-<CardGrid>
-  <Card href="/interface" title="The Interface">
-    Learn the screen layout and the terminal-vs-app keyboard model.
-  </Card>
-  <Card href="/desktop/agent-tabs" title="Agent Tabs & Worktrees">
-    Go deeper on creating, switching, and closing agent sessions.
-  </Card>
-  <Card href="/desktop/git" title="Git Workflow">
-    Push, pull base, merge back, rebase — and the safety boundary behind them.
-  </Card>
-  <Card href="/desktop/cli" title="CLI & Updating">
-    Keep FlightDeck current and explore the command-line subcommands.
-  </Card>
-</CardGrid>
+Then run `flightdeck` inside any Git repository. Every shortcut on this page
+works the same. See the [Terminal UI tour](/interface).

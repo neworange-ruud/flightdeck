@@ -16,7 +16,10 @@ const schema = z.object({
     allowToggle: z.boolean().optional(),
   }).optional(),
   search: z.object({ enabled: z.boolean().optional() }).optional(),
-  navigation: z.object({ collapsible: z.boolean().optional() }).optional(),
+  navigation: z.object({
+    collapsible: z.boolean().optional(),
+    collapsedSections: z.array(z.string().min(1)).optional(),
+  }).strict().optional(),
   mdxComponents: z.object({ enabled: z.array(z.enum(APPROVED_MDX_COMPONENTS)).optional() }).optional(),
   codeBlocks: z.object({
     lineNumbers: z.union([z.boolean(), z.literal("optional")]).optional(),
@@ -44,7 +47,10 @@ export async function loadSiteConfig(site: DocsSiteDefinition | string): Promise
       allowToggle: config.theme?.allowToggle ?? true,
     },
     search: { enabled: config.search?.enabled ?? true },
-    navigation: { collapsible: config.navigation?.collapsible ?? true },
+    navigation: {
+      collapsible: config.navigation?.collapsible ?? true,
+      collapsedSections: config.navigation?.collapsedSections ?? [],
+    },
     mdxComponents: { enabled: config.mdxComponents?.enabled ?? [...APPROVED_MDX_COMPONENTS] },
     codeBlocks: {
       lineNumbers: config.codeBlocks?.lineNumbers ?? false,

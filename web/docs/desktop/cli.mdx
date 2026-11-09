@@ -1,7 +1,7 @@
 ---
 label: CLI & Updating
-section: Desktop Guide
-order: 29
+section: Terminal UI
+order: 51
 ---
 
 # CLI & Updating
@@ -20,6 +20,8 @@ command-line subcommands for setup, maintenance, and updates.
 | `flightdeck setup-update` | Ensure `update.check = true` | required |
 | `flightdeck setup-status` | Write reusable status integrations to `.flightdeck/integrations/` | required |
 | `flightdeck setup-notifications` | Ensure notifications are enabled; print tuning guidance | required |
+| `flightdeck connect [name]` | The terminal UI attached to a paired worker or another FlightDeck (`--pair <addr>`, `--list`, `--observe`). See [Quickstart: Worker](/worker#use-a-terminal-instead-of-the-desktop) | no |
+| `flightdeck worker <start\|stop\|restart\|status\|pair\|devices\|revoke\|logs>` | Run and manage a headless worker. See [Worker in Depth](/worker/operations) | no |
 | `flightdeck doctor` | Verify Podman and agent images are ready | required |
 | `flightdeck image build [agent]` | Build/rebuild an agent's container image | required |
 
@@ -27,6 +29,19 @@ command-line subcommands for setup, maintenance, and updates.
   There is no `flightdeck init` — initialization happens automatically the first
   time you run `flightdeck` inside a repository.
 </Callout>
+
+## Isolated runs
+
+```bash
+flightdeck --isolated   # or: flightdeck -I
+```
+
+A throwaway run: one fresh agent session in the current directory, with no
+worktrees, no other projects and nothing written to the project. No
+`.flightdeck/config.toml`, `.gitignore` entry or `state.json` is created, and the
+session carries a permanent `ISOLATED` badge. Use it to poke at a repository or
+try FlightDeck without leaving a trace. The Desktop app accepts the same flag.
+It can't be combined with a subcommand (`flightdeck -I doctor` is an error).
 
 ## Updating FlightDeck
 

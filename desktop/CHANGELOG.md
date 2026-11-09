@@ -18,6 +18,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- **The docs treat FlightDeck Desktop as the main way to use FlightDeck.** The "preview" label and the build-from-source instructions are gone. Installing is now a download from GitHub Releases, with the first-launch step for macOS, and the docs walk through the Desktop on its own and the Desktop driving a worker. Building from source moved to `CONTRIBUTING.md`.
 - A remote window's rules (what stays local, what goes to the host, mirroring the host's terminals, a worker's picker, messages and takeover) now live in the shared core, so the terminal UI's upcoming `flightdeck connect` behaves exactly like this window. Nothing looks or works differently.
 
 ### Bug fixes

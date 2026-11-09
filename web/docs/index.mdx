@@ -1,88 +1,77 @@
 ---
 label: Overview
-section: Introduction
+section: Start Here
 order: 1
 icon: book-open
 ---
 
 # FlightDeck
 
-FlightDeck is a terminal workspace for running several local AI coding agents in
-parallel — each in its own Git worktree, on its own branch, in its own terminal
-session. You supervise the whole fleet from one keyboard-driven screen and stay
-in control of every commit, merge, and pull request.
+FlightDeck runs several AI coding agents side by side: Claude Code, Codex,
+OpenCode, Cursor, or your own. Every agent gets its own Git worktree and branch,
+so two agents never edit the same files, and you watch and steer all of them
+from one window.
 
-![The FlightDeck desktop app: branded header, the project tabs row, the Agents sidebar with live status, the active agent terminal, and the Git info bar.](/screenshots/desktop/main-layout.png)
+![FlightDeck Desktop connected to a worker: one row per agent with its live status, the selected agent's terminal, and the branch's git state along the bottom.](/screenshots/desktop-app/worker-window.png)
 
-*The FlightDeck desktop app — project tabs across the top to switch between repositories, one row per agent in the sidebar, the active agent's terminal in the main pane, and a live Git summary along the bottom.*
+*FlightDeck Desktop driving a worker. Each sidebar row is an agent on its own branch.*
 
-<Callout type="info">
-  The mental model in one line: **one agent tab = one worktree = one branch =
-  one primary agent process (plus optional shells).** Nothing is shared between
-  tabs, so parallel tasks never step on each other.
-</Callout>
+## Pick a setup
 
-## Why FlightDeck
-
-Running one AI agent is easy. Running five without them clobbering each other's
-files, branches, and commits is not. FlightDeck gives every task an isolated
-Git worktree so agents can work at the same time, and it surfaces each agent's
-live status so you always know which one needs you.
-
-- **True parallelism** — every agent works in a separate worktree and branch.
-- **You own history** — FlightDeck never commits, amends, squashes, or
-  force-pushes. It creates branches and worktrees, and pushes only after you
-  confirm.
-- **Any agent** — OpenCode, Claude Code, Codex CLI and Cursor CLI ship
-  pre-configured, and
-  agents are just config, so you can add your own.
-- **Know at a glance** — per-agent status indicators and native OS
-  notifications tell you the moment an agent finishes or needs input.
-- **Take it with you** — pair the [FlightDeck Remote](/remote) iOS app to
-  monitor and steer your agents from your phone over an end-to-end-encrypted
-  link.[\*](/remote#availability)
-
-## Start here
+There are two ways to run FlightDeck. Both use the same app and work the same
+way. The only difference is **where the agents run**.
 
 <CardGrid>
-  <Card href="/getting-started" title="Get Started">
-    Install FlightDeck, open a repository, and launch your first agent in a
-    couple of minutes.
+  <Card href="/worker" title="Desktop + a worker (recommended)">
+    Agents run on an always-on Mac or Linux machine. Your laptop is only the
+    screen, so you can close the lid and the agents keep working.
   </Card>
-  <Card href="/concepts" title="Core Concepts">
-    Understand projects, worktrees, agent tabs, and the Git safety boundary
-    before you dive in.
-  </Card>
-  <Card href="/interface" title="The Interface">
-    Take a guided tour of the screen layout and the two-mode keyboard model.
-  </Card>
-  <Card href="/remote" title="FlightDeck Remote">
-    Pair the iOS companion app to watch and control your agents from anywhere.
-    (The default relay is not publicly accessible — see availability.)
+  <Card href="/getting-started" title="Desktop on its own">
+    Agents run on your own computer. Nothing else to set up. You can add a
+    worker later without changing how you work.
   </Card>
 </CardGrid>
 
-## What FlightDeck does — and doesn't
+| | Desktop on its own | Desktop + a worker |
+| --- | --- | --- |
+| Agents run on | your computer | the worker |
+| Agents keep going while your laptop sleeps | no | yes |
+| What you need | the Desktop app, Git, an agent CLI | the same, plus a Mac or Linux machine for the worker and [Tailscale](https://tailscale.com) on both |
+| Time to set up | about 5 minutes | about 15 minutes |
 
-FlightDeck **may** detect your repo, create `.flightdeck/`, create and attach
-branches, create and recover worktrees, push branches after you confirm, run a
-guarded local merge-back, rebase a worktree onto its base, and pull the base
-branch after a PR merges.
+Not sure? Start with [Desktop on its own](/getting-started). The worker
+quickstart begins with the same install.
 
-It **never** stages files, creates or amends commits, rewrites history
-automatically, force-pushes, or opens pull requests for you. You and your agents
-make the commits; FlightDeck shows you a GitHub compare URL after a push so you
-open the PR yourself. See [the Git safety boundary](/concepts#the-git-safety-boundary).
-
-## Platform support
-
-FlightDeck runs on **macOS**, **Linux**, and **Windows**. The FlightDeck Remote
-companion app is **iOS 18+** (iPhone).[\*](/remote#availability) Head to
-[Get Started](/getting-started) to install.
-
-<Callout type="note">
-  \* FlightDeck Remote relies on a hosted relay to link your phone and Mac. The
-  relay configured by default is **restricted and not accessible to the public**;
-  you can [host your own](/remote#availability), though self-hosting is
-  unsupported. See [FlightDeck Remote → Availability](/remote#availability).
+<Callout type="info">
+  **Prefer the terminal?** Everything above also works without the Desktop app.
+  `flightdeck` is the same workspace as a terminal UI, and `flightdeck connect`
+  drives a worker from any terminal, over SSH too. See the
+  [Terminal UI tour](/interface).
 </Callout>
+
+## How it works
+
+<Callout type="info">
+  **One agent tab = one worktree = one branch = one agent.** You start an agent
+  by naming a task, for example `fix-login`. FlightDeck creates the branch
+  `flightdeck/fix-login`, checks it out in its own folder, and starts the agent
+  there. Your own checkout is never touched.
+</Callout>
+
+The sidebar shows what every agent is doing: working, waiting for you, or
+done. FlightDeck notifies you when one needs input, so you can leave them alone
+until then. When an agent's work is ready, you push the branch and open the
+pull request as usual.
+
+FlightDeck **never** commits, rewrites history, force-pushes, or opens pull
+requests for you. You and your agents make the commits.
+[Core Concepts](/concepts) explains the rest in five minutes.
+
+## The rest of the docs
+
+You don't need anything beyond **Start Here** and **Everyday Use** to work with
+FlightDeck. Containers, hooks, configuration, the browser interface and the
+iPhone app are under **Advanced** in the sidebar, and search finds every page.
+
+FlightDeck runs on **macOS**, **Linux** and **Windows**. A worker runs on macOS
+or Linux.

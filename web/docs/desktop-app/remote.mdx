@@ -1,0 +1,72 @@
+---
+label: Control Any FlightDeck
+section: Workers & Remote Hosts
+order: 31
+---
+
+# Control Any FlightDeck
+
+For a machine you keep running for agents, use a [worker](/worker). This page is
+for the other case: opening a window onto the terminal UI or Desktop that
+someone (or you) has running on another computer.
+
+The Desktop connects to the other machine's [FlightDeck Web](/web) interface,
+over your local network or a VPN, so it needs nothing new on that machine.
+`flightdeck connect` can attach to it the same way from a terminal.
+
+On the machine you want to control:
+
+1. Run `Start Web Interface` from the command palette.
+2. In the access panel, press `n` for network mode and read the address and the
+   4-digit code it shows.
+
+On the machine you are at, choose **Connect to remote…** (the launcher, or File
+in the menu bar), type the address and the code, and pick Control or Observe.
+The remote opens in its own window, with the usual sidebar, git strip and
+terminals.
+
+- **You browse independently.** Looking at another agent never moves the
+  selection on the other screen. A small `host` marker shows which agent the
+  person at that machine is looking at.
+- **Commands act on what you see.** Push, Finish, Restart, Close and the rest
+  act on the agent this window shows, with the same refusals and the same
+  typed-name step for destructive answers as a browser. Dialogs are shared:
+  they appear on both screens and either side can answer.
+- **Typing is shared** through FlightDeck Web's input lock. Take over from the
+  status bar when someone else is typing, or switch to Observe.
+- **Pairing is remembered** in `~/.flightdeck/remotes.json` (owner-only), so
+  reconnecting needs no code. Forget a remote from the connect window, or revoke
+  it from the other machine's access panel, where it is listed as
+  `FlightDeck Desktop`. Nothing connects when the app starts until you choose a
+  remote.
+- **The link is plain WebSocket**, like FlightDeck Web. The first connect to an
+  address outside loopback or Tailscale warns you once. Use it on a network you
+  trust, or over Tailscale or WireGuard.
+
+## Edit the other machine's files in VS Code
+
+**Open Worktree in VS Code** (command palette, or right-click an agent) opens
+the folder the agent works in in VS Code on the machine you are at. A remote
+window opens it over SSH with VS Code's
+[Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
+extension, so the files stay on the other machine and VS Code's terminal, git
+and language servers run there. A local window just opens the folder.
+
+For a remote window you need:
+
+- VS Code with the Remote - SSH extension on the machine you are at.
+- SSH access to the other machine as the account FlightDeck runs as there. On
+  Linux, `tailscale up --ssh` lets your tailnet log in with no keys. On macOS,
+  turn on **Remote Login** under System Settings → General → Sharing. On
+  Windows, add the **OpenSSH Server** optional feature.
+
+By default FlightDeck connects as the other machine's FlightDeck user, at the
+address you connected to (`user@100.73.111.96`). To use a `Host` entry from
+`~/.ssh/config` instead, add `"ssh_target": "my-alias"` to that remote's record
+in `~/.flightdeck/remotes.json`. It is read each time you open a folder. Set
+one when SSH needs something the address does not say: a port other than 22, a
+different user, or a remote you reach through a tunnel such as
+`localhost:7420`.
+
+Mission control and split view are not offered in a remote window yet. The remote's terminals keep the other machine's
+size: the window shows that grid and does not resize it.

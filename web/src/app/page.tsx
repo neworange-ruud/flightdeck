@@ -3,7 +3,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { JetBrains_Mono } from "next/font/google";
 
-import screenshot from "../../public/screenshots/desktop/main-layout.png";
+import screenshot from "../../public/screenshots/desktop-app/worker-window.png";
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -15,6 +15,8 @@ const MONO = "var(--font-mono), monospace";
 const GITHUB_URL = "https://github.com/neworange-ruud/flightdeck";
 const DOCS_URL = "/docs";
 const PRIVACY_URL = "/privacy";
+const DESKTOP_RELEASES_URL =
+  "https://github.com/neworange-ruud/flightdeck/releases?q=desktop&expanded=true";
 
 export default function HomePage() {
   return (
@@ -116,6 +118,9 @@ export default function HomePage() {
             </span>
           </a>
           <div style={{ display: "flex", alignItems: "center", gap: 30 }}>
+            <a href="#setups" style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
+              How it runs
+            </a>
             <a href="#features" style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
               Features
             </a>
@@ -191,7 +196,7 @@ export default function HomePage() {
               textTransform: "uppercase",
             }}
           >
-            Multiple projects · Parallel agents · one cockpit
+            Parallel agents · always-on workers · one window
           </span>
         </div>
         <h1
@@ -220,10 +225,10 @@ export default function HomePage() {
             textWrap: "pretty",
           }}
         >
-          FlightDeck is a keyboard-driven terminal workspace for running several local AI
-          coding agents in parallel — each in its own Git worktree, on its own branch, in
-          its own session. Supervise the whole fleet from one screen and stay in control of
-          every commit, merge, and pull request.
+          FlightDeck runs several AI coding agents side by side, each on its own Git branch
+          in its own worktree, and shows all of them in one window. Run them on your
+          laptop, or hand them to an always-on worker and keep FlightDeck Desktop as the
+          screen. You stay in control of every commit, merge and pull request.
         </p>
         <div
           style={{
@@ -250,10 +255,10 @@ export default function HomePage() {
               boxShadow: "0 0 40px rgba(111,220,242,0.28)",
             }}
           >
-            Read the documentation
+            Get started
           </Link>
           <a
-            href="#install"
+            href={DESKTOP_RELEASES_URL}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -263,12 +268,11 @@ export default function HomePage() {
               border: "1px solid rgba(255,255,255,0.14)",
               background: "rgba(255,255,255,0.03)",
               color: "#dbe4ee",
-              fontFamily: MONO,
-              fontSize: 14,
-              fontWeight: 500,
+              fontSize: 15,
+              fontWeight: 600,
             }}
           >
-            <span style={{ color: "#6fdcf2" }}>$</span> brew install flightdeck
+            <span style={{ color: "#6fdcf2" }}>↓</span> Download FlightDeck Desktop
           </a>
         </div>
         <p
@@ -307,7 +311,7 @@ export default function HomePage() {
         >
           <Image
             src={screenshot}
-            alt="FlightDeck: project tabs across the top, one row per agent in the sidebar, the active agent's live terminal in the main pane, and a real-time Git summary along the bottom"
+            alt="FlightDeck Desktop connected to a worker: one row per agent with its live status, the selected agent's terminal, and the branch's git state along the bottom"
             placeholder="blur"
             priority
             sizes="(max-width: 1120px) 100vw, 1064px"
@@ -324,10 +328,118 @@ export default function HomePage() {
             color: "#6b7a8c",
           }}
         >
+          FlightDeck Desktop driving a worker: one row per agent with its live status, the
+          selected agent&apos;s terminal, and the branch&apos;s git state along the bottom.
         </p>
       </section>
 
-
+      {/* SETUPS */}
+      <section
+        id="setups"
+        style={{
+          position: "relative",
+          zIndex: 1,
+          maxWidth: 1180,
+          margin: "100px auto 0",
+          padding: "0 28px",
+          textAlign: "center",
+        }}
+      >
+        <h2
+          style={{
+            fontSize: 44,
+            fontWeight: 700,
+            letterSpacing: "-0.03em",
+            color: "#f5f9fd",
+            margin: "0 0 12px",
+          }}
+        >
+          Two ways to run it.
+        </h2>
+        <p
+          style={{
+            fontSize: 18,
+            lineHeight: 1.6,
+            color: "#8b98a8",
+            margin: "0 auto 44px",
+            maxWidth: 620,
+          }}
+        >
+          Same app, same shortcuts. The only difference is where the agents run, and you
+          can switch any time.
+        </p>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+            gap: 18,
+            textAlign: "left",
+          }}
+        >
+          {SETUPS.map((setup) => (
+            <Link
+              key={setup.title}
+              href={setup.href}
+              style={{
+                display: "block",
+                padding: "28px 26px",
+                borderRadius: 14,
+                border: setup.recommended
+                  ? "1px solid rgba(111,220,242,0.45)"
+                  : "1px solid rgba(255,255,255,0.08)",
+                background: setup.recommended
+                  ? "rgba(111,220,242,0.05)"
+                  : "rgba(255,255,255,0.02)",
+                color: "inherit",
+              }}
+            >
+              <div
+                style={{
+                  fontFamily: MONO,
+                  fontSize: 11,
+                  letterSpacing: "0.12em",
+                  color: setup.recommended ? "#6fdcf2" : "#6b7a8c",
+                  marginBottom: 12,
+                  textTransform: "uppercase",
+                }}
+              >
+                {setup.kicker}
+              </div>
+              <h3
+                style={{
+                  fontSize: 22,
+                  fontWeight: 700,
+                  color: "#eaf1f8",
+                  margin: "0 0 10px",
+                  letterSpacing: "-0.02em",
+                }}
+              >
+                {setup.title}
+              </h3>
+              <p style={{ fontSize: 15, lineHeight: 1.6, color: "#8b98a8", margin: "0 0 18px" }}>
+                {setup.body}
+              </p>
+              <ol
+                style={{
+                  margin: 0,
+                  paddingLeft: 20,
+                  listStyle: "decimal",
+                  fontSize: 14.5,
+                  lineHeight: 1.8,
+                  color: "#b4c0cd",
+                }}
+              >
+                {setup.steps.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              <div style={{ marginTop: 20, fontSize: 14.5, fontWeight: 700, color: "#6fdcf2" }}>
+                {setup.cta} →
+              </div>
+            </Link>
+          ))}
+        </div>
+      </section>
 
       {/* FEATURES */}
       <section
@@ -432,7 +544,7 @@ export default function HomePage() {
             textAlign: "center",
           }}
         >
-          Installs in one command.
+          Up and running in minutes.
         </h2>
         <p
           style={{
@@ -444,34 +556,31 @@ export default function HomePage() {
             textAlign: "center",
           }}
         >
-          Install, drop into any Git repo, and run{" "}
-          <span style={{ fontFamily: MONO, color: "#a7b4c4" }}>flightdeck</span>. It
-          auto-initializes on first launch — no config required.
+          Download the Desktop app, open any Git repository and press{" "}
+          <span style={{ fontFamily: MONO, color: "#a7b4c4" }}>Ctrl-n</span>. No config
+          required. Install the CLI on the machine you want as a worker, or to use
+          FlightDeck from a terminal.
         </p>
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(3, 1fr)",
+            gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
             gap: 18,
           }}
         >
-          <InstallCard label="HOMEBREW">
-            <span style={{ color: "#6fdcf2" }}>$</span> brew install \
+          <InstallCard label="FLIGHTDECK DESKTOP · macOS · WINDOWS · LINUX">
+            <a href={DESKTOP_RELEASES_URL} style={{ color: "#6fdcf2", fontWeight: 700 }}>
+              ↓ Download from GitHub Releases
+            </a>
             <br />
-            &nbsp;&nbsp;neworange-ruud/tap/flightdeck
+            <span style={{ color: "#8b98a8" }}>.zip (macOS) · .msi (Windows) · .deb .rpm .AppImage</span>
           </InstallCard>
-          <InstallCard label="macOS / LINUX">
-            <span style={{ color: "#6fdcf2" }}>$</span> curl -LsSf \
+          <InstallCard label="CLI · WORKER & TERMINAL UI">
+            <span style={{ color: "#6fdcf2" }}>$</span> brew install neworange-ruud/tap/flightdeck
             <br />
-            &nbsp;&nbsp;<span style={{ color: "#8b98a8" }}>.../flightdeck-installer.sh</span> \
+            <span style={{ color: "#8b98a8" }}># or: curl -LsSf .../flightdeck-installer.sh | sh</span>
             <br />
-            &nbsp;&nbsp;| sh
-          </InstallCard>
-          <InstallCard label="WINDOWS">
-            <span style={{ color: "#6fdcf2" }}>&gt;</span> irm{" "}
-            <span style={{ color: "#8b98a8" }}>.../installer.ps1</span> \
-            <br />
-            &nbsp;&nbsp;| iex
+            <span style={{ color: "#8b98a8" }}># Windows: irm .../flightdeck-installer.ps1 | iex</span>
           </InstallCard>
         </div>
         <div style={{ textAlign: "center", marginTop: 40 }}>
@@ -588,6 +697,7 @@ function InstallCard({ label, children }: { label: string; children: React.React
           fontSize: 12.5,
           lineHeight: 1.7,
           color: "#cdd8e4",
+          overflowWrap: "anywhere",
         }}
       >
         {children}
@@ -596,53 +706,76 @@ function InstallCard({ label, children }: { label: string; children: React.React
   );
 }
 
+const SETUPS = [
+  {
+    kicker: "Recommended",
+    recommended: true,
+    title: "Desktop + a worker",
+    body: "Agents run on an always-on Mac or Linux machine. Your laptop is only the screen: close the lid and they keep working.",
+    steps: [
+      "flightdeck worker start on the worker",
+      "Pair FlightDeck Desktop with a 4-digit code",
+      "Open a project and start agents as usual",
+    ],
+    cta: "Quickstart: Worker",
+    href: "/docs/worker",
+  },
+  {
+    kicker: "Simplest",
+    recommended: false,
+    title: "Desktop on its own",
+    body: "Agents run on your own computer. Nothing else to set up, and you can add a worker later.",
+    steps: [
+      "Download FlightDeck Desktop",
+      "Open any Git repository",
+      "Press Ctrl-n, pick an agent, name the task",
+    ],
+    cta: "Quickstart: Desktop",
+    href: "/docs/getting-started",
+  },
+];
+
 const FEATURES = [
   {
     icon: "⎇",
     iconColor: "#6fdcf2",
-    title: "Isolated Git worktrees",
+    title: "One branch per agent",
     body: (
       <>
-        Each agent gets its own worktree and branch under{" "}
+        Each agent gets its own Git worktree and branch under{" "}
         <span style={{ fontFamily: MONO, color: "#a7b4c4" }}>.flightdeck/</span>. Agents work
-        simultaneously and never touch each other&apos;s changes.
+        at the same time and never touch each other&apos;s files.
       </>
     ),
   },
   {
-    icon: "⌘",
+    icon: "◉",
     iconColor: "#6fdcf2",
-    title: "Keyboard-first control",
-    body: (
-      <>
-        Two modes, one dependable fallback: the command palette on{" "}
-        <span style={{ fontFamily: MONO, color: "#a7b4c4" }}>Ctrl-g</span>. Switch projects,
-        spawn tabs, push branches — all without leaving the keyboard.
-      </>
-    ),
+    title: "Always-on workers",
+    body: "Put the agents on a spare Mac or Linux box over Tailscale. The Desktop is the screen, and it still notifies you when the window is closed.",
   },
   {
     icon: "●",
     iconColor: "#7ee787",
-    title: "Live agent status",
-    body: "Every tab shows whether its agent is working, idle, or waiting — from real lifecycle hooks, never guessed from terminal output.",
+    title: "Know who needs you",
+    body: "Every agent shows whether it is working, waiting or done, from the agent's own lifecycle events. Mission control puts the ones waiting on you first.",
   },
   {
-    icon: "▤",
+    icon: "✓",
     iconColor: "#6fdcf2",
-    title: "Multiple projects",
-    body: "Open several repos at once. Every project stays live in the background — its agents keep running and still notify while you look elsewhere.",
+    title: "You own the history",
+    body: "FlightDeck never commits, rewrites history, force-pushes or opens pull requests. It pushes your branch when you ask and hands you the PR link.",
   },
   {
-    icon: "⬢",
+    icon: "⌘",
     iconColor: "#6fdcf2",
-    title: "Sandboxed containers",
-    body: "Optionally run each agent inside a rootless Podman container with non-disableable guardrails — the host keeps owning every Git operation.",
+    title: "Any agent, any keyboard",
+    body: "Claude Code, Codex, OpenCode and Cursor out of the box, or add your own. Every action is one shortcut or one search away in the command palette.",
   },
   {
-    icon: "◈",
+    icon: "+",
     iconColor: "#6fdcf2",
-    title: "FlightDeck Remote",
-    body: "Pair your phone to check in on running sessions, chat with an agent, and get pinged the moment one finishes or needs you.",
+    title: "Room to grow",
+    body: "When you need more: run agents in rootless containers, control FlightDeck from a browser or your iPhone, and hook into every worktree's lifecycle.",
   },
 ];

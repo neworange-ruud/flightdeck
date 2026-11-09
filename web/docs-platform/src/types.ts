@@ -18,7 +18,13 @@ export interface DocsSiteConfig {
   mountPath: string;
   theme: { defaultColorMode: "light" | "dark" | "system"; allowToggle: boolean };
   search: { enabled: boolean };
-  navigation: { collapsible: boolean };
+  /**
+   * `collapsedSections` start folded in the sidebar (the one holding the
+   * current page opens), so a long tail of advanced pages stays reachable
+   * without crowding the getting-started path. Ignored when `collapsible` is
+   * false.
+   */
+  navigation: { collapsible: boolean; collapsedSections: string[] };
   mdxComponents: { enabled: DocsMdxComponentName[] };
   codeBlocks: { lineNumbers: boolean | "optional"; copyButton: boolean };
 }

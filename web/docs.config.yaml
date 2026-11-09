@@ -12,6 +12,15 @@ search:
 
 navigation:
   collapsible: true
+  # Folded under "Advanced" in the sidebar so the Start Here / Everyday Use
+  # path stays short. Every page is still in search and keeps its URL.
+  collapsedSections:
+    - Workers & Remote Hosts
+    - More Features
+    - Terminal UI
+    - FlightDeck Web
+    - FlightDeck Remote (iOS)
+    - Reference
 
 mdxComponents:
   enabled:
