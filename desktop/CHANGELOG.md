@@ -18,7 +18,8 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- The remote window's title bar no longer shows the remote's address next to
+  its name; hover the name to see it.
 
 ### Bug fixes
 

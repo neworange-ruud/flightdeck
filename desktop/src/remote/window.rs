@@ -486,19 +486,16 @@ impl RemoteWindow {
                 .hsla()),
             )
             .child(
+                // The address is only a hover away: the title bar keeps the
+                // name and the link state, not the full host:port.
                 div()
+                    .id("remote-name")
                     .debug_selector(|| "remote-name".into())
                     .text_size(px(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.ink.hsla())
+                    .tooltip(icons::tooltip(address))
                     .child(name),
-            )
-            .child(
-                div()
-                    .font_family(MONO_FAMILY)
-                    .text_size(px(11.))
-                    .text_color(p.muted.hsla())
-                    .child(address),
             )
             .child(
                 div()
