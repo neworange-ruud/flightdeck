@@ -3853,6 +3853,42 @@ pub(crate) enum PromptRefusal {
     InputLock,
 }
 
+/// Hand an answer to the agent's plugin: write `body` to the tab's reply file
+/// ([`crate::remote::bridge::agent_reply_path`]), which the plugin watches
+/// while a prompt waits and replies with through OpenCode's API.
+fn write_agent_reply(
+    workspace: &Workspace,
+    env: &Env,
+    project: usize,
+    tab: usize,
+    body: &str,
+) -> (CommandOutcome, Option<String>) {
+    let Some(p) = workspace.projects.get(project) else {
+        return remote_target_gone();
+    };
+    let Some(t) = p.state.tabs.get(tab) else {
+        return remote_target_gone();
+    };
+    // The plugin watches the reply file under the same root its status file
+    // lives in (the worktree, or an isolated run's redirect).
+    let status_root = t
+        .status_file
+        .as_deref()
+        .and_then(|f| f.parent()?.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| t.meta.worktree_path_relative.resolve(&p.state.repo_root));
+    match env
+        .fs
+        .write(&crate::remote::bridge::agent_reply_path(&status_root), body)
+    {
+        Ok(()) => (CommandOutcome::Applied, None),
+        Err(e) => (
+            CommandOutcome::Failed,
+            Some(format!("could not hand the answer to the agent: {e}")),
+        ),
+    }
+}
+
 /// [`answer_prompt`]'s body for either answerer: the same checks, the same
 /// translator and keystroke queue, and the input lock claimed by whoever is
 /// answering — the desktop on [`desktop_may_type`]'s terms, a remote viewer
@@ -4078,37 +4114,31 @@ fn execute_remote_translation(
             }
         }
 
+        Translation::AgentFormReply {
+            project,
+            tab,
+            form_id,
+            answer,
+        } => {
+            let body = match answer {
+                crate::remote::commands::FormAnswer::Selections(answers) => {
+                    serde_json::json!({ "requestID": form_id, "answers": answers })
+                }
+                crate::remote::commands::FormAnswer::Text(text) => {
+                    serde_json::json!({ "requestID": form_id, "text": text })
+                }
+            };
+            write_agent_reply(workspace, env, project, tab, &body.to_string())
+        }
+
         Translation::AgentPermissionReply {
             project,
             tab,
             request_id,
             reply,
         } => {
-            let Some(p) = workspace.projects.get(project) else {
-                return remote_target_gone();
-            };
-            let Some(t) = p.state.tabs.get(tab) else {
-                return remote_target_gone();
-            };
-            // The plugin watches the reply file under the same root its status
-            // file lives in (the worktree, or an isolated run's redirect).
-            let status_root = t
-                .status_file
-                .as_deref()
-                .and_then(|f| f.parent()?.parent())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| t.meta.worktree_path_relative.resolve(&p.state.repo_root));
             let body = serde_json::json!({ "requestID": request_id, "reply": reply }).to_string();
-            match env.fs.write(
-                &crate::remote::bridge::agent_reply_path(&status_root),
-                &body,
-            ) {
-                Ok(()) => (CommandOutcome::Applied, None),
-                Err(e) => (
-                    CommandOutcome::Failed,
-                    Some(format!("could not hand the answer to the agent: {e}")),
-                ),
-            }
+            write_agent_reply(workspace, env, project, tab, &body)
         }
 
         Translation::Dispatch {

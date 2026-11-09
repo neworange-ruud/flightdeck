@@ -384,6 +384,7 @@ fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
     index.sessions[0].agent_request = Some(AgentRequest {
         id: "per_abc".to_string(),
         replies: Vec::new(),
+        kind: AgentRequestKind::Permission,
     });
     for (choice, reply) in [
         (PermissionChoice::AllowOnce, "once"),
@@ -407,6 +408,86 @@ fn opencode_permission_with_a_plugin_request_is_replied_through_the_plugin() {
     ));
 }
 
+/// A decision with every answer field left to the caller.
+fn form_decision(
+    option_index: Option<u32>,
+    option_indices: Option<Vec<u32>>,
+    free_text: Option<&str>,
+    answers: Option<Vec<Vec<u32>>>,
+) -> CommandBody {
+    CommandBody::PermissionDecision {
+        session_id: SessionId::new("t1"),
+        prompt_id: PromptId::new("t1:p2"),
+        choice: None,
+        option_index,
+        option_indices,
+        free_text: free_text.map(str::to_string),
+        answers: answers.map(|a| {
+            a.into_iter()
+                .map(|option_indices| flightdeck_remote_protocol::QuestionAnswer { option_indices })
+                .collect()
+        }),
+    }
+}
+
+#[test]
+fn an_opencode_2_form_is_answered_through_the_plugin_not_typed() {
+    let mut index = answerable("t1:p2", StatusBackend::OpenCode);
+    index.sessions[0].agent_request = Some(AgentRequest {
+        id: "frm_1".to_string(),
+        replies: Vec::new(),
+        kind: AgentRequestKind::Form,
+    });
+    let reply = |answer| Translation::AgentFormReply {
+        project: 0,
+        tab: 0,
+        form_id: "frm_1".to_string(),
+        answer,
+    };
+    assert_eq!(
+        translate(&form_decision(Some(1), None, None, None), &index),
+        reply(FormAnswer::Selections(vec![vec![1]])),
+        "one option"
+    );
+    assert_eq!(
+        translate(&form_decision(None, Some(vec![0, 2]), None, None), &index),
+        reply(FormAnswer::Selections(vec![vec![0, 2]])),
+        "a checklist"
+    );
+    assert_eq!(
+        translate(
+            &form_decision(None, None, None, Some(vec![vec![1], vec![0, 1]])),
+            &index
+        ),
+        reply(FormAnswer::Selections(vec![vec![1], vec![0, 1]])),
+        "several questions, in order"
+    );
+    assert_eq!(
+        translate(&form_decision(Some(0), None, Some("Green"), None), &index),
+        reply(FormAnswer::Text("Green".to_string())),
+        "typed text wins, as it does for a typed answer"
+    );
+    assert!(matches!(
+        translate(&form_decision(None, None, None, None), &index),
+        Translation::Reject { .. }
+    ));
+    // A stale prompt is still refused before the plugin is involved.
+    assert!(matches!(
+        translate(&decision_option("t1:p1", 0), &index),
+        Translation::Reject { .. }
+    ));
+}
+
+#[test]
+fn an_opencode_question_without_a_form_request_is_still_typed() {
+    // OpenCode 1.x, or a 2.x service the plugin cannot reach.
+    let index = answerable("t1:p2", StatusBackend::OpenCode);
+    assert!(matches!(
+        translate(&decision_option("t1:p2", 1), &index),
+        Translation::PtyInput { .. }
+    ));
+}
+
 #[test]
 fn opencode_permission_options_reply_what_the_plugin_tagged_them_with() {
     // With Allow always the phone renders a list and answers by index.
@@ -414,6 +495,7 @@ fn opencode_permission_options_reply_what_the_plugin_tagged_them_with() {
     index.sessions[0].agent_request = Some(AgentRequest {
         id: "per_abc".to_string(),
         replies: vec!["once".into(), "always".into(), "reject".into()],
+        kind: AgentRequestKind::Permission,
     });
     for (option, reply) in [(0, "once"), (1, "always"), (2, "reject")] {
         assert_eq!(
@@ -1361,6 +1443,7 @@ fn build_index_reflects_live_workspace() {
             (sid == "t2").then(|| AgentRequest {
                 id: "per_t2".to_string(),
                 replies: Vec::new(),
+                kind: AgentRequestKind::Permission,
             })
         },
     );

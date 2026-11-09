@@ -1151,12 +1151,63 @@ fn sidecar_permission_carries_the_plugin_request_id() {
     );
     assert_eq!(read_prompt_sidecar(wt.path()).unwrap().1, None);
 
-    // Only permissions are answered through the plugin.
+    assert_eq!(request.kind, AgentRequestKind::Permission);
+}
+
+#[test]
+fn an_opencode_2_form_is_answered_through_the_plugin() {
+    // The OpenCode 2 plugin's sidecar for a one-question form it can answer
+    // through OpenCode's API (captured from 2.2.6).
+    let wt = tempfile::tempdir().unwrap();
     write_sidecar(
         wt.path(),
-        r#"{"kind":"question","text":"?","options":[{"label":"A"}],"requestID":"que_1"}"#,
+        r#"{"kind":"question","text":"Questions\nColor preference",
+            "options":[{"label":"Red","description":"Choose red"},{"label":"Blue"}],
+            "multiple":false,"requestID":"frm_1"}"#,
+    );
+    let (sp, request) = read_prompt_sidecar(wt.path()).expect("form sidecar parses");
+    assert_eq!(
+        request,
+        Some(AgentRequest {
+            id: "frm_1".to_string(),
+            replies: Vec::new(),
+            kind: AgentRequestKind::Form,
+        })
+    );
+    assert_eq!(sp.kind, PromptKind::Question);
+    assert_eq!(sp.options[1].label, "Blue");
+    assert!(
+        sp.questions.is_empty(),
+        "one question: the flat fields describe it"
+    );
+
+    // An OpenCode 1.x question (no request id) is typed into the TUI.
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"?","options":[{"label":"A"}]}"#,
     );
     assert_eq!(read_prompt_sidecar(wt.path()).unwrap().1, None);
+}
+
+#[test]
+fn a_multi_question_opencode_2_form_lists_every_question() {
+    let wt = tempfile::tempdir().unwrap();
+    write_sidecar(
+        wt.path(),
+        r#"{"kind":"question","text":"Setup\nLanguage?",
+            "options":[{"label":"Rust"},{"label":"Go"}],"multiple":false,"requestID":"frm_2",
+            "questions":[
+              {"text":"Language?","options":[{"label":"Rust"},{"label":"Go"}],"multiple":false},
+              {"text":"Extras?","options":[{"label":"CI"},{"label":"Docs"}],"multiple":true}]}"#,
+    );
+    let (sp, request) = read_prompt_sidecar(wt.path()).expect("form sidecar parses");
+    assert_eq!(request.map(|r| r.kind), Some(AgentRequestKind::Form));
+    let questions: Vec<(&str, usize, bool)> = sp
+        .questions
+        .iter()
+        .map(|q| (q.question.as_str(), q.options.len(), q.multi_select))
+        .collect();
+    assert_eq!(questions, [("Language?", 2, false), ("Extras?", 2, true)]);
 }
 
 #[test]
