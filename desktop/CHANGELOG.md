@@ -14,10 +14,12 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- **Mission control in remote windows.** A worker's window, or any FlightDeck opened with Connect to remote…, now has Mission control (Alt-m, or the titlebar's Projects | Mission control switch with the needs-you badge): live tiles across all the host's projects, recent cards, the scope menu, keyboard movement, Enter to open a session full size, and Approve/Deny on a waiting agent's prompt. Browsing stays in your window and never moves the host. A host on an older FlightDeck still shows its live sessions, but its prompts are answered by opening the session, and quiet sessions only appear once they change.
 - A Desktop or worker host now lists the terminal UI's new `flightdeck connect` client as "FlightDeck Terminal" with its machine name, and names that machine in "taken over by …". A worker paired from `flightdeck connect` is also listed in the Desktop's **WORKERS** section, because both use `~/.flightdeck/remotes.json`.
 
 ### Improvements
 
+- **Connect to remote… explains how to pair a worker.** The dialog used to describe only the web interface's network mode. It now says to run `flightdeck worker pair` on a worker, and a host that doesn't answer suggests `flightdeck worker status`.
 - **The docs treat FlightDeck Desktop as the main way to use FlightDeck.** The "preview" label and the build-from-source instructions are gone. Installing is now a download from GitHub Releases, with the first-launch step for macOS, and the docs walk through the Desktop on its own and the Desktop driving a worker. Building from source moved to `CONTRIBUTING.md`.
 - A remote window's rules (what stays local, what goes to the host, mirroring the host's terminals, a worker's picker, messages and takeover) now live in the shared core, so the terminal UI's upcoming `flightdeck connect` behaves exactly like this window. Nothing looks or works differently.
 
