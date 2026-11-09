@@ -19,7 +19,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode 2 works again.** OpenCode 2 rejected FlightDeck's status plugin ("Plugin must export a default definition with an id and an effect or setup function"), so OpenCode tabs showed no status and phone and Mission control answers stopped reaching it. FlightDeck's plugin is now one module that works with both OpenCode 2 (its new `setup` API) and OpenCode 1.x. On OpenCode 2 it reports turns, permission requests (answered through OpenCode's API, with Allow once, Allow always and Reject) and questions, and only for sessions in its own worktree, since OpenCode 2 serves every project from one shared service. The phone's OpenCode transcript also reads OpenCode 2's new conversation tables. The `opencode-flightdeck.js` that `flightdeck setup-status` writes is the same two-version module; install it in `~/.config/opencode/plugins/`, and replace an older copy in `~/.config/opencode/plugin/`, which OpenCode 2 also loads and refuses. Verified against OpenCode 2.2.6 and 1.19.5.
 
 ## [1.32.0] - 2026-11-04
 

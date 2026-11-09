@@ -23,6 +23,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **OpenCode 2 works again.** OpenCode 2 rejected FlightDeck's status plugin, so OpenCode tabs showed no status and Approve/Deny never reached them. FlightDeck's plugin is now one module that works with OpenCode 2's new plugin API and with OpenCode 1.x, and the phone's OpenCode transcript reads OpenCode 2's new tables. Verified against OpenCode 2.2.6 and 1.19.5.
 - The version-skew banner on a worker newer than the app now says to update
   FlightDeck Desktop, instead of telling you to update a worker that is already
   the newer one. A link that ends on a protocol mismatch before the worker said
