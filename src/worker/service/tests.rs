@@ -700,7 +700,10 @@ fn enable_on_macos_leaves_a_running_worker_alone() {
         "the plist is updated"
     );
     assert_eq!(os.ran(), vec![ENABLE], "nothing loaded or started");
-    assert!(out.contains("is left alone: run `flightdeck worker restart`"), "{out}");
+    assert!(
+        out.contains("is left alone: run `flightdeck worker restart`"),
+        "{out}"
+    );
 }
 
 #[test]
