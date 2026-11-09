@@ -67,6 +67,9 @@ pub fn run() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 result.new_version,
             );
+            if worker_runs_here() {
+                println!("{WORKER_RESTART_HINT}");
+            }
         }
         Ok(None) => {
             println!(
@@ -88,6 +91,18 @@ pub fn run() -> Result<()> {
 /// package manager, so we defer. Pure, so the decision is unit-testable.
 fn must_defer(receipt_loaded: bool, receipt_matches_executable: bool) -> bool {
     !receipt_loaded || !receipt_matches_executable
+}
+
+/// Printed after an update while a worker runs on this machine: it keeps the
+/// old binary until it restarts. The binary is replaced in place, so a start
+/// on boot unit (`flightdeck worker enable`) needs no refreshing.
+const WORKER_RESTART_HINT: &str = "FlightDeck: a worker is running on this machine. Run \
+     `flightdeck worker restart` to switch it to the new version.";
+
+/// Whether a worker (or its supervisor) runs for this account.
+fn worker_runs_here() -> bool {
+    crate::worker::paths::WorkerPaths::current()
+        .is_some_and(|paths| crate::worker::lock::worker_running(&crate::contracts::RealFs, &paths))
 }
 
 /// Guidance printed when this install can't be self-updated — no receipt, or a

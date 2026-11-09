@@ -13,6 +13,9 @@
 //! lock file ([`lock`]), so "is a worker running?" is answered by the OS, not
 //! by a pid file that may be stale. Linux and macOS only: on Windows every
 //! subcommand exits with a clear "not supported" error.
+//!
+//! Start on boot (`worker enable` / `disable`) hands the same supervisor to
+//! launchd or systemd, which only ever start it: see [`service`].
 
 pub mod cli;
 pub mod control;
@@ -21,6 +24,7 @@ pub mod lock;
 pub mod log;
 pub mod paths;
 pub mod run;
+pub mod service;
 pub mod state;
 pub mod status;
 pub mod status_cli;

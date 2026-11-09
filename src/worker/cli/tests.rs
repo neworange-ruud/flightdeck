@@ -66,6 +66,17 @@ fn parse_table() {
         (vec!["logs", &follow_flag], logs(true, 100)),
         (vec!["logs", &follow_flag, "-n", "20"], logs(true, 20)),
         (vec!["logs", "-n", "20", "--follow"], logs(true, 20)),
+        (vec!["enable"], Ok(Command::Enable { dry_run: false })),
+        (
+            vec!["enable", "--dry-run"],
+            Ok(Command::Enable { dry_run: true }),
+        ),
+        (vec!["disable"], Ok(Command::Disable { dry_run: false })),
+        (
+            vec!["disable", "--dry-run"],
+            Ok(Command::Disable { dry_run: true }),
+        ),
+        (vec!["enable", "--help"], Ok(Command::Help)),
         (
             vec!["frobnicate"],
             Err(ParseError::Unknown("frobnicate".to_string())),
@@ -92,6 +103,9 @@ fn misused_commands_are_usage_errors() {
         &["logs", "-n", "many"],
         &["logs", "-n", "-3"],
         &["logs", "--tail"],
+        &["enable", "--now"],
+        &["enable", "--dry-run", "--dry-run"],
+        &["disable", "now"],
     ] {
         assert!(
             matches!(parse(&strings(args)), Err(ParseError::Usage(_))),
@@ -110,6 +124,8 @@ fn no_command_or_help_prints_the_table() {
     }
     assert!(USAGE.contains("revoke <device>"));
     assert!(USAGE.contains("logs [-f] [-n N]"));
+    assert!(USAGE.contains("enable [--dry-run]"));
+    assert!(USAGE.contains("disable [--dry-run]"));
     assert!(
         !USAGE.contains("supervise"),
         "the internal command is not advertised"

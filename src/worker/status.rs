@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::worker::control::{DeviceReport, DeviceState, PhoneReport};
+use crate::worker::service::{self, BootReport};
 use crate::worker::state::{ExitReport, SupervisorPhase, SupervisorState};
 
 /// The `schema` of the `worker status --json` document.
@@ -47,6 +48,10 @@ pub struct WorkerStatusReport {
     pub restarts: u32,
     pub last_exit: Option<ExitReport>,
     pub gave_up_reason: Option<String>,
+    /// Whether start on boot (`flightdeck worker enable`) is set up; `None`
+    /// where the OS has no supported service manager.
+    #[serde(default)]
+    pub start_on_boot: Option<BootReport>,
 }
 
 /// The worker's overall state.
@@ -217,6 +222,7 @@ pub fn merge(
         restarts,
         last_exit,
         gave_up_reason,
+        start_on_boot: None,
     };
     match runtime {
         Some(rt) => {
@@ -346,6 +352,11 @@ pub fn render_text(r: &WorkerStatusReport) -> String {
     }
     if let Some(reason) = &r.gave_up_reason {
         line(format!("Gave up: {reason}"));
+    }
+    if let Some(boot) = &r.start_on_boot {
+        for l in service::render_status(boot, None) {
+            line(l);
+        }
     }
     out
 }
@@ -572,16 +583,73 @@ pub(crate) mod tests {
                 "signal": null,
                 "description": "exited with code 101 (panic)"
             },
-            "gave_up_reason": null
+            "gave_up_reason": null,
+            "start_on_boot": null
         });
         assert_eq!(serde_json::to_value(&r).unwrap(), expected);
-        // And it reads back, as does the shape from before `phone` existed.
+        // And it reads back, as does the shape from before `phone` and
+        // `start_on_boot` existed.
         let back: WorkerStatusReport = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(back, r);
         let mut before_phone = expected;
         before_phone.as_object_mut().unwrap().remove("phone");
+        before_phone
+            .as_object_mut()
+            .unwrap()
+            .remove("start_on_boot");
         let back: WorkerStatusReport = serde_json::from_value(before_phone).unwrap();
         assert_eq!(back, r);
+    }
+
+    fn boot() -> BootReport {
+        BootReport {
+            manager: service::Manager::Systemd,
+            unit: "/home/u/.config/systemd/user/flightdeck-worker.service".to_string(),
+            installed: true,
+            enabled: true,
+            loaded: true,
+            active: true,
+            linger: Some(true),
+            other_binary: false,
+            error: None,
+        }
+    }
+
+    /// `start_on_boot` is an addition to schema 1: its names are pinned too.
+    #[test]
+    fn start_on_boot_json_shape_is_pinned() {
+        let mut r = merge(None, None, false, false);
+        r.start_on_boot = Some(boot());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["start_on_boot"],
+            json!({
+                "manager": "systemd",
+                "unit": "/home/u/.config/systemd/user/flightdeck-worker.service",
+                "installed": true,
+                "enabled": true,
+                "loaded": true,
+                "active": true,
+                "linger": true,
+                "other_binary": false,
+                "error": null
+            })
+        );
+        let back: WorkerStatusReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn status_text_ends_with_start_on_boot() {
+        let mut r = merge(None, None, false, false);
+        r.start_on_boot = Some(boot());
+        let text = render_text(&r);
+        assert!(
+            text.ends_with("Start on boot: on (systemd user unit, lingering on)\n"),
+            "{text}"
+        );
+        r.start_on_boot = None;
+        assert!(!render_text(&r).contains("Start on boot"));
     }
 
     #[test]

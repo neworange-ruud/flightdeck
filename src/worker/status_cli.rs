@@ -4,7 +4,8 @@
 //! Each command asks the running worker over [`control::request`] and prints
 //! the answer. `status` also works with nothing running: it merges whatever
 //! it can learn (the worker's answer, `supervisor.json`, which locks are
-//! held) through [`status::merge`]. The rest need a worker and say how to
+//! held) through [`status::merge`], plus whether start on boot is set up
+//! ([`service::query`]). The rest need a worker and say how to
 //! start one when there is none. The text renderers are pure functions, so
 //! every shape is a unit test.
 
@@ -18,6 +19,7 @@ use crate::worker::control::{
     PhonePairingReport, PhonePairingState, PhoneReport,
 };
 use crate::worker::paths::WorkerPaths;
+use crate::worker::service::{self, RealServiceOs};
 use crate::worker::state;
 use crate::worker::status::{self, WorkerStatusReport};
 
@@ -96,7 +98,9 @@ fn status_to(paths: &WorkerPaths, json: bool, out: &mut dyn Write, err: &mut dyn
     // the start-up race (a `worker run` taking its lock at that instant).
     let worker_lock = runtime.is_some() || held(&RealFs, &paths.run_lock);
     let supervisor_lock = held(&RealFs, &paths.supervisor_lock);
-    let report = status::merge(runtime, sup, worker_lock, supervisor_lock);
+    let mut report = status::merge(runtime, sup, worker_lock, supervisor_lock);
+    report.start_on_boot =
+        service::Context::current(paths).map(|ctx| service::query(&RealServiceOs, &ctx));
     match render_status(&report, json) {
         Ok(text) => {
             let _ = write!(out, "{text}");
