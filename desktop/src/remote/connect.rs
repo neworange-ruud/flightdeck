@@ -671,8 +671,9 @@ impl Render for ConnectView {
                     .child("Connect to another FlightDeck"),
             )
             .child(div().text_size(px(12.5)).text_color(p.ink_2.hsla()).child(
-                "On the other machine, start the web interface, switch its access overlay \
-                 to network mode (n), and read the address and code it shows.",
+                "On a worker, run `flightdeck worker pair` there. On a terminal UI or \
+                 Desktop, start the web interface and switch its access overlay to network \
+                 mode (n). Enter the address and the 4-digit code it shows.",
             ))
             .child(field(&p, "Address", Input::new(&self.address)))
             .child(field(&p, "Code", Input::new(&self.code)))

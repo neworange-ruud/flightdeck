@@ -64,8 +64,9 @@ impl ExchangeError {
     pub fn sentence(&self) -> String {
         match self {
             ExchangeError::Unreachable(detail) => format!(
-                "Nothing answered at that address ({detail}). Check that the web interface is \
-                 running there in network mode."
+                "Nothing answered at that address ({detail}). On a worker, check that it runs \
+                 (`flightdeck worker status`); on a terminal UI or Desktop, that the web \
+                 interface is running in network mode."
             ),
             ExchangeError::Refused {
                 reason,
