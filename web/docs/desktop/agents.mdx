@@ -76,7 +76,9 @@ file in the worktree:
 
 - **Claude Code** — prompt/stop hooks via a launch-scoped plugin,
 - **Codex CLI** — prompt/stop hooks,
-- **OpenCode** — its native `session.status` events,
+- **OpenCode** — a launch-scoped plugin on its own events: turn start and end,
+  permission requests and questions. The same plugin works with OpenCode 2 and
+  OpenCode 1.x,
 - **Cursor CLI** — `beforeSubmitPrompt` / `stop` hooks.
 
 Generated bridge files live under the ignored `.flightdeck/runtime/` directory.

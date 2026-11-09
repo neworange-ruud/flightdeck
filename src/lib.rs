@@ -399,7 +399,7 @@ fn run_setup_status() -> Result<()> {
     println!();
     println!("  Claude Code → merge claude-code.settings.json into ~/.claude/settings.json");
     println!("  Codex CLI   → append codex-config.toml to ~/.codex/config.toml");
-    println!("  OpenCode    → copy opencode-flightdeck.js to ~/.config/opencode/plugin/");
+    println!("  OpenCode    → copy opencode-flightdeck.js to ~/.config/opencode/plugins/ (OpenCode 1.x and 2)");
     println!("  Cursor CLI  → merge cursor-hooks.json into ~/.cursor/hooks.json");
     Ok(())
 }

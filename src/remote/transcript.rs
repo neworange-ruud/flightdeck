@@ -1104,7 +1104,8 @@ fn opencode_tool_activity(
 ) -> (String, Option<String>, Option<String>, ActivityKind) {
     let s = |k: &str| input.get(k).and_then(Value::as_str);
     match tool {
-        "bash" => {
+        // OpenCode 2 calls its shell tool `shell`.
+        "bash" | "shell" => {
             let cmd = s("command").unwrap_or("");
             let summary = s("description")
                 .map(str::to_string)
@@ -1113,13 +1114,19 @@ fn opencode_tool_activity(
             (summary, None, body, ActivityKind::Command)
         }
         "edit" | "write" | "patch" => (
-            format!("Edited {}", basename(s("filePath").unwrap_or(""))),
+            format!(
+                "Edited {}",
+                basename(s("filePath").or_else(|| s("path")).unwrap_or(""))
+            ),
             None,
             None,
             ActivityKind::Edit,
         ),
         "read" => (
-            format!("Read {}", basename(s("filePath").unwrap_or(""))),
+            format!(
+                "Read {}",
+                basename(s("filePath").or_else(|| s("path")).unwrap_or(""))
+            ),
             None,
             None,
             ActivityKind::Search,
