@@ -34,7 +34,7 @@ pub mod view;
 pub mod zoom;
 
 use flightdeck::terminal::grid::Emulator;
-use flightdeck::terminal::session::{Terminal, TerminalProfile};
+use flightdeck::terminal::session::TerminalProfile;
 
 /// The emulator every desktop terminal is built on.
 pub const EMULATOR: Emulator = Emulator::Alacritty;
@@ -55,64 +55,13 @@ pub fn desktop_profile() -> TerminalProfile {
     }
 }
 
-/// The most bytes one [`pump`] parses. alacritty_terminal parses roughly
-/// 150 MB/s on an M2 Pro, so this is a few milliseconds of UI-thread time:
-/// output that piled up while the thread was busy (a window resize, a slow
-/// frame) is worked off over several polls with frames in between, instead of
-/// in one long stall.
-pub const PARSE_BUDGET: usize = 1 << 20;
-
-/// What one [`pump`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Pumped {
-    /// Bytes fed to the emulator.
-    pub parsed: usize,
-    /// The emulator released output it had been holding (a synchronized
-    /// update that ended or timed out): the screen changed without new bytes.
-    pub released: bool,
-    /// Bytes read but not yet parsed are waiting in the backlog.
-    pub backlog: bool,
-}
-
-impl Pumped {
-    /// Whether the screen may look different now.
-    pub fn changed(&self) -> bool {
-        self.parsed > 0 || self.released
-    }
-}
-
-/// Move what the PTY has produced into the grid, at most [`PARSE_BUDGET`]
-/// bytes of it (the rest waits in `backlog` for the next call), answer the
-/// queries it raised, then advance the emulator's timers. Shared by the
-/// window's poll loop and the headless `--dump-grid` probe, so the probe
-/// exercises exactly what the window draws.
-pub fn pump(terminal: &mut Terminal, backlog: &mut Vec<u8>) -> Pumped {
-    let held = terminal.screen().holds_output();
-    let fresh = terminal.session_mut().try_read_output().unwrap_or_default();
-    let parsed = if backlog.is_empty() && fresh.len() <= PARSE_BUDGET {
-        // The usual case: parse the read as is, no copy.
-        feed(terminal, &fresh);
-        fresh.len()
-    } else {
-        backlog.extend_from_slice(&fresh);
-        let chunk: Vec<u8> = backlog.drain(..backlog.len().min(PARSE_BUDGET)).collect();
-        feed(terminal, &chunk);
-        chunk.len()
-    };
-    terminal.tick();
-    Pumped {
-        parsed,
-        released: held && !terminal.screen().holds_output(),
-        backlog: !backlog.is_empty(),
-    }
-}
-
-fn feed(terminal: &mut Terminal, bytes: &[u8]) {
-    if !bytes.is_empty() {
-        terminal.process_output(bytes);
-        terminal.answer_cursor_position_query(bytes);
-    }
-}
+// The bounded PTY-to-grid pump is the core's, shared with the terminal UI's
+// remote client.
+pub use flightdeck::terminal::pump::pump;
+#[cfg(test)]
+use flightdeck::terminal::pump::{Pumped, PARSE_BUDGET};
+#[cfg(test)]
+use flightdeck::terminal::session::Terminal;
 
 /// Environment a desktop terminal's process starts with. A GUI app launched
 /// from the Finder, Explorer or a desktop launcher has no `TERM` of its own to

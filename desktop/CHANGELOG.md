@@ -18,7 +18,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- A remote window's rules (what stays local, what goes to the host, mirroring the host's terminals, a worker's picker, messages and takeover) now live in the shared core, so the terminal UI's upcoming `flightdeck connect` behaves exactly like this window. Nothing looks or works differently.
 
 ### Bug fixes
 

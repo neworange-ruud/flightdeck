@@ -211,7 +211,7 @@ pub struct TerminalView {
     /// which sets the polling rate.
     cadence: Cadence,
     /// Owned source: PTY bytes read but not parsed yet (see
-    /// [`super::PARSE_BUDGET`]).
+    /// [`flightdeck::terminal::pump::PARSE_BUDGET`]).
     backlog: Vec<u8>,
     /// Owned source: poll again soon regardless of the cadence (a backlog is
     /// waiting, or the emulator holds a synchronized update).

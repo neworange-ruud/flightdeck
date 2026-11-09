@@ -14,6 +14,8 @@
 //! | [`exchange`] | `POST /auth/exchange` and `GET /auth/session` |
 //! | [`link`] | the WebSocket task: attach, pump, reconnect, cursors |
 //! | [`mirror`] | [`RemoteWorkspace`]: snapshot + deltas, local selection |
+//! | [`session`] | [`session::RemoteSession`]: a front-end's whole remote model |
+//! | [`messages`] | a worker's host messages and update advice, in words |
 //! | [`input`] | the held-input queue and its one seq counter |
 //! | [`store`] | `~/.flightdeck/remotes.json`: paired instances and their tokens |
 //! | [`terminals`] | [`StreamPty`]: a remote terminal behind `PtySession` |
@@ -35,7 +37,9 @@ pub mod exchange;
 pub(crate) mod fake_host;
 pub mod input;
 pub mod link;
+pub mod messages;
 pub mod mirror;
+pub mod session;
 pub mod store;
 pub mod terminals;
 pub mod views;
