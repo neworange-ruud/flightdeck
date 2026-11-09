@@ -1309,5 +1309,7 @@ pub fn start(os: &dyn ServiceOs, ctx: &Context, report: &BootReport) -> ServiceS
     }
 }
 
-#[cfg(test)]
+// launchd and systemd only: the paths and commands the tests expect are Unix
+// ones, and `flightdeck worker` refuses to run on Windows.
+#[cfg(all(test, unix))]
 mod tests;
