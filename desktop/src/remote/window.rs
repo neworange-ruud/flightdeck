@@ -20,7 +20,14 @@
 //! rule: the root carries the `"Global"` context and performs table chords —
 //! through [`crate::commands::perform_remote_entry`] — the sidebar `"App"`,
 //! the terminal `"Terminal"`, and focus follows this window's own input mode.
-//! Mission control and split view have no remote counterpart in v1.
+//!
+//! Mission control is the local window's own view
+//! ([`crate::views::mission::MissionControl::for_remote`]), switched to with
+//! Alt-m or the titlebar's Projects | Mission control switch, drawn in place
+//! of the sidebar and main area. Its selection, main view and scope are this
+//! window's (R2), for the window's lifetime; chords and inline prompt answers
+//! go to the host as every other control's do. Split view has no remote
+//! counterpart: it arranges the host's own screen.
 //!
 //! The first tab, before the project tabs, is the SSH shell
 //! ([`super::shell`]): a terminal this window runs itself, drawn full width
@@ -43,8 +50,8 @@ use flightdeck_desktop::keys::{app_key_down, KeymapAction};
 use flightdeck_desktop::overlays::{Emit, OverlayContext, OverlayLayer};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    div, px, App, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
@@ -60,9 +67,11 @@ use crate::terminal::view::TerminalView;
 use crate::theme::Palette;
 use crate::views::git_strip::git_strip;
 use crate::views::icons;
+use crate::views::mission::{mission_hints, MissionControl};
 use crate::views::sidebar::{sidebar, SidebarData};
 use crate::views::status_bar::STATUS_BAR_HEIGHT;
-use crate::views::titlebar::TITLEBAR_HEIGHT;
+use crate::views::titlebar::{view_switcher, TITLEBAR_HEIGHT};
+use flightdeck::persistence::workspace::MainView;
 
 /// Room for the macOS traffic lights, as the local titlebar leaves.
 #[cfg(target_os = "macos")]
@@ -74,6 +83,9 @@ pub struct RemoteWindow {
     remote: Entity<RemoteModel>,
     terminal: Entity<TerminalView>,
     app_focus: FocusHandle,
+    /// Mission control (A2/A3) over the host, drawn instead of the sidebar
+    /// and main area while it is this window's main view.
+    mission: Entity<MissionControl>,
     layer: Entity<OverlayLayer>,
     /// The SSH shell, once its tab was first shown.
     shell: Option<Entity<TerminalView>>,
@@ -104,12 +116,17 @@ impl RemoteWindow {
         };
         let terminal = cx.new(|cx| TerminalView::for_remote(remote.clone(), cx));
         let layer = cx.new(|cx| OverlayLayer::new(emit, cx));
+        let app_focus = cx.focus_handle();
+        let mission = cx.new(|cx| {
+            MissionControl::for_remote(remote.clone(), terminal.clone(), app_focus.clone(), cx)
+        });
         // `open_remote_window` titles the window with the name it opened on.
         let titled = remote.read(cx).label().to_string();
         Self {
             remote,
             terminal,
-            app_focus: cx.focus_handle(),
+            app_focus,
+            mission,
             layer,
             shell: None,
             shell_target: String::new(),
@@ -362,14 +379,40 @@ impl RemoteWindow {
                     return;
                 }
             }
+            // In Mission control the moving keys follow tile order.
+            let surface = Surface::Remote(self.remote.clone());
+            if self.mission_shown(cx) && MissionControl::intercept_on(&surface, entry, cx) {
+                return;
+            }
             perform_remote_entry(entry, &self.remote, cx);
         }
+    }
+
+    /// Whether Mission control is what the window draws: it is the main view,
+    /// a project (not a shell's tab) is on screen, and the host is there to
+    /// show — a worker with no project yet keeps its "open a project" card.
+    fn mission_shown(&self, cx: &App) -> bool {
+        let model = self.remote.read(cx);
+        let ws = model.workspace();
+        model.main_view() == MainView::Mission
+            && model.tab() == Tab::Project
+            && ws.ready
+            && model.ended().is_none()
+            && model.picker().is_none()
+            && !(model.is_worker() && ws.projects.is_empty())
     }
 
     fn titlebar(&mut self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.remote.read(cx);
         let ws = model.workspace();
         let tabs = views::project_tabs(ws);
+        let main_view = model.main_view();
+        let needs_you = ws
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .filter(|s| flightdeck::app::activity::needs_you(s.status.interpreted))
+            .count();
         let tab = model.tab();
         let on_project = tab == Tab::Project;
         let worker = model.is_worker();
@@ -501,6 +544,12 @@ impl RemoteWindow {
             .border_b_1()
             .border_color(p.hairline.hsla())
             .child(identity)
+            .child(view_switcher(
+                p,
+                needs_you,
+                main_view,
+                &Surface::Remote(self.remote.clone()),
+            ))
             .child(div().flex_none().w(px(1.)).h(px(20.)).bg(p.border.hsla()))
             .child(tabs_row)
             .child(command);
@@ -530,6 +579,7 @@ impl RemoteWindow {
     }
 
     fn status_bar(&self, p: &Palette, cx: &Context<Self>) -> impl IntoElement {
+        let mission = self.mission_shown(cx);
         let model = self.remote.read(cx);
         let ws = model.workspace();
         let mode = model.mode();
@@ -624,7 +674,17 @@ impl RemoteWindow {
             .text_size(px(11.5))
             .text_color(p.muted.hsla())
             .child(pill)
-            .child(hint(p, "OpenPalette", "commands"))
+            .when_else(
+                mission,
+                |bar| {
+                    bar.children(mission_hints(
+                        mode,
+                        &Surface::Remote(self.remote.clone()),
+                        p,
+                    ))
+                },
+                |bar| bar.child(hint(p, "OpenPalette", "commands")),
+            )
             .child(div().flex_1().min_w_0().truncate().children(notice))
             .child(
                 div()
@@ -821,6 +881,7 @@ impl Render for RemoteWindow {
         self.sync_picker(window, cx);
         self.sync_rename(window, cx);
         self.sync_title(window, cx);
+        let mission = self.mission_shown(cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
             window.remove_window();
@@ -913,6 +974,13 @@ impl Render for RemoteWindow {
                     .min_h_0()
                     .w_full()
                     .child(picker)
+                    .into_any_element(),
+                None if mission => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .items_start()
+                    .child(self.mission.clone())
                     .into_any_element(),
                 None => h_flex()
                     .flex_1()

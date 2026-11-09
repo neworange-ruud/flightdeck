@@ -1061,11 +1061,13 @@ impl RemoteSession {
     /// the selection, so Projects opens on the very session that was selected.
     /// Either shows the host's projects (not a shell's tab).
     pub fn set_main_view(&mut self, to: MainView) {
+        // From a shell's tab, the view asked for comes back on screen even
+        // when it already is the main view underneath.
+        self.tab = Tab::Project;
         if self.main_view == to {
             return;
         }
         self.main_view = to;
-        self.tab = Tab::Project;
         if to == MainView::Mission {
             let view = self.mission_view();
             let on_a_tile = self

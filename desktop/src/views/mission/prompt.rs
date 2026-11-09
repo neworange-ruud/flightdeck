@@ -10,7 +10,9 @@
 //! A button sends [`HostEvent::AnswerPrompt`]; the host runs it through the
 //! phone's translator and keystroke queue and the input lock, so nothing here
 //! knows which keys an agent wants. Clicks stop at the button: answering a
-//! prompt does not also select (or, on a double click, open) the tile.
+//! prompt does not also select (or, on a double click, open) the tile. In a
+//! remote window the same event becomes the host's `answer_prompt`, which
+//! the host runs down that very path.
 //!
 //! [`HostEvent::AnswerPrompt`]: flightdeck::host::HostEvent::AnswerPrompt
 
@@ -18,14 +20,13 @@ use flightdeck::app::modes::InputMode;
 use flightdeck::host::HostEvent;
 use flightdeck::view::{MissionTile, PromptAnswer, PromptReply, PromptShape};
 use gpui::{
-    div, px, AnyElement, App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    div, px, AnyElement, App, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled,
 };
 use gpui_component::h_flex;
 
-use super::select_session;
 use crate::commands::keycap;
-use crate::host::HostModel;
+use crate::surface::Surface;
 use crate::theme::{Hex, Palette};
 use crate::views::icons;
 
@@ -39,13 +40,13 @@ const ROW_HEIGHT: f32 = 34.;
 pub fn prompt_row(
     index: usize,
     t: &MissionTile,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> Option<AnyElement> {
     let prompt = t.prompt.as_ref()?;
     let mut buttons: Vec<AnyElement> = Vec::new();
     if prompt.shape == PromptShape::Unsupported {
-        let host = host.clone();
+        let surface = surface.clone();
         let key = t.key.clone();
         let tab_index = t.tab_index;
         buttons.push(
@@ -61,7 +62,7 @@ pub fn prompt_row(
             ))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
-                select_session(&host, &key, tab_index, InputMode::Terminal, cx);
+                surface.select_session(&key, tab_index, InputMode::Terminal, cx);
             })
             .into_any_element(),
         );
@@ -77,12 +78,12 @@ pub fn prompt_row(
             prompt_id: prompt.prompt_id.clone(),
             answer: b.answer,
         };
-        let host = host.clone();
+        let surface = surface.clone();
         buttons.push(
             button((index, selector.into()), b.label.clone().into(), style, p)
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    answer(&host, reply.clone(), cx);
+                    answer(&surface, reply.clone(), cx);
                 })
                 .into_any_element(),
         );
@@ -110,12 +111,9 @@ pub fn prompt_row(
     )
 }
 
-/// Send the answer through the host, as every other control's event.
-fn answer(host: &Entity<HostModel>, reply: PromptReply, cx: &mut App) {
-    host.update(cx, |model, cx| {
-        model.dispatch(HostEvent::AnswerPrompt(reply), cx);
-        cx.notify();
-    });
+/// Send the answer through the model, as every other control's event.
+fn answer(surface: &Surface, reply: PromptReply, cx: &mut App) {
+    surface.dispatch(HostEvent::AnswerPrompt(reply), cx);
 }
 
 #[derive(Clone, Copy)]

@@ -323,6 +323,11 @@ fn the_view_and_scope_are_this_front_ends_and_outlive_a_reconnect() {
     };
     session.set_mission_scope(scope.clone());
     session.set_main_view(MainView::Mission);
+    // From the SSH shell's tab, asking for the view it already has shows it.
+    session.show_ssh_shell();
+    assert_eq!(session.tab(), Tab::SshShell);
+    session.set_main_view(MainView::Mission);
+    assert_eq!(session.tab(), Tab::Project);
     session.reconnect();
     assert_eq!(session.mission_scope(), &scope);
     assert_eq!(session.main_view(), MainView::Mission);
