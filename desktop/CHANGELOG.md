@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- A Desktop or worker host now lists the terminal UI's new `flightdeck connect` client as "FlightDeck Terminal" with its machine name, and names that machine in "taken over by …". A worker paired from `flightdeck connect` is also listed in the Desktop's **WORKERS** section, because both use `~/.flightdeck/remotes.json`.
 
 ### Improvements
 

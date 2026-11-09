@@ -1523,3 +1523,72 @@ fn pair_phone_on_a_worker_without_the_phone_link_says_how_to_turn_it_on() {
         "no phone identity was made"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The terminal UI's `flightdeck connect` (remote-control-ki05)
+// ---------------------------------------------------------------------------
+
+/// `flightdeck connect`'s front-end drives a worker the way a Desktop window
+/// does: it pairs under its own name, takes the worker over from the window
+/// already open, starts on the shell of a worker with no projects, sizes that
+/// shell to its pane (W5) and types into it.
+#[test]
+fn the_terminal_ui_takes_a_worker_over_and_drives_its_shell() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use flightdeck::connect::ui::ConnectUi;
+    use flightdeck::contracts::UiConfig;
+    use flightdeck::web::client::session::Tab;
+    use ratatui::layout::Rect;
+
+    let worker = Worker::start();
+    let (_desktop_token, mut window) = worker.window("laptop");
+
+    let code: PairingCode = worker.cli_json(&["worker", "pair", "--json"]);
+    let label = "FlightDeck Terminal/test (term-box)";
+    let token = on_runtime(exchange_code(&worker.addr, &code.code, label))
+        .unwrap_or_else(|e| panic!("the code is exchanged: {e:?}{}", worker.log_tail()));
+    let client = RemoteClient::connect(LinkConfig {
+        address: worker.addr.clone(),
+        token,
+        seat: SeatRequest::Write,
+        user_agent: label.to_string(),
+        connection: ConnectionKind::Window,
+        retry_cap_ms: None,
+    });
+    let mut ui = ConnectUi::new(client, "box", &worker.addr, None, UiConfig::default());
+    let area = Rect::new(0, 0, 120, 36);
+    worker.wait("the terminal UI to attach", || {
+        ui.pump(area);
+        ui.session().workspace().ready
+    });
+
+    // The Desktop window is told who took the worker over.
+    worker.wait("the Desktop window to be taken over", || {
+        window.pump();
+        matches!(window.state(), LinkState::Ended(LinkEnd::TakenOver { by }) if by == "term-box")
+    });
+    assert_eq!(
+        worker.status().attached.map(|a| a.label),
+        Some("term-box".to_string())
+    );
+
+    // A worker with no project open starts on its shell, sized to the pane.
+    assert_eq!(ui.session().tab(), Tab::WorkerShell);
+    worker.wait("the shell to take the pane's size", || {
+        ui.pump(area);
+        ui.session()
+            .worker_shell()
+            .is_some_and(|s| s.geometry.cols > 60 && s.geometry.cols < area.width)
+    });
+
+    for c in "echo fd-tui-$((6*7))".chars() {
+        ui.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    worker.wait("the shell to answer", || {
+        ui.pump(area);
+        ui.session()
+            .active_terminal()
+            .is_some_and(|t| t.screen().contents().contains("fd-tui-42"))
+    });
+}

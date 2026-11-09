@@ -93,6 +93,50 @@ If the worker isn't running, `pair` says so and tells you to run
 `flightdeck worker start`. If it prints a warning that the worker is not
 listening, see [No Tailscale address](#no-tailscale-address).
 
+## Drive it from a terminal
+
+You don't need the Desktop to use a worker. `flightdeck connect` is the terminal
+UI attached to a FlightDeck on another machine: the worker's projects, agents and
+shell, drawn with the same sidebar, tabs and palette as the local terminal UI. It
+runs on any machine with FlightDeck 1.33 or later, including over SSH.
+
+1. Pair once. On the worker, run `flightdeck worker pair`. Then, on your machine:
+
+   ```bash
+   flightdeck connect --pair box.tail1234.ts.net
+   ```
+
+   Type the code when asked. The port defaults to 7420. The token is saved in
+   `~/.flightdeck/remotes.json`. FlightDeck Desktop saves its pairings in the same
+   file, so a worker paired from either one works in both.
+
+2. Connect:
+
+   ```bash
+   flightdeck connect            # pick from the paired remotes
+   flightdeck connect box        # by name or address
+   flightdeck connect --list     # list them
+   ```
+
+The top row names the worker, shows the link's state and the last message from
+the worker. On a worker, the first project tab is the **worker shell**, and a
+worker with no projects opens on it. In the shell, every key goes to the shell.
+The key that leaves terminal focus (Alt+Esc, or F2) returns to the project.
+**Open Project** in the palette (Ctrl-g) opens the project picker: **Tab** moves
+between the repositories found in `projects_root`, a folder browser of your home
+directory, and a clone URL.
+
+The worker sizes its terminals to your terminal pane. `flightdeck connect` attaches
+as a window, so it takes the worker over from any Desktop window already open on
+it (see [One window at a time](#one-window-at-a-time)). Press **r** on the
+"taken over" screen to take it back. Use `--observe` to watch without typing.
+**Ctrl-q** disconnects. The worker and its agents keep running.
+
+`flightdeck connect` also works with another machine's terminal UI or Desktop,
+using the code its browser access overlay shows in network mode. The host's
+configuration manager is not available in `flightdeck connect` yet; use the
+Desktop, or edit `~/.flightdeck/config.toml` in the worker shell.
+
 ## Log in to your agents
 
 Each worker window has a **Worker shell** tab, first in the tab bar. It is a login
@@ -147,7 +191,7 @@ Anything that resolves outside it, including through a symlink, is refused.
 ## One window at a time
 
 A worker has one remote window at a time. If you open the worker from a second
-Desktop, the second one takes over. The first window shows **Taken over by
+Desktop, or with `flightdeck connect`, the newer one takes over. The first window shows **Taken over by
 `<device>`** with a **Reconnect** button, which takes the worker back. Its
 pairing stays valid.
 

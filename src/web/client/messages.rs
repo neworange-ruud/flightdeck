@@ -15,7 +15,7 @@
 //! differs between the two, because each updates itself differently:
 //! [`Advice`].
 
-use crate::web::protocol::{HostMessage, MessageLevel};
+use crate::web::protocol::{Health, HostMessage, MessageLevel};
 
 /// One message as a line: its level when it is louder than information,
 /// then the worker's words verbatim.
@@ -103,6 +103,41 @@ pub fn mismatch_advice(reason: &str, host: &str, app: &str, advice: &Advice) -> 
         text
     } else {
         format!("{reason} {text}")
+    }
+}
+
+/// Health in one line: `load 0.42 · 18 GB free · 3 agents`. Parts the
+/// worker could not measure are left out.
+pub fn health_line(health: &Health) -> String {
+    let mut parts = Vec::new();
+    if let Some(load) = health.load_avg_1m_centi {
+        parts.push(format!("load {}.{:02}", load / 100, load % 100));
+    }
+    if let Some(free) = health
+        .disk_free_projects_root_bytes
+        .or(health.disk_free_home_bytes)
+    {
+        parts.push(format!("{} free", bytes(free)));
+    }
+    match health.agents_total {
+        0 => {}
+        1 => parts.push("1 agent".to_string()),
+        n => parts.push(format!("{n} agents")),
+    }
+    parts.join(" · ")
+}
+
+/// A size as people read a disk's: decimal units, whole numbers from 10 up.
+fn bytes(n: u64) -> String {
+    const GB: f64 = 1e9;
+    const MB: f64 = 1e6;
+    let n = n as f64;
+    if n >= 10.0 * GB {
+        format!("{:.0} GB", n / GB)
+    } else if n >= GB {
+        format!("{:.1} GB", n / GB)
+    } else {
+        format!("{:.0} MB", n / MB)
     }
 }
 

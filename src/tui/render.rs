@@ -2528,11 +2528,29 @@ pub enum PaletteHit {
 /// acts — the border, the filter row, a group header, a blank row — so the box
 /// stays open under a click the user clearly aimed at it.
 pub fn palette_hit(area: Rect, palette: &CommandPalette, col: u16, row: u16) -> Option<PaletteHit> {
+    palette_rows_hit(
+        area,
+        &palette.filtered(),
+        palette.selected_index(),
+        col,
+        row,
+    )
+}
+
+/// [`palette_hit`] over rows a front-end filtered itself (a remote host's
+/// palette, `flightdeck connect`): `filtered` as drawn by
+/// [`draw_palette_rows`], with `selected` highlighted.
+pub fn palette_rows_hit(
+    area: Rect,
+    filtered: &[&'static PaletteEntry],
+    selected: usize,
+    col: u16,
+    row: u16,
+) -> Option<PaletteHit> {
     let pl = palette_layout(area);
     if !rect_contains(pl.overlay, col, row) {
         return Some(PaletteHit::Dismiss);
     }
-    let filtered = palette.filtered();
     if filtered.is_empty() {
         return None;
     }
@@ -2544,13 +2562,32 @@ pub fn palette_hit(area: Rect, palette: &CommandPalette, col: u16, row: u16) -> 
     } else {
         return None;
     };
-    let rows = palette_column_rows(entries, base, palette.selected_index());
+    let rows = palette_column_rows(entries, base, selected);
     let index = row.checked_sub(column.y)? as usize;
     rows.get(index).and_then(|r| r.entry).map(PaletteHit::Entry)
 }
 
 /// Draw the command palette as a centered overlay (SPECS §22).
 pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: Rect) {
+    draw_palette_rows(
+        frame,
+        area,
+        palette.filter(),
+        &palette.filtered(),
+        palette.selected_index(),
+    );
+}
+
+/// [`draw_palette_overlay`] for rows a front-end filtered itself (a remote
+/// host's palette, `flightdeck connect`): the box, the `filter` line and
+/// `filtered` in two columns with `selected` highlighted.
+pub fn draw_palette_rows(
+    frame: &mut Frame,
+    area: Rect,
+    filter: &str,
+    filtered: &[&'static PaletteEntry],
+    selected_idx: usize,
+) {
     // The same geometry the hit test measures, so a click lands on the row it
     // is pointing at.
     let pl = palette_layout(area);
@@ -2565,14 +2602,10 @@ pub fn draw_palette_overlay(frame: &mut Frame, palette: &CommandPalette, area: R
     // Filter input line.
     let filter_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(palette.filter().to_string()),
+        Span::raw(filter.to_string()),
         Span::styled("_", Style::default().fg(Color::Cyan)), // cursor
     ]);
     frame.render_widget(Paragraph::new(filter_line), pl.filter);
-
-    // Filtered list.
-    let filtered = palette.filtered();
-    let selected_idx = palette.selected_index();
 
     if filtered.is_empty() {
         frame.render_widget(
