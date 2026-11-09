@@ -13,6 +13,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 ### Improvements
 
 - The terminal UI now draws each frame from a screen model rather than straight from its own state. Nothing looks different; this is groundwork for `flightdeck connect`, which will let the terminal UI drive a FlightDeck worker (or another machine's FlightDeck) the way FlightDeck Desktop's remote window does.
+- FlightDeck Desktop's remote-window model (what stays local, what goes to the host, mirroring the host's terminals, a worker's picker, messages and takeover) moved into the shared core as `web::client::session`, so `flightdeck connect` and the Desktop follow the same rules. Nothing looks or works differently.
 
 ### Bug fixes
 

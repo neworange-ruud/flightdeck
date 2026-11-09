@@ -3,5 +3,6 @@
 
 pub mod grid;
 pub mod pty;
+pub mod pump;
 pub mod session;
 pub mod shell;
