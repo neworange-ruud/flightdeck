@@ -23,6 +23,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **Desktop releases are now notarized by Apple.** The release job was looking for notarization secrets that were never set, so it signed the macOS app but skipped notarization. It now uses the App Store Connect API key the iOS TestFlight upload already uses, so a downloaded `FlightDeck.app` opens without the Gatekeeper warning.
 - The version-skew banner on a worker newer than the app now says to update
   FlightDeck Desktop, instead of telling you to update a worker that is already
   the newer one. A link that ends on a protocol mismatch before the worker said
