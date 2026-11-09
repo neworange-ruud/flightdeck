@@ -12,7 +12,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- The terminal UI now draws each frame from a screen model rather than straight from its own state. Nothing looks different; this is groundwork for `flightdeck connect`, which will let the terminal UI drive a FlightDeck worker (or another machine's FlightDeck) the way FlightDeck Desktop's remote window does.
 
 ### Bug fixes
 

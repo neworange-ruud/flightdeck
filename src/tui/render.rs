@@ -28,16 +28,17 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::app::modes::InputMode;
-use crate::app::state::{AppState, TabPhase};
+use crate::app::state::AppState;
 use crate::git::status::WorktreeStatus;
 use crate::terminal::grid::{GridColor, GridView};
 use crate::tui::config_manager::{ConfigManager, Origin};
 use crate::tui::layout;
 use crate::tui::mode_style;
 use crate::tui::palette::{CommandPalette, PaletteEntry};
+use crate::tui::screen::Screen;
 use crate::tui::selection::Selection;
 use crate::view::{
-    AgentBadge, AgentRowView, ProjectStatus, ProjectTabView, TerminalRef, UpstreamState,
+    AgentBadge, AgentRowView, GitStripView, ProjectStatus, ProjectTabView, UpstreamState,
 };
 use crate::web::access::{AccessMode, WebAccessView};
 
@@ -380,12 +381,23 @@ pub enum HitTarget {
 /// Resolve a click at `(col, row)` (terminal coordinates) against the layout for
 /// `area`, returning the agent tab or child-terminal tab it lands on, if any.
 pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitTarget> {
-    let chrome = layout::chrome_for(area, state.mode());
-    let side = state.config.ui.agent_tab_side();
+    hit_test_screen(
+        area,
+        &Screen::from_state(state, &GitStatusCache::new(), 0),
+        col,
+        row,
+    )
+}
+
+/// [`hit_test`] against a [`Screen`]: the geometry the frame was drawn with,
+/// whichever host it came from.
+pub fn hit_test_screen(area: Rect, screen: &Screen, col: u16, row: u16) -> Option<HitTarget> {
+    let chrome = layout::chrome_for(area, screen.mode);
+    let side = screen.ui.agent_tab_side();
     let ml = layout::compute(
         area,
         chrome,
-        crate::tui::mode_style::border_enabled(&state.config.ui),
+        crate::tui::mode_style::border_enabled(screen.ui),
         side,
     );
     if rect_contains(ml.sidebar, col, row) {
@@ -397,17 +409,17 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         return Some(
             sidebar_hit(
                 ml.sidebar,
-                state.tabs.len(),
+                screen.agents.len(),
                 chrome,
                 side,
-                crate::tui::mode_style::border_enabled(&state.config.ui),
+                crate::tui::mode_style::border_enabled(screen.ui),
                 col,
                 row,
             )
             .unwrap_or(HitTarget::Sidebar),
         );
     }
-    if state.split_view {
+    if screen.split_view {
         // In split view a click on a column's header row switches to that
         // terminal. Clicks in the column *body* are not switch targets here —
         // they begin a text selection (handled by the mouse wiring, which still
@@ -415,7 +427,7 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
         // switches and the viewport selects.
         let region = layout::split_region(&ml);
         if rect_contains(region, col, row) {
-            let entries = child_tab_entries(state);
+            let entries = screen.child_entries();
             let cols = layout::split_columns(region, entries.len());
             for ((target, _label), c) in entries.iter().zip(cols.iter()) {
                 if rect_contains(c.header, col, row) {
@@ -428,12 +440,12 @@ pub fn hit_test(area: Rect, state: &AppState, col: u16, row: u16) -> Option<HitT
     if rect_contains(ml.child_tabs, col, row) {
         // The right-side buttons are drawn on top of the tab strip, so they win
         // hit-testing where they overlap a long tab strip: check them first.
-        for (target, start, w) in child_tab_buttons(ml.child_tabs, state) {
+        for (target, start, w) in child_tab_buttons(ml.child_tabs, screen.session.is_some()) {
             if col >= start && col < start.saturating_add(w) {
                 return Some(target);
             }
         }
-        for seg in child_tab_positions(ml.child_tabs, state) {
+        for seg in child_tab_positions(ml.child_tabs, screen) {
             if col >= seg.start && col < seg.start.saturating_add(seg.width) {
                 // A click on the tab's `✕` closes it; elsewhere selects it.
                 if col == seg.close_col {
@@ -531,28 +543,6 @@ fn sidebar_hit(
     Some(HitTarget::AgentTab(idx))
 }
 
-/// The child-terminal tab entries for the selected tab: the primary "agent" tab
-/// plus one per child shell. Shared by rendering and hit-testing so positions
-/// always agree.
-fn child_tab_entries(state: &AppState) -> Vec<(ChildTarget, String)> {
-    // The primary agent terminal is "agent"; additional agents count up from 2,
-    // shells count up from 1, each numbered in creation order (SPECS §19). The
-    // labels come from the shared view model.
-    match state.selected() {
-        Some(tab) => crate::view::terminal_views(tab)
-            .into_iter()
-            .map(|t| {
-                let target = match t.target {
-                    TerminalRef::Primary => ChildTarget::Primary,
-                    TerminalRef::Child(i) => ChildTarget::Child(i),
-                };
-                (target, t.label)
-            })
-            .collect(),
-        None => vec![(ChildTarget::Primary, "agent".to_string())],
-    }
-}
-
 /// The screen geometry of one child-terminal tab segment.
 struct ChildTabSeg {
     target: ChildTarget,
@@ -568,7 +558,8 @@ struct ChildTabSeg {
 /// as shown on the tab bar. Used so close confirmations name the same thing the
 /// user clicked. Returns `None` if the target is not present.
 pub fn child_tab_label(state: &AppState, target: ChildTarget) -> Option<String> {
-    child_tab_entries(state)
+    Screen::from_state(state, &GitStatusCache::new(), 0)
+        .child_entries()
         .into_iter()
         .find(|(t, _)| *t == target)
         .map(|(_, label)| label)
@@ -579,10 +570,10 @@ pub fn child_tab_label(state: &AppState, target: ChildTarget) -> Option<String> 
 /// `" {label} ✕ "`: a leading space, the label, a space, the close glyph, and a
 /// trailing space, so its width is `label.len() + 4` and the `✕` sits at
 /// `start + label.len() + 2`.
-fn child_tab_positions(area: Rect, state: &AppState) -> Vec<ChildTabSeg> {
+fn child_tab_positions(area: Rect, screen: &Screen) -> Vec<ChildTabSeg> {
     let mut out = Vec::new();
     let mut x = area.x;
-    for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
+    for (i, (target, label)) in screen.child_entries().into_iter().enumerate() {
         if i > 0 {
             x = x.saturating_add(3); // " | " separator
         }
@@ -603,11 +594,10 @@ fn child_tab_positions(area: Rect, state: &AppState) -> Vec<ChildTabSeg> {
 /// right-aligned in `area`. `+ shell` is only offered when a tab is selected (a
 /// child shell needs a host tab). Shared by rendering and hit-testing so the
 /// clickable regions always match what is drawn.
-fn child_tab_buttons(area: Rect, state: &AppState) -> Vec<(HitTarget, u16, u16)> {
+fn child_tab_buttons(area: Rect, has_tab: bool) -> Vec<(HitTarget, u16, u16)> {
     // Each button renders as " label " (one space of padding each side).
     let agent_w = NEW_AGENT_LABEL.chars().count() as u16 + 2;
     let shell_w = NEW_SHELL_LABEL.chars().count() as u16 + 2;
-    let has_tab = state.selected().is_some();
 
     let right = area.x.saturating_add(area.width);
     let mut out = Vec::new();
@@ -648,40 +638,53 @@ pub fn draw(
     input_holder: Option<&str>,
     now_ms: u64,
 ) {
+    let screen = Screen::from_state(state, cache, now_ms);
+    draw_screen(frame, &screen, overlay, input_holder, now_ms);
+}
+
+/// [`draw`] from a [`Screen`]: the whole UI below the project tab row, from
+/// whichever host the screen was built for.
+pub fn draw_screen(
+    frame: &mut Frame,
+    screen: &Screen,
+    overlay: &UiOverlay,
+    input_holder: Option<&str>,
+    now_ms: u64,
+) {
     let area = frame.area();
-    let chrome = layout::chrome_for(area, state.mode());
+    let chrome = layout::chrome_for(area, screen.mode);
     let ml = layout::compute(
         area,
         chrome,
-        crate::tui::mode_style::border_enabled(&state.config.ui),
-        state.config.ui.agent_tab_side(),
+        crate::tui::mode_style::border_enabled(screen.ui),
+        screen.ui.agent_tab_side(),
     );
 
     draw_header(frame, ml.header);
     let divider = Paragraph::new(divider_line(ml.divider.width as usize));
     frame.render_widget(divider, ml.divider);
-    draw_sidebar(frame, state, cache, ml.sidebar, chrome, now_ms);
-    if state.split_view {
+    draw_sidebar(frame, screen, ml.sidebar, chrome, now_ms);
+    if screen.split_view {
         // Split view reclaims the tab-bar row and lays the selected tab's
         // terminals out side by side in equal-width columns.
-        draw_split_view(frame, state, layout::split_region(&ml), now_ms);
+        draw_split_view(frame, screen, layout::split_region(&ml), now_ms);
     } else {
-        draw_child_tab_bar(frame, state, ml.child_tabs);
-        draw_terminal_viewport(frame, state, ml.terminal, now_ms);
+        draw_child_tab_bar(frame, screen, ml.child_tabs);
+        draw_terminal_viewport(frame, screen, ml.terminal, now_ms);
     }
 
     // Live-pane border (SPECS §23): frame ONLY the pane receiving keys. The
     // frame rects are present only when `mode_border != off`; geometry is fixed
     // by layout::compute. The non-focused pane's frame is not drawn at all —
     // previously it was rendered dark gray, which read as visual clutter.
-    let mode = state.mode();
+    let mode = screen.mode;
     if mode == InputMode::App {
         if let Some(frame_rect) = ml.sidebar_frame {
             let block =
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(mode_style::pane_border_style(
-                        &state.config.ui,
+                        screen.ui,
                         mode,
                         mode_style::Pane::Sidebar,
                     ));
@@ -694,7 +697,7 @@ pub fn draw(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(mode_style::pane_border_style(
-                        &state.config.ui,
+                        screen.ui,
                         mode,
                         mode_style::Pane::Terminal,
                     ));
@@ -707,21 +710,21 @@ pub fn draw(
     if chrome == layout::Chrome::Full {
         let info_divider = Paragraph::new(divider_line(ml.info_divider.width as usize));
         frame.render_widget(info_divider, ml.info_divider);
-        draw_info_bar(frame, state, cache, ml.info_bar);
+        draw_info_bar(frame, &screen.git, ml.info_bar);
     }
     let status_divider = Paragraph::new(divider_line(ml.status_divider.width as usize));
     frame.render_widget(status_divider, ml.status_divider);
     if chrome == layout::Chrome::Collapsed {
         frame.render_widget(
             Paragraph::new(compact_status_bar_text(
-                state,
+                screen,
                 input_holder,
                 ml.status_bar.width,
             )),
             ml.status_bar,
         );
     } else {
-        draw_status_bar(frame, state, input_holder, ml.status_bar);
+        draw_status_bar(frame, screen, input_holder, ml.status_bar);
     }
 
     // Draw overlay on top if active.
@@ -732,8 +735,8 @@ pub fn draw(
         UiOverlay::Help => draw_help_overlay(
             frame,
             area,
-            state.config.ui.use_f2_to_leave_terminal_focus,
-            state.isolated,
+            screen.ui.use_f2_to_leave_terminal_focus,
+            screen.isolated,
         ),
         UiOverlay::About => draw_about_overlay(frame, area),
         UiOverlay::GitStatus { status, pr_url } => {
@@ -1043,19 +1046,19 @@ pub fn draw_project_tab_bar(
 /// Draw the left Agent Tabs sidebar.
 pub fn draw_sidebar(
     frame: &mut Frame,
-    state: &AppState,
-    cache: &GitStatusCache,
+    screen: &Screen,
     area: Rect,
     chrome: layout::Chrome,
     now_ms: u64,
 ) {
     if chrome == layout::Chrome::Collapsed {
-        draw_sidebar_collapsed(frame, state, area, now_ms);
+        draw_sidebar_collapsed(frame, screen, area, now_ms);
         return;
     }
 
-    let side = state.config.ui.agent_tab_side();
-    let block = sidebar_block(mode_style::border_enabled(&state.config.ui), side);
+    let side = screen.ui.agent_tab_side();
+    let animations = screen.ui.animations;
+    let block = sidebar_block(mode_style::border_enabled(screen.ui), side);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1073,7 +1076,7 @@ pub fn draw_sidebar(
         .alignment(Alignment::Center),
     );
 
-    if state.tabs.is_empty() {
+    if screen.agents.is_empty() {
         lines.push(divider_line(width));
         lines.push(Line::from(Span::styled(
             "No tabs. Ctrl-n to create.",
@@ -1086,10 +1089,8 @@ pub fn draw_sidebar(
     // Each tab block is SIDEBAR_ROWS_PER_TAB rows: divider, name, agent, git —
     // a divider above every tab including the first (SPECS §20).
     // What each row says comes from the shared view model; the loop below only
-    // decides how it looks. The TUI shows no elapsed-status text, so the unix
-    // seconds argument is only an approximation.
-    let rows = crate::view::agent_row_views(state, cache, now_ms, now_ms / 1000);
-    for row in &rows {
+    // decides how it looks.
+    for row in &screen.agents {
         let selected = row.selected;
 
         // Divider (top of the tab block).
@@ -1121,10 +1122,7 @@ pub fn draw_sidebar(
                 side,
                 marker,
                 name_style,
-                Span::styled(
-                    format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
-                    spin,
-                ),
+                Span::styled(format!("{} ", spinner_frame(now_ms, animations)), spin),
                 &row.name,
             ));
             lines.push(Line::from(vec![
@@ -1146,7 +1144,7 @@ pub fn draw_sidebar(
                 .map(|_| Color::Cyan)
                 .unwrap_or_else(|| badge_color(row.badge))
         };
-        let indicator = badge_indicator(row.badge, now_ms, state.config.ui.animations);
+        let indicator = badge_indicator(row.badge, now_ms, animations);
         lines.push(sidebar_name_line(
             width,
             side,
@@ -1186,25 +1184,19 @@ pub fn draw_sidebar(
 
 /// Draw the collapsed agent strip: one indicator glyph per agent, no heading
 /// and no close control, for windows too small to afford the full sidebar.
-fn draw_sidebar_collapsed(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
+fn draw_sidebar_collapsed(frame: &mut Frame, screen: &Screen, area: Rect, now_ms: u64) {
     let block = sidebar_block(
-        mode_style::border_enabled(&state.config.ui),
-        state.config.ui.agent_tab_side(),
+        mode_style::border_enabled(screen.ui),
+        screen.ui.agent_tab_side(),
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> =
-        crate::view::agent_row_views(state, &HashMap::new(), now_ms, now_ms / 1000)
-            .iter()
-            .map(|row| {
-                Line::from(collapsed_agent_span(
-                    row,
-                    now_ms,
-                    state.config.ui.animations,
-                ))
-            })
-            .collect();
+    let lines: Vec<Line> = screen
+        .agents
+        .iter()
+        .map(|row| Line::from(collapsed_agent_span(row, now_ms, screen.ui.animations)))
+        .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1432,26 +1424,22 @@ fn build_git_indicator_line(row: &AgentRowView) -> Line<'static> {
 /// Layout: `agent ✕ | shell 1 ✕ | …` on the left, with `+ agent` / `+ shell`
 /// buttons right-aligned. Each tab carries a `✕` close control; the buttons are
 /// styled distinctly from the tabs so they read as actions, not tabs.
-pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    match state.selected() {
+pub fn draw_child_tab_bar(frame: &mut Frame, screen: &Screen, area: Rect) {
+    match &screen.session {
         None => {
             let empty =
                 Paragraph::new(" No tab selected ").style(Style::default().fg(Color::DarkGray));
             frame.render_widget(empty, area);
         }
-        Some(tab) => {
+        Some(session) => {
             // Build "agent ✕ | shell 1 ✕ …" from the shared segmentation so the
             // rendered positions line up with mouse hit-testing (SPECS §19).
-            let active = tab.session.selected_child(); // None = primary
             let mut spans: Vec<Span> = Vec::new();
-            for (i, (target, label)) in child_tab_entries(state).into_iter().enumerate() {
+            for (i, (target, label)) in screen.child_entries().into_iter().enumerate() {
                 if i > 0 {
                     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
                 }
-                let is_active = match target {
-                    ChildTarget::Primary => active.is_none(),
-                    ChildTarget::Child(c) => active == Some(c),
-                };
+                let is_active = target == session.active;
                 let style = if is_active {
                     let bg = if matches!(target, ChildTarget::Primary) {
                         Color::Yellow
@@ -1477,7 +1465,7 @@ pub fn draw_child_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
     }
 
     // Right-aligned action buttons, drawn on top of the tab strip.
-    for (target, start, width) in child_tab_buttons(area, state) {
+    for (target, start, width) in child_tab_buttons(area, screen.session.is_some()) {
         if start < area.x {
             continue; // no room
         }
@@ -1517,50 +1505,61 @@ fn dim_terminal(focused: bool, ui: &crate::contracts::UiConfig) -> bool {
 /// Draw the active terminal viewport (SPECS §20): the VT100 screen of the
 /// selected tab's active terminal (primary agent, or the selected child shell),
 /// rendered cell-by-cell from its parser.
-pub fn draw_terminal_viewport(frame: &mut Frame, state: &AppState, area: Rect, now_ms: u64) {
-    let Some(tab) = state.selected() else {
-        let p = Paragraph::new(
-            "\n  FlightDeck — no Agent Session Tab selected.\n  Press Ctrl-n to create one.",
-        )
-        .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(p, area);
+pub fn draw_terminal_viewport(frame: &mut Frame, screen: &Screen, area: Rect, now_ms: u64) {
+    let Some(session) = &screen.session else {
+        draw_no_session(frame, area);
         return;
     };
 
     // While the worktree is being created on a background worker there is no
     // session yet: show an animated progress message so the UI never looks
     // frozen (SPECS §16/§17).
-    if tab.phase == TabPhase::Creating {
-        let msg = Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format!("Creating worktree for {}…", tab.meta.branch),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]))
-        .alignment(Alignment::Center);
-        let inner = Rect {
-            y: area.y + area.height / 2,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(msg, inner);
+    if let Some(branch) = &session.creating {
+        draw_creating(frame, area, branch, now_ms, screen.ui.animations);
         return;
     }
 
-    let Some(term) = tab.session.active() else {
+    let Some(term) = screen.active_terminal() else {
         let p =
             Paragraph::new("  (terminal starting…)").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
         return;
     };
 
-    let focused = state.mode() == InputMode::Terminal;
-    let dim = dim_terminal(focused, &state.config.ui);
+    let focused = screen.mode == InputMode::Terminal;
+    let dim = dim_terminal(focused, screen.ui);
     render_screen(frame, area, term.screen(), focused, term.selection(), dim);
+}
+
+/// The main pane with no agent selected.
+fn draw_no_session(frame: &mut Frame, area: Rect) {
+    let p = Paragraph::new(
+        "\n  FlightDeck — no Agent Session Tab selected.\n  Press Ctrl-n to create one.",
+    )
+    .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(p, area);
+}
+
+/// The main pane while `branch`'s worktree is being created: one animated
+/// progress line, centred (SPECS §16/§17).
+fn draw_creating(frame: &mut Frame, area: Rect, branch: &str, now_ms: u64, animations: bool) {
+    let msg = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{} ", spinner_frame(now_ms, animations)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("Creating worktree for {branch}…"),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]))
+    .alignment(Alignment::Center);
+    let inner = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(msg, inner);
 }
 
 /// Background colour used to highlight selected terminal cells (SPECS §20).
@@ -1667,49 +1666,25 @@ fn grid_color(c: GridColor) -> Color {
 /// between columns. Replaces the horizontal tab bar + single viewport when split
 /// view is enabled. Column geometry comes from [`layout::split_columns`] so it
 /// matches the per-terminal PTY sizing the wiring layer applies.
-pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms: u64) {
-    let Some(tab) = state.selected() else {
-        let p = Paragraph::new(
-            "\n  FlightDeck — no Agent Session Tab selected.\n  Press Ctrl-n to create one.",
-        )
-        .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(p, region);
+pub fn draw_split_view(frame: &mut Frame, screen: &Screen, region: Rect, now_ms: u64) {
+    let Some(session) = &screen.session else {
+        draw_no_session(frame, region);
         return;
     };
 
     // While the worktree is materializing there is no session yet (SPECS §16/§17).
-    if tab.phase == TabPhase::Creating {
-        let msg = Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{} ", spinner_frame(now_ms, state.config.ui.animations)),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                format!("Creating worktree for {}…", tab.meta.branch),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]))
-        .alignment(Alignment::Center);
-        let inner = Rect {
-            y: region.y + region.height / 2,
-            height: 1,
-            ..region
-        };
-        frame.render_widget(msg, inner);
+    if let Some(branch) = &session.creating {
+        draw_creating(frame, region, branch, now_ms, screen.ui.animations);
         return;
     }
 
-    let entries = child_tab_entries(state);
-    let cols = layout::split_columns(region, entries.len());
-    let active = tab.session.selected_child(); // None = primary
-    let focused = state.mode() == InputMode::Terminal;
-    let dim = dim_terminal(focused, &state.config.ui);
+    let cols = layout::split_columns(region, session.terminals.len());
+    let focused = screen.mode == InputMode::Terminal;
+    let dim = dim_terminal(focused, screen.ui);
 
-    for (i, ((target, label), col)) in entries.iter().zip(cols.iter()).enumerate() {
-        let is_active = match target {
-            ChildTarget::Primary => active.is_none(),
-            ChildTarget::Child(c) => active == Some(*c),
-        };
+    for (i, (pane, col)) in session.terminals.iter().zip(cols.iter()).enumerate() {
+        let (target, label) = (&pane.target, &pane.label);
+        let is_active = *target == session.active;
 
         // Column header: the terminal label, highlighted when active (matching
         // the tab-bar colours: agent = yellow, shell = cyan).
@@ -1732,11 +1707,7 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
 
         // Column body: the terminal's VT100 screen. Only the active column shows
         // the cursor, and only while a terminal is focused.
-        let term = match target {
-            ChildTarget::Primary => tab.session.primary(),
-            ChildTarget::Child(c) => tab.session.child(*c),
-        };
-        match term {
+        match pane.terminal {
             Some(term) => render_screen(
                 frame,
                 col.viewport,
@@ -1781,8 +1752,8 @@ pub fn draw_split_view(frame: &mut Frame, state: &AppState, region: Rect, now_ms
 /// add/modify/delete file counts, ahead/behind vs upstream, base drift, and the
 /// base branch. Data comes from the [`GitStatusCache`]; a missing entry renders
 /// as `git: ?` and never panics.
-pub fn draw_info_bar(frame: &mut Frame, state: &AppState, cache: &GitStatusCache, area: Rect) {
-    let line = info_bar_line(state, cache);
+pub fn draw_info_bar(frame: &mut Frame, git: &GitStripView, area: Rect) {
+    let line = git_strip_line(git);
     let para = Paragraph::new(line).style(Style::default().bg(Color::Reset));
     frame.render_widget(para, area);
 }
@@ -1811,9 +1782,11 @@ fn shorten_branch(branch: &str, max_chars: usize) -> String {
 
 /// Build the git info bar [`Line`] for the selected tab. Exported for testing.
 pub fn info_bar_line(state: &AppState, cache: &GitStatusCache) -> Line<'static> {
-    use crate::view::UpstreamState;
+    git_strip_line(&crate::view::git_strip_view(state, cache))
+}
 
-    let view = crate::view::git_strip_view(state, cache);
+/// The git info bar [`Line`] for a [`GitStripView`], whichever host built it.
+pub fn git_strip_line(view: &GitStripView) -> Line<'static> {
     let configured_default = shorten_branch(&view.default_branch, 18);
     let invalid_default = !view.default_branch_valid;
     let Some(agent) = &view.agent else {
@@ -1952,17 +1925,12 @@ pub const HELP_KEYS: &str = "F1 / Alt-h";
 /// Both help keys are listed, and identically on every OS: unlike the
 /// leave-focus key they are the same binding everywhere, so a platform-varying
 /// label would imply a difference that does not exist.
-pub fn draw_status_bar(
-    frame: &mut Frame,
-    state: &AppState,
-    input_holder: Option<&str>,
-    area: Rect,
-) {
+pub fn draw_status_bar(frame: &mut Frame, screen: &Screen, input_holder: Option<&str>, area: Rect) {
     let text = status_bar_text(
-        state.mode(),
-        &state.config.ui,
-        state.update_available.as_deref(),
-        state.isolated,
+        screen.mode,
+        screen.ui,
+        screen.update_available,
+        screen.isolated,
         input_holder,
     );
     let para = Paragraph::new(text).style(Style::default().bg(Color::Reset));
@@ -2046,24 +2014,36 @@ pub fn status_bar_hit(
     col: u16,
     row: u16,
 ) -> Option<StatusAction> {
-    let chrome = layout::chrome_for(area, state.mode());
+    let screen = Screen::from_state(state, &GitStatusCache::new(), 0);
+    status_bar_hit_screen(area, &screen, input_holder, col, row)
+}
+
+/// [`status_bar_hit`] against a [`Screen`].
+pub fn status_bar_hit_screen(
+    area: Rect,
+    screen: &Screen,
+    input_holder: Option<&str>,
+    col: u16,
+    row: u16,
+) -> Option<StatusAction> {
+    let chrome = layout::chrome_for(area, screen.mode);
     let ml = layout::compute(
         area,
         chrome,
-        crate::tui::mode_style::border_enabled(&state.config.ui),
-        state.config.ui.agent_tab_side(),
+        crate::tui::mode_style::border_enabled(screen.ui),
+        screen.ui.agent_tab_side(),
     );
     if !rect_contains(ml.status_bar, col, row) {
         return None;
     }
     let segments = if chrome == layout::Chrome::Collapsed {
-        compact_status_bar_segments(state, input_holder, ml.status_bar.width)
+        compact_status_bar_segments(screen, input_holder, ml.status_bar.width)
     } else {
         status_bar_segments(
-            state.mode(),
-            &state.config.ui,
-            state.update_available.as_deref(),
-            state.isolated,
+            screen.mode,
+            screen.ui,
+            screen.update_available,
+            screen.isolated,
             input_holder,
         )
     };
@@ -2074,18 +2054,18 @@ pub fn status_bar_hit(
 /// and mode indicators come first, followed by bounded base context; optional
 /// shortcut hints are the first content allowed to clip.
 fn compact_status_bar_text(
-    state: &AppState,
+    screen: &Screen,
     input_holder: Option<&str>,
     width: u16,
 ) -> Line<'static> {
-    status_line(compact_status_bar_segments(state, input_holder, width))
+    status_line(compact_status_bar_segments(screen, input_holder, width))
 }
 
 /// The compact bar as clickable segments. The mode chip acts at every width;
 /// the shortcut hints exist only from 100 columns on, so below that there is
 /// nothing to click but the chip.
 fn compact_status_bar_segments(
-    state: &AppState,
+    screen: &Screen,
     input_holder: Option<&str>,
     width: u16,
 ) -> Vec<StatusSegment> {
@@ -2094,13 +2074,10 @@ fn compact_status_bar_segments(
         50..=79 => 8,
         _ => 16,
     };
-    let configured_default = state
-        .invalid_base_branch
-        .as_deref()
-        .unwrap_or(&state.base_branch);
-    let configured_default = shorten_branch(configured_default, branch_limit);
+    let configured_default = shorten_branch(&screen.git.default_branch, branch_limit);
+    let default_invalid = !screen.git.default_branch_valid;
     let mut segs: Vec<StatusSegment> = Vec::new();
-    if state.isolated {
+    if screen.isolated {
         segs.push(inert(vec![Span::styled(
             " ISOLATED",
             Style::default()
@@ -2116,7 +2093,7 @@ fn compact_status_bar_segments(
             Style::default()
                 .fg(Color::Black)
                 .bg(crate::tui::mode_style::chip_color(
-                    &state.config.ui,
+                    screen.ui,
                     InputMode::Terminal,
                 ))
                 .add_modifier(Modifier::BOLD),
@@ -2135,7 +2112,7 @@ fn compact_status_bar_segments(
             ),
         ]));
     }
-    if let Some(version) = &state.update_available {
+    if let Some(version) = screen.update_available {
         segs.push(inert(vec![
             Span::raw(" "),
             Span::styled(
@@ -2151,12 +2128,12 @@ fn compact_status_bar_segments(
     segs.push(inert(vec![
         info_sep(),
         Span::styled(
-            if state.invalid_base_branch.is_some() {
+            if default_invalid {
                 format!("default: !{configured_default}")
             } else {
                 format!("default: {configured_default}")
             },
-            if state.invalid_base_branch.is_some() {
+            if default_invalid {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::White)
@@ -2164,13 +2141,13 @@ fn compact_status_bar_segments(
         ),
     ]));
     if width >= 50 {
-        if let Some(tab) = state.selected() {
+        if let Some(agent) = &screen.git.agent {
             segs.push(inert(vec![
                 info_sep(),
                 Span::styled(
                     format!(
                         "target: {}",
-                        shorten_branch(&tab.meta.base_branch, branch_limit)
+                        shorten_branch(&agent.target_branch, branch_limit)
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -2182,9 +2159,7 @@ fn compact_status_bar_segments(
         segs.push(clickable(
             vec![
                 Span::styled(
-                    crate::tui::platform::leave_focus_key(
-                        state.config.ui.use_f2_to_leave_terminal_focus,
-                    ),
+                    crate::tui::platform::leave_focus_key(screen.ui.use_f2_to_leave_terminal_focus),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::raw(": app"),
@@ -4274,15 +4249,14 @@ mod tests {
     #[test]
     fn working_badge_shows_fixed_spinner_when_animations_are_off() {
         let mut state = state_with_tabs(1);
-        state.tabs[0].phase = TabPhase::Creating;
+        state.tabs[0].phase = crate::app::state::TabPhase::Creating;
         state.config.ui.animations = false;
         let rows = |state: &AppState, now_ms: u64| {
             let mut term = test_terminal(40, 8);
             term.draw(|frame| {
                 draw_sidebar(
                     frame,
-                    state,
-                    &empty_cache(),
+                    &Screen::from_state(state, &empty_cache(), now_ms),
                     Rect::new(0, 0, 40, 8),
                     layout::Chrome::Full,
                     now_ms,
@@ -4308,14 +4282,13 @@ mod tests {
         let mut state = state_with_tabs(3);
         state.selected_tab = Some(1);
         // Tab 2 is mid-creation, so it must show a spinner rather than a dot.
-        state.tabs[2].phase = TabPhase::Creating;
+        state.tabs[2].phase = crate::app::state::TabPhase::Creating;
 
         let mut term = test_terminal(layout::COLLAPSED_SIDEBAR_WIDTH, 6);
         term.draw(|frame| {
             draw_sidebar(
                 frame,
-                &state,
-                &empty_cache(),
+                &Screen::from_state(&state, &empty_cache(), 0),
                 Rect::new(0, 0, layout::COLLAPSED_SIDEBAR_WIDTH, 6),
                 layout::Chrome::Collapsed,
                 0,
@@ -4595,6 +4568,83 @@ mod tests {
     }
 
     #[test]
+    fn screen_without_a_selection_still_has_one_agent_slot() {
+        let state = empty_state();
+        let screen = Screen::from_state(&state, &empty_cache(), 0);
+        assert!(screen.session.is_none());
+        assert!(screen.active_terminal().is_none());
+        assert_eq!(
+            screen.child_entries(),
+            vec![(ChildTarget::Primary, "agent".to_string())]
+        );
+    }
+
+    #[test]
+    fn screen_carries_the_branch_of_a_worktree_being_created() {
+        let mut state = state_with_tabs(1);
+        state.tabs[0].phase = crate::app::state::TabPhase::Creating;
+        let screen = Screen::from_state(&state, &empty_cache(), 0);
+        let session = screen.session.as_ref().expect("a tab is selected");
+        assert_eq!(session.creating.as_deref(), Some("flightdeck/tab0"));
+        assert_eq!(session.active, ChildTarget::Primary);
+    }
+
+    #[test]
+    fn a_hand_built_screen_draws_without_an_app_state() {
+        // The remote TUI builds its Screen from the mirror, not from AppState:
+        // the renderer must draw whatever terminal and rows it is handed.
+        use crate::contracts::{PtySize, UiConfig};
+        use crate::testing::FakePty;
+        use crate::tui::screen::{SessionPane, TerminalPane};
+        use std::path::Path;
+
+        let pty = FakePty::new();
+        pty.queue_session();
+        let mut state = state_with_tabs(2);
+        state.tabs[0]
+            .session
+            .spawn_primary(&pty, "agent", &[], Path::new("/wt"), PtySize::default())
+            .unwrap();
+        state.tabs[0]
+            .session
+            .primary_mut()
+            .unwrap()
+            .process_output(b"REMOTE_BYTES");
+        let agents = Screen::from_state(&state, &empty_cache(), 0).agents;
+        let ui = UiConfig::default();
+        let screen = Screen {
+            ui: &ui,
+            mode: InputMode::App,
+            isolated: false,
+            update_available: None,
+            split_view: false,
+            agents,
+            git: crate::view::git_strip_view(&state, &empty_cache()),
+            session: Some(SessionPane {
+                creating: None,
+                terminals: vec![TerminalPane {
+                    target: ChildTarget::Primary,
+                    label: "agent".to_string(),
+                    terminal: state.tabs[0].session.primary(),
+                }],
+                active: ChildTarget::Primary,
+            }),
+        };
+
+        let mut term = test_terminal(80, 24);
+        term.draw(|frame| draw_screen(frame, &screen, &UiOverlay::None, None, 0))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let all_text: String = (0..24).map(|y| buffer_row(&buffer, y)).collect();
+        assert!(all_text.contains("REMOTE_BYTES"), "{all_text}");
+        assert!(all_text.contains("tab1"), "sidebar rows: {all_text}");
+        assert_eq!(
+            hit_test_screen(Rect::new(0, 0, 80, 24), &screen, 30, 3),
+            Some(HitTarget::Child(ChildTarget::Primary))
+        );
+    }
+
+    #[test]
     fn hit_test_maps_child_tab_bar_to_primary() {
         let state = state_with_tabs(1);
         let area = Rect::new(0, 0, 80, 24);
@@ -4624,7 +4674,8 @@ mod tests {
             .spawn_child(&pty, "zsh", &[], Path::new("/wt"), PtySize::default())
             .unwrap();
 
-        let labels: Vec<String> = child_tab_entries(&state)
+        let labels: Vec<String> = Screen::from_state(&state, &empty_cache(), 0)
+            .child_entries()
             .into_iter()
             .map(|(_, l)| l)
             .collect();
@@ -5207,7 +5258,11 @@ mod tests {
     fn collapsed_status_keeps_default_and_target_visible_first() {
         let mut state = state_with_tabs(1);
         state.base_branch = "develop".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, None, 100));
+        let flat = flatten(&compact_status_bar_text(
+            &Screen::from_state(&state, &empty_cache(), 0),
+            None,
+            100,
+        ));
         assert!(flat.contains("default: develop"), "got: {flat:?}");
         assert!(flat.contains("target: main"), "got: {flat:?}");
     }
@@ -5217,7 +5272,11 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.isolated = true;
         state.update_available = Some("2.0.0".to_string());
-        let flat = flatten(&compact_status_bar_text(&state, None, 100));
+        let flat = flatten(&compact_status_bar_text(
+            &Screen::from_state(&state, &empty_cache(), 0),
+            None,
+            100,
+        ));
         assert!(flat.contains("ISOLATED"), "got: {flat:?}");
         assert!(flat.contains("v2.0.0 update"), "got: {flat:?}");
     }
@@ -5225,7 +5284,11 @@ mod tests {
     #[test]
     fn collapsed_status_names_the_input_lock_holder() {
         let state = state_with_tabs(1);
-        let flat = flatten(&compact_status_bar_text(&state, Some("Safari/iOS"), 100));
+        let flat = flatten(&compact_status_bar_text(
+            &Screen::from_state(&state, &empty_cache(), 0),
+            Some("Safari/iOS"),
+            100,
+        ));
         assert!(flat.contains("INPUT: Safari/iOS"), "got: {flat:?}");
     }
 
@@ -5250,7 +5313,11 @@ mod tests {
         let mut state = state_with_tabs(1);
         state.base_branch = "feature/a-very-long-project-default-branch".to_string();
         state.tabs[0].meta.base_branch = "release/a-very-long-pinned-target-branch".to_string();
-        let flat = flatten(&compact_status_bar_text(&state, None, 80));
+        let flat = flatten(&compact_status_bar_text(
+            &Screen::from_state(&state, &empty_cache(), 0),
+            None,
+            80,
+        ));
         assert!(flat.contains("default: featur...-branch"), "got: {flat:?}");
         assert!(flat.contains("target: releas...-branch"), "got: {flat:?}");
         assert!(flat.contains("MODE: TERMINAL"), "got: {flat:?}");

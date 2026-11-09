@@ -17,4 +17,5 @@ pub mod palette;
 pub mod platform;
 pub mod quiet_backend;
 pub mod render;
+pub mod screen;
 pub mod selection;
