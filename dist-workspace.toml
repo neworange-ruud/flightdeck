@@ -50,3 +50,7 @@ allow-dirty = ["ci"]
 # the graph includes C deps (aws-lc-sys via rustls) that are painful to cross-build.
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+# cargo-dist 0.32.0 defaults this target to macos-14, which GitHub retired
+# (v1.33.0's first build failed: "The configuration 'macos-14-arm64-us-default'
+# is not supported"). macos-15 is Apple Silicon too.
+aarch64-apple-darwin = "macos-15"
