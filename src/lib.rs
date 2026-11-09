@@ -2642,6 +2642,7 @@ fn build_web_host_state(
                         .collect::<std::path::PathBuf>()
                         .display()
                         .to_string(),
+                    activity: tab.meta.activity,
                     terminals,
                 },
                 streams,
@@ -3814,6 +3815,58 @@ fn answer_prompt(
     first_tasks: &mut Vec<PendingFirstTask>,
     reply: &crate::view::PromptReply,
 ) -> bool {
+    match answer_prompt_as(
+        bridge,
+        workspace,
+        env,
+        ui,
+        first_tasks,
+        reply,
+        &PromptAnswerer::Desktop,
+    ) {
+        Ok(()) => true,
+        Err(PromptRefusal::Said(why)) => {
+            ui.message(why);
+            false
+        }
+        // The holder is named on the status bar already.
+        Err(PromptRefusal::InputLock) => false,
+    }
+}
+
+/// Who answers a prompt ([`answer_prompt_as`]): the person at this machine,
+/// or a remote window ([`crate::web::protocol::command::ANSWER_PROMPT`]).
+pub(crate) enum PromptAnswerer<'a> {
+    Desktop,
+    Viewer {
+        viewer_id: &'a crate::web::protocol::ViewerId,
+        label: &'a str,
+    },
+}
+
+/// Why [`answer_prompt_as`] typed nothing.
+pub(crate) enum PromptRefusal {
+    /// In words, for whoever clicked.
+    Said(String),
+    /// The desktop's claim on the input lock was refused; the status bar
+    /// names the holder.
+    InputLock,
+}
+
+/// [`answer_prompt`]'s body for either answerer: the same checks, the same
+/// translator and keystroke queue, and the input lock claimed by whoever is
+/// answering — the desktop on [`desktop_may_type`]'s terms, a remote viewer
+/// as that viewer, so its click never lands in the middle of someone else's
+/// typing either.
+pub(crate) fn answer_prompt_as(
+    bridge: &mut RemoteBridge,
+    workspace: &mut Workspace,
+    env: &Env,
+    ui: &mut Ui,
+    first_tasks: &mut Vec<PendingFirstTask>,
+    reply: &crate::view::PromptReply,
+    answerer: &PromptAnswerer<'_>,
+) -> std::result::Result<(), PromptRefusal> {
     let crate::view::PromptReply {
         key: crate::view::SessionKey { project, tab_id },
         prompt_id,
@@ -3830,10 +3883,7 @@ fn answer_prompt(
         .filter(|view| view.prompt_id == *prompt_id)
         .is_some_and(|view| view.buttons.iter().any(|b| b.answer == answer));
     if !offered {
-        ui.message(
-            "That prompt is no longer waiting for this answer. Open the session to answer it.",
-        );
-        return false;
+        return Err(PromptRefusal::Said(PROMPT_GONE_REFUSAL.to_string()));
     }
     let body = answer.decision(
         SessionId::new(tab_id.as_str()),
@@ -3841,22 +3891,66 @@ fn answer_prompt(
     );
     let translation = translate(&body, &index);
     if let Translation::Reject { reason } = &translation {
-        ui.message(format!("Could not answer the prompt: {reason}."));
-        return false;
+        return Err(PromptRefusal::Said(format!(
+            "Could not answer the prompt: {reason}."
+        )));
     }
-    if !desktop_may_type(ui, now_ms as i64) {
-        return false;
+    match answerer {
+        PromptAnswerer::Desktop => {
+            if !desktop_may_type(ui, now_ms as i64) {
+                return Err(PromptRefusal::InputLock);
+            }
+        }
+        PromptAnswerer::Viewer { viewer_id, label } => {
+            viewer_may_type(ui, viewer_id, label, now_ms as i64).map_err(PromptRefusal::Said)?
+        }
     }
     let (outcome, message) =
         execute_queued_translation(translation, bridge, workspace, env, now_ms, first_tasks);
-    let typed = matches!(outcome, CommandOutcome::Applied | CommandOutcome::Accepted);
-    if !typed {
-        ui.message(format!(
+    if matches!(outcome, CommandOutcome::Applied | CommandOutcome::Accepted) {
+        Ok(())
+    } else {
+        Err(PromptRefusal::Said(format!(
             "Could not answer the prompt: {}.",
             message.unwrap_or_else(|| "the agent terminal did not take it".to_string())
-        ));
+        )))
     }
-    typed
+}
+
+/// Why a host that does not track prompts refuses an inline answer.
+pub(crate) const PROMPTS_UNTRACKED_REFUSAL: &str =
+    "This FlightDeck is not tracking its agents' prompts. Open the session to answer it.";
+
+/// Why an inline answer was refused because its prompt is no longer the one
+/// waiting (answered elsewhere, superseded, or the agent moved on).
+pub(crate) const PROMPT_GONE_REFUSAL: &str =
+    "That prompt is no longer waiting for this answer. Open the session to answer it.";
+
+/// [`desktop_may_type`] for a remote viewer's prompt answer: claim the input
+/// lock as that viewer, or say who holds it.
+fn viewer_may_type(
+    ui: &Ui,
+    viewer_id: &crate::web::protocol::ViewerId,
+    label: &str,
+    now_ms: i64,
+) -> std::result::Result<(), String> {
+    let Some(lock) = ui.input_lock.as_ref() else {
+        return Ok(());
+    };
+    let mut lock = match lock.lock() {
+        Ok(lock) => lock,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match lock.claim(
+        &crate::web::arbiter::Writer::Viewer(viewer_id.clone()),
+        label,
+        now_ms,
+    ) {
+        crate::web::arbiter::Claim::Granted => Ok(()),
+        crate::web::arbiter::Claim::Refused { label, .. } => Err(format!(
+            "{label} is typing on the host — the answer was not sent."
+        )),
+    }
 }
 
 /// Poll each live remote shell's backing child terminal and report a one-shot
@@ -8195,6 +8289,12 @@ fn run_web_command(
                 "`{}` is answered by the server and should not have reached the host.",
                 spec.name
             )),
+        ),
+        // Answered by `AppHost::route_inbound`, which owns the prompt tracker
+        // the answer is checked against; reaching here means no tracker.
+        Route::Prompt => ack(
+            AckOutcome::Rejected,
+            Some(PROMPTS_UNTRACKED_REFUSAL.to_string()),
         ),
         Route::Rejected(reason) | Route::NotSupported(reason) => {
             ack(AckOutcome::Rejected, Some((*reason).to_string()))

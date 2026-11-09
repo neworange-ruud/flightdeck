@@ -71,6 +71,8 @@ fn session(id: &str, name: &str, shells: &[&str]) -> SessionView {
         recovered: false,
         attached_existing_branch: false,
         worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
+        activity: None,
+        prompt: None,
     }
 }
 

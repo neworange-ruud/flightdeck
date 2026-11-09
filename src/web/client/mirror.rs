@@ -163,6 +163,10 @@ pub struct RemoteWorkspace {
     pub host_kind: Option<HostKind>,
     /// The worker's own state. `Some` only on a worker host.
     pub worker: Option<WorkerMirror>,
+    /// How many snapshots have been applied: a new one restates everything,
+    /// so whoever dated changes since the last ([`super::mission::ActivityWatch`])
+    /// starts over.
+    snapshots: u64,
     selection: LocalSelection,
 }
 
@@ -196,6 +200,7 @@ impl RemoteWorkspace {
     pub fn apply_snapshot(&mut self, snapshot: Snapshot) {
         let first = !self.ready;
         self.ready = true;
+        self.snapshots += 1;
         self.host_version = snapshot.host_version;
         self.protocol_version = snapshot.protocol_version;
         self.viewer_id = Some(snapshot.viewer_id);
@@ -530,6 +535,27 @@ impl RemoteWorkspace {
         let session = self.selected_session()?;
         let id = self.selection.terminals.get(&session.session_id)?;
         session.terminals.iter().find(|t| &t.terminal_id == id)
+    }
+
+    /// The terminal session `session` shows: the one this client last looked
+    /// at in it, else its primary (else its first). What a Mission control
+    /// tile draws, whether or not the session is the selected one.
+    pub fn session_terminal(&self, session: &TabId) -> Option<&TerminalView> {
+        let view = self.session(session)?;
+        let remembered = self.selection.terminals.get(session);
+        remembered
+            .and_then(|id| view.terminals.iter().find(|t| &t.terminal_id == id))
+            .or_else(|| {
+                view.terminals
+                    .iter()
+                    .find(|t| t.role == TerminalRole::Primary)
+            })
+            .or_else(|| view.terminals.first())
+    }
+
+    /// How many snapshots have been applied so far.
+    pub fn snapshots(&self) -> u64 {
+        self.snapshots
     }
 
     /// The selected project's index in [`RemoteWorkspace::projects`].

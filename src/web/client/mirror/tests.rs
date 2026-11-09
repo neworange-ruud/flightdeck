@@ -55,6 +55,8 @@ fn session(project: &str, id: &str, name: &str, shells: &[&str]) -> SessionView 
         recovered: false,
         attached_existing_branch: false,
         worktree_path: String::new(),
+        activity: None,
+        prompt: None,
     }
 }
 

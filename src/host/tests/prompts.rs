@@ -582,3 +582,128 @@ fn an_answered_prompt_is_not_offered_again_and_a_repeat_click_types_nothing() {
         .unwrap();
     assert_eq!(w.pty.input(), b"y".to_vec(), "the second click is dropped");
 }
+
+// ---------------------------------------------------------------------------
+// A remote window's Mission control (`remote-control-pgy3`)
+// ---------------------------------------------------------------------------
+
+/// A remote window's `answer_prompt` frame for `w`'s waiting session.
+fn web_answer(
+    w: &mut Waiting,
+    prompt_id: &str,
+    answer: crate::web::protocol::PromptAnswerView,
+) -> crate::web::protocol::Ack {
+    use crate::web::protocol::{command as names, AnswerPromptArgs, Command as WireCommand};
+    use crate::web::server::{WebInbound, WebOutbound};
+    let args = AnswerPromptArgs {
+        session_id: crate::contracts::TabId(w.tab_id.clone()),
+        prompt_id: prompt_id.to_string(),
+        answer,
+    };
+    let out = w.host.route_inbound(WebInbound::Command {
+        viewer_id: crate::web::protocol::ViewerId::new("viewer-1"),
+        label: "studio-mac".to_string(),
+        command: WireCommand {
+            seq: 7,
+            name: names::ANSWER_PROMPT.to_string(),
+            args: Some(serde_json::to_value(args).unwrap()),
+        },
+    });
+    match out.as_slice() {
+        [WebOutbound::Viewer {
+            msg: crate::web::protocol::ServerMsg::Ack(ack),
+            ..
+        }] => ack.clone(),
+        other => panic!("one ack to the viewer, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_published_row_carries_the_prompt_and_the_activity() {
+    use crate::web::protocol::{PromptAnswerView, PromptShapeView};
+    let fakes = Fakes::new();
+    let w = waiting(&fakes, "codex", Sidecar::None, false);
+    let state = w.host.web_host_state();
+    let session = &state.projects[0].sessions[0];
+    let prompt = session.prompt.as_ref().expect("the waiting prompt");
+    assert_eq!(prompt.prompt_id, w.prompt().unwrap().prompt_id);
+    assert_eq!(prompt.shape, PromptShapeView::Binary);
+    assert_eq!(
+        prompt.buttons.iter().map(|b| b.answer).collect::<Vec<_>>(),
+        [PromptAnswerView::Approve, PromptAnswerView::Deny]
+    );
+    assert_eq!(
+        session.activity,
+        Some(w.host.active_state().tabs[0].meta.activity),
+        "the tab's own moments"
+    );
+}
+
+#[test]
+fn a_remote_answer_types_what_a_local_click_types() {
+    use crate::web::protocol::{AckOutcome, PromptAnswerView};
+    let fakes = Fakes::new();
+    let mut w = waiting(&fakes, "codex", Sidecar::None, false);
+    let prompt_id = w.prompt().unwrap().prompt_id;
+    let ack = web_answer(&mut w, &prompt_id, PromptAnswerView::Approve);
+    assert_eq!(ack.seq, 7);
+    assert_eq!(ack.outcome, AckOutcome::Applied, "{:?}", ack.detail);
+    assert_eq!(w.pty.input(), b"y".to_vec());
+    assert_eq!(w.prompt(), None, "answered: no longer offered");
+    assert_eq!(
+        w.host.web_host_state().projects[0].sessions[0].prompt,
+        None,
+        "and withdrawn from the remote window"
+    );
+
+    // A second click on the same prompt is refused and types nothing.
+    let again = web_answer(&mut w, &prompt_id, PromptAnswerView::Approve);
+    assert_eq!(again.outcome, AckOutcome::Rejected);
+    assert_eq!(w.pty.input(), b"y".to_vec());
+}
+
+#[test]
+fn a_remote_answer_is_refused_for_a_stale_prompt_or_another_writer() {
+    use crate::web::protocol::{AckOutcome, PromptAnswerView};
+    let fakes = Fakes::new();
+    let mut w = waiting(&fakes, "claude", Sidecar::None, false);
+    let ack = web_answer(&mut w, "an-old-prompt", PromptAnswerView::Approve);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack.detail.unwrap().contains("Open the session"));
+    let ack = web_answer(&mut w, "x", PromptAnswerView::Unrecognized);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(w.pty.input().is_empty());
+
+    // Someone else is typing on the host: refused, named, nothing queued.
+    let lock = InputArbiter::shared();
+    lock.lock()
+        .unwrap()
+        .claim(&Writer::Desktop, "desktop", 2_000);
+    w.host.ui.input_lock = Some(lock);
+    let prompt_id = w.prompt().unwrap().prompt_id;
+    let ack = web_answer(&mut w, &prompt_id, PromptAnswerView::Approve);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack.detail.unwrap().contains("desktop is typing"));
+    assert!(w.pty.input().is_empty());
+    assert!(w.prompt().is_some(), "still offered");
+}
+
+#[test]
+fn a_host_that_tracks_no_prompts_refuses_a_remote_answer() {
+    use crate::web::protocol::{AckOutcome, PromptAnswerView};
+    let fakes = Fakes::new();
+    let (state, _pty) = fakes.state_with_a_tab();
+    let tab_id = state.tabs[0].meta.id.clone();
+    let host = fakes.host(state);
+    let mut w = Waiting {
+        host,
+        pty: fakes.pty.queue_session(),
+        tab_id,
+        _root: TempDir::new().unwrap(),
+        phone_sent: 0,
+    };
+    assert_eq!(w.host.web_host_state().projects[0].sessions[0].prompt, None);
+    let ack = web_answer(&mut w, "p", PromptAnswerView::Approve);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack.detail.unwrap().contains("not tracking"));
+}

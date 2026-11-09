@@ -274,6 +274,8 @@ impl Host {
                 recovered: false,
                 attached_existing_branch: false,
                 worktree_path: String::new(),
+                activity: None,
+                prompt: None,
             })
             .collect::<Vec<_>>();
         let selected = self

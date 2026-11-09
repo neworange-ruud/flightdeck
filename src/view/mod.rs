@@ -32,8 +32,9 @@ pub use agent::{
 };
 pub use git_strip::{git_actions, git_strip_view, GitActions, GitStripAgent, GitStripView};
 pub use mission::{
-    grid_columns, grid_visible_rows, mission_view, move_selection, CardAction, GridMove, LastEvent,
-    LastEventKind, MissionCard, MissionSource, MissionTile, MissionView, SessionKey,
+    grid_columns, grid_visible_rows, mission_move, mission_view, mission_view_of, move_selection,
+    CardAction, GridMove, LastEvent, LastEventKind, MissionCard, MissionMove, MissionProject,
+    MissionSession, MissionSource, MissionTile, MissionView, SessionKey,
 };
 pub use mode_bar::{mode_bar_view, HintAction, HintView, ModeBarView};
 pub use project::{project_tab_view, ProjectStatus, ProjectTabView};

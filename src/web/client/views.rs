@@ -136,31 +136,56 @@ pub fn agent_rows(ws: &RemoteWorkspace) -> Vec<AgentRowView> {
         .sessions
         .iter()
         .enumerate()
-        .map(|(index, session)| AgentRowView {
-            id: session.session_id.0.clone(),
-            index,
-            alt_index: (index < 9).then(|| index as u8 + 1),
-            name: session.name.clone(),
-            agent_name: session.agent_display_name.clone(),
-            branch: session.git.branch.clone().unwrap_or_default(),
-            badge: agent_badge(session.status.interpreted),
-            manual_status: session.status.manual,
-            status_text: match session.status.manual {
-                Some(manual) => manual.as_str().to_string(),
-                None => agent_status_text(session.status.interpreted).to_string(),
-            },
-            status_since_secs: Some(session.status.running_time_secs),
-            creating: session.phase == SessionPhase::Creating,
-            selected: selected.as_ref() == Some(&session.session_id),
-            unread: false,
-            changes: changes(&session.git),
-            upstream: upstream(&session.git),
-            base_drift: session.git.drift,
-            recovered: session.recovered,
-            attached_existing_branch: session.attached_existing_branch,
-            terminals: terminal_rows(session),
+        .map(|(index, session)| {
+            session_row(
+                index,
+                session,
+                selected.as_ref() == Some(&session.session_id),
+            )
         })
         .collect()
+}
+
+/// One session's agent row: `index` is its position in its project,
+/// `selected` whether it is this client's selected session (R2).
+pub fn session_row(index: usize, session: &SessionView, selected: bool) -> AgentRowView {
+    AgentRowView {
+        id: session.session_id.0.clone(),
+        index,
+        alt_index: (index < 9).then(|| index as u8 + 1),
+        name: session.name.clone(),
+        agent_name: session.agent_display_name.clone(),
+        branch: session.git.branch.clone().unwrap_or_default(),
+        badge: agent_badge(session.status.interpreted),
+        manual_status: session.status.manual,
+        status_text: match session.status.manual {
+            Some(manual) => manual.as_str().to_string(),
+            None => agent_status_text(session.status.interpreted).to_string(),
+        },
+        status_since_secs: Some(session.status.running_time_secs),
+        creating: session.phase == SessionPhase::Creating,
+        selected,
+        unread: false,
+        changes: changes(&session.git),
+        upstream: upstream(&session.git),
+        base_drift: session.git.drift,
+        recovered: session.recovered,
+        attached_existing_branch: session.attached_existing_branch,
+        terminals: terminal_rows(session),
+    }
+}
+
+/// The git actions a remote session's strip offers: what [`git_strip`]
+/// enables for the selected session, for any session.
+pub fn session_git_actions(session: &SessionView) -> GitActions {
+    let ready = session.phase == SessionPhase::Ready;
+    GitActions {
+        push: ready,
+        // Pull Base is refused from a remote surface (SPECS §5.2,
+        // `PULL_BASE_REFUSAL`), so it is never offered live.
+        pull_base: false,
+        finish: ready,
+    }
 }
 
 /// The selected session's focused terminal as the sidebar marks it: `None`
@@ -191,7 +216,6 @@ pub fn git_strip(ws: &RemoteWorkspace) -> GitStripView {
         .map(|p| p.base_branch.clone())
         .unwrap_or_default();
     let agent = ws.selected_session().map(|session| {
-        let ready = session.phase == SessionPhase::Ready;
         let target_branch = base.clone();
         GitStripAgent {
             name: session.name.clone(),
@@ -201,13 +225,7 @@ pub fn git_strip(ws: &RemoteWorkspace) -> GitStripView {
             changes: changes(&session.git),
             upstream: upstream(&session.git),
             base_drift: session.git.drift,
-            actions: GitActions {
-                push: ready,
-                // Pull Base is refused from a remote surface (SPECS §5.2,
-                // `PULL_BASE_REFUSAL`), so it is never offered live.
-                pull_base: false,
-                finish: ready,
-            },
+            actions: session_git_actions(session),
         }
     });
     GitStripView {

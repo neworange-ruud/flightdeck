@@ -86,6 +86,7 @@
 //! | [`Delta::DialogOpened`] + [`DialogOrigin`] | D13 — shared dialogs carry who opened them |
 //! | [`Command`] (name + free-form args) | D13/D8 — the M2 door: palette, dialogs, git commands |
 //! | [`SessionView::lifecycle_reporting`], [`StatusBucket::Unknown`] | turn 2 §5.1 "unknown stays unknown" |
+//! | [`SessionView::activity`], [`SessionView::prompt`], [`PendingPrompt`], [`command::ANSWER_PROMPT`] | Mission control in a remote window (`remote-control-pgy3`): recency and order, and a waiting tile's inline answers (additive, rule 4) |
 //! | [`HostKind`], [`Snapshot::host_kind`], [`WORKER_MIN_CLIENT_VERSION`], [`negotiated`] | `specs/WORKER_PRD.md` §5 — a Desktop must know it drives a worker, and a v6 Desktop must keep driving a v7 TUI host |
 //! | [`ConnectionKind`], [`Attach::connection`], [`ServerMsg::TakenOver`], [`Delta::Connections`] | PRD W10/W17/W19 — one window per worker, the new one takes over, plus background links that only watch |
 //! | [`WorkerSnapshot`], [`Delta::Health`], [`Delta::WorkerShell`], [`Delta::WorkerStatus`], [`Delta::HostMessage`], [`Delta::Notification`] | PRD W15/W18/W27/W29 — the worker's shell, status, health, messages and notifications |
@@ -129,7 +130,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agents::status::DisplayStatus;
-use crate::contracts::{AgentTabPosition, InterpretedStatus, ManualStatus, PtySize, TabId};
+use crate::contracts::{
+    AgentTabPosition, InterpretedStatus, ManualStatus, PtySize, TabActivity, TabId,
+};
 use crate::terminal::session::TerminalKind;
 
 #[cfg(test)]
@@ -1009,6 +1012,112 @@ pub struct SessionView {
     /// path syntax. Empty from a host that predates the field.
     #[serde(default)]
     pub worktree_path: String,
+    /// The session's recorded moments — last output, last status change,
+    /// last git change — in the host's unix seconds: what Mission control's
+    /// recency, order and "2h ago" are read from.
+    ///
+    /// Stated **when the row is sent** (a snapshot, a
+    /// [`Delta::SessionUpsert`]), never as a delta of its own: the output
+    /// stamp moves every second an agent prints, and a frame per second per
+    /// busy session would cost every browser a resnapshot each time. A native
+    /// client dates what happens after the row arrived itself, from the
+    /// [`Delta::Status`] and [`Delta::Git`] frames it already receives.
+    ///
+    /// Additive under rule 4: `None` from a host that predates it, whose
+    /// sessions a client then dates only from what it saw happen.
+    #[serde(default)]
+    pub activity: Option<TabActivity>,
+    /// The prompt the session's agent is waiting on, when the host detected
+    /// one (FlightDeck Remote's detection: the needs-input edge, the agents'
+    /// prompt sidecars, the Claude session-file ingest), with the inline
+    /// answers it accepts through [`command::ANSWER_PROMPT`]. `None` while the
+    /// session is not waiting on a detected prompt.
+    ///
+    /// Additive under rule 4: a host that predates it, or does not track
+    /// prompts, never sends one, and its waiting sessions are answered in
+    /// the session itself.
+    #[serde(default)]
+    pub prompt: Option<Box<PendingPrompt>>,
+}
+
+/// A waiting session's pending prompt, as Mission control answers it inline
+/// ([`SessionView::prompt`]). The host's own `crate::view::PromptView`, on
+/// the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPrompt {
+    /// Echoed back in [`AnswerPromptArgs::prompt_id`], so an answer to a
+    /// prompt that was answered or superseded meanwhile is refused rather than
+    /// typed into the next one.
+    pub prompt_id: String,
+    /// How it can be answered.
+    #[serde(default)]
+    pub shape: PromptShapeView,
+    /// The question, or what the agent wants permission for (may be empty).
+    #[serde(default)]
+    pub text: String,
+    /// The answers to offer, in order; empty for
+    /// [`PromptShapeView::Unsupported`].
+    #[serde(default)]
+    pub buttons: Vec<PromptButtonView>,
+}
+
+/// Which kind of inline answer a [`PendingPrompt`] allows.
+///
+/// Open rather than closed (rule 2's shape): a shape this build does not know
+/// reads as [`PromptShapeView::Unsupported`] — answer it in the session —
+/// which is the honest lesser answer, not a wrong one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptShapeView {
+    /// Approve / Deny.
+    Binary,
+    /// One button per option.
+    SingleSelect,
+    /// No inline answer: open the session to answer it.
+    #[default]
+    #[serde(other)]
+    Unsupported,
+}
+
+/// One inline answer of a [`PendingPrompt`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptButtonView {
+    /// The agent's own option label, or "Approve" / "Deny".
+    pub label: String,
+    /// What choosing it answers.
+    pub answer: PromptAnswerView,
+}
+
+/// What one inline answer says, sent back in [`AnswerPromptArgs::answer`].
+/// An answer kind this build does not know parses as
+/// [`PromptAnswerView::Unrecognized`], and its button is not offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptAnswerView {
+    /// Allow a binary permission prompt (once).
+    Approve,
+    /// Deny a binary permission prompt.
+    Deny,
+    /// Pick the option at this 0-based index of a single-select question.
+    Option {
+        /// The option's index.
+        index: u32,
+    },
+    /// A kind this build does not know.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// The `args` of [`command::ANSWER_PROMPT`]: which session, which prompt,
+/// which of its answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerPromptArgs {
+    /// The waiting session.
+    pub session_id: TabId,
+    /// [`PendingPrompt::prompt_id`] as the client saw it.
+    pub prompt_id: String,
+    /// One of the prompt's [`PendingPrompt::buttons`]' answers.
+    pub answer: PromptAnswerView,
 }
 
 /// One open project (a tab in the project row).
@@ -2869,6 +2978,19 @@ pub mod command {
     /// `{ dialog_id }`; cancelling is the one dialog decision that is never
     /// destructive, so it is accepted for every dialog kind.
     pub const DIALOG_CANCEL: &str = "dialog_cancel";
+
+    // -- a waiting agent's prompt (Mission control's inline answers) ---------
+
+    /// Answer the prompt a session's agent is waiting on with one of the
+    /// inline answers its [`super::SessionView::prompt`] offers. `args` is
+    /// [`super::AnswerPromptArgs`]. The host checks it against the prompt it
+    /// detected and types exactly what a phone's tap on the same answer types,
+    /// claiming the input lock for the viewer that sent it.
+    ///
+    /// Not a version bump: `args` has been free-form since v1, and a host that
+    /// predates the name refuses it as unknown — which a client never sends,
+    /// since that host also never sends a prompt to answer.
+    pub const ANSWER_PROMPT: &str = "answer_prompt";
 
     // -- the palette surface (§22's actions, by wire name) -----------------
 

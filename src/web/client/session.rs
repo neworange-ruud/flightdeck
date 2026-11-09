@@ -60,20 +60,35 @@
 //! The host's configuration manager ([`RemoteConfigEditor`]) is offered on
 //! every host kind that forwards it (design A1): staged here, saved in one
 //! command.
+//!
+//! ## Mission control
+//!
+//! The main view ([`MainView`]) and Mission control's scope are this
+//! front-end's own, like the rest of browsing: kept for the life of the
+//! session (across reconnects), never sent, never persisted. Mission control
+//! is the local window's ([`crate::view::mission`]), built from the mirror
+//! ([`super::mission`]); its selection is this front-end's selected session,
+//! so selecting a tile moves nothing on the host. Its moving keys
+//! ([`RemoteSession::mission_move`]) are the local window's, and a tile's
+//! inline prompt answer ([`HostEvent::AnswerPrompt`]) goes to the host as
+//! `answer_prompt`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::app::commands::Selector;
-use crate::app::keymap::encode_paste;
+use crate::app::keymap::{encode_paste, Action};
 use crate::app::modes::InputMode;
-use crate::contracts::{Notification, NotificationSound, Notifier, PtySize, TabId};
+use crate::contracts::{Clock, Notification, NotificationSound, Notifier, PtySize, TabId};
 use crate::host::{GitStatusView, HostEvent, MessageView, OverlayInput, OverlayKey, OverlayView};
+use crate::persistence::workspace::{MainView, MissionScope};
 use crate::terminal::session::{Terminal, TerminalKind, TerminalProfile};
 use crate::tui::clipboard::{check_pasted_image, PastedImage};
 use crate::tui::palette::FrontEndAction;
 use crate::view::TerminalRef;
+use crate::view::{mission_move, MissionView, PromptReply, SessionKey};
 use crate::web::client::messages;
+use crate::web::client::mission::{self, ActivityWatch};
 use crate::web::client::views::{self, DialogDraft, LocalAction, RemoteAction};
 use crate::web::client::worker::OpenedProject;
 use crate::web::client::{CloneEvent, EditorEffect, ProjectPicker, RemoteConfigEditor};
@@ -203,7 +218,26 @@ pub struct RemoteSession {
     /// mouse selection does), for the front-end to put on this machine's
     /// clipboard: the host's emulator cannot, its clipboard is not ours.
     copied: Option<String>,
+    /// This machine's clock: what Mission control's ages are measured
+    /// against and what the activity watch dates changes with.
+    clock: Rc<dyn Clock>,
+    /// Projects or Mission control.
+    main_view: MainView,
+    /// What Mission control shows.
+    mission_scope: MissionScope,
+    /// What this front-end saw happen to each session since the host last
+    /// stated its activity.
+    watch: ActivityWatch,
+    /// Prompts answered from here and not yet withdrawn by the host (at most
+    /// [`ANSWERED_KEPT`]), so a tile's buttons go away on the click.
+    answered: VecDeque<String>,
+    /// The seq of each `answer_prompt` not acked yet, and the prompt it
+    /// answered: a refused answer offers the prompt's buttons again.
+    answer_seqs: HashMap<u64, String>,
 }
+
+/// How many answered prompt ids are remembered.
+const ANSWERED_KEPT: usize = 64;
 
 impl RemoteSession {
     /// Wrap a client (connecting, or scripted in tests). Its terminals are
@@ -240,7 +274,18 @@ impl RemoteSession {
             awaiting_replay: true,
             notifier: Rc::new(crate::notify::SystemNotifier),
             copied: None,
+            clock: Rc::new(crate::contracts::real::RealClock),
+            main_view: MainView::Projects,
+            mission_scope: MissionScope::default(),
+            watch: ActivityWatch::new(),
+            answered: VecDeque::new(),
+            answer_seqs: HashMap::new(),
         }
+    }
+
+    /// Read time from `clock` instead of the system's.
+    pub fn set_clock(&mut self, clock: Rc<dyn Clock>) {
+        self.clock = clock;
     }
 
     /// Parse mirrored terminals with `pump` instead of the core's.
@@ -476,6 +521,9 @@ impl RemoteSession {
         self.pending_open = None;
         self.config_seq = None;
         self.awaiting_replay = true;
+        self.watch.reset();
+        self.answered.clear();
+        self.answer_seqs.clear();
     }
 
     /// Whether the front-end should close (the palette's Quit, or the user's
@@ -570,7 +618,27 @@ impl RemoteSession {
         changed |= self.select_opened();
         changed |= self.sync_terminals();
         self.sync_geometry();
+        self.watch
+            .observe(self.client.workspace(), self.clock.now_unix_secs());
+        changed |= self.forget_withdrawn_prompts();
         changed
+    }
+
+    /// Forget the answered prompts the host no longer shows, so the list
+    /// stays short and a prompt id the host reuses is offered again.
+    fn forget_withdrawn_prompts(&mut self) -> bool {
+        if self.answered.is_empty() {
+            return false;
+        }
+        let ws = self.client.workspace();
+        let before = self.answered.len();
+        self.answered.retain(|id| {
+            ws.projects
+                .iter()
+                .flat_map(|p| p.sessions.iter())
+                .any(|s| s.prompt.as_ref().is_some_and(|p| &p.prompt_id == id))
+        });
+        before != self.answered.len()
     }
 
     /// A worker's words since the last turn: its host messages (a notice,
@@ -715,6 +783,11 @@ impl RemoteSession {
                 self.config_answered(ack.outcome, ack.detail);
                 continue;
             }
+            if let Some(prompt_id) = self.answer_seqs.remove(&ack.seq) {
+                if ack.outcome != AckOutcome::Applied {
+                    self.answered.retain(|id| id != &prompt_id);
+                }
+            }
             match (ack.outcome, ack.detail) {
                 (AckOutcome::Rejected, Some(detail)) => self.local = Local::Message(detail),
                 (_, Some(detail)) => self.notice = Some(detail),
@@ -734,6 +807,9 @@ impl RemoteSession {
                 self.config_seq = None;
                 self.config_answered(AckOutcome::Rejected, Some(error.message));
                 continue;
+            }
+            if let Some(prompt_id) = error.seq.and_then(|seq| self.answer_seqs.remove(&seq)) {
+                self.answered.retain(|id| id != &prompt_id);
             }
             match error.code {
                 ErrorCode::SeatHeld | ErrorCode::ReadOnly => self.notice = Some(error.message),
@@ -958,8 +1034,154 @@ impl RemoteSession {
                         .to_string(),
                 )
             }
-            // Mission control's inline prompt answers are a local window's.
-            HostEvent::AnswerPrompt(_) => {}
+            HostEvent::AnswerPrompt(reply) => self.answer_prompt(&reply),
+        }
+    }
+
+    // -- Mission control ----------------------------------------------------
+
+    /// Projects or Mission control.
+    pub fn main_view(&self) -> MainView {
+        self.main_view
+    }
+
+    /// Mission control's scope.
+    pub fn mission_scope(&self) -> &MissionScope {
+        &self.mission_scope
+    }
+
+    /// Replace Mission control's scope.
+    pub fn set_mission_scope(&mut self, scope: MissionScope) {
+        self.mission_scope = scope;
+    }
+
+    /// Show `to`, as a local window's view switch does: entering Mission
+    /// control lands on the grid (APP mode) with a tile selected when there is
+    /// one, so the chords have a target from the first key; leaving it keeps
+    /// the selection, so Projects opens on the very session that was selected.
+    /// Either shows the host's projects (not a shell's tab).
+    pub fn set_main_view(&mut self, to: MainView) {
+        if self.main_view == to {
+            return;
+        }
+        self.main_view = to;
+        self.tab = Tab::Project;
+        if to == MainView::Mission {
+            let view = self.mission_view();
+            let on_a_tile = self
+                .mission_selection()
+                .is_some_and(|k| view.tile(&k).is_some());
+            match view.tiles.first() {
+                Some(first) if !on_a_tile => {
+                    let key = first.key.clone();
+                    self.select_mission_session(&key, InputMode::App);
+                }
+                _ => self.mode = InputMode::App,
+            }
+        }
+    }
+
+    /// The other view (Alt-m).
+    pub fn toggle_main_view(&mut self) {
+        self.set_main_view(self.main_view.toggled());
+    }
+
+    /// Mission control over the host, now.
+    pub fn mission_view(&self) -> MissionView {
+        let answered: Vec<String> = self.answered.iter().cloned().collect();
+        mission::mission_view(
+            self.workspace(),
+            &self.watch,
+            &self.mission_scope,
+            self.clock.now_unix_secs(),
+            &answered,
+        )
+    }
+
+    /// The session Mission control has selected: this front-end's own.
+    pub fn mission_selection(&self) -> Option<SessionKey> {
+        let ws = self.workspace();
+        Some(SessionKey {
+            project: ws.selected_project_index()?,
+            tab_id: ws.selected_session()?.session_id.0.clone(),
+        })
+    }
+
+    /// Select `key` (this front-end's selection only, R2) and be in `mode`:
+    /// APP keeps the grid, TERMINAL opens the focus view when the session has
+    /// a terminal to focus.
+    pub fn select_mission_session(&mut self, key: &SessionKey, mode: InputMode) {
+        let id = TabId(key.tab_id.clone());
+        if !self.client.workspace_mut().select_session(&id) {
+            return;
+        }
+        self.tab = Tab::Project;
+        match mode {
+            InputMode::Terminal if self.active_terminal().is_some() => {
+                self.mode = InputMode::Terminal
+            }
+            InputMode::Terminal => {}
+            InputMode::App => self.mode = InputMode::App,
+        }
+    }
+
+    /// Take over `action` when it means *moving* in Mission control
+    /// ([`mission_move`], the local window's rule): returns whether it did.
+    /// Every other chord is left to [`RemoteSession::apply`], and acts on the
+    /// selected tile like it does on the selected row.
+    pub fn mission_move(&mut self, action: &Action) -> bool {
+        let view = self.mission_view();
+        let current = self
+            .mission_selection()
+            .and_then(|k| view.tile(&k).map(|(i, _)| i));
+        let Some(to) = mission_move(action, self.mode, current, view.tiles.len()) else {
+            return false;
+        };
+        if let Some(tile) = view.tiles.get(to.tile) {
+            let key = tile.key.clone();
+            self.select_mission_session(&key, to.mode);
+        }
+        true
+    }
+
+    /// The terminal Mission control draws for `key`: the one this front-end
+    /// last looked at in that session, else its agent.
+    pub fn session_terminal(&self, key: &SessionKey) -> Option<&Terminal> {
+        let id = self
+            .workspace()
+            .session_terminal(&TabId(key.tab_id.clone()))?
+            .terminal_id
+            .clone();
+        self.terminals.get(&id).map(|m| &m.terminal)
+    }
+
+    /// Send a tile's inline answer to the host (`answer_prompt`), which checks
+    /// it against the prompt it detected and types what a local click would.
+    fn answer_prompt(&mut self, reply: &PromptReply) {
+        if !mission::answers_prompts(self.workspace()) {
+            self.local = Local::Message(
+                "The host does not take inline answers. Open the session to answer it.".to_string(),
+            );
+            return;
+        }
+        if self.answered.contains(&reply.prompt_id) {
+            return;
+        }
+        match self
+            .client
+            .command(names::ANSWER_PROMPT, Some(mission::answer_args(reply)))
+        {
+            Some(seq) => {
+                self.answer_seqs.insert(seq, reply.prompt_id.clone());
+                self.answered.push_back(reply.prompt_id.clone());
+                while self.answered.len() > ANSWERED_KEPT {
+                    self.answered.pop_front();
+                }
+            }
+            None => {
+                self.local =
+                    Local::Message("Not connected to the host — the answer was not sent.".into())
+            }
         }
     }
 

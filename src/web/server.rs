@@ -3676,12 +3676,14 @@ async fn handle_command(
         // §8's configuration manager forwards for the same kind of reason: the
         // two config files and the layer walk live with the TUI's own manager,
         // and this module has no business reading them a second time
-        // (`remote-control-1p22`, §6.5 R22).
+        // (`remote-control-1p22`, §6.5 R22). A prompt answer forwards because
+        // the prompt tracker it is checked against is the host's.
         Route::Selection(_)
         | Route::ActivityRead
         | Route::Palette(_)
         | Route::Dialog(_)
-        | Route::Config => {
+        | Route::Config
+        | Route::Prompt => {
             shared.notify(WebInbound::Command {
                 viewer_id: viewer_id.clone(),
                 label: shared

@@ -138,10 +138,13 @@ pub struct GitFingerprint {
 impl GitFingerprint {
     /// Fingerprint a freshly collected status.
     pub fn of(status: &WorktreeStatus) -> Self {
-        Self {
-            changes: status.changes,
-            ahead: status.ahead,
-        }
+        Self::from_parts(status.changes, status.ahead)
+    }
+
+    /// Fingerprint the two facts directly — what a remote client reads off
+    /// the wire's git bar, which is not a [`WorktreeStatus`].
+    pub fn from_parts(changes: WorktreeChanges, ahead: u32) -> Self {
+        Self { changes, ahead }
     }
 }
 
