@@ -16,7 +16,7 @@ set -eu
 #   PROFILE=release scripts/build-windows
 #
 # Note: this only *builds* the .exe. Running it requires Windows (real, a
-# Windows-on-ARM VM, or the windows-latest CI job) — see README "Cross-building
+# Windows-on-ARM VM, or the windows-latest CI job) — see CONTRIBUTING.md "Cross-building
 # for Windows".
 
 TARGET="x86_64-pc-windows-msvc"

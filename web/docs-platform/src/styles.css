@@ -56,3 +56,9 @@
 /* A standalone italic line directly under an image reads as its caption. */
 .docs-prose p:has(> em:only-child) { margin-top: -0.6rem; text-align: center; }
 .docs-prose p:has(> em:only-child) em { color: var(--docs-muted); font-size: 0.85rem; font-style: normal; }
+
+/* Folded sidebar sections (navigation.collapsedSections). */
+.docs-nav-fold > summary { list-style: none; display: flex; align-items: center; justify-content: space-between; }
+.docs-nav-fold > summary::-webkit-details-marker { display: none; }
+.docs-nav-fold > summary::after { content: "›"; font-size: 1rem; line-height: 1; transition: transform 120ms ease; }
+.docs-nav-fold[open] > summary::after { transform: rotate(90deg); }

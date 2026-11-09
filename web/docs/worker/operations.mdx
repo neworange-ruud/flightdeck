@@ -1,0 +1,206 @@
+---
+label: Worker in Depth
+section: Workers & Remote Hosts
+order: 30
+---
+
+# Worker in Depth
+
+The [worker quickstart](/worker) gets a worker running and paired. This page
+covers the rest: what the Desktop shows about a worker, the security model,
+day-to-day operation, phone pairing and the `[worker]` settings.
+
+## One window at a time
+
+A worker has one remote window at a time. If you open the worker from a second
+Desktop, or with `flightdeck connect`, the newer one takes over. The first window shows **Taken over by
+`<device>`** with a **Reconnect** button, which takes the worker back. Its
+pairing stays valid.
+
+If the worker is stopped, the window shows **The worker stopped.** and tells you
+to run `flightdeck worker start` on the machine, then **Reconnect**.
+
+When no window is open, each Desktop keeps a status-only background link to its
+saved workers. Each row in the **WORKERS** section shows a status pill:
+
+| Pill | Meaning |
+| --- | --- |
+| **connecting…** | The Desktop is dialling the worker. |
+| **online** | Connected. The row shows the worker's health (for example `load 0.42 · 18 GB free · 3 agents`), how many agents need you, and its version. |
+| **offline** | Unreachable. The row shows when it was last seen, and the Desktop retries. |
+| **not paired** | This Desktop's token is gone. **Connect to remote…** pairs it again. |
+| **access revoked** | The worker revoked this Desktop. Pair again with a new code. |
+| **update needed** | The Desktop and the worker speak protocols too far apart. The row says which side to update. |
+
+A **version differs** badge means the worker runs a different FlightDeck version
+than the Desktop. Click a row to open that worker's window.
+
+The Desktop raises OS notifications for the worker's agents (needs input, error,
+done), the way a local FlightDeck would. They are not posted while a window to
+that worker is open, because that window notifies instead. When several Desktop
+processes run on one machine, only one posts them. Background links carry no
+terminal output and can't send input, and they never cause a takeover.
+
+Host messages (for example a refused merge or a failed clone) appear in the open
+window. While nothing is attached, the worker keeps the last 100. The next window
+shows them as **N messages while you were away**.
+
+## Security
+
+<Callout type="warning">
+  **Pairing a Desktop with a worker gives it the worker account's full power:** a
+  shell and read and write access to the whole home directory. Only pair
+  Desktops you trust as much as you trust a login on that account.
+</Callout>
+
+- **The tailnet is the boundary.** The worker listens only on Tailscale
+  addresses, so your Tailscale ACLs decide who can even reach the port.
+- **Codes need a shell on the box.** A pairing code can only be minted through a
+  control socket that only the worker account can reach. Getting a code already
+  means being logged in as that account.
+- **Tokens are per Desktop and revocable.** List them with
+  `flightdeck worker devices`. Revoke one with `flightdeck worker revoke <device>`,
+  by id, by label (case-insensitive) or by a unique id prefix. Its live
+  connections close at once, and it must pair again to reconnect.
+- **No credentials cross the wire.** Nothing leaves the WireGuard tunnel, so there
+  is no TLS, and the worker never handles your agent or git logins.
+
+```bash
+flightdeck worker devices
+flightdeck worker revoke mbp
+```
+
+`devices` prints a table with each Desktop's id, label, state (attached,
+background or offline; revoked ones are marked), when it paired, when it was last
+seen and its address. `devices --json` prints a bare array for scripts.
+
+Whether agents run in containers or worktree isolation follows your normal
+[configuration](/reference/configuration), with no worker-specific default.
+
+## Pair the iPhone app
+
+A worker can also pair the FlightDeck Remote iPhone app directly, over its
+Tailscale address. It is off by default, because a paired phone can type into
+agents and open a shell.
+
+1. Add `phone = true` under `[worker]` in the worker's
+   `~/.flightdeck/config.toml` and run `flightdeck worker restart`.
+2. In the Worker shell, run `flightdeck worker pair --phone`. It prints a QR
+   code and a 4-digit code and waits until the phone has paired.
+
+The phone lists the worker as `<host> (worker)`. `flightdeck worker devices` and
+`flightdeck worker status` list paired phones, and
+`flightdeck worker revoke <pairing id>` unpairs one. The worker sends no phone
+notifications while a Desktop window is attached to it. See
+[FlightDeck Remote](/remote) for the app itself.
+
+## Operate the worker
+
+### Status
+
+```bash
+flightdeck worker status
+flightdeck worker status --json
+```
+
+`status` shows whether the worker is running, its pid, uptime and version, the
+addresses it listens on (or why it isn't listening), paired devices, the attached
+device, background links, and every project with its agents and their status.
+When the worker is stopped, it shows the supervisor's last exit and, if it gave
+up, why. `--json` prints a stable shape for scripts.
+
+### Logs
+
+```bash
+flightdeck worker logs          # last 100 lines
+flightdeck worker logs -n 500   # last 500 lines
+flightdeck worker logs -f       # follow
+```
+
+The log is `~/.flightdeck/logs/worker.log`, rotated at 10 MB with 5 files kept. It
+reads the file directly, so it works while the worker is down.
+
+### Stop and restart
+
+```bash
+flightdeck worker stop
+flightdeck worker restart
+```
+
+`stop` shuts the worker down gracefully and saves state, so the next `start`
+resumes your agents. `restart` is stop then start. Agents relaunch with their
+resume command, as in the terminal UI. A turn that was in progress is lost.
+
+### Crash recovery
+
+A small supervisor restarts the worker if it crashes, waiting longer after each
+crash (from 1 second up to 60). If the worker crashes 5 times within 10 minutes,
+the supervisor gives up. `flightdeck worker status` then shows `Gave up:` with the
+reason (for example `5 crashes within 10 minutes`), and `flightdeck worker logs`
+shows the details. A run that lasts at least a minute resets the wait to 1 second. Fix the cause and run
+`flightdeck worker start`. The supervisor also gives up at once if the global
+config is invalid, or if another worker already runs for the account.
+
+### No Tailscale address
+
+If the worker has no Tailscale address (Tailscale is down or logged out), it keeps
+running and your agents keep working. `status` reports **Not listening: no
+Tailscale address**. The worker checks every 5 seconds and starts listening as
+soon as an address appears, and rebinds if the address changes. Desktops
+reconnect on their own. Run `tailscale up` on the worker if it stays that way.
+
+### Update
+
+On the worker, in the Worker shell or over SSH:
+
+```bash
+flightdeck update
+flightdeck worker restart
+```
+
+The restart makes the worker and its supervisor run the new binary. Until then,
+`status` shows the running worker's version with a note that the CLI differs,
+and the Desktop shows a **version differs** badge in the launcher and a banner in
+the worker window: "This worker runs FlightDeck `<worker>`; this app was built with
+`<app>`. Update it from the worker shell: `flightdeck update`, then
+`flightdeck worker restart`." Updating from the Desktop is not available
+in this version.
+
+### The terminal UI on a worker machine
+
+While a worker runs, starting the terminal UI or a local Desktop window on that
+machine refuses: "A FlightDeck worker is running on this machine and serving its
+projects. Control it from FlightDeck Desktop, or run `flightdeck worker stop`."
+Desktop remote windows on that machine are not affected.
+
+## Configuration
+
+The worker reads a `[worker]` table from your **global**
+`~/.flightdeck/config.toml`. A project's `[worker]` table is ignored. Every key is
+optional.
+
+```toml
+[worker]
+port = 7420
+projects_root = "~/flightdeck"
+default_cols = 200
+default_rows = 50
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `port` | `7420` | TCP port served on each Tailscale address. `0` is rejected. |
+| `projects_root` | `"~/flightdeck"` | Scanned two levels deep for repositories to offer, and where clones land. `~` and relative paths are relative to your home directory. Must not be empty. |
+| `default_cols` | `200` | Terminal width for an agent started while no window has reported a size (20 to 1000). |
+| `default_rows` | `50` | Terminal height in the same case (4 to 500). |
+| `phone` | `false` | Allow pairing the iPhone app with `flightdeck worker pair --phone`. See [Pair the iPhone app](#pair-the-iphone-app). |
+
+An attached window resizes terminals to fit its panes, so the defaults only apply
+when nothing is attached. An invalid `[worker]` table stops the worker from
+starting. Run `flightdeck worker logs` to see the message. These settings aren't
+in the configuration manager, so edit the file and run `flightdeck worker restart`.
+
+To change other settings (agents, git, UI) for the worker's projects, open the
+configuration manager from the worker window: choose **Open Configuration** in the
+command palette. It edits the configuration on the worker, and it works in a
+remote window on any host, not only workers.
