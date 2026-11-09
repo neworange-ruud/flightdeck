@@ -5,9 +5,11 @@
 //! --help` prints this family's help. The return value is the process exit
 //! code.
 //!
-//! The lifecycle commands live here: `start` spawns the supervisor and waits
-//! for the worker to answer, `stop` signals whoever holds a lock and waits for
-//! the locks to free, `restart` is both, and `logs` reads the log file. The
+//! The lifecycle commands live here: `start` spawns the supervisor (through
+//! the service manager when start on boot is set up) and waits for the worker
+//! to answer, `stop` signals whoever holds a lock and waits for the locks to
+//! free, `restart` is both, `enable` / `disable` set start on boot up and take
+//! it down ([`crate::worker::service`]), and `logs` reads the log file. The
 //! commands that talk to a running worker go to [`crate::worker::status_cli`].
 
 use std::io::Write;
@@ -18,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::contracts::{Clock, FileSystem, RealClock, RealFs};
 use crate::worker::control::{self, ControlRequest};
 use crate::worker::paths::WorkerPaths;
+use crate::worker::service::{self, RealServiceOs, ServiceStart};
 use crate::worker::state::{self, SupervisorPhase};
 use crate::worker::{daemon, lock, log, status_cli, supervisor};
 
@@ -45,6 +48,10 @@ COMMANDS:
     devices [--json]     List paired Desktops (and, as text, paired phones)
     revoke <device>      Revoke a Desktop's access, or unpair a phone
     logs [-f] [-n N]     Print (or follow) the worker log
+    enable [--dry-run]   Start the worker on boot (macOS: at login) with launchd
+                         or systemd, and start it now; run again to refresh
+                         its PATH. --dry-run prints the file and commands
+    disable [--dry-run]  Stop starting the worker on boot
     run                  Run the worker in the foreground, logging to stderr
 
 Linux and macOS only.
@@ -90,6 +97,12 @@ enum Command {
     Run,
     /// Internal: what `start` runs in the background.
     Supervise,
+    Enable {
+        dry_run: bool,
+    },
+    Disable {
+        dry_run: bool,
+    },
 }
 
 /// Why a command line was refused.
@@ -150,7 +163,20 @@ fn parse(args: &[String]) -> Result<Command, ParseError> {
             )),
         },
         "logs" => parse_logs(rest),
+        "enable" => dry_run_only(command, rest).map(|dry_run| Command::Enable { dry_run }),
+        "disable" => dry_run_only(command, rest).map(|dry_run| Command::Disable { dry_run }),
         other => Err(ParseError::Unknown(other.to_string())),
+    }
+}
+
+/// `[--dry-run]`: whether it was given.
+fn dry_run_only(command: &str, rest: &[String]) -> Result<bool, ParseError> {
+    match rest {
+        [] => Ok(false),
+        [flag] if flag == "--dry-run" => Ok(true),
+        _ => Err(ParseError::Usage(format!(
+            "`flightdeck worker {command}` takes only `--dry-run`."
+        ))),
     }
 }
 
@@ -258,6 +284,8 @@ fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             logs(&paths, lines, &stop, out, err)
         }
         Command::Run => crate::worker::run::run(&paths),
+        Command::Enable { dry_run } => enable(&paths, dry_run, out, err),
+        Command::Disable { dry_run } => disable(&paths, dry_run, out, err),
         Command::Supervise => match supervisor::supervise(&paths) {
             Ok(code) => code,
             Err(e) => {
@@ -285,7 +313,23 @@ fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// `worker start`: spawn the supervisor and wait for the worker to answer.
+/// How `start` launched the supervisor, so it knows which supervisor's
+/// state to watch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Launch {
+    /// Spawned here, detached: its pid.
+    Detached(u32),
+    /// Started by the service manager at or after this unix second; its pid
+    /// is learnt from `supervisor.json`.
+    Service { since: u64 },
+}
+
+/// `worker start`: start the supervisor and wait for the worker to answer.
+///
+/// With start on boot set up, the service manager starts it
+/// ([`service::start`]), so the worker gets the service's environment (and,
+/// on macOS, the GUI login session); otherwise, or when the manager cannot,
+/// it is spawned detached.
 fn start(paths: &WorkerPaths, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if lock::worker_running(&RealFs, paths) {
         let pid = read_pid(&paths.worker_pid).or_else(|| read_pid(&paths.supervisor_pid));
@@ -301,27 +345,76 @@ fn start(paths: &WorkerPaths, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = writeln!(err, "Could not create {}: {e}", paths.dir.display());
         return 1;
     }
+    let launch = match start_through_service(paths, out) {
+        Some(since) => Launch::Service { since },
+        None => match spawn_supervisor(paths, err) {
+            Some(pid) => Launch::Detached(pid),
+            None => return 1,
+        },
+    };
+    let _ = writeln!(out, "Starting the worker…");
+    wait_for_worker(paths, launch, out, err)
+}
+
+/// Ask the service manager to start the supervisor, when start on boot is
+/// set up: the unix second it was asked at, or `None` to spawn it here (with
+/// a line saying why, when the manager was not used or refused).
+fn start_through_service(paths: &WorkerPaths, out: &mut dyn Write) -> Option<u64> {
+    let ctx = service::Context::current(paths)?;
+    let os = RealServiceOs;
+    let report = service::query(&os, &ctx);
+    let since = RealClock.now_unix_secs();
+    match service::start(&os, &ctx, &report) {
+        ServiceStart::Started => Some(since),
+        ServiceStart::NotInstalled => None,
+        ServiceStart::Skipped(why) | ServiceStart::Failed(why) => {
+            let _ = writeln!(
+                out,
+                "Starting the worker directly, not through its {}: {why}.",
+                ctx.manager.describe()
+            );
+            None
+        }
+    }
+}
+
+/// Spawn `worker supervise` detached: its pid, or `None` after saying why
+/// not.
+fn spawn_supervisor(paths: &WorkerPaths, err: &mut dyn Write) -> Option<u32> {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
             let _ = writeln!(err, "Could not find the flightdeck binary: {e}");
-            return 1;
+            return None;
         }
     };
-    let supervisor_pid = match daemon::spawn_detached(
+    match daemon::spawn_detached(
         &exe,
         &["worker", "supervise"],
         &paths.home,
         Some(&paths.log_file),
     ) {
-        Ok(pid) => pid,
+        Ok(pid) => Some(pid),
         Err(e) => {
             let _ = writeln!(err, "Could not start the worker: {e}");
-            return 1;
+            None
         }
-    };
-    let _ = writeln!(out, "Starting the worker…");
+    }
+}
+
+/// Wait until the worker answers on its control socket, or until its
+/// supervisor gives up, exits, or [`START_TIMEOUT`] passes.
+fn wait_for_worker(
+    paths: &WorkerPaths,
+    launch: Launch,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let deadline = Instant::now() + START_TIMEOUT;
+    let mut supervisor_pid = match launch {
+        Launch::Detached(pid) => Some(pid),
+        Launch::Service { .. } => None,
+    };
     loop {
         if let Some((pid, version)) = control::ping(paths) {
             let _ = writeln!(
@@ -331,26 +424,37 @@ fn start(paths: &WorkerPaths, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             );
             return 0;
         }
-        // Only this supervisor's state counts, not one a previous run left.
-        let ours =
-            state::read(&paths.supervisor_state).filter(|s| s.supervisor_pid == supervisor_pid);
-        if let Some(s) = ours.as_ref().filter(|s| s.phase == SupervisorPhase::GaveUp) {
-            let reason = s.gave_up_reason.as_deref().unwrap_or("unknown");
-            return start_failed(paths, &format!("the supervisor gave up: {reason}"), err);
-        }
-        if !daemon::alive(supervisor_pid) {
-            if ours
+        let current = state::read(&paths.supervisor_state);
+        if let (None, Launch::Service { since }) = (supervisor_pid, launch) {
+            // The first supervisor to start since the manager was asked.
+            supervisor_pid = current
                 .as_ref()
-                .is_some_and(|s| s.phase == SupervisorPhase::Stopped)
-            {
-                let _ = writeln!(err, "The worker was stopped before it answered.");
-                return 1;
+                .filter(|s| s.started_at >= since)
+                .map(|s| s.supervisor_pid);
+        }
+        if let Some(supervisor_pid) = supervisor_pid {
+            // Only this supervisor's state counts, not one a previous run left.
+            let ours = current.filter(|s| s.supervisor_pid == supervisor_pid);
+            if let Some(s) = ours.as_ref().filter(|s| s.phase == SupervisorPhase::GaveUp) {
+                let reason = s.gave_up_reason.as_deref().unwrap_or("unknown");
+                return start_failed(paths, &format!("the supervisor gave up: {reason}"), err);
             }
-            let why = match ours.and_then(|s| s.last_exit) {
-                Some(exit) => format!("the supervisor exited; the worker {}", exit.description),
-                None => "the supervisor exited".to_string(),
-            };
-            return start_failed(paths, &why, err);
+            if !daemon::alive(supervisor_pid) {
+                if ours
+                    .as_ref()
+                    .is_some_and(|s| s.phase == SupervisorPhase::Stopped)
+                {
+                    let _ = writeln!(err, "The worker was stopped before it answered.");
+                    return 1;
+                }
+                let why = match ours.and_then(|s| s.last_exit) {
+                    Some(exit) => {
+                        format!("the supervisor exited; the worker {}", exit.description)
+                    }
+                    None => "the supervisor exited".to_string(),
+                };
+                return start_failed(paths, &why, err);
+            }
         }
         if Instant::now() >= deadline {
             let _ = writeln!(
@@ -453,6 +557,84 @@ fn restart(paths: &WorkerPaths, out: &mut dyn Write, err: &mut dyn Write) -> i32
         );
     }
     start(paths, out, err)
+}
+
+/// Printed by `enable` and `disable` on a unix without launchd or systemd.
+const NO_SERVICE_MANAGER: &str =
+    "Start on boot needs launchd (macOS) or systemd (Linux); this system has neither.";
+
+/// `worker enable [--dry-run]`: set up start on boot, and start the worker
+/// through the service manager when none runs.
+fn enable(paths: &WorkerPaths, dry_run: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(ctx) = service::Context::current(paths) else {
+        let _ = writeln!(err, "{NO_SERVICE_MANAGER}");
+        return 2;
+    };
+    if !dry_run {
+        // launchd opens the log for the supervisor's stderr.
+        if let Err(e) = paths.ensure_dirs() {
+            let _ = writeln!(err, "Could not create {}: {e}", paths.dir.display());
+            return 1;
+        }
+    }
+    let env = service::Environment::current();
+    if env.login_path.is_none() {
+        let _ = writeln!(
+            out,
+            "Could not read PATH from your login shell; the worker gets this command's PATH."
+        );
+    }
+    let spec = ctx.spec(&env);
+    let running = lock::worker_running(&RealFs, paths);
+    let since = RealClock.now_unix_secs();
+    match service::enable(&RealServiceOs, &ctx, &spec, running, dry_run, out, err) {
+        Err(code) => code,
+        Ok(done) if done.started => {
+            let _ = writeln!(out, "\nStarting the worker…");
+            wait_for_worker(paths, Launch::Service { since }, out, err)
+        }
+        Ok(_) => 0,
+    }
+}
+
+/// `worker disable [--dry-run]`: take start on boot down. A worker the
+/// service manager runs is stopped first, gracefully, as `worker stop` does;
+/// one started otherwise keeps running.
+fn disable(paths: &WorkerPaths, dry_run: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let Some(ctx) = service::Context::current(paths) else {
+        let _ = writeln!(err, "{NO_SERVICE_MANAGER}");
+        return 2;
+    };
+    let os = RealServiceOs;
+    let report = service::query(&os, &ctx);
+    let mut stopped = false;
+    if report.active {
+        if dry_run {
+            let _ = writeln!(
+                out,
+                "Would stop the worker first, as `flightdeck worker stop` does: its {} runs it.\n",
+                ctx.manager.describe()
+            );
+        } else {
+            let code = stop(paths, out, err);
+            if code != 0 {
+                return code;
+            }
+            stopped = true;
+        }
+    }
+    if let Err(code) = service::disable(&os, &ctx, &report, dry_run, out, err) {
+        return code;
+    }
+    if stopped {
+        let _ = writeln!(
+            out,
+            "The worker is stopped. `flightdeck worker start` starts it again."
+        );
+    } else if !dry_run && lock::worker_running(&RealFs, paths) {
+        let _ = writeln!(out, "The running worker keeps running.");
+    }
+    0
 }
 
 /// `worker logs`: the last `lines` lines, then, unless `stop` is already

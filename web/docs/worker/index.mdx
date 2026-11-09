@@ -55,10 +55,26 @@ flightdeck worker start
 It returns once the worker is running in the background. If it can't start, it
 tells you why.
 
+Then make it come back on its own after a reboot:
+
+```bash
+flightdeck worker enable
+```
+
+This hands the worker to your system's service manager (launchd on a Mac,
+systemd on Linux). Your projects and agents resume where they were after every
+restart.
+
 <Callout type="note">
-  The worker doesn't start by itself after a reboot yet. Run
-  `flightdeck worker start` again; your projects and agents resume where they
-  were.
+  **On a Mac, "on boot" means "at login".** The worker starts when the worker
+  account logs in at the screen. For a Mac that reboots unattended, turn on
+  automatic login (System Settings → Users & Groups; not available with
+  FileVault). If nobody is logged in at the screen yet, `enable` sets it up for
+  the next login.
+
+  **On Linux**, `enable` tells you if the account needs *lingering* to start at
+  boot instead of at login, and prints the command:
+  `sudo loginctl enable-linger $USER`.
 </Callout>
 
 ## 2. Pair your Desktop
@@ -104,9 +120,11 @@ whatever login the worker account has.
 <Callout type="warning">
   **macOS workers and Claude Code.** Claude Code keeps its login in the macOS
   Keychain, which an agent started from an SSH session may not be able to read.
-  If an agent says it isn't logged in, put an API key in the worker account's
-  shell profile instead (for example `ANTHROPIC_API_KEY`), then run
-  `flightdeck worker restart`.
+  If an agent says it isn't logged in, make sure the worker runs through
+  `flightdeck worker enable` with the account logged in at the screen, so it
+  runs in that login session. If that doesn't help, put an API key in the
+  worker account's shell profile instead (for example `ANTHROPIC_API_KEY`),
+  run `flightdeck worker enable` again, then `flightdeck worker restart`.
 </Callout>
 
 ## 4. Open a project
@@ -134,7 +152,10 @@ A few things are different on a worker:
   the Desktop still sends you a notification when one needs you or finishes.
 - **One window at a time.** If you open the worker from a second computer, that
   window takes over and the first one offers **Reconnect**.
-- **Mission control and split view** aren't available in a worker's window yet.
+- **Mission control works here too** (`Alt-m`): every live agent on the worker
+  as a tile, and you can approve or deny a waiting agent's prompt from its
+  tile. Browsing never changes what another window sees. Split view isn't
+  available in a worker's window.
 
 ## Use a terminal instead of the Desktop
 

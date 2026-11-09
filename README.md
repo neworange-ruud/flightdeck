@@ -74,6 +74,7 @@ On the worker (a Mac or Linux machine on your tailnet), over SSH:
 
 ```bash
 flightdeck worker start
+flightdeck worker enable     # come back after a reboot (macOS: at login)
 flightdeck worker pair       # prints an address and a 4-digit code
 ```
 

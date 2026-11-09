@@ -1,6 +1,7 @@
 //! A tile's live terminal: any session's grid, read-only and scaled down.
 //!
-//! The grid is the host's ([`AppHost::tab_terminal`]), sized by the Projects
+//! The grid is the host's ([`AppHost::tab_terminal`]) — in a remote window the
+//! mirrored one ([`Surface::tile_terminal`]) — sized by the Projects
 //! view's PTY viewport, which is far larger than a tile. Squeezing every cell
 //! in would mean a 5px font; instead the tile picks a small readable size
 //! ([`MIN_FONT`]..[`MAX_FONT`], shrinking to fit the width when it can) and
@@ -38,7 +39,7 @@ use gpui::{
     TextAlign, Window,
 };
 
-use crate::host::HostModel;
+use crate::surface::Surface;
 use crate::terminal::element::{mono_font, paint_box, shape_text, CellMetrics};
 use crate::terminal::layout::{RowLayout, TermPalette};
 use crate::terminal::rowcache::{CachedRow, RowCache};
@@ -54,7 +55,7 @@ const LINE_HEIGHT: f32 = 1.45;
 
 /// One tile's grid, as a cached view (see the module docs).
 pub struct TileView {
-    host: Entity<HostModel>,
+    surface: Surface,
     key: SessionKey,
     palette: TermPalette,
     /// The rows laid out and shaped on earlier frames; lent to the element
@@ -65,9 +66,9 @@ pub struct TileView {
 }
 
 impl TileView {
-    pub fn new(host: Entity<HostModel>, key: SessionKey, cx: &mut Context<Self>) -> Self {
+    pub fn new(surface: Surface, key: SessionKey, cx: &mut Context<Self>) -> Self {
         Self {
-            host,
+            surface,
             key,
             palette: TermPalette::from_palette(Palette::global(cx)),
             cache: RowCache::default(),
@@ -80,8 +81,8 @@ impl TileView {
     /// Whether this tile's terminal changed since the tile last drew it
     /// (damage since its own position, or a different terminal altogether),
     /// so Mission control redraws only the tiles that need it.
-    pub fn has_changes(&self, host: &flightdeck::host::AppHost<'_>) -> bool {
-        match host.tab_terminal(self.key.project, &self.key.tab_id) {
+    pub fn has_changes(&self, cx: &App) -> bool {
+        match self.surface.tile_terminal(&self.key, cx) {
             None => !self.cache.rows().is_empty(),
             Some(terminal) => {
                 self.cache.source() != Some(grid_identity(terminal))
@@ -96,7 +97,7 @@ impl Render for TileView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         TileGrid {
             tile: cx.entity(),
-            host: self.host.clone(),
+            surface: self.surface.clone(),
             key: self.key.clone(),
             palette: self.palette,
         }
@@ -143,7 +144,7 @@ fn last_content_row<S>(rows: &[CachedRow<S>]) -> Option<u16> {
 
 struct TileGrid {
     tile: Entity<TileView>,
-    host: Entity<HostModel>,
+    surface: Surface,
     key: SessionKey,
     palette: TermPalette,
 }
@@ -205,8 +206,7 @@ impl Element for TileGrid {
         if !window.content_mask().bounds.intersects(&bounds) {
             return Prepared { cache, shown: None };
         }
-        let host = self.host.read(cx).host();
-        let Some(terminal) = host.tab_terminal(self.key.project, &self.key.tab_id) else {
+        let Some(terminal) = self.surface.tile_terminal(&self.key, cx) else {
             return Prepared { cache, shown: None };
         };
         let (rows, cols) = terminal.screen().size();

@@ -22,6 +22,45 @@ export function Badge({ children, tone = "neutral" }: { children: ReactNode; ton
   return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold uppercase ${tone === "success" ? "border-emerald-400 text-emerald-600" : "border-[color:var(--docs-border)] text-[color:var(--docs-muted)]"}`}>{children}</span>;
 }
 
+/**
+ * A video in a docs page. Self-hosted (`src`, a file under `web/public/videos/`
+ * or any https URL) or a YouTube embed (`youtube`, the video id), never both.
+ * `title` is required: it labels the player for screen readers and is the
+ * iframe title. Bad props fail the build rather than ship a broken player.
+ *
+ * ```mdx
+ * <Video src="/videos/worker-setup.mp4" poster="/videos/worker-setup.jpg"
+ *   captions="/videos/worker-setup.vtt" title="Set up a worker"
+ *   caption="Five minutes from SSH to a running agent." />
+ * <Video youtube="dQw4w9WgXcQ" title="FlightDeck in 90 seconds" />
+ * <Video src="/videos/mission-control.mp4" title="Approve from Mission control" loop />
+ * ```
+ *
+ * `loop` makes a short silent clip that plays like an animated screenshot
+ * (muted, autoplay, looping, no controls until hovered by the browser's own UI).
+ */
+export function Video({ src, webm, poster, captions, youtube, title, caption, loop = false }: { src?: string; webm?: string; poster?: string; captions?: string; youtube?: string; title: string; caption?: string; loop?: boolean }) {
+  if (!title?.trim()) throw new Error("<Video> needs a title.");
+  if (Boolean(src) === Boolean(youtube)) throw new Error(`<Video title="${title}"> needs exactly one of src or youtube.`);
+  if (youtube && !/^[\w-]{11}$/.test(youtube)) throw new Error(`<Video title="${title}">: youtube must be an 11-character video id, not a URL.`);
+  if (youtube && (webm || poster || captions || loop)) throw new Error(`<Video title="${title}">: webm, poster, captions and loop only apply to a self-hosted src.`);
+
+  const player = youtube
+    ? <iframe allow="encrypted-media; fullscreen; picture-in-picture" allowFullScreen className="aspect-video h-auto w-full" loading="lazy" referrerPolicy="strict-origin-when-cross-origin" src={`https://www.youtube-nocookie.com/embed/${youtube}?rel=0`} title={title} />
+    : <video aria-label={title} autoPlay={loop} className="block h-auto w-full" controls={!loop} loop={loop} muted={loop} playsInline poster={poster} preload="metadata">
+        {webm ? <source src={webm} type="video/webm" /> : null}
+        <source src={src} type="video/mp4" />
+        {captions ? <track default kind="captions" label="English" src={captions} srcLang="en" /> : null}
+      </video>;
+
+  return (
+    <figure className="docs-video my-8">
+      <div className="overflow-hidden rounded-[0.9rem] border border-[color:var(--docs-border)] bg-[color:var(--docs-surface)] shadow-[0_12px_34px_-14px_rgba(2,8,20,0.65)]">{player}</div>
+      {caption ? <figcaption className="mt-3 text-center text-[0.85rem] text-[color:var(--docs-muted)]">{caption}</figcaption> : null}
+    </figure>
+  );
+}
+
 function DocsLink({ currentPage, siteConfig, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { currentPage: DocsPage; siteConfig: DocsSiteConfig }) {
   const href = props.href ?? "#";
   if (href.startsWith("#") || /^(?:[a-z]+:)?\/\//i.test(href)) return <a {...props} className={linkClass} href={href} />;
@@ -43,6 +82,7 @@ export async function renderDocsMdx(page: DocsPage, siteConfig: DocsSiteConfig) 
       Callout,
       Card: (props) => <Card {...props} currentPage={page} siteConfig={siteConfig} />,
       CardGrid,
+      Video,
     },
     options: { parseFrontmatter: false, mdxOptions: { remarkPlugins: [remarkGfm], rehypePlugins: [rehypeSlug, [rehypeAutolinkHeadings, { behavior: "wrap" }]] } },
   });

@@ -37,6 +37,17 @@
 //! with no special case. The only keys Mission control takes over are the
 //! ones that mean *moving* ([`MissionControl::intercept`]): the arrows and
 //! Alt-1..9 follow tile order here, and Enter with no tiles does nothing.
+//!
+//! ## A remote window
+//!
+//! The same view draws a remote host's Mission control
+//! ([`MissionControl::for_remote`]): every control acts through a
+//! [`Surface`], so the tiles, cards, rail, scope menu and focus view are these
+//! very elements. What differs is whose state it is. The selection, the main
+//! view and the scope are the remote window's own (R2: browsing never moves
+//! the host), the model is [`flightdeck::web::client::mission`]'s, and a
+//! chord or an inline answer goes to the host through the remote window's
+//! path ([`crate::commands::perform_remote_entry`]).
 
 pub mod prompt;
 pub mod tile;
@@ -53,8 +64,8 @@ use flightdeck::app::modes::InputMode;
 use flightdeck::host::{AppHost, HostEvent};
 use flightdeck::persistence::workspace::{MainView, MissionScope, RecentScope};
 use flightdeck::view::{
-    format_elapsed, grid_columns, grid_visible_rows, move_selection, AgentBadge, AgentRowView,
-    CardAction, GridMove, MissionCard, MissionTile, MissionView, SessionKey,
+    format_elapsed, grid_columns, grid_visible_rows, mission_move, AgentBadge, AgentRowView,
+    CardAction, MissionCard, MissionTile, MissionView, SessionKey,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -66,9 +77,11 @@ use gpui_component::button::Button;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex, Sizable};
 
-use crate::commands::{keycap, keymap, perform_entry, perform_id};
+use crate::commands::{keycap, keymap, perform_id};
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
+use crate::remote::RemoteModel;
+use crate::surface::Surface;
 use crate::terminal::view::TerminalView;
 use crate::theme::{Hex, Palette};
 use crate::views::icons;
@@ -180,21 +193,30 @@ pub fn set_scope(host: &Entity<HostModel>, scope: MissionScope, cx: &mut App) {
 /// Perform a card's action for its session: select it, then run the keymap
 /// entry whose command the action is — the chord's own event.
 pub fn perform_card_action(
-    host: &Entity<HostModel>,
+    surface: &Surface,
     card: &MissionCard,
     action: CardAction,
     cx: &mut App,
 ) {
-    select_session(host, &card.key, card.tab_index, InputMode::App, cx);
+    surface.select_session(&card.key, card.tab_index, InputMode::App, cx);
     if let Some(entry) = keymap().entry_for_action(&Action::Dispatch(action.command())) {
-        perform_entry(entry, host, cx);
+        surface.perform_entry(entry, cx);
+    }
+}
+
+/// The session Mission control has selected on `surface`: the host's (local)
+/// or the window's own (remote).
+fn selection(surface: &Surface, cx: &App) -> Option<SessionKey> {
+    match surface {
+        Surface::Local(host) => host_selection(host.read(cx).host()),
+        Surface::Remote(remote) => remote.read(cx).mission_selection(),
     }
 }
 
 /// The root of Mission control: owns the tiles' cached views and their
 /// refresh timer. See the module docs.
 pub struct MissionControl {
-    host: Entity<HostModel>,
+    surface: Surface,
     /// The window's terminal view: the focus view's full-size terminal is the
     /// same view the Projects view shows (only one is ever on screen).
     terminal: Entity<TerminalView>,
@@ -220,21 +242,30 @@ impl MissionControl {
         app_focus: FocusHandle,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&host, |this, host, cx| {
-            let model = host.read(cx);
-            if model.host().workspace_ui().view != MainView::Mission {
-                return;
-            }
-            this.dirty = true;
-            // The selected tile keeps up with its output; the rest wait for
-            // the next refresh.
-            if let Some(tile) = host_selection(model.host()).and_then(|k| this.tiles.get(&k)) {
-                if tile.read(cx).has_changes(model.host()) {
-                    tile.update(cx, |_, cx| cx.notify());
-                }
-            }
-        })
-        .detach();
+        cx.observe(&host, |this, _, cx| this.model_changed(cx))
+            .detach();
+        Self::with_surface(Surface::Local(host), terminal, app_focus, cx)
+    }
+
+    /// Mission control over a remote host, in its window: `terminal` is the
+    /// window's mirrored terminal view, `app_focus` its APP-mode focus.
+    pub fn for_remote(
+        remote: Entity<RemoteModel>,
+        terminal: Entity<TerminalView>,
+        app_focus: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&remote, |this, _, cx| this.model_changed(cx))
+            .detach();
+        Self::with_surface(Surface::Remote(remote), terminal, app_focus, cx)
+    }
+
+    fn with_surface(
+        surface: Surface,
+        terminal: Entity<TerminalView>,
+        app_focus: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let refresh = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(TILE_REFRESH).await;
             if this.update(cx, |view, cx| view.refresh_tiles(cx)).is_err() {
@@ -242,7 +273,7 @@ impl MissionControl {
             }
         });
         Self {
-            host,
+            surface,
             terminal,
             app_focus,
             tiles: HashMap::new(),
@@ -254,12 +285,31 @@ impl MissionControl {
         }
     }
 
+    /// The model produced something: the tiles redraw on the next refresh,
+    /// except the selected one, which keeps up with its output now.
+    fn model_changed(&mut self, cx: &mut Context<Self>) {
+        if self.surface.main_view(cx) != MainView::Mission {
+            return;
+        }
+        self.dirty = true;
+        if let Some(tile) = selection(&self.surface, cx).and_then(|k| self.tiles.get(&k)) {
+            if tile.read(cx).has_changes(cx) {
+                tile.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
     fn refresh_tiles(&mut self, cx: &mut Context<Self>) {
         // Every other project's git status, now and then: the host keeps only
         // the active one fresh, and here every project's diff is on screen.
+        // (A remote host refreshes every project itself while a client is
+        // attached.)
         self.refreshes = self.refreshes.wrapping_add(1);
-        if self.refreshes.is_multiple_of(GIT_REFRESH_EVERY) {
-            self.host.update(cx, |model, _| {
+        if let (true, Surface::Local(host)) = (
+            self.refreshes.is_multiple_of(GIT_REFRESH_EVERY),
+            &self.surface,
+        ) {
+            host.update(cx, |model, _| {
                 let (shown, active, count) = {
                     let host = model.host();
                     (
@@ -281,7 +331,7 @@ impl MissionControl {
         // Only the tiles whose own terminal changed redraw: output in one
         // session leaves the other tiles' cached frames alone.
         for tile in self.tiles.values() {
-            if !tile.read(cx).has_changes(self.host.read(cx).host()) {
+            if !tile.read(cx).has_changes(cx) {
                 continue;
             }
             tile.update(cx, |_, cx| cx.notify());
@@ -297,6 +347,9 @@ impl MissionControl {
     /// - Focus (TERMINAL): Alt-N and Alt-Up/Down swap the open session for
     ///   another tile, staying in the focus view. (Alt-Left/Right still cycle
     ///   the open session's own terminals.)
+    ///
+    /// The rule itself is the core's [`mission_move`], which a remote
+    /// window's Mission control follows too ([`MissionControl::intercept_on`]).
     pub fn intercept(host: &Entity<HostModel>, entry: &KeymapEntry, cx: &mut App) -> bool {
         let (view, current, mode) = {
             let h = host.read(cx).host();
@@ -306,55 +359,27 @@ impl MissionControl {
                 h.active_state().mode(),
             )
         };
-        let count = view.tiles.len();
-        let columns = grid_columns(count);
-        let go = |index: usize, mode: InputMode, cx: &mut App| {
-            if let Some(tile) = view.tiles.get(index) {
-                select_session(host, &tile.key, tile.tab_index, mode, cx);
-            }
+        let Some(to) = mission_move(&entry.action, mode, current, view.tiles.len()) else {
+            return false;
         };
-        let step = |mv: GridMove| match current {
-            Some(i) => move_selection(i, count, columns, mv),
-            None => 0,
-        };
-        match (mode, &entry.action) {
-            (InputMode::App, Action::Dispatch(Command::SwitchAgentTab(sel))) => {
-                let target = match sel {
-                    Selector::Prev => step(GridMove::Up),
-                    Selector::Next => step(GridMove::Down),
-                    Selector::Index(i) => *i,
-                };
-                go(target, InputMode::App, cx);
-                true
-            }
-            (InputMode::App, Action::Dispatch(Command::SwitchChildTerminal(sel))) => {
-                let target = match sel {
-                    Selector::Prev => step(GridMove::Left),
-                    Selector::Next => step(GridMove::Right),
-                    Selector::Index(_) => return false,
-                };
-                go(target, InputMode::App, cx);
-                true
-            }
-            // On a tile, Enter is just FocusTerminal: the chord's own event.
-            (InputMode::App, Action::FocusTerminal) => match current {
-                Some(_) => false,
-                None => {
-                    go(0, InputMode::Terminal, cx);
-                    true
+        if let Some(tile) = view.tiles.get(to.tile) {
+            select_session(host, &tile.key, tile.tab_index, to.mode, cx);
+        }
+        true
+    }
+
+    /// [`MissionControl::intercept`] on either surface: a remote window moves
+    /// its own selection, never the host's.
+    pub fn intercept_on(surface: &Surface, entry: &KeymapEntry, cx: &mut App) -> bool {
+        match surface {
+            Surface::Local(host) => Self::intercept(host, entry, cx),
+            Surface::Remote(remote) => remote.update(cx, |model, cx| {
+                let taken = model.mission_move(&entry.action);
+                if taken {
+                    cx.notify();
                 }
-            },
-            (InputMode::Terminal, Action::Dispatch(Command::SwitchAgentTab(sel))) => {
-                let target = match (sel, current) {
-                    (Selector::Index(i), _) => *i,
-                    (Selector::Prev, Some(i)) => i.saturating_sub(1),
-                    (Selector::Next, Some(i)) => (i + 1).min(count.saturating_sub(1)),
-                    (_, None) => 0,
-                };
-                go(target, InputMode::Terminal, cx);
-                true
-            }
-            _ => false,
+                taken
+            }),
         }
     }
 
@@ -363,9 +388,9 @@ impl MissionControl {
         if let Some(tile) = self.tiles.get(key) {
             return tile.clone();
         }
-        let host = self.host.clone();
+        let surface = self.surface.clone();
         let for_key = key.clone();
-        let tile = cx.new(|cx| TileView::new(host, for_key, cx));
+        let tile = cx.new(|cx| TileView::new(surface, for_key, cx));
         self.tiles.insert(key.clone(), tile.clone());
         tile
     }
@@ -383,6 +408,31 @@ struct Frame {
 }
 
 impl Frame {
+    fn of(surface: &Surface, cx: &App) -> Frame {
+        match surface {
+            Surface::Local(host) => Frame::read(host.read(cx).host()),
+            Surface::Remote(remote) => Frame::read_remote(remote.read(cx)),
+        }
+    }
+
+    /// A remote window's frame: its own selection, mode and scope over the
+    /// host's projects.
+    fn read_remote(model: &RemoteModel) -> Frame {
+        Frame {
+            view: model.mission_view(),
+            selected: model.mission_selection(),
+            mode: model.mode(),
+            has_terminal: model.active_terminal().is_some(),
+            scope: model.mission_scope().clone(),
+            projects: model
+                .workspace()
+                .projects
+                .iter()
+                .map(|p| (p.name.clone(), p.root.clone()))
+                .collect(),
+        }
+    }
+
     fn read(host: &AppHost<'_>) -> Frame {
         Frame {
             view: host.mission_view(),
@@ -409,22 +459,22 @@ impl Frame {
 impl Render for MissionControl {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *Palette::global(cx);
-        let frame = Frame::read(self.host.read(cx).host());
+        let frame = Frame::of(&self.surface, cx);
         // Tiles that left the grid lose their cached view.
         self.tiles
             .retain(|key, _| frame.view.tiles.iter().any(|t| &t.key == key));
 
-        let sidebar = mission_sidebar(&frame, &self.host, &p)
+        let sidebar = mission_sidebar(&frame, &self.surface, &p)
             .key_context(flightdeck::app::keymap::Context::App.name())
             .track_focus(&self.app_focus)
             .on_key_down({
-                let host = self.host.clone();
+                let surface = self.surface.clone();
                 move |event, _, cx| {
                     // The TUI's leniency for App-mode chords GPUI did not bind
                     // exactly, through the same interception as a bound chord.
                     if let Some(entry) = flightdeck_desktop::keys::app_key_down(keymap(), event) {
-                        if !MissionControl::intercept(&host, entry, cx) {
-                            perform_entry(entry, &host, cx);
+                        if !MissionControl::intercept_on(&surface, entry, cx) {
+                            surface.perform_entry(entry, cx);
                         }
                         cx.stop_propagation();
                     }
@@ -464,7 +514,7 @@ impl MissionControl {
             .enumerate()
             .map(|(i, t)| {
                 let grid = self.tile_view(&t.key, cx);
-                tile(i, t, frame.is_selected(&t.key), grid, &self.host, p)
+                tile(i, t, frame.is_selected(&t.key), grid, &self.surface, p)
             })
             .collect();
 
@@ -524,10 +574,10 @@ impl MissionControl {
             .p(GAP)
             .gap(GAP)
             .bg(p.surface_terminal.hsla())
-            .child(scope_bar(frame, &self.host, p))
+            .child(scope_bar(frame, &self.surface, p))
             .child(grid)
             .when(!view.cards.is_empty(), |d| {
-                d.child(cards(view, &frame.scope, &self.host, p))
+                d.child(cards(view, &frame.scope, &self.surface, p))
             })
             .into_any_element()
     }
@@ -535,21 +585,33 @@ impl MissionControl {
     /// A3's main area: the strip, the git strip, the full-size terminal.
     fn focus_main(&mut self, frame: &Frame, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let view = &frame.view;
-        let (strip_view, project_name) = {
-            let host = self.host.read(cx).host();
-            (
-                host.git_strip(),
-                host.project_name(host.active_project_index())
-                    .unwrap_or_default()
-                    .to_string(),
-            )
+        let (strip_view, project_name) = match &self.surface {
+            Surface::Local(host) => {
+                let host = host.read(cx).host();
+                (
+                    host.git_strip(),
+                    host.project_name(host.active_project_index())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            }
+            Surface::Remote(remote) => {
+                let ws = remote.read(cx).workspace();
+                (
+                    flightdeck::web::client::views::git_strip(ws),
+                    ws.selected_project()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default(),
+                )
+            }
         };
-        let previews: Vec<String> = {
-            let host = self.host.read(cx).host();
-            view.tiles.iter().map(|t| last_line(host, &t.key)).collect()
-        };
+        let previews: Vec<String> = view
+            .tiles
+            .iter()
+            .map(|t| last_line(&self.surface, &t.key, cx))
+            .collect();
         let back = {
-            let host = self.host.clone();
+            let surface = self.surface.clone();
             v_flex()
                 .id("mission-back-to-grid")
                 .debug_selector(|| "mission-back-to-grid".into())
@@ -567,7 +629,7 @@ impl MissionControl {
                 .cursor_pointer()
                 .child(icons::icon(crate::assets::icon::MISSION, px(13.), p.ink_2))
                 .child("Grid")
-                .on_click(move |_, _, cx| perform_id("FocusApp", &host, cx))
+                .on_click(move |_, _, cx| surface.perform_id("FocusApp", cx))
         };
         let entries = view
             .tiles
@@ -575,7 +637,7 @@ impl MissionControl {
             .zip(previews)
             .enumerate()
             .map(|(i, (t, preview))| {
-                strip_entry(i, t, frame.is_selected(&t.key), preview, &self.host, p)
+                strip_entry(i, t, frame.is_selected(&t.key), preview, &self.surface, p)
             });
         let strip = h_flex()
             .flex_shrink_0()
@@ -589,7 +651,7 @@ impl MissionControl {
             .children(entries);
 
         let show_in_projects = {
-            let host = self.host.clone();
+            let surface = self.surface.clone();
             h_flex()
                 .id("mission-show-in-projects")
                 .debug_selector(|| "mission-show-in-projects".into())
@@ -608,7 +670,7 @@ impl MissionControl {
                     keycap("ToggleMissionControl").unwrap_or_default(),
                     p.faint,
                 ))
-                .on_click(move |_, _, cx| switch_view(&host, MainView::Projects, cx))
+                .on_click(move |_, _, cx| surface.switch_view(MainView::Projects, cx))
         };
         let header = h_flex()
             .flex_shrink_0()
@@ -632,7 +694,7 @@ impl MissionControl {
                     .min_w_0()
                     .child(crate::views::git_strip::git_strip(
                         &strip_view,
-                        &crate::surface::Surface::Local(self.host.clone()),
+                        &self.surface,
                         p,
                     )),
             )
@@ -683,8 +745,8 @@ const SCOPE_BAR_HEIGHT: Pixels = px(28.);
 /// The last line of words a session's terminal shows, for the strip: the
 /// lowest row with a letter or digit on it, so a dialog's bottom border
 /// (`╰────╯`) or a bare prompt is skipped for the question above it.
-fn last_line(host: &AppHost<'_>, key: &SessionKey) -> String {
-    let Some(terminal) = host.tab_terminal(key.project, &key.tab_id) else {
+fn last_line(surface: &Surface, key: &SessionKey, cx: &App) -> String {
+    let Some(terminal) = surface.tile_terminal(key, cx) else {
         return String::new();
     };
     let screen = terminal.screen();
@@ -787,7 +849,7 @@ fn tile(
     t: &MissionTile,
     selected: bool,
     grid: Entity<TileView>,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> AnyElement {
     let row = &t.row;
@@ -881,13 +943,13 @@ fn tile(
     });
 
     // Waiting on a detected prompt: its inline answers (see `prompt`).
-    let answers = prompt::prompt_row(index, t, host, p);
+    let answers = prompt::prompt_row(index, t, surface, p);
 
     let mut shadow = p.status_attention.hsla();
     shadow.a = 0.14;
     let key = t.key.clone();
     let tab_index = t.tab_index;
-    let host = host.clone();
+    let surface = surface.clone();
     v_flex()
         .id(("mission-tile", index))
         .debug_selector(move || format!("mission-tile-{index}"))
@@ -927,7 +989,7 @@ fn tile(
             } else {
                 InputMode::App
             };
-            select_session(&host, &key, tab_index, mode, cx);
+            surface.select_session(&key, tab_index, mode, cx);
         })
         .into_any_element()
 }
@@ -994,10 +1056,10 @@ fn chip(text: String, ink: Hex, bg: Hex) -> gpui::Div {
 
 /// Scope menu, project filter and the counts (the mockup's titlebar row; it
 /// sits above the grid so the titlebar stays the one shared with Projects).
-fn scope_bar(frame: &Frame, host: &Entity<HostModel>, p: &Palette) -> impl IntoElement {
+fn scope_bar(frame: &Frame, surface: &Surface, p: &Palette) -> impl IntoElement {
     let (view, scope, projects) = (&frame.view, &frame.scope, frame.projects.as_slice());
     let window_menu = {
-        let host = host.clone();
+        let surface = surface.clone();
         let scope = scope.clone();
         Button::new("mission-scope")
             .icon(gpui_component::Icon::empty().path(crate::assets::icon::CLOCK))
@@ -1010,13 +1072,13 @@ fn scope_bar(frame: &Frame, host: &Entity<HostModel>, p: &Palette) -> impl IntoE
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
                 for window in RecentScope::ALL {
-                    let host = host.clone();
+                    let surface = surface.clone();
                     let mut next = scope.clone();
                     next.window = window;
                     menu = menu.item(
                         PopupMenuItem::new(scope_label(window))
                             .checked(window == scope.window)
-                            .on_click(move |_, _, cx| set_scope(&host, next.clone(), cx)),
+                            .on_click(move |_, _, cx| surface.set_scope(next.clone(), cx)),
                     );
                 }
                 menu
@@ -1030,7 +1092,7 @@ fn scope_bar(frame: &Frame, host: &Entity<HostModel>, p: &Palette) -> impl IntoE
         },
     };
     let project_menu = {
-        let host = host.clone();
+        let surface = surface.clone();
         let scope = scope.clone();
         let projects = projects.to_vec();
         let filter = view.project_filter;
@@ -1043,22 +1105,22 @@ fn scope_bar(frame: &Frame, host: &Entity<HostModel>, p: &Palette) -> impl IntoE
             .text_color(p.ink_2.hsla())
             .dropdown_menu(move |menu, _, _| {
                 let all = {
-                    let host = host.clone();
+                    let surface = surface.clone();
                     let mut next = scope.clone();
                     next.project = None;
                     PopupMenuItem::new("All projects")
                         .checked(filter.is_none())
-                        .on_click(move |_, _, cx| set_scope(&host, next.clone(), cx))
+                        .on_click(move |_, _, cx| surface.set_scope(next.clone(), cx))
                 };
                 let mut menu = menu.item(all).separator();
                 for (i, (name, root)) in projects.iter().enumerate() {
-                    let host = host.clone();
+                    let surface = surface.clone();
                     let mut next = scope.clone();
                     next.project = Some(root.clone());
                     menu = menu.item(
                         PopupMenuItem::new(name.clone())
                             .checked(filter == Some(i))
-                            .on_click(move |_, _, cx| set_scope(&host, next.clone(), cx)),
+                            .on_click(move |_, _, cx| surface.set_scope(next.clone(), cx)),
                     );
                 }
                 menu
@@ -1102,14 +1164,14 @@ fn scope_bar(frame: &Frame, host: &Entity<HostModel>, p: &Palette) -> impl IntoE
 fn cards(
     view: &MissionView,
     scope: &MissionScope,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> impl IntoElement {
     let cards: Vec<AnyElement> = view
         .cards
         .iter()
         .enumerate()
-        .map(|(i, c)| card(i, c, host, p))
+        .map(|(i, c)| card(i, c, surface, p))
         .collect();
     let mut rows = Vec::new();
     let mut iter = cards.into_iter().peekable();
@@ -1148,7 +1210,7 @@ fn cards(
 }
 
 /// One card: name and age, the detail line, diff and the one action.
-fn card(index: usize, c: &MissionCard, host: &Entity<HostModel>, p: &Palette) -> AnyElement {
+fn card(index: usize, c: &MissionCard, surface: &Surface, p: &Palette) -> AnyElement {
     let row = &c.row;
     let ago = c
         .last_event
@@ -1165,7 +1227,7 @@ fn card(index: usize, c: &MissionCard, host: &Entity<HostModel>, p: &Palette) ->
             .into_any_element(),
     };
     let action = c.action.map(|action| {
-        let host = host.clone();
+        let surface = surface.clone();
         let card = c.clone();
         let cap = keymap()
             .entry_for_action(&Action::Dispatch(action.command()))
@@ -1188,12 +1250,12 @@ fn card(index: usize, c: &MissionCard, host: &Entity<HostModel>, p: &Palette) ->
             .child(icons::keycap(cap, p.faint))
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();
-                perform_card_action(&host, &card, action, cx);
+                perform_card_action(&surface, &card, action, cx);
             })
     });
     let key = c.key.clone();
     let tab_index = c.tab_index;
-    let select_host = host.clone();
+    let select_surface = surface.clone();
     v_flex()
         .id(("mission-card", index))
         .debug_selector(move || format!("mission-card-{index}"))
@@ -1257,7 +1319,9 @@ fn card(index: usize, c: &MissionCard, host: &Entity<HostModel>, p: &Palette) ->
                 .child(div().flex_1())
                 .children(action),
         )
-        .on_click(move |_, _, cx| select_session(&select_host, &key, tab_index, InputMode::App, cx))
+        .on_click(move |_, _, cx| {
+            select_surface.select_session(&key, tab_index, InputMode::App, cx)
+        })
         .into_any_element()
 }
 
@@ -1267,7 +1331,7 @@ fn strip_entry(
     t: &MissionTile,
     open: bool,
     preview: String,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> AnyElement {
     let (bg, border) = match (open, t.needs_you) {
@@ -1294,7 +1358,7 @@ fn strip_entry(
     };
     let key = t.key.clone();
     let tab_index = t.tab_index;
-    let host = host.clone();
+    let surface = surface.clone();
     v_flex()
         .id(("mission-strip", index))
         .debug_selector(move || format!("mission-strip-{index}"))
@@ -1351,16 +1415,12 @@ fn strip_entry(
                 )
                 .child(preview),
         )
-        .on_click(move |_, _, cx| select_session(&host, &key, tab_index, InputMode::Terminal, cx))
+        .on_click(move |_, _, cx| surface.select_session(&key, tab_index, InputMode::Terminal, cx))
         .into_any_element()
 }
 
 /// The rail, regrouped by status across all projects (A2/A3's sidebar).
-fn mission_sidebar(
-    frame: &Frame,
-    host: &Entity<HostModel>,
-    p: &Palette,
-) -> gpui::Stateful<gpui::Div> {
+fn mission_sidebar(frame: &Frame, surface: &Surface, p: &Palette) -> gpui::Stateful<gpui::Div> {
     let view = &frame.view;
     let scope = &frame.scope;
     let needs: Vec<(usize, &MissionTile)> = view
@@ -1402,7 +1462,7 @@ fn mission_sidebar(
         list = list.children(
             needs
                 .iter()
-                .map(|(i, t)| session_row(*i, t, frame.is_selected(&t.key), host, p)),
+                .map(|(i, t)| session_row(*i, t, frame.is_selected(&t.key), surface, p)),
         );
     }
     if !working.is_empty() {
@@ -1411,7 +1471,7 @@ fn mission_sidebar(
         list = list.children(
             working
                 .iter()
-                .map(|(i, t)| session_row(*i, t, frame.is_selected(&t.key), host, p)),
+                .map(|(i, t)| session_row(*i, t, frame.is_selected(&t.key), surface, p)),
         );
     }
     if !view.cards.is_empty() {
@@ -1425,7 +1485,7 @@ fn mission_sidebar(
             view.cards
                 .iter()
                 .enumerate()
-                .map(|(i, c)| card_row(i, c, frame.is_selected(&c.key), host, p)),
+                .map(|(i, c)| card_row(i, c, frame.is_selected(&c.key), surface, p)),
         );
     }
     if view.tiles.is_empty() && view.cards.is_empty() {
@@ -1439,7 +1499,7 @@ fn mission_sidebar(
     }
 
     let footer = {
-        let host = host.clone();
+        let surface = surface.clone();
         let text = match view.quiet_count {
             0 => "Every session is shown".to_string(),
             1 => "1 quiet session hidden".to_string(),
@@ -1463,7 +1523,7 @@ fn mission_sidebar(
                     .text_color(p.accent.hsla())
                     .cursor_pointer()
                     .child("see all in Projects")
-                    .on_click(move |_, _, cx| switch_view(&host, MainView::Projects, cx)),
+                    .on_click(move |_, _, cx| surface.switch_view(MainView::Projects, cx)),
             )
     };
 
@@ -1492,7 +1552,7 @@ fn session_row(
     index: usize,
     t: &MissionTile,
     selected: bool,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> AnyElement {
     let row = &t.row;
@@ -1544,7 +1604,7 @@ fn session_row(
         .unwrap_or_default();
     let key = t.key.clone();
     let tab_index = t.tab_index;
-    let host = host.clone();
+    let surface = surface.clone();
     h_flex()
         .id(("mission-row", index))
         .debug_selector(move || format!("mission-row-{index}"))
@@ -1600,12 +1660,12 @@ fn session_row(
                 ),
         )
         .on_click(move |_, _, cx| {
-            let mode = if host.read(cx).host().terminal_focused() {
+            let mode = if surface.terminal_focused(cx) {
                 InputMode::Terminal
             } else {
                 InputMode::App
             };
-            select_session(&host, &key, tab_index, mode, cx);
+            surface.select_session(&key, tab_index, mode, cx);
         })
         .into_any_element()
 }
@@ -1615,7 +1675,7 @@ fn card_row(
     index: usize,
     c: &MissionCard,
     selected: bool,
-    host: &Entity<HostModel>,
+    surface: &Surface,
     p: &Palette,
 ) -> AnyElement {
     let age = c
@@ -1624,7 +1684,7 @@ fn card_row(
         .unwrap_or_default();
     let key = c.key.clone();
     let tab_index = c.tab_index;
-    let host = host.clone();
+    let surface = surface.clone();
     h_flex()
         .id(("mission-card-row", index))
         .debug_selector(move || format!("mission-card-row-{index}"))
@@ -1663,7 +1723,7 @@ fn card_row(
                 .text_color(p.muted.hsla())
                 .child(age),
         )
-        .on_click(move |_, _, cx| select_session(&host, &key, tab_index, InputMode::App, cx))
+        .on_click(move |_, _, cx| surface.select_session(&key, tab_index, InputMode::App, cx))
         .into_any_element()
 }
 
@@ -1702,6 +1762,38 @@ pub fn mission_status_bar(host: &Entity<HostModel>, p: &Palette, cx: &App) -> im
             .child(word)
             .on_click(move |_, _, cx| perform_id(pill_entry, &host, cx))
     };
+    let surface = Surface::Local(host.clone());
+    h_flex()
+        .flex_shrink_0()
+        .h(crate::views::status_bar::STATUS_BAR_HEIGHT)
+        .px(px(14.))
+        .gap_4()
+        .bg(p.surface_window.hsla())
+        .border_t_1()
+        .border_color(p.hairline.hsla())
+        .text_size(px(11.5))
+        .text_color(p.muted.hsla())
+        .child(pill)
+        .children(mission_hints(mode, &surface, p))
+        .child(div().flex_1())
+        .children(flightdeck_desktop::overlays::update::isolated_badge(
+            &notices, cx,
+        ))
+        .child(flightdeck_desktop::overlays::remote::remote_indicator(
+            &remote, cx,
+        ))
+        .child(hint(
+            keycap("OpenHelp").unwrap_or_default(),
+            "help",
+            Some("OpenHelp"),
+            &surface,
+            p,
+        ))
+}
+
+/// The hints A2 (`mode` APP) and A3 (TERMINAL) show in the status bar, each
+/// its keymap entry's keycap and click on `surface`.
+pub fn mission_hints(mode: InputMode, surface: &Surface, p: &Palette) -> Vec<AnyElement> {
     let jump = format!("{}…9", keycap("JumpToAgentTab1").unwrap_or_default());
     let hints: Vec<(String, &'static str, Option<&'static str>)> = match mode {
         InputMode::App => vec![
@@ -1727,51 +1819,41 @@ pub fn mission_status_bar(host: &Entity<HostModel>, p: &Palette, cx: &App) -> im
             (jump, "swap session", None),
         ],
     };
-    let hint = |key: String, label: &'static str, entry: Option<&'static str>| {
-        let host = host.clone();
-        h_flex()
-            .id(label)
-            .debug_selector(move || format!("mission-hint-{label}"))
-            .flex_none()
-            .gap_1()
-            .when(entry.is_some(), |d| {
-                d.cursor_pointer().hover(|s| s.text_color(p.ink_2.hsla()))
-            })
-            .child(
-                div()
-                    .font_family(MONO_FAMILY)
-                    .text_color(p.ink_2.hsla())
-                    .child(key),
-            )
-            .child(label)
-            .on_click(move |_, _, cx| {
-                if let Some(entry) = entry {
-                    perform_id(entry, &host, cx);
-                }
-            })
-    };
+    hints
+        .into_iter()
+        .map(|(k, l, e)| hint(k, l, e, surface, p).into_any_element())
+        .collect()
+}
+
+/// One status-bar hint: a keycap and a word, clickable when it is an entry.
+fn hint(
+    key: String,
+    label: &'static str,
+    entry: Option<&'static str>,
+    surface: &Surface,
+    p: &Palette,
+) -> gpui::Stateful<gpui::Div> {
+    let surface = surface.clone();
+    let hover = p.ink_2;
     h_flex()
-        .flex_shrink_0()
-        .h(crate::views::status_bar::STATUS_BAR_HEIGHT)
-        .px(px(14.))
-        .gap_4()
-        .bg(p.surface_window.hsla())
-        .border_t_1()
-        .border_color(p.hairline.hsla())
-        .text_size(px(11.5))
-        .text_color(p.muted.hsla())
-        .child(pill)
-        .children(hints.into_iter().map(|(k, l, e)| hint(k, l, e)))
-        .child(div().flex_1())
-        .children(flightdeck_desktop::overlays::update::isolated_badge(
-            &notices, cx,
-        ))
-        .child(flightdeck_desktop::overlays::remote::remote_indicator(
-            &remote, cx,
-        ))
-        .child(hint(
-            keycap("OpenHelp").unwrap_or_default(),
-            "help",
-            Some("OpenHelp"),
-        ))
+        .id(label)
+        .debug_selector(move || format!("mission-hint-{label}"))
+        .flex_none()
+        .gap_1()
+        .when(entry.is_some(), |d| {
+            d.cursor_pointer()
+                .hover(move |s| s.text_color(hover.hsla()))
+        })
+        .child(
+            div()
+                .font_family(MONO_FAMILY)
+                .text_color(p.ink_2.hsla())
+                .child(key),
+        )
+        .child(label)
+        .on_click(move |_, _, cx| {
+            if let Some(entry) = entry {
+                surface.perform_id(entry, cx);
+            }
+        })
 }

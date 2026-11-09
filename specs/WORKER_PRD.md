@@ -53,7 +53,10 @@ give you a shell, and tell you something went wrong.
 
 - Windows workers (W2).
 - Init-system integration and start on boot (W3, W11). After a reboot you run
-  `flightdeck worker start` yourself.
+  `flightdeck worker start` yourself. *Since added as `flightdeck worker
+  enable` (remote-control-9h7j; SPECS §33 "Start on boot"): a launchd agent or
+  systemd user unit that runs the supervisor, which keeps W11's crash
+  recovery.*
 - The phone. No relay pairing, no direct link, no pushes from a worker (W6, W18).
   *Since added as an opt-in, `[worker] phone` (remote-control-qlyd.28; SPECS
   §33 "The phone").*
@@ -119,6 +122,7 @@ and the default paths are proposed defaults, to be confirmed in implementation.
 | `flightdeck worker revoke <device>` | Revokes a Desktop's token and closes its connections at once. |
 | `flightdeck worker logs [-f] [-n N]` | Prints or follows the worker log. Reads the file directly, so it works while the worker is down. |
 | `flightdeck worker run` | The worker in the foreground, with logs on stderr. What the supervisor runs; also for debugging. |
+| `flightdeck worker enable [--dry-run]` / `disable [--dry-run]` | *Added after v1 (remote-control-9h7j).* Start on boot: a launchd agent (macOS, at login) or systemd user unit (Linux). See SPECS §33 "Start on boot". |
 
 `flightdeck worker` with no subcommand prints this table. All of them are
 Linux and macOS only; on Windows they exit with a clear "not supported" error.
@@ -298,6 +302,7 @@ releases must both ship v7.
 - Phone pushes from a worker through the push-only relay. *Done, with the
   whole phone link, as `[worker] phone` (remote-control-qlyd.28).*
 - Start on boot (`worker enable` writing a systemd user unit / launchd agent).
+  *Done as `flightdeck worker enable` / `disable` (remote-control-9h7j).*
 - A TUI attaching to a running worker as a client. *Done as `flightdeck
   connect` (epic remote-control-ki05): the core's `RemoteSession`, which the
   Desktop's remote window also runs on, drawn with the TUI's widgets. Any host

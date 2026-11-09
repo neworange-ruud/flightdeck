@@ -51,11 +51,13 @@ fn the_wire_surface_is_the_palette_plus_the_browsers_own_rows() {
     // (D16 names it but the palette does not offer it), the three rows the
     // browser needs for itself (snapshot, seat, read-marking), and D13's two
     // dialog answers (`dialog_confirm` / `dialog_cancel`) — which the desktop
-    // answers with its keyboard, so they have no palette row on either side.
+    // answers with its keyboard, so they have no palette row on either side —
+    // and `answer_prompt`, a Mission control tile's inline answer, likewise no
+    // palette row.
     // `take_input_lock` is in both counts: it is a palette row *and* a wire row,
     // because both surfaces need the same explicit override (D14 as revised).
     assert_eq!(all_entries().len(), REQUIRED_ACTION_COUNT);
-    assert_eq!(INVENTORY.len(), REQUIRED_ACTION_COUNT + 9);
+    assert_eq!(INVENTORY.len(), REQUIRED_ACTION_COUNT + 10);
 }
 
 /// Two commands sharing a name would make one of them unreachable — the exact
@@ -504,8 +506,9 @@ fn refusals_are_sentences() {
     }
 }
 
-/// D13: exactly the two dialog answers say so on the wire, so the browser's
-/// palette can leave them out without a hardcoded list of its own — and every
+/// D13: exactly the two dialog answers — and a waiting agent's prompt answer,
+/// which answers a question too — say so on the wire, so the browser's
+/// palette can leave them out without a hardcoded list of its own, and every
 /// other row is a palette row.
 #[test]
 fn only_the_dialog_answers_are_flagged_as_answering_a_dialog() {
@@ -516,9 +519,25 @@ fn only_the_dialog_answers_are_flagged_as_answering_a_dialog() {
         .collect();
     assert_eq!(
         answering,
-        vec![names::DIALOG_CONFIRM, names::DIALOG_CANCEL],
-        "the palette on either surface is INVENTORY minus these two"
+        vec![
+            names::DIALOG_CONFIRM,
+            names::DIALOG_CANCEL,
+            names::ANSWER_PROMPT
+        ],
+        "the palette on either surface is INVENTORY minus these three"
     );
+}
+
+/// A prompt answer is a writer's frame, forwarded to the host (its prompt
+/// tracker is the host's), and refused by no host kind.
+#[test]
+fn the_prompt_answer_is_a_writers_forwarded_row() {
+    let spec = lookup(names::ANSWER_PROMPT).expect("in the inventory");
+    assert_eq!(spec.route, Route::Prompt);
+    assert!(spec.requires_control(), "an observer may not type");
+    assert_eq!(spec.refusal(), None);
+    assert_eq!(worker_refusal(names::ANSWER_PROMPT), None);
+    assert_eq!(spec.target(), None, "it names its session in its args");
 }
 
 // ---------------------------------------------------------------------------

@@ -157,6 +157,15 @@ pub enum Route {
     /// comes from the browser — only which curated field, in which of the two
     /// files, gets which of the values that field admits.
     Config,
+    /// Answer the prompt a waiting session's agent shows, with one of the
+    /// inline answers [`crate::web::protocol::SessionView::prompt`] offered
+    /// (Mission control's Approve / Deny, `remote-control-pgy3`). Applied by
+    /// the host through the very translator and keystroke queue a desktop
+    /// tile's click and a phone's tap take, so there is no second answer
+    /// engine. Reads the frame's `args`
+    /// ([`crate::web::protocol::AnswerPromptArgs`]); what may be typed comes
+    /// from the prompt the host detected, never from the frame.
+    Prompt,
     /// Refused with [`crate::web::protocol::AckOutcome::Rejected`] and this
     /// reason: the host implements it, but its effect must not — or cannot —
     /// land for a browser.
@@ -867,6 +876,19 @@ pub static INVENTORY: &[CommandSpec] = &[
         annotation: Some("answers the open dialog"),
         route: Route::Dialog(DialogAct::Cancel),
     },
+    // -- a waiting agent's prompt -------------------------------------------
+    //
+    // Not a palette row on any surface, for the same reason as the two above:
+    // it answers a question already put to the user (here, by the agent), and
+    // only the waiting tile that shows the question can say which answer.
+    CommandSpec {
+        name: names::ANSWER_PROMPT,
+        label: "Answer Prompt",
+        group: "Session",
+        host_only: false,
+        annotation: Some("answers a waiting agent's prompt"),
+        route: Route::Prompt,
+    },
 ];
 
 /// The spec for one wire name, or `None` if this build has no such command.
@@ -898,6 +920,7 @@ impl CommandSpec {
             | Route::Palette(_)
             | Route::Dialog(_)
             | Route::Config
+            | Route::Prompt
             | Route::Rejected(_)
             | Route::NotSupported(_) => true,
         }
@@ -912,15 +935,17 @@ impl CommandSpec {
             | Route::ActivityRead
             | Route::Palette(_)
             | Route::Dialog(_)
-            | Route::Config => None,
+            | Route::Config
+            | Route::Prompt => None,
         }
     }
 
-    /// D13: whether this row answers the open dialog instead of being a palette
-    /// row. Derived from the route rather than stored, so a new
-    /// [`Route::Dialog`] row cannot forget to say so.
+    /// D13: whether this row answers a question already put to the user —
+    /// the open dialog, or a waiting agent's prompt ([`Route::Prompt`]) —
+    /// instead of being a palette row. Derived from the route rather than
+    /// stored, so a new [`Route::Dialog`] row cannot forget to say so.
     pub fn answers_dialog(&self) -> bool {
-        matches!(self.route, Route::Dialog(_))
+        matches!(self.route, Route::Dialog(_) | Route::Prompt)
     }
 
     /// What the browser must expand this row over, filling `run.args`.
@@ -934,6 +959,7 @@ impl CommandSpec {
             | Route::Palette(_)
             | Route::Dialog(_)
             | Route::Config
+            | Route::Prompt
             | Route::Rejected(_)
             | Route::NotSupported(_) => None,
         }
@@ -1302,6 +1328,7 @@ pub fn dispatched_command(route: &Route) -> Option<&Command> {
         Route::Palette(_)
         | Route::Dialog(_)
         | Route::Config
+        | Route::Prompt
         | Route::Server
         | Route::Selection(_)
         | Route::ActivityRead

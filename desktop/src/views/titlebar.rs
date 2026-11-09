@@ -35,6 +35,7 @@ use flightdeck_desktop::overlays::{self, Emit};
 use crate::commands::keycap;
 use crate::fonts::MONO_FAMILY;
 use crate::host::HostModel;
+use crate::surface::Surface;
 use crate::theme::Palette;
 use crate::views::icons;
 
@@ -96,7 +97,12 @@ impl Render for TitleBar {
             .bg(p.surface_window.hsla())
             .border_b_1()
             .border_color(p.hairline.hsla())
-            .child(view_switcher(&p, needs_you, view, &self.host))
+            .child(view_switcher(
+                &p,
+                needs_you,
+                view,
+                &Surface::Local(self.host.clone()),
+            ))
             .child(div().flex_none().w(px(1.)).h(px(20.)).bg(p.border.hsla()))
             .child(project_tabs(&p, &tabs, &self.host, &self.emit, isolated))
             .child(command_field(&p, &self.emit));
@@ -130,12 +136,13 @@ impl Render for TitleBar {
 
 /// `[ Projects | Mission control (n) ]`: the view switch (Alt-m), with the
 /// needs-you count across every project on the Mission control segment. A
-/// click shows that view, as the chord toggles it.
-fn view_switcher(
+/// click shows that view, as the chord toggles it — on the local workspace,
+/// or a remote window's own view of its host.
+pub fn view_switcher(
     p: &Palette,
     needs_you: usize,
     current: MainView,
-    host: &Entity<HostModel>,
+    surface: &Surface,
 ) -> impl IntoElement {
     let segment = |path: &'static str, label: &'static str, view: MainView| {
         let selected = view == current;
@@ -143,7 +150,7 @@ fn view_switcher(
             MainView::Projects => "view-projects",
             MainView::Mission => "view-mission",
         };
-        let host = host.clone();
+        let surface = surface.clone();
         let base = h_flex()
             .id(id)
             .debug_selector(move || id.into())
@@ -153,7 +160,7 @@ fn view_switcher(
             .rounded(px(5.))
             .text_size(px(12.))
             .cursor_pointer()
-            .on_click(move |_, _, cx| crate::views::mission::switch_view(&host, view, cx));
+            .on_click(move |_, _, cx| surface.switch_view(view, cx));
         if selected {
             base.bg(p.surface_raised_nested.hsla())
                 .text_color(p.ink.hsla())

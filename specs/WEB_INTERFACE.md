@@ -3535,6 +3535,47 @@ Desktop host drops the frame silently, and D4 holds there unchanged.
 declares the optional v7 fields and `WireTakenOver`, and bumps its
 `PROTOCOL_VERSION` to 7 to stay in step with the host.
 
+### R29 — Mission control in a remote window, with no version bump
+
+FlightDeck Desktop's remote window (a worker's, or any FlightDeck reached
+through Connect to remote…) draws the local window's Mission control
+(`remote-control-pgy3`). Its rules are `src/view/mission.rs`'s, fed from the
+mirror by `src/web/client/mission.rs`; its selection, main view and scope are
+the window's own (R2), for the window's lifetime, never sent. What the mirror
+lacked, and how it was added, all under rule 4:
+
+| Addition | Why | An older host |
+| --- | --- | --- |
+| `SessionView.activity` (`TabActivity`: last output / status change / git change, host unix seconds) | recency, order and a card's "2h ago" | `None`: the client dates only what it sees change |
+| `SessionView.prompt` (`PendingPrompt`: `prompt_id`, `shape`, `text`, `buttons[{label, answer}]`) | a waiting tile's inline Approve / Deny / option buttons | never sent: no inline answers |
+| `command::ANSWER_PROMPT` (`answer_prompt`, args `AnswerPromptArgs { session_id, prompt_id, answer }`) | answering one of those buttons | not in its inventory: the tile offers "Open to answer" instead |
+
+**`activity` rides with the row, never as a delta of its own.** The output
+stamp moves every second an agent prints, and the SPA answers every `Status` /
+`Git` / `SessionUpsert` with a resnapshot, so a per-second frame would cost
+every browser a snapshot per busy session. `session_deltas` therefore ignores
+`activity`; it is current whenever a snapshot or an upsert carries the row. A
+native client brings it forward itself (`ActivityWatch`): a status or git
+change is dated when its delta arrives, by the host's own edge rules
+(`ActivityProbe`), and a new snapshot starts the watch over. Output is not
+watched, because every attach replays the terminals' recent bytes.
+
+**`prompt` changes are an upsert** (they appear and go rarely). The host
+detects prompts while its web interface runs (`AppHost::track_prompts`, which
+transmits nothing) and publishes each waiting session's unanswered one.
+
+**Open vocabularies inside the prompt.** `PromptShapeView` and
+`PromptAnswerView` parse an unknown member as `unsupported` / `unrecognized`
+(`#[serde(other)]`), and a client offers no inline answer for a prompt with an
+answer it cannot name — the lesser reading (open the session), not a wrong one.
+
+**`answer_prompt` is a writer's row, forwarded, and not a palette row.**
+`Route::Prompt` sets `answers_dialog`, so the SPA's palette leaves it out with
+D13's two answers. The host runs it down the path a local tile's click takes
+(`answer_prompt_as`: offered-answer check, the phone's translator, the
+deferred keystroke queue) and claims the input lock **as that viewer**, so a
+remote click never lands in the middle of someone else's typing either.
+
 ---
 
 ## 7. Reference

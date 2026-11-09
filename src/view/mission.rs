@@ -27,13 +27,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::app::activity::{compare_sessions, is_active, is_recent, needs_you, SessionActivity};
-use crate::app::commands::Command;
+use crate::app::commands::{Command, Selector};
+use crate::app::keymap::Action;
+use crate::app::modes::InputMode;
 use crate::app::state::AppState;
 use crate::contracts::{InterpretedStatus, TabActivity};
 use crate::git::status::WorktreeStatus;
 use crate::persistence::workspace::MissionScope;
 use crate::view::agent::{agent_row_view, AgentBadge, AgentRowView, UpstreamState};
-use crate::view::git_strip::git_actions;
+use crate::view::git_strip::{git_actions, GitActions};
 use crate::view::prompt::PromptView;
 
 /// One open project, as Mission control reads it.
@@ -202,6 +204,36 @@ impl MissionView {
     }
 }
 
+/// One session as Mission control reads it, whatever it came from: a local
+/// project's [`AppState`] ([`mission_view`]) or a remote host's mirror
+/// (`crate::web::client::mission`). Everything the rules below look at is
+/// here, so the two sources cannot be judged by different rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissionSession {
+    /// The Projects view's row for it: id, name, badge, git, age.
+    pub row: AgentRowView,
+    /// The interpreted status the tile / card / quiet split reads.
+    pub status: InterpretedStatus,
+    /// Its recorded moments: recency, order, the card's last event.
+    pub activity: TabActivity,
+    /// The git actions its strip would enable (a card's one action).
+    pub git_actions: GitActions,
+    /// Whether its git status is known at all: unknown git offers no guess.
+    pub git_known: bool,
+}
+
+/// One open project and its sessions in tab order, as [`mission_view_of`]
+/// reads it.
+#[derive(Debug, Clone)]
+pub struct MissionProject<'a> {
+    /// Display name.
+    pub name: &'a str,
+    /// Repository root: what the scope's project filter names.
+    pub root: &'a Path,
+    /// Its sessions, in tab order.
+    pub sessions: Vec<MissionSession>,
+}
+
 /// One in-scope session while the view is being sorted.
 struct Candidate<'a> {
     project: usize,
@@ -220,6 +252,40 @@ pub fn mission_view(
     now_ms: u64,
     now_secs: u64,
 ) -> MissionView {
+    let projects: Vec<MissionProject<'_>> = projects
+        .iter()
+        .map(|source| MissionProject {
+            name: source.name,
+            root: source.root,
+            sessions: source
+                .state
+                .tabs
+                .iter()
+                .enumerate()
+                .filter_map(|(ti, tab)| {
+                    let row = agent_row_view(source.state, ti, source.git, now_ms, now_secs)?;
+                    Some(MissionSession {
+                        row,
+                        status: tab.display_status(now_ms).interpreted,
+                        activity: tab.meta.activity,
+                        git_actions: git_actions(tab),
+                        git_known: source.git.contains_key(&tab.meta.id),
+                    })
+                })
+                .collect(),
+        })
+        .collect();
+    mission_view_of(&projects, scope, now_secs)
+}
+
+/// Build Mission control from source-agnostic `projects` (in workspace
+/// order) under `scope`, with ages against `now_secs` (unix seconds): the
+/// rules in the module docs, for a local workspace and a remote one alike.
+pub fn mission_view_of(
+    projects: &[MissionProject<'_>],
+    scope: &MissionScope,
+    now_secs: u64,
+) -> MissionView {
     let project_filter = scope
         .project
         .as_deref()
@@ -229,8 +295,8 @@ pub fn mission_view(
     let mut needs_you_count = 0;
     let mut candidates: Vec<Candidate<'_>> = Vec::new();
     for (pi, source) in projects.iter().enumerate() {
-        for (ti, tab) in source.state.tabs.iter().enumerate() {
-            let status = tab.display_status(now_ms).interpreted;
+        for (ti, session) in source.sessions.iter().enumerate() {
+            let status = session.status;
             if needs_you(status) {
                 needs_you_count += 1;
             }
@@ -242,10 +308,10 @@ pub fn mission_view(
                 tab_index: ti,
                 status,
                 activity: SessionActivity {
-                    id: &tab.meta.id,
-                    name: &tab.meta.name,
+                    id: &session.row.id,
+                    name: &session.row.name,
                     status,
-                    activity: tab.meta.activity,
+                    activity: session.activity,
                 },
             });
         }
@@ -263,10 +329,8 @@ pub fn mission_view(
     };
     for c in candidates {
         let source = &projects[c.project];
-        let Some(row) = agent_row_view(source.state, c.tab_index, source.git, now_ms, now_secs)
-        else {
-            continue;
-        };
+        let session = &source.sessions[c.tab_index];
+        let row = session.row.clone();
         let key = SessionKey {
             project: c.project,
             tab_id: row.id.clone(),
@@ -288,15 +352,13 @@ pub fn mission_view(
                 prompt: None,
             });
         } else if is_recent(&c.activity.activity, now_secs, window) {
-            let tab = &source.state.tabs[c.tab_index];
-            let git = source.git.get(&tab.meta.id);
             view.cards.push(MissionCard {
                 key,
                 project_name: source.name.to_string(),
                 tab_index: c.tab_index,
                 last_event: LastEvent::of(&c.activity.activity, now_secs),
                 detail: card_detail(&row, c.status),
-                action: card_action(&row, git_actions(tab), git.is_some()),
+                action: card_action(&row, session.git_actions, session.git_known),
                 row,
             });
         } else {
@@ -364,11 +426,7 @@ fn capitalise(word: &str) -> String {
 ///    the upstream): **Push**.
 /// 4. Otherwise **Finish**, when git status is known — a clean, pushed,
 ///    up-to-date session is done with. Unknown git state offers nothing.
-fn card_action(
-    row: &AgentRowView,
-    actions: crate::view::GitActions,
-    git_known: bool,
-) -> Option<CardAction> {
+fn card_action(row: &AgentRowView, actions: GitActions, git_known: bool) -> Option<CardAction> {
     if actions.finish && row.badge == AgentBadge::Done {
         return Some(CardAction::Finish);
     }
@@ -440,6 +498,77 @@ pub fn move_selection(current: usize, count: usize, columns: usize, mv: GridMove
                 (current + columns).min(count - 1)
             }
         }
+    }
+}
+
+/// Where a chord Mission control takes over moves the selection: a tile, by
+/// its position in tile order, and the input mode to land in (APP keeps the
+/// grid, TERMINAL is the focus view). The tile may be past the last one
+/// (Alt-9 over three tiles): the chord is still taken, and nothing moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissionMove {
+    /// The tile's position in [`MissionView::tiles`].
+    pub tile: usize,
+    /// The mode to be in afterwards.
+    pub mode: InputMode,
+}
+
+/// The chords that mean *moving* in Mission control, over `count` tiles with
+/// the tile at `current` selected (`None`: the selection is not on a tile),
+/// in `mode`. `None` leaves the chord to its ordinary meaning — every other
+/// chord acts on the selected tile with no special case.
+///
+/// - Grid (APP): Up/Down (bare or Alt) move a row, Left/Right a tile, Alt-N
+///   selects tile N; Enter with no tile selected selects the first and opens
+///   it (on a tile, Enter is just FocusTerminal: the chord's own event).
+/// - Focus (TERMINAL): Alt-N and Alt-Up/Down swap the open session for
+///   another tile, staying in the focus view. (Alt-Left/Right still cycle the
+///   open session's own terminals.)
+///
+/// What a local window and a remote one both do, so the two cannot drift.
+pub fn mission_move(
+    action: &Action,
+    mode: InputMode,
+    current: Option<usize>,
+    count: usize,
+) -> Option<MissionMove> {
+    let columns = grid_columns(count);
+    let step = |mv: GridMove| match current {
+        Some(i) => move_selection(i, count, columns, mv),
+        None => 0,
+    };
+    let to = |tile: usize, mode: InputMode| Some(MissionMove { tile, mode });
+    match (mode, action) {
+        (InputMode::App, Action::Dispatch(Command::SwitchAgentTab(sel))) => {
+            let target = match sel {
+                Selector::Prev => step(GridMove::Up),
+                Selector::Next => step(GridMove::Down),
+                Selector::Index(i) => *i,
+            };
+            to(target, InputMode::App)
+        }
+        (InputMode::App, Action::Dispatch(Command::SwitchChildTerminal(sel))) => {
+            let target = match sel {
+                Selector::Prev => step(GridMove::Left),
+                Selector::Next => step(GridMove::Right),
+                Selector::Index(_) => return None,
+            };
+            to(target, InputMode::App)
+        }
+        (InputMode::App, Action::FocusTerminal) => match current {
+            Some(_) => None,
+            None => to(0, InputMode::Terminal),
+        },
+        (InputMode::Terminal, Action::Dispatch(Command::SwitchAgentTab(sel))) => {
+            let target = match (sel, current) {
+                (Selector::Index(i), _) => *i,
+                (Selector::Prev, Some(i)) => i.saturating_sub(1),
+                (Selector::Next, Some(i)) => (i + 1).min(count.saturating_sub(1)),
+                (_, None) => 0,
+            };
+            to(target, InputMode::Terminal)
+        }
+        _ => None,
     }
 }
 
@@ -843,5 +972,85 @@ mod tests {
         // Out of range (the grid shrank) clamps first.
         assert_eq!(move_selection(9, 5, 3, Left), 3);
         assert_eq!(move_selection(0, 0, 3, Down), 0);
+    }
+
+    #[test]
+    fn the_source_agnostic_input_reads_like_the_workspace() {
+        // The same projects fed through `MissionSession`s give the same view
+        // as `mission_view` builds from `AppState`.
+        let mut p = project(
+            "alpha",
+            &[
+                ("wait", Some(WaitingForInput), Some(10)),
+                ("idle", Some(Idle), Some(HOUR)),
+                ("old", None, Some(40 * 24 * HOUR)),
+            ],
+        );
+        p.git.insert("t1".to_string(), ws(2, None, 0, 0));
+        let ps = [p, project("beta", &[("work", Some(Working), Some(5))])];
+        let scope = MissionScope::default();
+        let from_state = build(&ps, &scope);
+        let input: Vec<MissionProject<'_>> = ps
+            .iter()
+            .map(|p| MissionProject {
+                name: p.name,
+                root: &p.root,
+                sessions: p
+                    .state
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tab)| MissionSession {
+                        row: agent_row_view(&p.state, i, &p.git, 0, NOW).unwrap(),
+                        status: tab.display_status(0).interpreted,
+                        activity: tab.meta.activity,
+                        git_actions: git_actions(tab),
+                        git_known: p.git.contains_key(&tab.meta.id),
+                    })
+                    .collect(),
+            })
+            .collect();
+        assert_eq!(mission_view_of(&input, &scope, NOW), from_state);
+        assert_eq!(tile_names(&from_state), ["wait", "work"]);
+        assert_eq!(card_names(&from_state), ["idle"]);
+        assert_eq!(from_state.cards[0].action, Some(CardAction::Push));
+    }
+
+    #[test]
+    fn mission_moves_follow_tile_order_in_both_modes() {
+        use crate::app::modes::InputMode::{App, Terminal};
+        let agent = |sel| Action::Dispatch(Command::SwitchAgentTab(sel));
+        let child = |sel| Action::Dispatch(Command::SwitchChildTerminal(sel));
+        let go = |tile, mode| Some(MissionMove { tile, mode });
+        // 5 tiles, 3 columns, the second selected.
+        let m = |action: &Action, mode| mission_move(action, mode, Some(1), 5);
+        assert_eq!(m(&agent(Selector::Next), App), go(4, App), "Down a row");
+        assert_eq!(m(&agent(Selector::Prev), App), go(1, App), "top row stays");
+        assert_eq!(m(&child(Selector::Next), App), go(2, App), "Right");
+        assert_eq!(m(&child(Selector::Prev), App), go(0, App), "Left");
+        assert_eq!(m(&agent(Selector::Index(3)), App), go(3, App), "Alt-4");
+        assert_eq!(
+            m(&agent(Selector::Index(8)), App),
+            go(8, App),
+            "taken, past the last tile"
+        );
+        assert_eq!(m(&child(Selector::Index(0)), App), None);
+        assert_eq!(m(&Action::FocusTerminal, App), None, "Enter on a tile");
+        assert_eq!(
+            mission_move(&Action::FocusTerminal, App, None, 5),
+            go(0, Terminal),
+            "Enter off the tiles opens the first"
+        );
+        // The focus view swaps sessions in tile order.
+        assert_eq!(m(&agent(Selector::Next), Terminal), go(2, Terminal));
+        assert_eq!(m(&agent(Selector::Prev), Terminal), go(0, Terminal));
+        assert_eq!(m(&agent(Selector::Index(4)), Terminal), go(4, Terminal));
+        assert_eq!(m(&child(Selector::Next), Terminal), None);
+        assert_eq!(
+            mission_move(&agent(Selector::Next), Terminal, Some(4), 5),
+            go(4, Terminal),
+            "the last stays"
+        );
+        assert_eq!(m(&Action::OpenPalette, App), None);
     }
 }

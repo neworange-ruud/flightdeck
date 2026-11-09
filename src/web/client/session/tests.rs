@@ -50,6 +50,8 @@ pub(crate) fn session(id: &str, name: &str) -> SessionView {
         recovered: false,
         attached_existing_branch: false,
         worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
+        activity: None,
+        prompt: None,
     }
 }
 
@@ -244,4 +246,162 @@ fn a_takeover_ends_the_link_and_reconnect_dials_again() {
     assert_eq!(dialled.get(), 1);
     assert!(session.ended().is_none());
     assert!(session.active_terminal().is_none(), "mirrors start over");
+}
+
+// -- Mission control (`remote-control-pgy3`) -----------------------------------
+
+/// The commands sent so far, as `(seq, name, args)`.
+fn commands_sent(script: &mut Script) -> Vec<(u64, String, Option<serde_json::Value>)> {
+    frames(script)
+        .into_iter()
+        .filter_map(|f| match f {
+            ClientMsg::Command(c) => Some((c.seq, c.name, c.args)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn selected_tab(session: &RemoteSession) -> Option<String> {
+    session.mission_selection().map(|k| k.tab_id)
+}
+
+#[test]
+fn mission_control_browses_this_front_ends_selection_and_sends_nothing() {
+    use crate::app::commands::Command as AppCommand;
+    let (mut session, mut script) = open(snapshot(false, Vec::new()));
+    script.sent();
+    session.apply(HostEvent::FocusTerminal);
+    assert_eq!(session.mode(), InputMode::Terminal);
+    session.toggle_main_view();
+    assert_eq!(session.main_view(), MainView::Mission);
+    assert_eq!(session.mode(), InputMode::App, "it lands on the grid");
+    // Both sessions are working: tiles in name order, `search` (the host's
+    // selection, and so this front-end's first) already on one.
+    let view = session.mission_view();
+    let names: Vec<&str> = view.tiles.iter().map(|t| t.row.name.as_str()).collect();
+    assert_eq!(names, ["login", "search"]);
+    assert_eq!(selected_tab(&session).as_deref(), Some("s2"));
+
+    // Left steps back a tile, in this front-end only.
+    let left = Action::Dispatch(AppCommand::SwitchChildTerminal(Selector::Prev));
+    assert!(session.mission_move(&left));
+    assert_eq!(selected_tab(&session).as_deref(), Some("s1"));
+    // Enter on a tile is FocusTerminal's own: not a move.
+    assert!(!session.mission_move(&Action::FocusTerminal));
+    session.apply(HostEvent::FocusTerminal);
+    assert_eq!(session.mode(), InputMode::Terminal, "the focus view");
+    // Alt-2 swaps the open session, staying in the focus view.
+    let alt_2 = Action::Dispatch(AppCommand::SwitchAgentTab(Selector::Index(1)));
+    assert!(session.mission_move(&alt_2));
+    assert_eq!(selected_tab(&session).as_deref(), Some("s2"));
+    assert_eq!(session.mode(), InputMode::Terminal);
+    assert!(session.session_terminal(&view.tiles[0].key).is_some());
+    // Back to the grid, then to Projects on the same session.
+    session.apply(HostEvent::FocusApp);
+    session.toggle_main_view();
+    assert_eq!(session.main_view(), MainView::Projects);
+    assert_eq!(
+        session
+            .workspace()
+            .selected_session()
+            .map(|s| s.name.as_str()),
+        Some("search")
+    );
+    assert!(
+        commands_sent(&mut script).is_empty(),
+        "browsing never reaches the host"
+    );
+}
+
+#[test]
+fn the_view_and_scope_are_this_front_ends_and_outlive_a_reconnect() {
+    let (mut session, _script) = open(snapshot(false, Vec::new()));
+    session.set_dialer(Rc::new(|| RemoteClient::scripted().0));
+    let scope = MissionScope {
+        window: crate::persistence::workspace::RecentScope::Week,
+        project: Some("/repo".to_string()),
+    };
+    session.set_mission_scope(scope.clone());
+    session.set_main_view(MainView::Mission);
+    // From the SSH shell's tab, asking for the view it already has shows it.
+    session.show_ssh_shell();
+    assert_eq!(session.tab(), Tab::SshShell);
+    session.set_main_view(MainView::Mission);
+    assert_eq!(session.tab(), Tab::Project);
+    session.reconnect();
+    assert_eq!(session.mission_scope(), &scope);
+    assert_eq!(session.main_view(), MainView::Mission);
+}
+
+#[test]
+fn a_tiles_answer_goes_to_the_host_and_a_refusal_offers_it_again() {
+    use crate::view::{PromptAnswer, PromptShape};
+    use crate::web::protocol::{
+        Ack, AckOutcome, PendingPrompt, PromptAnswerView, PromptButtonView, PromptShapeView,
+    };
+    let mut snap = snapshot(false, Vec::new());
+    let waiting = &mut snap.projects[0].sessions[0];
+    waiting.status.interpreted = InterpretedStatus::WaitingForInput;
+    waiting.status.bucket = StatusBucket::Waiting;
+    waiting.prompt = Some(Box::new(PendingPrompt {
+        prompt_id: "p1".to_string(),
+        shape: PromptShapeView::Binary,
+        text: "Run it?".to_string(),
+        buttons: vec![
+            PromptButtonView {
+                label: "Approve".to_string(),
+                answer: PromptAnswerView::Approve,
+            },
+            PromptButtonView {
+                label: "Deny".to_string(),
+                answer: PromptAnswerView::Deny,
+            },
+        ],
+    }));
+    let (mut session, mut script) = open(snap);
+    script.sent();
+    let tile = session.mission_view().tiles[0].clone();
+    assert_eq!(tile.row.name, "login");
+    let prompt = tile.prompt.clone().expect("the host's prompt");
+    assert_eq!(prompt.shape, PromptShape::Binary);
+
+    let deny = PromptReply {
+        key: tile.key.clone(),
+        prompt_id: prompt.prompt_id.clone(),
+        answer: PromptAnswer::Deny,
+    };
+    session.apply(HostEvent::AnswerPrompt(deny.clone()));
+    let sent = commands_sent(&mut script);
+    assert_eq!(sent.len(), 1);
+    let (seq, name, args) = sent[0].clone();
+    assert_eq!(name, names::ANSWER_PROMPT);
+    assert_eq!(
+        args,
+        Some(serde_json::json!({
+            "session_id": "s1",
+            "prompt_id": "p1",
+            "answer": { "kind": "deny" },
+        }))
+    );
+    assert_eq!(session.mission_view().tiles[0].prompt, None, "answered");
+    // A second click before the host answers sends nothing more.
+    session.apply(HostEvent::AnswerPrompt(deny));
+    assert!(commands_sent(&mut script).is_empty());
+
+    // The host refuses (someone else is typing): the buttons come back, and
+    // the reason is shown.
+    script.send(LinkEvent::Ack(
+        Ack {
+            seq,
+            outcome: AckOutcome::Rejected,
+            detail: Some("desktop is typing on the host — the answer was not sent.".into()),
+        },
+        crate::web::client::AckFor::Command,
+    ));
+    session.pump();
+    assert!(session.mission_view().tiles[0].prompt.is_some());
+    assert!(matches!(
+        session.overlay(),
+        Some(OverlayView::Message(m)) if m.text.contains("typing")
+    ));
 }

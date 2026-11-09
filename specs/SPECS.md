@@ -1612,6 +1612,8 @@ the Desktop opens a remote window onto them. Requirements are in
 | `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
 | `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. A selector no Desktop matches is tried against the paired phones' pairing ids (exact or unique prefix), and a match is unpaired. |
 | `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
+| `flightdeck worker enable [--dry-run]` | Sets up start on boot (see "Start on boot" below): writes the launchd agent (macOS) or systemd user unit (Linux), registers it, and starts the worker through it when none runs. Idempotent: running it again rewrites the unit (refreshing the binary path and `PATH`). `--dry-run` prints the file and the commands without changing anything. |
+| `flightdeck worker disable [--dry-run]` | Takes start on boot down: a worker the service manager runs is stopped first (as `stop` does), then the unit is unregistered and removed. A worker started otherwise keeps running. "Not set up" is not an error. |
 | `flightdeck worker run` | The worker in the foreground, logging to stderr. What the supervisor runs; also for debugging. |
 
 `flightdeck worker` with no command (or `--help`) prints this table; an unknown
@@ -1645,6 +1647,79 @@ opening a *local* Desktop window, on that machine refuses with:
 Desktop *remote* windows on the worker machine are unaffected. Checking does
 not create `~/.flightdeck/worker/` on a machine that never ran a worker.
 
+### Start on boot
+
+`worker enable` registers the worker with the account's own service manager;
+nothing needs root.
+
+| | macOS | Linux |
+| --- | --- | --- |
+| Manager | launchd agent, domain `gui/<uid>` | systemd user unit |
+| File | `~/Library/LaunchAgents/agency.neworange.flightdeck.worker.plist` | `~/.config/systemd/user/flightdeck-worker.service` |
+| Register | `launchctl enable`, `bootout` (ignored if not loaded), `bootstrap gui/<uid> <plist>` | `systemctl --user daemon-reload`, `enable` (and `start`) |
+| Starts | at login (`RunAtLoad`) | at boot with lingering on, else at login |
+| Unregister | `launchctl bootout`, remove the file | `systemctl --user disable`, remove the file, `daemon-reload`, `reset-failed` |
+
+**Process model.** The unit runs `flightdeck worker supervise` in the
+foreground, the same supervisor `start` spawns. The manager only starts it and
+never restarts it (launchd `KeepAlive` false; systemd `Restart=no`): crash
+restarts, backoff and giving up stay the supervisor's. So `worker stop`
+(`SIGTERM` to the supervisor, which exits 0) leaves the worker stopped until
+the next `start`, boot or login, and a give-up is not undone. systemd uses
+`KillMode=mixed` (a `systemctl stop` signals the supervisor alone, which stops
+the worker gracefully) and `TimeoutStopSec=45`; launchd `ExitTimeOut` is 45 s.
+The worker runs in its own session, so launchd's process-group kill when the
+supervisor exits never reaches it early, and the supervisor always outlives it.
+
+**`start` goes through the manager.** While the unit is installed, `start`
+(and so `restart`) asks the manager: launchd reloads the plist (`bootout`, then
+`bootstrap`, retried up to 3 times) so a rewritten plist takes effect;
+systemd runs `systemctl --user start`. The worker then has the unit's
+environment and, on macOS, runs in the GUI login session. `start` spawns the
+supervisor itself, as before, when the manager cannot: no GUI session (macOS,
+nobody logged in at the screen), the agent disabled with `launchctl disable`,
+the unit not enabled, no user bus, or lingering off (Linux: a worker systemd
+started would stop at logout). It says why. `start` waits for the first
+supervisor whose `supervisor.json` `started_at` is at or after the request.
+Two workers cannot run: each process takes its lock, and neither `enable` nor
+`start` asks the manager to start one while a worker runs (`enable` then
+leaves it alone and suggests `restart`).
+
+**macOS domain.** `gui/<uid>` rather than `user/<uid>`: launchd loads
+`~/Library/LaunchAgents` into `gui/<uid>` at a login at the screen, and a job
+there runs in that session, with the login Keychain unlocked (Claude Code keeps
+its login there). `user/<uid>` is not loaded at boot and does not get the GUI
+session's Keychain. The cost: on macOS start on boot is start **at login**; an
+unattended Mac needs automatic login. Without a GUI session (SSH only),
+`enable` still writes the plist, which loads at the next login. Starting at
+boot without a login would take a root-installed LaunchDaemon, without the
+login Keychain; out of scope.
+
+**Linux lingering.** `enable` reads `loginctl show-user <user>
+--property=Linger`. When it is not `yes` it prints `sudo loginctl
+enable-linger <user>` and does not start the worker through systemd; it never
+runs sudo.
+
+**Environment.** The unit sets `PATH` (the login shell's, asked as
+`$SHELL -l -i` with a 5 s deadline, else `enable`'s own; then the binary's
+directory and `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`; relative and
+duplicate entries dropped), `SHELL` and `LANG`. Nothing else from the shell
+profile is copied, so exported secrets stay out of the unit. Run `enable`
+again to refresh them. launchd sends the supervisor's stderr to
+`worker.log`; systemd to the journal.
+
+**Binary path.** The unit runs the binary `enable` ran as: a Homebrew `Cellar`
+path becomes the prefix's `bin/flightdeck` link (which `brew upgrade` keeps),
+and Linux's `… (deleted)` suffix is dropped. `flightdeck update` replaces the
+binary in place, so the unit stays valid; it reminds the user to `worker
+restart` when a worker runs.
+
+**Status.** `worker status` ends with a `Start on boot:` (macOS: `Start at
+login:`) line: off; on (loaded, or loading at the next login); disabled; not
+enabled; only after login (lingering off, with the command); systemd not
+reachable; and whether the unit runs another `flightdeck` binary. `--json`
+carries it as `start_on_boot`.
+
 ### Exit codes of `worker run`
 
 | Code | Meaning | Supervisor |
@@ -1669,6 +1744,7 @@ not create `~/.flightdeck/worker/` on a machine that never ran a worker.
 | `~/.flightdeck/worker/devices.json` | Paired Desktops' tokens, in the web interface's credential format but separate from `~/.flightdeck/web.json`: a browser token for a TUI's web interface never grants a worker shell. |
 | `~/.flightdeck/worker/remote.json`, `remote.lock`, `remote-direct/` | With `[worker] phone` on: the worker's own FlightDeck Remote identity and phone pairings, its lock, and the direct link's outboxes. Separate from the TUI's `~/.flightdeck/remote.json`, so the phone sees the worker as a machine of its own. |
 | `~/.flightdeck/logs/worker.log` | The log, rotated at 10 MiB, 5 files kept (`worker.log`, `.1` … `.4`). The supervisor's own lines go to the same file. |
+| `~/Library/LaunchAgents/agency.neworange.flightdeck.worker.plist` (macOS), `~/.config/systemd/user/flightdeck-worker.service` (Linux) | Start on boot, written by `worker enable` (mode 0644) and removed by `worker disable`. |
 
 ### `[worker]` section
 
@@ -1781,7 +1857,13 @@ never missing.
   "restarts": 1,
   "last_exit": {"at": 1700000600, "code": 101, "signal": null,
                 "description": "exited with code 101 (panic)"},
-  "gave_up_reason": null
+  "gave_up_reason": null,
+  "start_on_boot": {
+    "manager": "systemd",
+    "unit": "/home/u/.config/systemd/user/flightdeck-worker.service",
+    "installed": true, "enabled": true, "loaded": true, "active": true,
+    "linger": true, "other_binary": false, "error": null
+  }
 }
 ```
 
@@ -1805,6 +1887,13 @@ never missing.
   revoke` takes), `transport` (`direct` or `relay`) and `connected`.
 - `restarts`, `last_exit` and `gave_up_reason` come from `supervisor.json` and
   are reported even when stopped.
+- `start_on_boot` is `null` where the OS has no supported service manager.
+  `manager` is `launchd` or `systemd`; `unit` the unit file; `installed` that
+  it exists; `enabled` that it starts with the OS (launchd: installed and not
+  `launchctl disable`d); `loaded` that the manager knows it; `active` that the
+  manager runs it now; `linger` (systemd only, `null` when unknown) whether it
+  starts at boot rather than at login; `other_binary` that it runs a different
+  `flightdeck` than the one asked; `error` why systemd could not be asked.
 
 ### Security model
 

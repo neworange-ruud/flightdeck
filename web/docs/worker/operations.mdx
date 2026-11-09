@@ -131,6 +131,41 @@ flightdeck worker restart
 resumes your agents. `restart` is stop then start. Agents relaunch with their
 resume command, as in the terminal UI. A turn that was in progress is lost.
 
+### Start on boot
+
+```bash
+flightdeck worker enable            # set it up and start the worker
+flightdeck worker enable --dry-run  # show the file and commands, change nothing
+flightdeck worker disable           # take it down (stops a worker it started)
+```
+
+`enable` writes `~/Library/LaunchAgents/agency.neworange.flightdeck.worker.plist`
+(macOS) or `~/.config/systemd/user/flightdeck-worker.service` (Linux). It needs
+no root. The service manager starts the worker's supervisor and never restarts
+it itself, so [crash recovery](#crash-recovery) works as described below, and
+`flightdeck worker stop` keeps the worker stopped until the next `start`,
+reboot or login. While it is set up, `start` and `restart` go through the
+service manager too. When they can't (on a Mac with nobody logged in at the
+screen, or on Linux without lingering) they start the worker directly and say
+why.
+
+The worker gets your login shell's `PATH`, `SHELL` and `LANG` as they were when
+you ran `enable`. Nothing else from your shell profile is copied, so API keys
+exported there don't reach it. Run `flightdeck worker enable` again after
+installing tools in a new place, then `flightdeck worker restart`.
+
+- **macOS:** the worker starts when the account logs in at the screen. For an
+  unattended Mac, turn on automatic login.
+- **Linux:** without lingering, systemd starts the worker only once you log in
+  and stops it when you log out. `enable` prints the command to fix that:
+  `sudo loginctl enable-linger $USER`.
+
+`flightdeck worker status` has a **Start on boot** line (**Start at login** on a
+Mac) that says whether it is on. To dig deeper, use
+`launchctl print gui/$(id -u)/agency.neworange.flightdeck.worker` on a Mac, or
+`systemctl --user status flightdeck-worker` and
+`journalctl --user -u flightdeck-worker` on Linux.
+
 ### Crash recovery
 
 A small supervisor restarts the worker if it crashes, waiting longer after each
@@ -164,7 +199,8 @@ and the Desktop shows a **version differs** badge in the launcher and a banner i
 the worker window: "This worker runs FlightDeck `<worker>`; this app was built with
 `<app>`. Update it from the worker shell: `flightdeck update`, then
 `flightdeck worker restart`." Updating from the Desktop is not available
-in this version.
+in this version. Start on boot doesn't need setting up again after an update:
+Homebrew and the installer both keep the binary's path.
 
 ### The terminal UI on a worker machine
 

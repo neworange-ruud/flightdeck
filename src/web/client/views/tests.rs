@@ -51,6 +51,8 @@ fn session(id: &str, name: &str, status: InterpretedStatus, git: GitBar) -> Sess
         recovered: false,
         attached_existing_branch: false,
         worktree_path: String::new(),
+        activity: None,
+        prompt: None,
     }
 }
 

@@ -57,11 +57,12 @@
 //! the browser guessing either fact. Both arrive as data.
 
 use crate::agents::status::DisplayStatus;
-use crate::contracts::domain::{AgentDef, PtySize, TabId};
+use crate::contracts::domain::{AgentDef, PtySize, TabActivity, TabId};
 use crate::git::status::WorktreeStatus;
 use crate::web::protocol::{
-    Delta, DialogOutcome, Geometry, GitBar, ProjectId, ProjectView, SessionPhase, SessionStatus,
-    SessionView, StatusBucket, TerminalId, TerminalRole, TerminalView,
+    Delta, DialogOutcome, Geometry, GitBar, PendingPrompt, ProjectId, ProjectView,
+    PromptAnswerView, PromptButtonView, PromptShapeView, SessionPhase, SessionStatus, SessionView,
+    StatusBucket, TerminalId, TerminalRole, TerminalView,
 };
 use crate::web::server::HostState;
 
@@ -230,6 +231,8 @@ pub struct SessionFacts<'a> {
     pub attached_existing_branch: bool,
     /// The absolute folder the session runs in.
     pub worktree_path: String,
+    /// Its recorded moments ([`SessionView::activity`]).
+    pub activity: TabActivity,
     /// The session's terminals, in tab order.
     pub terminals: Vec<TerminalFacts>,
 }
@@ -261,6 +264,36 @@ pub fn session_view(facts: &SessionFacts<'_>, streams: &TerminalStreams) -> Sess
         recovered: facts.recovered,
         attached_existing_branch: facts.attached_existing_branch,
         worktree_path: facts.worktree_path.clone(),
+        activity: Some(facts.activity),
+        // Filled in by the host, which alone holds the prompt tracker
+        // (`AppHost::publish`).
+        prompt: None,
+    }
+}
+
+/// A detected prompt ([`crate::view::PromptView`]) as the wire carries it.
+pub fn pending_prompt(view: &crate::view::PromptView) -> PendingPrompt {
+    use crate::view::{PromptAnswer, PromptShape};
+    PendingPrompt {
+        prompt_id: view.prompt_id.clone(),
+        shape: match view.shape {
+            PromptShape::Binary => PromptShapeView::Binary,
+            PromptShape::SingleSelect => PromptShapeView::SingleSelect,
+            PromptShape::Unsupported => PromptShapeView::Unsupported,
+        },
+        text: view.text.clone(),
+        buttons: view
+            .buttons
+            .iter()
+            .map(|b| PromptButtonView {
+                label: b.label.clone(),
+                answer: match b.answer {
+                    PromptAnswer::Approve => PromptAnswerView::Approve,
+                    PromptAnswer::Deny => PromptAnswerView::Deny,
+                    PromptAnswer::Option(index) => PromptAnswerView::Option { index },
+                },
+            })
+            .collect(),
     }
 }
 
@@ -477,7 +510,10 @@ fn worker_deltas(
 fn session_deltas(was: &SessionView, now: &SessionView, out: &mut Vec<Delta>) {
     // Fields with no delta of their own. A whole-row upsert is the honest
     // answer; the cheap per-field deltas below exist only for the two things
-    // that change often enough to be worth them.
+    // that change often enough to be worth them. `activity` is deliberately
+    // not among them: it moves every second an agent prints, and the row
+    // carries its latest value whenever it is sent anyway (see
+    // `SessionView::activity`).
     if was.name != now.name
         || was.agent != now.agent
         || was.agent_display_name != now.agent_display_name
@@ -485,6 +521,7 @@ fn session_deltas(was: &SessionView, now: &SessionView, out: &mut Vec<Delta>) {
         || was.lifecycle_reporting != now.lifecycle_reporting
         || was.recovered != now.recovered
         || was.attached_existing_branch != now.attached_existing_branch
+        || was.prompt != now.prompt
     {
         out.push(Delta::SessionUpsert(now.clone()));
         return;

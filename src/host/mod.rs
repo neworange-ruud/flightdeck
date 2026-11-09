@@ -51,7 +51,7 @@ use crate::remote::pairing::{build_e2e_channel, channel_seal_open, PairingSessio
 use crate::remote::{ProjectView, RemoteBridge, RemoteInbound, RemoteOutbound};
 use crate::web::protocol::HostKind;
 use crate::{
-    answer_prompt, apply_host_event, apply_update_notice, build_web_host_state,
+    answer_prompt, answer_prompt_as, apply_host_event, apply_update_notice, build_web_host_state,
     cleanup_isolated_run, drain_create_outcomes, drain_pty_output, drive_pairing_overlay,
     flush_deferred_pty, isolated_status_dir, open_project, open_web_access_overlay,
     persist_quietly, prompt_for, rebind_web_interface, record_web_transitions,
@@ -59,8 +59,8 @@ use crate::{
     resolve_dialog_outcomes, service_remote_commands, session_index, spawn_finish_count,
     spawn_status_refresh, spawn_worktree_job, start_isolated_session, start_remote,
     terminate_all_sessions, update_check_enabled, web_dialog_now, web_host_state_now,
-    web_input_holder, web_started_message, Env, RemoteSetup, RemoteStart, StatusMsg, Ui,
-    WebSurface, Workspace, WorkspaceTerminals,
+    web_input_holder, web_started_message, Env, PromptAnswerer, PromptRefusal, RemoteSetup,
+    RemoteStart, StatusMsg, Ui, WebSurface, Workspace, WorkspaceTerminals,
 };
 use flightdeck_remote_protocol::ProjectId;
 
@@ -1108,6 +1108,15 @@ impl<'a> AppHost<'a> {
             .running()
             .then(|| self.worker_host_state())
             .flatten();
+        // The waiting sessions' prompts, for a remote window's Mission control
+        // to answer inline. Serving a remote surface is reason enough to
+        // detect them (`track_prompts` is idempotent and transmits nothing).
+        let prompts = if self.web_surface.running() {
+            self.track_prompts();
+            self.published_prompts()
+        } else {
+            Vec::new()
+        };
 
         let env = &self.env;
         let workspace = &mut self.workspace;
@@ -1127,6 +1136,7 @@ impl<'a> AppHost<'a> {
                 &web_surface.flavor,
             );
             next.worker = worker_state;
+            fill_prompts(&mut next, prompts);
             let decided = std::mem::take(&mut ui.dialog_decisions);
             if next != web_surface.published {
                 // Publish, *then* the matching deltas: publishing changes what
@@ -1330,6 +1340,25 @@ impl<'a> AppHost<'a> {
                         reason.to_string(),
                     )];
                 }
+            }
+            // A waiting agent's prompt, answered from a remote window's
+            // Mission control: checked against this host's prompt tracker.
+            if command.name == crate::web::protocol::command::ANSWER_PROMPT
+                && !self.workspace.projects.is_empty()
+            {
+                let (outcome, detail) =
+                    match self.answer_web_prompt(command.args.as_ref(), viewer_id, label) {
+                        Ok(()) => (crate::web::protocol::AckOutcome::Applied, None),
+                        Err(why) => (crate::web::protocol::AckOutcome::Rejected, Some(why)),
+                    };
+                return vec![WebOutbound::Viewer {
+                    viewer_id: viewer_id.clone(),
+                    msg: crate::web::protocol::ServerMsg::Ack(crate::web::protocol::Ack {
+                        seq: command.seq,
+                        outcome,
+                        detail,
+                    }),
+                }];
             }
             // D13: a dialog this command opens is tagged with the seat that
             // asked, so the desktop can say `opened from browser ·
@@ -1618,6 +1647,7 @@ impl<'a> AppHost<'a> {
             &self.web_surface.flavor,
         );
         state.worker = self.worker_host_state();
+        fill_prompts(&mut state, self.published_prompts());
         state
     }
 
@@ -1698,7 +1728,9 @@ impl<'a> AppHost<'a> {
     /// Detect the prompts waiting sessions show, so [`AppHost::mission_view`]
     /// can offer inline answers ([`crate::view::MissionTile::prompt`]) and
     /// [`HostEvent::AnswerPrompt`] can deliver them. For a front-end that draws
-    /// them (the desktop app); the TUI does not call it, and pays nothing.
+    /// them (the desktop app), and turned on by [`AppHost::publish`] while the
+    /// web interface runs, so a remote window's Mission control can answer
+    /// them too; a TUI serving no one does not call it, and pays nothing.
     ///
     /// The detection is FlightDeck Remote's — the needs-input edge, the
     /// agents' prompt sidecars, the Claude session-file ingest — so a tile
@@ -1725,6 +1757,98 @@ impl<'a> AppHost<'a> {
             .or(self.local_prompts.as_ref())?;
         let index = session_index(&self.workspace, bridge, self.now_ms);
         self.unanswered(prompt_for(&index, bridge, project, tab_id))
+    }
+
+    /// Answer a waiting agent's prompt for remote viewer `viewer_id`
+    /// ([`crate::web::protocol::command::ANSWER_PROMPT`], a remote window's
+    /// Mission control): the path a local tile's click takes
+    /// ([`HostEvent::AnswerPrompt`]) — the same checks, translator and
+    /// keystroke queue — with the input lock claimed as that viewer. The
+    /// refusal, in words, is the ack's detail.
+    fn answer_web_prompt(
+        &mut self,
+        args: Option<&serde_json::Value>,
+        viewer_id: &crate::web::protocol::ViewerId,
+        label: &str,
+    ) -> std::result::Result<(), String> {
+        use crate::view::PromptAnswer;
+        use crate::web::protocol::{AnswerPromptArgs, PromptAnswerView};
+        let args: AnswerPromptArgs = args
+            .cloned()
+            .and_then(|a| serde_json::from_value(a).ok())
+            .ok_or_else(|| "The answer did not say which prompt it answers.".to_string())?;
+        let answer = match args.answer {
+            PromptAnswerView::Approve => PromptAnswer::Approve,
+            PromptAnswerView::Deny => PromptAnswer::Deny,
+            PromptAnswerView::Option { index } => PromptAnswer::Option(index),
+            PromptAnswerView::Unrecognized => {
+                return Err("This FlightDeck does not know that answer.".to_string())
+            }
+        };
+        let project = self
+            .workspace
+            .projects
+            .iter()
+            .position(|p| p.state.tabs.iter().any(|t| t.meta.id == args.session_id.0))
+            .ok_or_else(|| "That session is no longer open on the host.".to_string())?;
+        // A repeat click on a prompt already answered does nothing.
+        if self.answered_prompts.contains(&args.prompt_id) {
+            return Err(crate::PROMPT_GONE_REFUSAL.to_string());
+        }
+        let reply = crate::view::PromptReply {
+            key: crate::view::SessionKey {
+                project,
+                tab_id: args.session_id.0.clone(),
+            },
+            prompt_id: args.prompt_id,
+            answer,
+        };
+        let Some(bridge) = self.remote_bridge.as_mut().or(self.local_prompts.as_mut()) else {
+            return Err(crate::PROMPTS_UNTRACKED_REFUSAL.to_string());
+        };
+        let answered = answer_prompt_as(
+            bridge,
+            &mut self.workspace,
+            &self.env,
+            &mut self.ui,
+            &mut self.remote_first_tasks,
+            &reply,
+            &PromptAnswerer::Viewer { viewer_id, label },
+        );
+        if answered.is_ok() {
+            self.answered_prompts.push_back(reply.prompt_id);
+            while self.answered_prompts.len() > ANSWERED_PROMPTS_KEPT {
+                self.answered_prompts.pop_front();
+            }
+        }
+        self.after_input();
+        answered.map_err(|refusal| match refusal {
+            PromptRefusal::Said(why) => why,
+            PromptRefusal::InputLock => "Someone else is typing on the host.".to_string(),
+        })
+    }
+
+    /// Every waiting session's detected prompt, as a remote window answers it
+    /// ([`crate::web::protocol::SessionView::prompt`]): `(project index, tab
+    /// id, prompt)`. Empty when prompts are not tracked.
+    fn published_prompts(&self) -> Vec<(usize, String, crate::web::protocol::PendingPrompt)> {
+        let Some(bridge) = self.remote_bridge.as_ref().or(self.local_prompts.as_ref()) else {
+            return Vec::new();
+        };
+        let index = session_index(&self.workspace, bridge, self.now_ms);
+        let mut out = Vec::new();
+        for (pi, project) in self.workspace.projects.iter().enumerate() {
+            for tab in &project.state.tabs {
+                if let Some(view) = self.unanswered(prompt_for(&index, bridge, pi, &tab.meta.id)) {
+                    out.push((
+                        pi,
+                        tab.meta.id.clone(),
+                        crate::web::stream::pending_prompt(&view),
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// `view`, unless it was answered from here already.
@@ -1988,6 +2112,23 @@ impl<'a> AppHost<'a> {
 /// enough to take twice a turn: a status file or a finalized worktree moves
 /// it without any byte of PTY output, and [`AppHost::pump`] must still say
 /// "redraw" for those.
+/// Put each detected prompt (`(project index, tab id, prompt)`, from
+/// [`AppHost::published_prompts`]) on its session's row.
+fn fill_prompts(
+    state: &mut crate::web::server::HostState,
+    prompts: Vec<(usize, String, crate::web::protocol::PendingPrompt)>,
+) {
+    for (project, tab_id, prompt) in prompts {
+        let session = state
+            .projects
+            .get_mut(project)
+            .and_then(|p| p.sessions.iter_mut().find(|s| s.session_id.0 == tab_id));
+        if let Some(session) = session {
+            session.prompt = Some(Box::new(prompt));
+        }
+    }
+}
+
 /// Whether this turn also refreshes the projects that are not active: on the
 /// active refresh's tick, no more often than [`BACKGROUND_GIT_REFRESH_MIN_MS`],
 /// and only while a remote client is attached. `remote_viewers` is asked last,

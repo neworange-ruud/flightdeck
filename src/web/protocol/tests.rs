@@ -92,6 +92,8 @@ fn session_view() -> SessionView {
         recovered: true,
         attached_existing_branch: false,
         worktree_path: String::new(),
+        activity: None,
+        prompt: None,
     }
 }
 

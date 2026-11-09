@@ -151,6 +151,8 @@ fn session(id: &str, bucket: StatusBucket) -> SessionView {
         recovered: false,
         attached_existing_branch: false,
         worktree_path: format!("/home/u/flightdeck/app/.flightdeck/worktrees/{id}"),
+        activity: None,
+        prompt: None,
     }
 }
 

@@ -14,6 +14,7 @@
 //! | [`exchange`] | `POST /auth/exchange` and `GET /auth/session` |
 //! | [`link`] | the WebSocket task: attach, pump, reconnect, cursors |
 //! | [`mirror`] | [`RemoteWorkspace`]: snapshot + deltas, local selection |
+//! | [`mission`] | Mission control over the host: [`mission::ActivityWatch`] and the view |
 //! | [`session`] | [`session::RemoteSession`]: a front-end's whole remote model |
 //! | [`messages`] | a worker's host messages and update advice, in words |
 //! | [`input`] | the held-input queue and its one seq counter |
@@ -39,6 +40,7 @@ pub mod input;
 pub mod link;
 pub mod messages;
 pub mod mirror;
+pub mod mission;
 pub mod session;
 pub mod store;
 pub mod terminals;

@@ -71,6 +71,8 @@ fn session(id: &str, name: &str, shells: &[&str]) -> SessionView {
         recovered: false,
         attached_existing_branch: false,
         worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
+        activity: None,
+        prompt: None,
     }
 }
 
@@ -2138,5 +2140,274 @@ mod worker {
             m.dispatch(HostEvent::Overlay(OverlayInput::Cancel), cx)
         });
         assert!(model.read_with(cx, |m, _| m.overlay()).is_none());
+    }
+}
+
+/// Mission control in a remote window (`remote-control-pgy3`): the local
+/// window's view over the host's sessions, browsed in this window only, with
+/// every action sent the way the Projects view sends it.
+mod mission {
+    use super::*;
+    use flightdeck::app::modes::InputMode;
+    use flightdeck::contracts::TabActivity;
+    use flightdeck::persistence::workspace::MainView;
+    use flightdeck::web::protocol::{
+        command as names, PendingPrompt, PromptAnswerView, PromptButtonView, PromptShapeView,
+    };
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn status(interpreted: InterpretedStatus) -> SessionStatus {
+        SessionStatus {
+            interpreted,
+            manual: None,
+            bucket: StatusBucket::from_interpreted(interpreted),
+            running_time_secs: 0,
+        }
+    }
+
+    /// `login` waits on an Approve / Deny prompt, `search` works (the host's
+    /// selection), `docs` went idle an hour ago with unpushed changes: tiles
+    /// `login`, `search`; one card, `docs`.
+    fn mission_snapshot() -> Snapshot {
+        let now = now_secs();
+        let mut snap = snapshot();
+        let sessions = &mut snap.projects[0].sessions;
+        sessions[0].status = status(InterpretedStatus::WaitingForInput);
+        sessions[0].activity = Some(TabActivity {
+            last_output_at: Some(now - 60),
+            ..TabActivity::default()
+        });
+        sessions[0].prompt = Some(Box::new(PendingPrompt {
+            prompt_id: "p1".to_string(),
+            shape: PromptShapeView::Binary,
+            text: "Run `cargo test`?".to_string(),
+            buttons: vec![
+                PromptButtonView {
+                    label: "Approve".to_string(),
+                    answer: PromptAnswerView::Approve,
+                },
+                PromptButtonView {
+                    label: "Deny".to_string(),
+                    answer: PromptAnswerView::Deny,
+                },
+            ],
+        }));
+        sessions[1].activity = Some(TabActivity {
+            last_output_at: Some(now - 5),
+            ..TabActivity::default()
+        });
+        let mut docs = session("s3", "docs", &[]);
+        docs.status = status(InterpretedStatus::Idle);
+        docs.git = GitBar {
+            branch: Some("flightdeck/docs".to_string()),
+            collected: true,
+            modified: 2,
+            files_changed: 2,
+            ..GitBar::default()
+        };
+        docs.activity = Some(TabActivity {
+            last_status_change_at: Some(now - 3_600),
+            ..TabActivity::default()
+        });
+        sessions.push(docs);
+        snap
+    }
+
+    /// The window on [`mission_snapshot`], in APP mode with nothing sent yet.
+    fn open_mission(
+        app: &mut TestAppContext,
+        snap: Snapshot,
+    ) -> (Entity<RemoteModel>, Script, &mut VisualTestContext) {
+        let (model, mut script, _, cx) = open_on(app, snap);
+        model.update(cx, |m, cx| m.dispatch(HostEvent::FocusApp, cx));
+        cx.run_until_parked();
+        script.sent();
+        (model, script, cx)
+    }
+
+    fn view_of(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> MainView {
+        model.read_with(cx, |m, _| m.main_view())
+    }
+
+    fn mode_of(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> InputMode {
+        model.read_with(cx, |m, _| m.mode())
+    }
+
+    /// This window's selected session, by name.
+    fn selected(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> String {
+        model.read_with(cx, |m, _| {
+            m.workspace()
+                .selected_session()
+                .map(|s| s.name.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    fn leave_focus_keys() -> String {
+        let entry = crate::commands::keymap().entry("FocusApp").unwrap();
+        flightdeck_desktop::keys::chord_to_gpui(entry.triggers[0].chord).unwrap()
+    }
+
+    #[gpui::test]
+    fn alt_m_shows_the_hosts_mission_control_and_browsing_stays_here(app: &mut TestAppContext) {
+        let (model, mut script, cx) = open_mission(app, mission_snapshot());
+        assert_eq!(view_of(&model, cx), MainView::Projects);
+        assert!(cx.debug_bounds("agent-row-0").is_some());
+
+        cx.simulate_keystrokes("alt-m");
+        assert_eq!(view_of(&model, cx), MainView::Mission);
+        for present in ["mission-tile-0", "mission-tile-1", "mission-card-0"] {
+            assert!(cx.debug_bounds(present).is_some(), "{present}");
+        }
+        assert!(cx.debug_bounds("mission-tile-2").is_none(), "two live");
+        assert!(
+            cx.debug_bounds("agent-row-0").is_none(),
+            "the Projects rail is gone"
+        );
+        assert_eq!(selected(&model, cx), "search", "already on a tile");
+        assert_eq!(mode_of(&model, cx), InputMode::App);
+
+        // The arrows move this window's selection in tile order.
+        cx.simulate_keystrokes("left");
+        assert_eq!(selected(&model, cx), "login");
+        cx.simulate_keystrokes("alt-2");
+        assert_eq!(selected(&model, cx), "search");
+
+        // Enter opens it full size with its terminal focused; typing goes to
+        // that session's terminal on the host.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(mode_of(&model, cx), InputMode::Terminal);
+        assert!(cx.debug_bounds("mission-tile-0").is_none(), "no grid");
+        assert!(cx.debug_bounds("mission-strip-0").is_some(), "the strip");
+        cx.simulate_input("y");
+        assert_eq!(
+            inputs(&mut script),
+            [("s2:primary".to_string(), b"y".to_vec())]
+        );
+        // Alt-1 swaps the open session, staying full size.
+        cx.simulate_keystrokes("alt-1");
+        assert_eq!(selected(&model, cx), "login");
+        assert_eq!(mode_of(&model, cx), InputMode::Terminal);
+
+        // Alt-Esc goes back to the grid, Alt-m back to Projects on the same
+        // session.
+        cx.simulate_keystrokes(&leave_focus_keys());
+        assert_eq!(mode_of(&model, cx), InputMode::App);
+        assert!(cx.debug_bounds("mission-tile-0").is_some(), "the grid");
+        cx.simulate_keystrokes("alt-m");
+        assert_eq!(view_of(&model, cx), MainView::Projects);
+        assert_eq!(selected(&model, cx), "login", "selection kept");
+        assert!(
+            commands(&mut script).is_empty(),
+            "browsing never moved the host"
+        );
+    }
+
+    #[gpui::test]
+    fn the_titlebar_switch_shows_either_view_with_the_badge(app: &mut TestAppContext) {
+        let (model, mut script, cx) = open_mission(app, mission_snapshot());
+        assert!(
+            cx.debug_bounds("view-mission-badge").is_some(),
+            "login needs you"
+        );
+        click(cx, "view-mission");
+        assert_eq!(view_of(&model, cx), MainView::Mission);
+        click(cx, "view-mission");
+        assert_eq!(view_of(&model, cx), MainView::Mission, "shows, not toggles");
+        click(cx, "view-projects");
+        assert_eq!(view_of(&model, cx), MainView::Projects);
+        assert!(commands(&mut script).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_chord_and_a_card_act_on_their_session_through_the_host(app: &mut TestAppContext) {
+        let (model, mut script, cx) = open_mission(app, mission_snapshot());
+        cx.simulate_keystrokes("alt-m");
+        cx.simulate_keystrokes("left");
+        // Ctrl-p is the Projects view's Push, for the selected tile.
+        cx.simulate_keystrokes("ctrl-p");
+        assert_eq!(
+            commands(&mut script),
+            [(
+                names::PUSH_BRANCH.to_string(),
+                Some(serde_json::json!({ "session_id": "s1" }))
+            )]
+        );
+        // The card's one action: Push, for its own session.
+        click(cx, "mission-card-action-0");
+        assert_eq!(selected(&model, cx), "docs");
+        assert_eq!(
+            commands(&mut script),
+            [(
+                names::PUSH_BRANCH.to_string(),
+                Some(serde_json::json!({ "session_id": "s3" }))
+            )]
+        );
+    }
+
+    #[gpui::test]
+    fn a_waiting_tiles_approve_is_answered_on_the_host(app: &mut TestAppContext) {
+        let (model, mut script, cx) = open_mission(app, mission_snapshot());
+        cx.simulate_keystrokes("alt-m");
+        assert!(cx.debug_bounds("mission-tile-0-approve").is_some());
+        assert!(cx.debug_bounds("mission-tile-0-deny").is_some());
+        assert!(
+            cx.debug_bounds("mission-tile-1-approve").is_none(),
+            "a working tile has no answers"
+        );
+        click(cx, "mission-tile-0-approve");
+        assert_eq!(
+            commands(&mut script),
+            [(
+                names::ANSWER_PROMPT.to_string(),
+                Some(serde_json::json!({
+                    "session_id": "s1",
+                    "prompt_id": "p1",
+                    "answer": { "kind": "approve" },
+                }))
+            )]
+        );
+        assert!(
+            cx.debug_bounds("mission-tile-0-approve").is_none(),
+            "answered: the buttons go"
+        );
+        assert_eq!(selected(&model, cx), "search", "answering is not selecting");
+    }
+
+    #[gpui::test]
+    fn a_host_that_takes_no_inline_answer_offers_to_open_the_session(app: &mut TestAppContext) {
+        let mut snap = mission_snapshot();
+        snap.commands.retain(|c| c.run.name != names::ANSWER_PROMPT);
+        let (model, mut script, cx) = open_mission(app, snap);
+        cx.simulate_keystrokes("alt-m");
+        assert!(cx.debug_bounds("mission-tile-0-approve").is_none());
+        click(cx, "mission-tile-0-open-to-answer");
+        assert_eq!(selected(&model, cx), "login");
+        assert_eq!(mode_of(&model, cx), InputMode::Terminal, "opened");
+        assert!(commands(&mut script).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_host_that_sends_no_activity_still_draws_its_live_tiles(app: &mut TestAppContext) {
+        // An older host: no activity, no prompts. The live sessions are still
+        // tiles; nothing quiet is guessed into a card.
+        let mut snap = mission_snapshot();
+        for s in snap.projects[0].sessions.iter_mut() {
+            s.activity = None;
+            s.prompt = None;
+        }
+        let (model, _script, cx) = open_mission(app, snap);
+        cx.simulate_keystrokes("alt-m");
+        assert!(cx.debug_bounds("mission-tile-1").is_some());
+        assert!(cx.debug_bounds("mission-card-0").is_none());
+        assert!(cx.debug_bounds("mission-tile-0-approve").is_none());
+        assert!(cx.debug_bounds("mission-tile-0-open-to-answer").is_none());
+        assert_eq!(view_of(&model, cx), MainView::Mission);
     }
 }

@@ -980,6 +980,7 @@ mod delta {
                 recovered: false,
                 attached_existing_branch: false,
                 worktree_path: String::new(),
+                activity: Default::default(),
                 terminals,
             },
             &streams,
@@ -1015,6 +1016,38 @@ mod delta {
         let before = state(InterpretedStatus::Working, vec![terminal("tab-1:primary")]);
         let after = state(InterpretedStatus::Working, vec![terminal("tab-1:primary")]);
         assert!(deltas(&before, &after).is_empty());
+    }
+
+    /// The activity stamps move every second an agent prints: that alone is
+    /// no frame (each would cost a browser a resnapshot), while a detected
+    /// prompt appearing or going is the row's upsert.
+    #[test]
+    fn activity_alone_is_silent_and_a_prompt_is_an_upsert() {
+        let before = state(InterpretedStatus::Working, vec![terminal("tab-1:primary")]);
+        let mut after = before.clone();
+        after.projects[0].sessions[0].activity = Some(crate::contracts::TabActivity {
+            last_output_at: Some(42),
+            ..Default::default()
+        });
+        assert!(deltas(&before, &after).is_empty());
+
+        let mut waiting = after.clone();
+        waiting.projects[0].sessions[0].prompt =
+            Some(Box::new(crate::web::protocol::PendingPrompt {
+                prompt_id: "p1".to_string(),
+                shape: crate::web::protocol::PromptShapeView::Unsupported,
+                text: String::new(),
+                buttons: Vec::new(),
+            }));
+        let out = deltas(&after, &waiting);
+        assert!(
+            matches!(out.as_slice(), [Delta::SessionUpsert(s)] if s.prompt.is_some()),
+            "{out:?}"
+        );
+        assert!(matches!(
+            deltas(&waiting, &after).as_slice(),
+            [Delta::SessionUpsert(s)] if s.prompt.is_none()
+        ));
     }
 
     /// The cheap, frequent one: a status transition is a `Status` delta, and the

@@ -82,8 +82,8 @@ use crate::web::server::{WebInbound, WebOutbound};
 mod host_state;
 
 pub use host_state::{
-    deltas, geometry_of, git_bar, is_git_unknown, lifecycle_reporting, project_view, session_view,
-    GitFacts, SessionFacts, TerminalFacts,
+    deltas, geometry_of, git_bar, is_git_unknown, lifecycle_reporting, pending_prompt,
+    project_view, session_view, GitFacts, SessionFacts, TerminalFacts,
 };
 
 #[cfg(test)]

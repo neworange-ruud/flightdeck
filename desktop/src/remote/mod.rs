@@ -70,9 +70,10 @@ use flightdeck::app::modes::InputMode;
 use flightdeck::contracts::Notifier;
 use flightdeck::contracts::PtySize;
 use flightdeck::host::{HostEvent, OverlayView};
+use flightdeck::persistence::workspace::{MainView, MissionScope};
 use flightdeck::terminal::session::Terminal;
 use flightdeck::tui::palette::FrontEndAction;
-use flightdeck::view::TerminalRef;
+use flightdeck::view::{MissionView, SessionKey, TerminalRef};
 use flightdeck::web::client::session::RemoteSession;
 #[cfg(test)]
 pub use flightdeck::web::client::session::WORKER_SHELL_COMMAND_REFUSAL;
@@ -574,6 +575,53 @@ impl RemoteModel {
     /// Ask for a seat: observe, write, or take the input lock.
     pub fn request_seat(&mut self, seat: SeatRequest) {
         self.session.request_seat(seat);
+    }
+
+    // -- Mission control ----------------------------------------------------
+
+    /// Projects or Mission control (this window's own, for its lifetime).
+    pub fn main_view(&self) -> MainView {
+        self.session.main_view()
+    }
+
+    /// Show `to`: Mission control lands on the grid with a tile selected.
+    pub fn set_main_view(&mut self, to: MainView) {
+        self.session.set_main_view(to);
+    }
+
+    /// Mission control's scope (this window's own, for its lifetime).
+    pub fn mission_scope(&self) -> &MissionScope {
+        self.session.mission_scope()
+    }
+
+    /// Replace Mission control's scope.
+    pub fn set_mission_scope(&mut self, scope: MissionScope) {
+        self.session.set_mission_scope(scope);
+    }
+
+    /// Mission control over the host, now.
+    pub fn mission_view(&self) -> MissionView {
+        self.session.mission_view()
+    }
+
+    /// The session Mission control has selected: this window's own.
+    pub fn mission_selection(&self) -> Option<SessionKey> {
+        self.session.mission_selection()
+    }
+
+    /// Select `key` in this window and be in `mode`.
+    pub fn select_mission_session(&mut self, key: &SessionKey, mode: InputMode) {
+        self.session.select_mission_session(key, mode);
+    }
+
+    /// Take over a chord that means moving in Mission control.
+    pub fn mission_move(&mut self, action: &flightdeck::app::keymap::Action) -> bool {
+        self.session.mission_move(action)
+    }
+
+    /// The terminal a Mission control tile for `key` draws.
+    pub fn session_terminal(&self, key: &SessionKey) -> Option<&Terminal> {
+        self.session.session_terminal(key)
     }
 
     /// Close the window (the link closes with it).

@@ -121,11 +121,11 @@ pub fn perform_id(id: &str, host: &Entity<HostModel>, cx: &mut App) {
 
 /// Perform `entry` against a remote window: the same intent, handed to the
 /// remote model, which keeps browsing local and sends the rest (see
-/// [`crate::remote`]). Mission control has no remote counterpart.
+/// [`crate::remote`]). The main view is the window's own, as it is locally.
 pub fn perform_remote_entry(entry: &KeymapEntry, remote: &Entity<RemoteModel>, cx: &mut App) {
     match intent_for(&entry.action) {
         Intent::Host(event) => remote.update(cx, |model, cx| model.dispatch(event, cx)),
-        Intent::ToggleMainView => {}
+        Intent::ToggleMainView => crate::surface::Surface::Remote(remote.clone()).toggle_view(cx),
         Intent::PasteClipboard => {
             if let Some(event) = clipboard_paste(cx.read_from_clipboard()) {
                 remote.update(cx, |model, cx| model.dispatch(event, cx));
