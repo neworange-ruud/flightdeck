@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.12.0] - 2026-11-09
+
+### New features
+
 - **Mission control in remote windows.** A worker's window, or any FlightDeck opened with Connect to remote…, now has Mission control (Alt-m, or the titlebar's Projects | Mission control switch with the needs-you badge): live tiles across all the host's projects, recent cards, the scope menu, keyboard movement, Enter to open a session full size, and Approve/Deny on a waiting agent's prompt. Browsing stays in your window and never moves the host. A host on an older FlightDeck still shows its live sessions, but its prompts are answered by opening the session, and quiet sessions only appear once they change.
 - A Desktop or worker host now lists the terminal UI's new `flightdeck connect` client as "FlightDeck Terminal" with its machine name, and names that machine in "taken over by …". A worker paired from `flightdeck connect` is also listed in the Desktop's **WORKERS** section, because both use `~/.flightdeck/remotes.json`.
 
