@@ -46,7 +46,7 @@ use base64::Engine;
 use crate::agents::setup::{status_backend, StatusBackend};
 use crate::app::state::AppState;
 use crate::contracts::AgentDef;
-use crate::remote::commands::AgentRequest;
+use crate::remote::commands::{AgentRequest, AgentRequestKind};
 use crate::remote::crypto::E2eChannel;
 use crate::remote::feed::{self, FeedState, SessionExtras, TurnTimer};
 use crate::remote::notifier::{
@@ -61,8 +61,8 @@ use crate::tui::render::GitStatusCache;
 
 use flightdeck_remote_protocol::{
     AgentStatus, CommandAck, CommandBody, DeepLink, DesktopToPhone, EventId, PairingId,
-    PermissionChoice, PermissionOption, PhoneCommand, ProjectId, PromptId, PromptKind, PushClass,
-    PushNotifyBody, Role, SessionId, StateSnapshot,
+    PermissionChoice, PermissionOption, PhoneCommand, ProjectId, PromptId, PromptKind,
+    PromptQuestion, PushClass, PushNotifyBody, Role, SessionId, StateSnapshot,
 };
 
 /// How long to wait for a racing Claude `AskUserQuestion` to be ingested from
@@ -1599,10 +1599,25 @@ struct PromptSidecar {
     /// OpenCode runtime plugin probes `multiple`/`multiSelect` and writes this.
     #[serde(default)]
     multiple: bool,
-    /// The OpenCode permission request id, present only when the plugin can
-    /// reply to it through OpenCode's API (see [`agent_reply_path`]).
+    /// The OpenCode request id, present only when the plugin can reply to it
+    /// through OpenCode's API (see [`agent_reply_path`]): a permission's, or
+    /// an OpenCode 2 question form's.
     #[serde(default, rename = "requestID")]
     request_id: Option<String>,
+    /// Every question of an OpenCode 2 form that asks more than one; the
+    /// flat `text` / `options` / `multiple` are its first.
+    #[serde(default)]
+    questions: Vec<PromptSidecarQuestion>,
+}
+
+#[derive(serde::Deserialize)]
+struct PromptSidecarQuestion {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    options: Vec<PromptSidecarOption>,
+    #[serde(default)]
+    multiple: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -1690,26 +1705,41 @@ fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<A
     let mut replies = Vec::new();
     let prompt = match parsed.kind.as_str() {
         "question" => {
-            let options = parsed
-                .options
-                .into_iter()
-                .enumerate()
-                .map(|(i, o)| PermissionOption {
-                    index: i as u32,
-                    choice: None,
-                    label: o.label,
-                    description: o.description,
-                })
-                .collect();
+            let to_options = |options: Vec<PromptSidecarOption>| -> Vec<PermissionOption> {
+                options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, o)| PermissionOption {
+                        index: i as u32,
+                        choice: None,
+                        label: o.label,
+                        description: o.description,
+                    })
+                    .collect()
+            };
+            // A multi-question OpenCode 2 form is answered question by
+            // question; a single question is described by the flat fields.
+            let questions = if parsed.questions.len() > 1 {
+                parsed
+                    .questions
+                    .into_iter()
+                    .map(|q| PromptQuestion {
+                        header: None,
+                        question: q.text,
+                        options: to_options(q.options),
+                        multi_select: q.multiple,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Some(StructuredPrompt {
                 kind: PromptKind::Question,
                 command: parsed.text,
-                options,
+                options: to_options(parsed.options),
                 allow_free_text: true,
                 multi_select: parsed.multiple,
-                // OpenCode's sidecar carries a single question; the flat fields
-                // above describe it, so the multi-question list stays empty.
-                questions: Vec::new(),
+                questions,
             })
         }
         // Permissions are binary. Build a structured prompt only when every
@@ -1750,10 +1780,13 @@ fn read_prompt_sidecar(status_root: &Path) -> Option<(StructuredPrompt, Option<A
         }
         _ => None,
     }?;
-    // Only a permission is answered through the plugin; a question is typed.
-    let request = request_id
-        .filter(|_| prompt.kind == PromptKind::Permission)
-        .map(|id| AgentRequest { id, replies });
+    // A permission, and an OpenCode 2 question form, are answered through the
+    // plugin; an OpenCode 1.x question (no request id) is typed.
+    let kind = match prompt.kind {
+        PromptKind::Permission => AgentRequestKind::Permission,
+        PromptKind::Question => AgentRequestKind::Form,
+    };
+    let request = request_id.map(|id| AgentRequest { id, replies, kind });
     Some((prompt, request))
 }
 

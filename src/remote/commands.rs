@@ -143,16 +143,40 @@ pub struct SessionEntry {
     pub agent_request: Option<AgentRequest>,
 }
 
-/// An OpenCode permission the agent's runtime plugin replies to through
-/// OpenCode's API.
+/// An OpenCode prompt the agent's runtime plugin answers through OpenCode's
+/// API rather than by keystroke.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
-    /// The OpenCode permission request id.
+    /// The OpenCode request id: a permission's (`per_…`) or a form's (`frm_…`).
     pub id: String,
     /// OpenCode's reply (`once`, `always`, `reject`) for each option index of
-    /// the prompt, when the plugin tagged its options; empty for a plugin that
-    /// offers only Allow once / Reject and is answered by `choice`.
+    /// a permission, when the plugin tagged its options; empty for a plugin
+    /// that offers only Allow once / Reject and is answered by `choice`, and
+    /// for a form.
     pub replies: Vec<String>,
+    /// What the request is, which decides how an answer is handed over.
+    pub kind: AgentRequestKind,
+}
+
+/// What an [`AgentRequest`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRequestKind {
+    /// An OpenCode permission, replied with `once` / `always` / `reject`.
+    Permission,
+    /// An OpenCode 2 question form, replied with the chosen options or a
+    /// typed answer ([`FormAnswer`]).
+    Form,
+}
+
+/// The answer to an OpenCode 2 question form, as the plugin receives it. The
+/// plugin maps indices to its fields' option values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormAnswer {
+    /// The chosen 0-based option indices, one list per question (field), in
+    /// the form's order.
+    Selections(Vec<Vec<u32>>),
+    /// A typed answer to the (first) question.
+    Text(String),
 }
 
 /// One open project, for `new_agent` routing.
@@ -365,6 +389,19 @@ pub enum Translation {
         count: u32,
         /// This chunk's bytes.
         bytes: Vec<u8>,
+    },
+    /// Answer an OpenCode 2 question form through the agent's plugin, which
+    /// replies via OpenCode's API: the executor writes `answer` for `form_id`
+    /// to the tab's reply file ([`crate::remote::bridge::agent_reply_path`]).
+    AgentFormReply {
+        /// Workspace project index.
+        project: usize,
+        /// Tab index within the project.
+        tab: usize,
+        /// The OpenCode form id.
+        form_id: String,
+        /// The chosen options or the typed answer.
+        answer: FormAnswer,
     },
     /// Answer an OpenCode permission through the agent's plugin, which replies
     /// via OpenCode's API: the executor writes `reply` for `request_id` to the
@@ -779,7 +816,39 @@ pub fn translate(body: &CommandBody, index: &SessionIndex) -> Translation {
             // OpenCode's API: its dialog ignored the injected Enter
             // (remote-control-9dnm). The phone sends `choice` for a two-button
             // prompt and `option_index` once Allow always makes it a list.
-            if let Some(request) = &s.agent_request {
+            // An OpenCode 2 question is a form the plugin answers through
+            // OpenCode's API: the 2.x TUI's form dialog is not the 1.x
+            // question dialog the keystrokes below were written for.
+            if let Some(request) = s
+                .agent_request
+                .as_ref()
+                .filter(|r| r.kind == AgentRequestKind::Form)
+            {
+                let answer = if let Some(text) = free_text.as_deref().filter(|t| !t.is_empty()) {
+                    FormAnswer::Text(text.to_string())
+                } else if let Some(answers) = answers.as_deref().filter(|a| !a.is_empty()) {
+                    FormAnswer::Selections(
+                        answers.iter().map(|a| a.option_indices.clone()).collect(),
+                    )
+                } else if let Some(indices) = option_indices.as_deref().filter(|v| !v.is_empty()) {
+                    FormAnswer::Selections(vec![indices.to_vec()])
+                } else if let Some(n) = option_index {
+                    FormAnswer::Selections(vec![vec![*n]])
+                } else {
+                    return reject("empty decision");
+                };
+                return Translation::AgentFormReply {
+                    project: s.project,
+                    tab: s.tab,
+                    form_id: request.id.clone(),
+                    answer,
+                };
+            }
+            if let Some(request) = s
+                .agent_request
+                .as_ref()
+                .filter(|r| r.kind == AgentRequestKind::Permission)
+            {
                 let reply = match (choice, option_index) {
                     (Some(PermissionChoice::AllowOnce), _) => Some("once"),
                     (Some(PermissionChoice::Deny), _) => Some("reject"),

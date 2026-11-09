@@ -25,6 +25,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **Answering an OpenCode 2 question from the phone or a Mission control tile works.** OpenCode 2 asks questions as forms in a new dialog, which the keystrokes FlightDeck typed for OpenCode 1.x never reached. The plugin now answers the form through the same API OpenCode's own TUI uses, with the options you picked (one per question for a form that asks several) or the answer you typed. OpenCode 1.x questions are still answered by keystroke, as before.
 - **OpenCode 2 works again.** OpenCode 2 rejected FlightDeck's status plugin, so OpenCode tabs showed no status and Approve/Deny never reached them. FlightDeck's plugin is now one module that works with OpenCode 2's new plugin API and with OpenCode 1.x, and the phone's OpenCode transcript reads OpenCode 2's new tables. Verified against OpenCode 2.2.6 and 1.19.5.
 - **Desktop releases are now notarized by Apple.** The release job was looking for notarization secrets that were never set, so it signed the macOS app but skipped notarization. It now uses the App Store Connect API key the iOS TestFlight upload already uses, so a downloaded `FlightDeck.app` opens without the Gatekeeper warning.
 - The version-skew banner on a worker newer than the app now says to update

@@ -439,6 +439,46 @@ fn allow_always_from_the_phone_is_replied_through_the_plugin() {
     }
 }
 
+/// What the OpenCode 2 plugin writes for a question form it can answer
+/// through OpenCode's API (captured from 2.2.6).
+const OPENCODE_2_FORM: &str = r#"{"kind":"question","text":"Questions\nColor preference",
+    "options":[{"label":"Red","description":"Choose red"},{"label":"Blue","description":"Choose blue"}],
+    "multiple":false,"requestID":"frm_1"}"#;
+
+#[test]
+fn an_opencode_2_question_is_answered_through_the_plugin_from_the_phone_and_the_tile() {
+    for remote in [true, false] {
+        let fakes = Fakes::new();
+        let mut w = waiting(&fakes, "opencode", Sidecar::OpenCode(OPENCODE_2_FORM), true);
+        let view = w.prompt().expect("the question is offered");
+        assert!(
+            view.buttons
+                .iter()
+                .any(|b| b.answer == PromptAnswer::Option(1)),
+            "Blue is offered: {:?}",
+            view.buttons
+        );
+        if remote {
+            w.phone_answers(PromptAnswer::Option(1));
+        } else {
+            w.answer(PromptAnswer::Option(1));
+        }
+        let typed = timeline(&mut w, &fakes, 5);
+        assert!(
+            typed.iter().all(Vec::is_empty),
+            "remote: {remote}: nothing is typed into OpenCode 2's form dialog"
+        );
+        let reply_file = crate::remote::bridge::agent_reply_path(w._root.path());
+        let written: serde_json::Value =
+            serde_json::from_str(&fakes.fs.read_to_string(&reply_file).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({ "requestID": "frm_1", "answers": [[1]] }),
+            "remote: {remote}"
+        );
+    }
+}
+
 #[test]
 fn queued_opencode_permissions_are_offered_one_after_another() {
     // OpenCode asks once per parallel tool call; the plugin shows the oldest and,
