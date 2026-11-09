@@ -3,6 +3,7 @@ export const APPROVED_MDX_COMPONENTS = [
   "CardGrid",
   "Card",
   "Badge",
+  "Video",
 ] as const;
 
 export type DocsMdxComponentName = (typeof APPROVED_MDX_COMPONENTS)[number];

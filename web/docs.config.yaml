@@ -28,6 +28,7 @@ mdxComponents:
     - CardGrid
     - Card
     - Badge
+    - Video
 
 codeBlocks:
   lineNumbers: optional
