@@ -102,7 +102,7 @@ cargo-dist release uses** (`release.yml`), so one Developer ID certificate serve
 | --- | --- |
 | `CODESIGN_CERTIFICATE` (base64 `.p12`), `CODESIGN_CERTIFICATE_PASSWORD` | imports the Developer ID cert into a temporary keychain |
 | `CODESIGN_IDENTITY` | `macos-bundle.sh` codesigns the `.app` (hardened runtime, timestamped; no `--deep`, no entitlements needed) |
-| `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_P8_BASE64` | notarization with an App Store Connect API key (preferred): `xcrun notarytool submit --key --key-id --issuer` |
+| `FD_ASC_KEY_ID`, `FD_ASC_ISSUER_ID`, `FD_ASC_KEY_P8` (base64 `.p8`) | notarization with an App Store Connect API key (preferred): `xcrun notarytool submit --key --key-id --issuer`. The **same key the iOS TestFlight upload uses** (`ios-testflight.yml`); the workflow maps them to the script's `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` and `APPLE_API_KEY_P8_BASE64` |
 | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | notarization alternative with an Apple ID and app-specific password |
 | `WINDOWS_SIGN_PFX_BASE64`, `WINDOWS_SIGN_PFX_PASSWORD` | decoded to a temp `.pfx`; `windows-package.ps1` signs the MSI and the portable `.exe` |
 
@@ -128,7 +128,9 @@ missing assets (`--clobber`).
 
 #### First release checklist
 
-1. Set the secrets above (at minimum `CODESIGN_*`; they already exist for the TUI).
+1. Set the secrets above (at minimum `CODESIGN_*`; they already exist for the TUI, and
+   `FD_ASC_*` already exist for TestFlight, so macOS signing and notarization need no new
+   secrets).
 2. Run `desktop.yml` manually (workflow_dispatch, no tag) and confirm `check` and
    `package` pass on all three OSes; this is the first time Linux and Windows run.
 3. Run `scripts/release-desktop <x.y.z>` on `main` (see "Cutting a release"). Confirm
