@@ -85,7 +85,7 @@ use crate::web::protocol::{
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Parses what a mirrored terminal's stream delivered into its grid; whether
 /// the screen may look different now. The core's bounded

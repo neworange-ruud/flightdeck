@@ -8,7 +8,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **`flightdeck connect`: drive a FlightDeck worker from the terminal.** The terminal UI can now attach to a FlightDeck on another machine, such as a worker, and show its projects, agents and shell with the same sidebar, tabs and palette as the local terminal UI. Pair once with `flightdeck connect --pair <host[:port]>` and the code from `flightdeck worker pair`, then run `flightdeck connect` (or `flightdeck connect <name>`). Pairings are saved in `~/.flightdeck/remotes.json`, shared with FlightDeck Desktop. On a worker, the first project tab is the worker shell, **Open Project** opens the scan / browse / clone picker, and the worker sizes its terminals to your pane. It attaches as a window, so it takes the worker over from an open Desktop window; **r** takes it back after a takeover. `--observe` watches without typing. It also drives another machine's terminal UI or Desktop. Not yet included: the host's configuration manager.
+- A host now lists a `flightdeck connect` client as "FlightDeck Terminal" with its machine name, in its device list and in "taken over by …".
 
 ### Improvements
 

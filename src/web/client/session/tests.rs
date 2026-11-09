@@ -12,7 +12,7 @@ use crate::web::protocol::{
     PROTOCOL_VERSION,
 };
 
-fn terminal(session: &str, id: &str, role: TerminalRole) -> TerminalView {
+pub(crate) fn terminal(session: &str, id: &str, role: TerminalRole) -> TerminalView {
     TerminalView {
         terminal_id: id.into(),
         session_id: TabId(session.to_string()),
@@ -26,7 +26,7 @@ fn terminal(session: &str, id: &str, role: TerminalRole) -> TerminalView {
     }
 }
 
-fn session(id: &str, name: &str) -> SessionView {
+pub(crate) fn session(id: &str, name: &str) -> SessionView {
     SessionView {
         session_id: TabId(id.to_string()),
         project_id: "/repo".into(),
@@ -55,7 +55,7 @@ fn session(id: &str, name: &str) -> SessionView {
 
 /// One project with two sessions, the host looking at the second; a worker
 /// when `worker`, with `messages` kept for the next attach.
-fn snapshot(worker: bool, messages: Vec<HostMessage>) -> Snapshot {
+pub(crate) fn snapshot(worker: bool, messages: Vec<HostMessage>) -> Snapshot {
     Snapshot {
         protocol_version: PROTOCOL_VERSION,
         host_version: "1.0.0".to_string(),

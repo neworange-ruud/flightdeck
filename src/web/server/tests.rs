@@ -1479,6 +1479,15 @@ fn a_device_label_is_a_desktops_hostname_or_else_the_chip_label() {
         identity(Some("FlightDeck Desktop")).device_label(),
         "100.64.1.9 · FlightDeck Desktop"
     );
+    // The terminal UI's `flightdeck connect` names its machine the same way.
+    assert_eq!(
+        identity(Some("FlightDeck Terminal/1.33.0 (build-box)")).device_label(),
+        "build-box"
+    );
+    assert_eq!(
+        crate::web::server::coarse_user_agent("FlightDeck Terminal/1.33.0 (build-box)"),
+        "FlightDeck Terminal"
+    );
     assert_eq!(
         identity(Some("Chrome on macOS")).device_label(),
         "100.64.1.9 · Chrome on macOS"

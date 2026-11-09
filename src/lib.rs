@@ -12,6 +12,7 @@ pub mod testing;
 pub mod agents;
 pub mod app;
 pub mod config;
+pub mod connect;
 pub mod defender;
 pub mod fs;
 pub mod git;
@@ -155,6 +156,11 @@ pub fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("worker") {
         std::process::exit(crate::worker::cli::main(&argv[2..]));
+    }
+    // `flightdeck connect …` drives a FlightDeck on another machine: no local
+    // host, so nothing below (the worker lock, the workspace) applies.
+    if argv.get(1).map(String::as_str) == Some("connect") {
+        std::process::exit(crate::connect::main(&argv[2..]));
     }
 
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
@@ -1032,6 +1038,10 @@ fn print_help() {
     println!();
     println!("WORKER (Linux and macOS — a headless host for FlightDeck Desktop):");
     println!("    worker <command>       Run `flightdeck worker` for its commands");
+    println!();
+    println!("REMOTE (drive a FlightDeck on another machine, such as a worker):");
+    println!("    connect [<remote>]     Connect to a paired remote; `flightdeck connect");
+    println!("                           --help` for pairing and options");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help       Print this help");

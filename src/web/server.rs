@@ -2727,7 +2727,11 @@ impl ViewerIdentity {
         let host = self
             .user_agent_label
             .as_deref()
-            .and_then(|agent| agent.strip_prefix(NATIVE_CLIENT_AGENT))
+            .and_then(|agent| {
+                NATIVE_CLIENT_AGENTS
+                    .iter()
+                    .find_map(|name| agent.strip_prefix(name))
+            })
             .and_then(|rest| rest.strip_suffix(')'))
             .and_then(|rest| rest.rsplit_once('('))
             .map(|(_, host)| host.trim())
@@ -2806,14 +2810,26 @@ pub(crate) fn truncate_chars(raw: &str, max: usize) -> String {
 /// (`FlightDeck Desktop/<version>`) when it controls another instance.
 pub const NATIVE_CLIENT_AGENT: &str = "FlightDeck Desktop";
 
+/// The product name the terminal UI's `flightdeck connect` sends as its
+/// `User-Agent` (`FlightDeck Terminal/<version>`) when it controls another
+/// instance (`remote-control-ki05`).
+pub const NATIVE_TERMINAL_AGENT: &str = "FlightDeck Terminal";
+
+/// Every native client's product name, so each is listed — and revoked, and
+/// named in "taken over by …" — by name rather than as an unknown browser.
+const NATIVE_CLIENT_AGENTS: [&str; 2] = [NATIVE_CLIENT_AGENT, NATIVE_TERMINAL_AGENT];
+
 /// Reduce a `User-Agent` to the `Chrome on macOS` shape turn 2 asks for, keeping
 /// only characters that are safe to render verbatim in a terminal chip.
 pub(crate) fn coarse_user_agent(raw: &str) -> String {
     // FlightDeck Desktop controlling this instance as a native client
     // (`specs/DESKTOP_REMOTE_CONTROL_PLAN.md` §2.4). It names itself in full,
     // so the access overlay can list — and revoke — it by name.
-    if raw.starts_with(NATIVE_CLIENT_AGENT) {
-        return NATIVE_CLIENT_AGENT.to_string();
+    if let Some(name) = NATIVE_CLIENT_AGENTS
+        .iter()
+        .find(|name| raw.starts_with(**name))
+    {
+        return name.to_string();
     }
     let browser = if raw.contains("Firefox/") {
         "Firefox"

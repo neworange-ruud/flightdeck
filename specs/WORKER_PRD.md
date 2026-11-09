@@ -61,7 +61,8 @@ give you a shell, and tell you something went wrong.
 - FlightDeck managing agent or git credentials (W12, W13).
 - Updating a worker from the Desktop (W20 → deferred by W25; follow-up issue).
 - The new host capabilities on TUI or Desktop hosts (W23).
-- A TUI that attaches to a running worker (W22).
+- A TUI that attaches to a running worker (W22). *Since added as
+  `flightdeck connect` (§9).*
 - Listening on anything but Tailscale addresses, and so TLS (W8).
 
 ## 3. Decisions
@@ -297,7 +298,10 @@ releases must both ship v7.
 - Phone pushes from a worker through the push-only relay. *Done, with the
   whole phone link, as `[worker] phone` (remote-control-qlyd.28).*
 - Start on boot (`worker enable` writing a systemd user unit / launchd agent).
-- A TUI attaching to a running worker as a client.
+- A TUI attaching to a running worker as a client. *Done as `flightdeck
+  connect` (epic remote-control-ki05): the core's `RemoteSession`, which the
+  Desktop's remote window also runs on, drawn with the TUI's widgets. Any host
+  kind, not only workers; it attaches as a window, so it takes a worker over.*
 
 ## 10. Issue map
 
