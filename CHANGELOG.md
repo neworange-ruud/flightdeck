@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.33.0] - 2026-11-09
+
+### New features
+
 - **Workers start on boot.** `flightdeck worker enable` registers the worker with launchd (macOS, at login) or systemd (Linux) and starts it; `flightdeck worker disable` removes it, and `--dry-run` shows the file and commands first. The service manager only starts the worker's supervisor and never restarts it, so crash recovery and `flightdeck worker stop` behave as before. `flightdeck worker status` says whether it is set up and, on Linux, whether lingering is on. While it is set up, `worker start` and `restart` go through the service manager, so the worker gets your login shell's `PATH` and, on a Mac, your login session.
 - **`flightdeck connect`: drive a FlightDeck worker from the terminal.** The terminal UI can now attach to a FlightDeck on another machine, such as a worker, and show its projects, agents and shell with the same sidebar, tabs and palette as the local terminal UI. Pair once with `flightdeck connect --pair <host[:port]>` and the code from `flightdeck worker pair`, then run `flightdeck connect` (or `flightdeck connect <name>`). Pairings are saved in `~/.flightdeck/remotes.json`, shared with FlightDeck Desktop. On a worker, the first project tab is the worker shell, **Open Project** opens the scan / browse / clone picker, and the worker sizes its terminals to your pane. It attaches as a window, so it takes the worker over from an open Desktop window; **r** takes it back after a takeover. `--observe` watches without typing. It also drives another machine's terminal UI or Desktop. Not yet included: the host's configuration manager.
 - A host now lists a `flightdeck connect` client as "FlightDeck Terminal" with its machine name, in its device list and in "taken over by …".
