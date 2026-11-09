@@ -23,7 +23,8 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- Mission control in a remote or worker window now fills the window's height;
+  it used to stop below its last card, leaving the rest of the window empty.
 
 ## [0.12.0] - 2026-11-09
 

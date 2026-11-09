@@ -972,13 +972,10 @@ impl Render for RemoteWindow {
                     .w_full()
                     .child(picker)
                     .into_any_element(),
-                None if mission => h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .items_start()
-                    .child(self.mission.clone())
-                    .into_any_element(),
+                // Straight into the column, as in the local window: Mission
+                // control's own `flex_1` row then takes the window's height.
+                // Wrapped in a top-aligned row it stopped at its content.
+                None if mission => self.mission.clone().into_any_element(),
                 None => h_flex()
                     .flex_1()
                     .min_h_0()
