@@ -2309,6 +2309,23 @@ mod mission {
         );
     }
 
+    /// Mission control fills the window's height, as in the local window: its
+    /// rail's footer sits on the status bar, not under the last card.
+    #[gpui::test]
+    fn mission_control_fills_the_windows_height(app: &mut TestAppContext) {
+        let (_model, _script, cx) = open_mission(app, mission_snapshot());
+        cx.simulate_keystrokes("alt-m");
+        let footer = cx
+            .debug_bounds("mission-see-all")
+            .expect("the rail's footer");
+        let status = cx.debug_bounds("remote-seat").expect("the status bar");
+        let gap = status.top() - footer.bottom();
+        assert!(
+            gap < gpui::px(40.),
+            "the rail stops {gap:?} above the status bar"
+        );
+    }
+
     #[gpui::test]
     fn the_titlebar_switch_shows_either_view_with_the_badge(app: &mut TestAppContext) {
         let (model, mut script, cx) = open_mission(app, mission_snapshot());

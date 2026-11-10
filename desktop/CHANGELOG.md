@@ -18,11 +18,13 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- The remote window's title bar no longer shows the remote's address next to
+  its name; hover the name to see it.
 
 ### Bug fixes
 
-- None yet.
+- Mission control in a remote or worker window now fills the window's height;
+  it used to stop below its last card, leaving the rest of the window empty.
 
 ## [0.12.0] - 2026-11-09
 

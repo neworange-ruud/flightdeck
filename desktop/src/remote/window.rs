@@ -486,19 +486,16 @@ impl RemoteWindow {
                 .hsla()),
             )
             .child(
+                // The address is only a hover away: the title bar keeps the
+                // name and the link state, not the full host:port.
                 div()
+                    .id("remote-name")
                     .debug_selector(|| "remote-name".into())
                     .text_size(px(12.5))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(p.ink.hsla())
+                    .tooltip(icons::tooltip(address))
                     .child(name),
-            )
-            .child(
-                div()
-                    .font_family(MONO_FAMILY)
-                    .text_size(px(11.))
-                    .text_color(p.muted.hsla())
-                    .child(address),
             )
             .child(
                 div()
@@ -975,13 +972,10 @@ impl Render for RemoteWindow {
                     .w_full()
                     .child(picker)
                     .into_any_element(),
-                None if mission => h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .items_start()
-                    .child(self.mission.clone())
-                    .into_any_element(),
+                // Straight into the column, as in the local window: Mission
+                // control's own `flex_1` row then takes the window's height.
+                // Wrapped in a top-aligned row it stopped at its content.
+                None if mission => self.mission.clone().into_any_element(),
                 None => h_flex()
                     .flex_1()
                     .min_h_0()
