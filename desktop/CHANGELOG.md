@@ -18,6 +18,16 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.12.1] - 2026-11-10
+
+### Improvements
+
 - The remote window's title bar no longer shows the remote's address next to
   its name; hover the name to see it.
 
