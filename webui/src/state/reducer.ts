@@ -22,7 +22,26 @@ import {
   pickerSent,
 } from "./picker";
 import type { PickerState } from "./picker";
-import { awayText, messageLine } from "./worker";
+import {
+  defaultUploadDir,
+  isUploading,
+  newUpload,
+  uploadAck,
+  uploadAdd,
+  uploadCancel,
+  uploadFinished,
+  uploadLinkLost,
+  uploadPlan,
+  uploadProgress,
+  uploadRemove,
+  uploadRequested,
+  uploadResolve,
+  uploadSetDir,
+  uploadStarted,
+  uploadStartOver,
+} from "./upload";
+import type { UploadState } from "./upload";
+import { awayText, messageLine, uploadAvailable } from "./worker";
 import { widthClass } from "./viewport";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
@@ -117,7 +136,9 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           staleness: null,
         };
       }
-      return { ...state, connection: action.status };
+      /** An upload request still out will not be answered across a
+       * reconnect; a transfer carries on, since its ticket needs no socket. */
+      return withUpload({ ...state, connection: action.status }, uploadLinkLost);
     }
 
     case "geometry/set":
@@ -230,6 +251,9 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           snapshot.hostKind === "worker" ? state.workerShellTab : false,
         /** The picker only exists on a worker. */
         picker: snapshot.hostKind === "worker" ? state.picker : null,
+        protocolVersion: snapshot.protocolVersion ?? null,
+        /** So does the upload panel (v8). */
+        upload: snapshot.hostKind === "worker" ? state.upload : null,
       };
     }
 
@@ -725,6 +749,21 @@ function reduceAction(state: AppState, action: AppAction): AppState {
        * its acks settle its requests, and an applied open closes it. The
        * owners' seqs never overlap, since one counter mints them all.
        */
+      /** So does the upload panel (v8): a refusal of its `begin_upload` is
+       * its note, in the worker's words. */
+      if (state.upload !== null) {
+        const answered = uploadAck(
+          state.upload,
+          action.seq,
+          action.outcome,
+          action.detail ?? null,
+        );
+        if (answered.owned) {
+          return answered.upload === state.upload
+            ? state
+            : { ...state, upload: answered.upload };
+        }
+      }
       if (state.picker !== null) {
         const answered = pickerAck(
           state.picker,
@@ -1282,7 +1321,22 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       return { ...state, workerShellTab: action.show };
 
     case "picker/request":
-      if (state.hostKind !== "worker" || action.intent.kind !== "open") {
+      if (state.hostKind !== "worker") {
+        return state;
+      }
+      /** The upload panel's Choose…: a picker of its own, over the panel,
+       * that only browses — and only while the panel can still change. */
+      if (action.intent.kind === "choose_folder") {
+        if (state.upload === null || state.upload.phase.kind !== "choosing") {
+          return state;
+        }
+        return {
+          ...state,
+          palette: null,
+          picker: newPicker(state.worker?.home ?? "", "choose_folder"),
+        };
+      }
+      if (action.intent.kind !== "open") {
         return state;
       }
       return {
@@ -1373,6 +1427,9 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         picker: null,
         palette: null,
         retry: null,
+        /** An upload request out will not be answered; a transfer under way
+         * keeps going on its ticket. */
+        upload: state.upload === null ? null : uploadLinkLost(state.upload),
       };
 
     case "connection/reclaim":
@@ -1390,6 +1447,88 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       return state.notifications === action.permission
         ? state
         : { ...state, notifications: action.permission };
+
+    /* --- Uploading files to a worker (v8, W34, R30) ------------------------ */
+
+    case "upload/open": {
+      if (!uploadAvailable(state)) {
+        return state;
+      }
+      if (state.upload === null) {
+        return {
+          ...state,
+          /** One overlay at a time: the palette is usually what opened this. */
+          palette: null,
+          upload: uploadAdd(newUpload(defaultUploadDir(state)), action.picked),
+        };
+      }
+      return withUpload(state, (upload) => uploadAdd(upload, action.picked));
+    }
+
+    case "upload/remove":
+      return withUpload(state, (upload) => uploadRemove(upload, action.index));
+
+    case "upload/dir":
+      return withUpload(state, (upload) => uploadSetDir(upload, action.dir));
+
+    case "upload/submit":
+      /** `main.ts` sends the request this means; nothing local changes. */
+      return state;
+
+    case "upload/requested":
+      return withUpload(state, (upload) =>
+        uploadRequested(upload, action.seq, action.onConflict),
+      );
+
+    case "upload/note":
+      return withUpload(state, (upload) =>
+        upload.note === action.note ? upload : { ...upload, note: action.note },
+      );
+
+    case "upload/resolve":
+      /** `cancel` goes back to the list here; the other two are sent again
+       * by `main.ts`, which reports back with `upload/requested`. */
+      return action.resolution === "cancel"
+        ? withUpload(state, (upload) => uploadResolve(upload, "cancel").upload)
+        : state;
+
+    case "upload/plan":
+      return withUpload(state, (upload) => uploadPlan(upload, action.plan));
+
+    case "upload/started":
+      return withUpload(state, (upload) => uploadStarted(upload, action.index));
+
+    case "upload/progress":
+      return withUpload(state, (upload) =>
+        uploadProgress(upload, action.index, action.sent),
+      );
+
+    case "upload/finished":
+      return withUpload(state, (upload) =>
+        uploadFinished(upload, action.index, action.result),
+      );
+
+    case "upload/cancel":
+      return withUpload(state, (upload) => uploadCancel(upload).upload);
+
+    case "upload/startOver":
+      return withUpload(state, uploadStartOver);
+
+    case "upload/close":
+      if (state.upload === null || isUploading(state.upload)) {
+        return state;
+      }
+      return { ...state, upload: null, picker: null };
+
+    case "picker/chosen": {
+      if (state.picker === null || state.picker.purpose !== "choose_folder") {
+        return state;
+      }
+      const path = action.path;
+      return withUpload({ ...state, picker: null }, (upload) =>
+        uploadSetDir(upload, path),
+      );
+    }
 
     default: {
       // Exhaustiveness check: a new AppAction variant left unhandled above is
@@ -1515,6 +1654,22 @@ function refreshArrivingIncumbent(
 }
 
 /**
+ * The upload panel moved by `step`, when there is one. Identity when there is
+ * none, or when `step` changed nothing, so an unrelated action costs no
+ * re-render.
+ */
+function withUpload(
+  state: AppState,
+  step: (upload: UploadState) => UploadState,
+): AppState {
+  if (state.upload === null) {
+    return state;
+  }
+  const upload = step(state.upload);
+  return upload === state.upload ? state : { ...state, upload };
+}
+
+/**
  * The picker after an answer: still open, or — when the worker opened a
  * project for it — closed, with the project to go to and a notice saying so.
  * The native client's `close_opened_picker`, as a reduction.
@@ -1537,7 +1692,12 @@ function settlePicker(state: AppState, picker: PickerState): AppState {
  * its first line is the notice instead. The native window's `show_message`.
  */
 function showMessage(state: AppState, title: string, text: string): AppState {
-  if (state.palette !== null || state.config !== null || state.picker !== null) {
+  if (
+    state.palette !== null ||
+    state.config !== null ||
+    state.picker !== null ||
+    state.upload !== null
+  ) {
     return { ...state, notice: text.split(NEWLINE)[0] ?? text };
   }
   return { ...state, palette: null, readOnly: { kind: "message", title, text } };

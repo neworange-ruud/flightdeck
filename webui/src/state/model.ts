@@ -124,6 +124,13 @@ export interface Session {
   /** `null` when git has not answered for this session yet */
   readonly gitBar: GitBarInfo | null;
   readonly terminals: readonly TerminalTab[];
+  /**
+   * The session's worktree on the host (`SessionView::worktree_path`). Read
+   * only on a worker, where it is the upload panel's default folder (R30).
+   * Optional, like `Project.root`, so a fixture that predates it still
+   * describes a whole session.
+   */
+  readonly worktreePath?: string;
 }
 
 export interface Project {
@@ -419,6 +426,12 @@ export interface Snapshot {
    * or Desktop host keeps D4's one host grid, `geometry` above.
    */
   readonly terminalGeometry?: Readonly<Record<string, { readonly cols: number; readonly rows: number }>>;
+  /**
+   * The protocol version the host answered this tab at
+   * (`Snapshot::protocol_version`). Optional so the fixtures need not say;
+   * only the upload panel reads it (v8, R30).
+   */
+  readonly protocolVersion?: number;
 }
 
 /** `protocol::HostKind`. */

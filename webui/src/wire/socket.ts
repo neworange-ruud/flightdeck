@@ -55,6 +55,7 @@ import {
   seatOf,
   snapshotFromWire,
   statusFromLabel,
+  uploadPlanOf,
   workerShellOf,
   workerStatusOf,
 } from "./adapt";
@@ -75,6 +76,7 @@ import {
   type WireNotificationView,
   type WireProjectScan,
   type WireTakenOver,
+  type WireUploadPlan,
   type WireWorkerShellView,
   type WireWorkerStatusView,
   type WireDialogView,
@@ -1215,7 +1217,12 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         return;
       /* --- v8 ------------------------------------------------------------- */
       case "upload_plan":
-        /** The answer to a `begin_upload` this tab does not send yet. */
+        /** The answer to the upload panel's `begin_upload`; the `ack` for
+         * the same seq follows as `command/result`. */
+        store.dispatch({
+          type: "upload/plan",
+          plan: uploadPlanOf(frame as WireUploadPlan),
+        });
         return;
       default:
         /** A frame this build has never heard of. Ignored on purpose. */

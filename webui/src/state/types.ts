@@ -39,6 +39,14 @@ import type {
   PickerState,
 } from "./picker";
 import type { NotificationPermissionState } from "./worker";
+import type {
+  OnConflict,
+  Picked,
+  Resolution,
+  TransferResult,
+  UploadPlan,
+  UploadState,
+} from "./upload";
 import type { ConfigDoc, ConfigEdits, ConfigScope } from "./config";
 import type { ViewportWidth } from "./viewport";
 import type {
@@ -443,6 +451,13 @@ export interface AppState {
   readonly takenOverBy: string | null;
   /** What this browser allows for notifications, as `main.ts` read it. */
   readonly notifications: NotificationPermissionState;
+  /**
+   * The protocol version the host answered this tab at, `null` until a
+   * snapshot says. Only the upload panel reads it (v8, R30).
+   */
+  readonly protocolVersion: number | null;
+  /** Upload files to a worker (W34, R30): the panel, or `null` when closed. */
+  readonly upload: UploadState | null;
 }
 
 /**
@@ -633,6 +648,8 @@ export function createInitialState(): AppState {
     takenOverBy: null,
     /** The honest default until `main.ts` has asked the browser. */
     notifications: "unsupported",
+    protocolVersion: null,
+    upload: null,
   };
 }
 
@@ -1108,6 +1125,49 @@ export type AppAction =
   /** "Take it back": the transport is attaching as a window again. */
   | { readonly type: "connection/reclaim" }
   | { readonly type: "notice/set"; readonly notice: string | null }
+  /* --- Uploading files to a worker (v8, W34, R30) ------------------------- */
+  /**
+   * Files picked or dropped: opens the upload panel at the default folder
+   * (`defaultUploadDir`) with them, or adds them to the open one while it is
+   * still choosing.
+   */
+  | { readonly type: "upload/open"; readonly picked: readonly Picked[] }
+  | { readonly type: "upload/remove"; readonly index: number }
+  /** The folder field, as typed. */
+  | { readonly type: "upload/dir"; readonly dir: string }
+  /** Upload pressed. `main.ts` sends the `begin_upload` it means (or says
+   * why there is none) and reports back with `upload/requested`. */
+  | { readonly type: "upload/submit" }
+  /** A `begin_upload` went out as `seq`; `null` when it could not be sent. */
+  | {
+      readonly type: "upload/requested";
+      readonly seq: number | null;
+      readonly onConflict: OnConflict;
+    }
+  /** Something the panel could not send, said on its note line. */
+  | { readonly type: "upload/note"; readonly note: string }
+  /** The answer to taken names. `cancel` is local; `main.ts` sends the
+   * other two again. */
+  | { readonly type: "upload/resolve"; readonly resolution: Resolution }
+  /** `ServerMsg::UploadPlan`. */
+  | { readonly type: "upload/plan"; readonly plan: UploadPlan }
+  /** `main.ts` started item `index`'s transfer. */
+  | { readonly type: "upload/started"; readonly index: number }
+  | { readonly type: "upload/progress"; readonly index: number; readonly sent: number }
+  | {
+      readonly type: "upload/finished";
+      readonly index: number;
+      readonly result: TransferResult;
+    }
+  /** Stop. `main.ts` aborts a transfer under way. */
+  | { readonly type: "upload/cancel" }
+  /** Upload more: an empty list, same folder. */
+  | { readonly type: "upload/startOver" }
+  /** Close the panel. Refused while uploading — Cancel first. */
+  | { readonly type: "upload/close" }
+  /** The project picker, opened by the upload panel's Choose…, chose `path`
+   * as the upload's folder. */
+  | { readonly type: "picker/chosen"; readonly path: string }
   | {
       readonly type: "notifications/permission";
       readonly permission: NotificationPermissionState;

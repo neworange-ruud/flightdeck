@@ -77,6 +77,9 @@ describe("createInitialState", () => {
       takenOverBy: null,
       /** Nothing has asked the browser yet. */
       notifications: "unsupported",
+      /** No snapshot has said a version, and nothing is being uploaded. */
+      protocolVersion: null,
+      upload: null,
     });
   });
 });
