@@ -136,6 +136,24 @@
   gap: 8px;
   min-width: 0;
 }
+/* The worker line only ever takes the status bar's free space: a zero basis
+ * means it never squeezes the mode chip, 1h's hints or 2c's strip (any
+ * shortfall at all, even a fraction of a pixel, wraps their text inside the
+ * 32px bar), and it grows ahead of the spacer up to its own width, truncating
+ * its health or notice text when the room runs out. */
+.fd-statusbar > .fd-statusbar__worker {
+  flex: 1000 1 0;
+  max-width: max-content;
+  overflow: hidden;
+}
+.fd-statusbar__worker > * {
+  flex-shrink: 0;
+}
+.fd-statusbar__worker > .fd-statusbar__notice,
+.fd-statusbar__worker > .fd-statusbar__health {
+  flex-shrink: 1;
+  min-width: 0;
+}
 .fd-statusbar__notice,
 .fd-statusbar__health {
   overflow: hidden;
