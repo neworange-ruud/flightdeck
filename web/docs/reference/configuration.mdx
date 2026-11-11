@@ -114,7 +114,7 @@ FlightDeck Web (the browser control surface). See [FlightDeck Web](/web).
 
 ## `[worker]`
 
-FlightDeck Worker (headless host controlled from Desktop). Global config only. See
+FlightDeck Worker (headless host controlled from Desktop or a browser). Global config only. See
 [Run a FlightDeck Worker](/worker).
 
 | Key | Default | Meaning |
@@ -123,6 +123,9 @@ FlightDeck Worker (headless host controlled from Desktop). Global config only. S
 | `projects_root` | `"~/flightdeck"` | Scanned two levels deep for repositories to offer; clones land here |
 | `default_cols` | `200` | Terminal width when no window has reported a size (20–1000) |
 | `default_rows` | `50` | Terminal height when no window has reported a size (4–500) |
+| `phone` | `false` | Let the FlightDeck iPhone app pair with this worker |
+| `web` | `true` | Serve FlightDeck Web's page, so a browser can pair and drive the worker |
+| `https` | `true` | Fetch a Tailscale certificate and answer HTTPS on the same port (only when the tailnet has HTTPS certificates on) |
 
 ## `[containers]`
 

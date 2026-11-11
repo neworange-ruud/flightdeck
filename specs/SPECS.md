@@ -1743,6 +1743,7 @@ carries it as `start_on_boot`.
 | `~/.flightdeck/worker/workspace.json` | The worker's open projects, separate from the TUI's `~/.flightdeck/workspace.json`. Each project's `state.json` stays in its repository, as for the TUI. |
 | `~/.flightdeck/worker/devices.json` | Paired Desktops' tokens, in the web interface's credential format but separate from `~/.flightdeck/web.json`: a browser token for a TUI's web interface never grants a worker shell. |
 | `~/.flightdeck/worker/remote.json`, `remote.lock`, `remote-direct/` | With `[worker] phone` on: the worker's own FlightDeck Remote identity and phone pairings, its lock, and the direct link's outboxes. Separate from the TUI's `~/.flightdeck/remote.json`, so the phone sees the worker as a machine of its own. |
+| `~/.flightdeck/worker/tls/cert.pem`, `key.pem` | The Tailscale certificate for HTTPS (W32), when the tailnet allows it. The key is mode 0600. |
 | `~/.flightdeck/logs/worker.log` | The log, rotated at 10 MiB, 5 files kept (`worker.log`, `.1` … `.4`). The supervisor's own lines go to the same file. |
 | `~/Library/LaunchAgents/agency.neworange.flightdeck.worker.plist` (macOS), `~/.config/systemd/user/flightdeck-worker.service` (Linux) | Start on boot, written by `worker enable` (mode 0644) and removed by `worker disable`. |
 
@@ -1759,6 +1760,8 @@ projects_root = "~/flightdeck"
 default_cols = 200
 default_rows = 50
 phone = false
+web = true
+https = true
 ```
 
 - **`port`** (integer, default `7420`) — the TCP port served on each Tailscale
@@ -1775,6 +1778,14 @@ phone = false
   with this worker (see "The phone"). Off by default because a paired phone can
   type into agents and open a shell. Read at start: restart the worker after
   changing it.
+- **`web`** (boolean, default `true`) — serve FlightDeck Web's page on the
+  worker's port, so a browser can pair and drive the worker as a Desktop does.
+  `false` serves the protocol only; paired browsers then get a 404. Read at
+  start.
+- **`https`** (boolean, default `true`) — fetch a certificate with `tailscale
+  cert` for this machine's MagicDNS name and answer TLS on the same port. Only
+  acted on when the tailnet has HTTPS turned on; `false` never asks Tailscale for
+  a certificate and serves plain HTTP only. Read at start.
 
 An invalid `[worker]` table makes `worker run` exit 78. It is not in the
 configuration manager (numbers and a path, not toggles): edit the file.
@@ -1782,13 +1793,33 @@ configuration manager (numbers and a path, not toggles): edit the file.
 ### Network and pairing
 
 The worker serves the web protocol's `/ws`, `/auth/exchange` and
-`/auth/session` (no browser assets) **only on the addresses Tailscale
-reports**, never on loopback, `0.0.0.0` or another network. With no Tailscale
+`/auth/session`, and FlightDeck Web's page unless `[worker] web = false`,
+**only on the addresses Tailscale reports**, never on loopback, `0.0.0.0` or
+another network. With no Tailscale
 address it keeps running, reports "not listening: no Tailscale address", polls
 every 5 s and binds when one appears. Pairing uses the web interface's
 single-use bootstrap codes, minted by `worker pair` over the control socket.
 One remote window is attached at a time (a second takes over; the first's token
-stays valid); any number of status-only background links may be held.
+stays valid); any number of status-only background links may be held. A
+browser attaches as a window, so a browser and a Desktop take the worker over
+from each other.
+
+**HTTPS on the same port.** Each connection is told apart by its first byte: a
+TLS ClientHello is served with the worker's certificate, anything else as plain
+HTTP. The certificate comes from `tailscale cert --cert-file - --key-file -
+<magicdns-name>`, asked for only when `[worker] https` is on and `tailscale
+status --json` lists the name in `CertDomains` (the tailnet admin turned HTTPS
+on; doing so publishes machine names in Certificate Transparency logs). It is
+stored in `~/.flightdeck/worker/tls/` (key mode 0600), loaded at start and
+re-fetched every 24 h; a renewal swaps it in without rebinding. Without a
+certificate a TLS connection is closed and the page is served over plain HTTP.
+With one, a plain request for the page redirects (308) to
+`https://<magicdns-name>:<port>`; `/ws` and `/auth/*` never redirect, because
+the Desktop speaks plain `ws://`. A cookie issued over TLS is `Secure`.
+
+`worker pair` prints the browser link with the code in its fragment
+(`https://<name>:<port>/#NNNN`, or `http://<address>/#NNNN` without a
+certificate) beside the Desktop's address.
 
 ### The phone
 

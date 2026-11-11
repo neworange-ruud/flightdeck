@@ -16,11 +16,13 @@ pick up where they are.
  worker (Mac or Linux, always on)                your computer
  ┌────────────────────────────────┐              ┌──────────────────────────┐
  │ flightdeck worker              │   Tailscale  │ FlightDeck Desktop       │
- │  projects, agents, git, shell  │◄────────────►│  (or flightdeck connect) │
+ │  projects, agents, git, shell  │◄────────────►│  (or a browser, or       │
+ │                                │              │   flightdeck connect)    │
  └────────────────────────────────┘              └──────────────────────────┘
 ```
 
-Setup takes about 15 minutes, once. After that you only use the Desktop.
+Setup takes about 15 minutes, once. After that you only use the Desktop, or a
+browser on any device in your tailnet.
 
 ## What you need
 
@@ -88,11 +90,22 @@ flightdeck worker pair
 ```text
 Pairing code: 4821   (valid for 120 s, single use)
 Address:      box.tail1234.ts.net:7420
+In a browser: https://box.tail1234.ts.net:7420/#4821
 ```
 
 On your computer, open FlightDeck Desktop, choose **Connect to remote…**, and
 enter the address and the code. The code works once and expires after two
 minutes; run `flightdeck worker pair` again if it runs out.
+
+**Or use a browser.** Open the **In a browser** link on any device in your
+tailnet (a laptop without the Desktop, a tablet). The code is in the link, so the
+page signs you in at once and remembers the browser. You get the same things as
+the Desktop's worker window: the Worker shell, your projects and agents, and
+**Open Project**. Pair the Desktop, a browser, or both; each needs its own code.
+
+The link is `https://` when your tailnet has HTTPS certificates turned on (see
+[HTTPS](/worker/operations#https)); otherwise it is `http://` on the worker's
+Tailscale address, which still travels encrypted inside Tailscale.
 
 ![Connect to remote…: the worker's address and the pairing code.](/screenshots/desktop-app/connect-remote.png)
 

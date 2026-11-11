@@ -84,6 +84,7 @@ cross-cutting work gets several (the seq-deadlock bug was
 | `area:tui` | `src/tui/` — panes, input, rendering |
 | `area:gui` | the native GPUI desktop app — window, terminal element, views |
 | `area:web` | `web/` — the site and privacy policy |
+| `area:webui` | `webui/` — FlightDeck Web, the browser SPA embedded in the binary |
 | `area:containers` | `containers/` — agent isolation images |
 | `area:ci` | `.github/workflows/` — CI, release, TestFlight |
 | `area:ops` | infrastructure, mailboxes, App Store admin |

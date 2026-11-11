@@ -236,6 +236,12 @@ FlightDeck tab open is silent by design.
 > version earns its keep is a separate and much smaller question. D17 does not
 > decide it and no milestone carries it.
 
+> **A worker is a second secure-context case** (remote-control-ougi, PRD W32). A
+> worker served over HTTPS with a Tailscale certificate for its MagicDNS name is a
+> secure context, so its page uses the `Notification` API while the tab is open
+> and hidden. That is still not Web Push: no service worker, no subscription, and
+> a closed tab is silent, exactly as above.
+
 ### D12 — Wire protocol: a new web-only protocol in its own module
 
 `src/web/protocol.rs`, versioned, JSON over WebSocket:
@@ -3530,10 +3536,19 @@ floor at most one below it, rather than none.
 sizes the PTYs (PRD W5), since a worker has no pane of its own. A TUI or
 Desktop host drops the frame silently, and D4 holds there unchanged.
 
-**The SPA handles none of it.** A worker serves no SPA (only `/ws`,
+**The SPA handled none of it at first.** A worker serves no SPA (only `/ws`,
 `/auth/exchange` and `/auth/session`), so `webui/src/wire/frames.ts` only
 declares the optional v7 fields and `WireTakenOver`, and bumps its
 `PROTOCOL_VERSION` to 7 to stay in step with the host.
+
+*Amended (remote-control-ougi, PRD W31–W33).* A worker now serves the SPA too,
+and the SPA has a worker mode keyed on the snapshot's `host_kind`: it handles
+`taken_over` as the end of the link (no automatic retry, a "Take it back"
+button), sends `resize_terminal` for the terminal on screen (W5 — D4's
+letterbox is off on a worker only), shows the worker shell, opens the project
+picker for Open Project, and shows host messages, health and notifications.
+D3's shared selection is kept: a worker has one window, so the host's selection
+is that window's. TUI and Desktop hosts are unchanged.
 
 ### R29 — Mission control in a remote window, with no version bump
 

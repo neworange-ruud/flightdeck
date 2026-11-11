@@ -85,7 +85,8 @@ opens the port on your **local** network. To reach a running FlightDeck from
 somewhere else, use a tool built for it:
 
 - **Tailscale** (or another mesh VPN) — the address stays private and no port is
-  published to the internet.
+  published to the internet. For an always-on machine, a
+  [worker](/worker) serves FlightDeck Web over Tailscale by itself, with HTTPS.
 - **`ssh -L 7420:127.0.0.1:7420 you@host`** — forwards the loopback port over a
   connection you already trust, and lets you leave the bind on `127.0.0.1`.
 - A tunnel service, if you accept what publishing it means.

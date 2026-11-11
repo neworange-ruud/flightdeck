@@ -66,7 +66,9 @@ give you a shell, and tell you something went wrong.
 - The new host capabilities on TUI or Desktop hosts (W23).
 - A TUI that attaches to a running worker (W22). *Since added as
   `flightdeck connect` (§9).*
-- Listening on anything but Tailscale addresses, and so TLS (W8).
+- Listening on anything but Tailscale addresses, and so TLS (W8). *Still only
+  Tailscale addresses, but a worker now also speaks HTTPS on the same port with a
+  Tailscale certificate when the tailnet allows it (W32, remote-control-ougi).*
 
 ## 3. Decisions
 
@@ -102,6 +104,9 @@ give you a shell, and tell you something went wrong.
 | W28 | Architectures | **x86_64 and aarch64** on both Linux and macOS. |
 | W29 | Observability | A rotating log + `worker logs`; `worker status` (text and JSON); health in the Desktop; host messages forwarded to the Desktop. |
 | W30 | Done | Headless integration tests in CI, a manual pass on a real Mac, and a docs page. |
+| W31 | Browser | *Added after v1 (remote-control-ougi).* A worker **serves FlightDeck Web** as well as the protocol, on by default (`[worker] web`). A browser pairs with the same `worker pair` code and attaches as a **window**, so a browser and a Desktop take the worker over from each other (W17). Supersedes the earlier "protocol routes only, no browser SPA" rule (design note A5). |
+| W32 | HTTPS | *Added after v1.* The same port answers **TLS and plain** connections, told apart by the first byte. TLS uses a certificate from `tailscale cert` for the machine's MagicDNS name, fetched only when the tailnet has HTTPS turned on (`CertDomains`) and `[worker] https` is on, renewed daily. Plain HTTP stays for the Desktop and as the browser's fallback; a plain page request redirects to HTTPS once a certificate is loaded. |
+| W33 | Browser scope | *Added after v1.* The browser does what the Desktop's worker window does: terminals sized to the browser (W5), the worker shell (W15), Open Project (W9), the takeover screen, host messages, health and notifications. The configuration manager in the browser is a follow-up (remote-control-knuy). |
 
 ## 4. Requirements
 
@@ -152,7 +157,9 @@ Linux and macOS only; on Windows they exit with a clear "not supported" error.
 ### 4.3 Network and pairing (W6–W8, W17, W19, W27)
 
 - The worker serves the web protocol's `/ws` and `/auth/exchange` on port 7420
-  by default (`[worker] port`). It binds **only** the addresses Tailscale reports,
+  by default (`[worker] port`), and FlightDeck Web's page on the same port unless
+  `[worker] web = false` (W31), over HTTPS when it has a Tailscale certificate
+  (W32). It binds **only** the addresses Tailscale reports,
   reusing `src/remote/direct/net.rs` (`tailscale_addresses`,
   `select_bind_addresses`), never `0.0.0.0` and never loopback.
 - When there is no Tailscale address the worker keeps running: agents work, the
@@ -261,15 +268,21 @@ releases must both ship v7.
 
 ## 6. Security model
 
-- **Pairing a Desktop with a worker gives it the worker account's full power**: a
-  shell (W15) and the whole home directory (W16). The docs must say so plainly.
+- **Pairing a Desktop or a browser with a worker gives it the worker account's full
+  power**: a shell (W15) and the whole home directory (W16). The docs must say so
+  plainly.
 - The outer boundary is the tailnet. The worker listens nowhere else (W8), so
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket that only the account
   itself can reach, so getting a code already requires a shell on the box.
 - Tokens are long-lived, one per Desktop, listed by `worker devices` and revoked by
   `worker revoke`, which closes live connections at once.
-- No credentials cross the wire; no TLS is needed because nothing leaves WireGuard.
+- No credentials cross the wire unencrypted: everything travels inside WireGuard.
+  TLS (W32) is added for the browser's sake — a secure context for notifications
+  and the clipboard, and a `Secure` cookie — not because the tailnet needs it.
+  Requesting a certificate publishes the machine's MagicDNS name in public
+  Certificate Transparency logs, so the worker only asks once the tailnet admin
+  has turned HTTPS on.
 
 ## 7. Open decisions
 
@@ -307,6 +320,7 @@ releases must both ship v7.
   connect` (epic remote-control-ki05): the core's `RemoteSession`, which the
   Desktop's remote window also runs on, drawn with the TUI's widgets. Any host
   kind, not only workers; it attaches as a window, so it takes a worker over.*
+- FlightDeck Web from a worker. *Done as W31–W33 (epic remote-control-ougi).*
 
 ## 10. Issue map
 
