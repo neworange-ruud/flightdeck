@@ -130,6 +130,13 @@ export interface Project {
   readonly id: string;
   readonly name: string;
   readonly sessions: readonly Session[];
+  /**
+   * The repository's path on the host, when the host sent it. Read only on a
+   * worker, where it is how the project the picker just opened is found again
+   * (`remote-control-vjtb`). Optional so a fixture that predates it still
+   * describes a whole project.
+   */
+  readonly root?: string;
 }
 
 /**
@@ -396,6 +403,93 @@ export interface Snapshot {
    * not send it, which is the default the setting itself has.
    */
   readonly sidebarPosition: SidebarPosition;
+  /**
+   * v7: what kind of FlightDeck this is (`Snapshot::host_kind`), or `null` from
+   * a host that predates it (a TUI or Desktop). Everything worker-specific in
+   * this tab switches on `"worker"`; optional so the fixtures that describe a
+   * TUI host need not say so.
+   */
+  readonly hostKind?: HostKind | null;
+  /** v7: the worker's own state, `null` (or absent) from every other host. */
+  readonly worker?: WorkerInfo | null;
+  /**
+   * Each terminal's own grid, by terminal id — the worker shell's included.
+   * Only a worker's window reads it (W5: there every terminal is sized to the
+   * window, so one global grid would be wrong for all but one of them); a TUI
+   * or Desktop host keeps D4's one host grid, `geometry` above.
+   */
+  readonly terminalGeometry?: Readonly<Record<string, { readonly cols: number; readonly rows: number }>>;
+}
+
+/** `protocol::HostKind`. */
+export type HostKind = "tui" | "desktop" | "worker";
+
+/**
+ * A worker's own state, as its window paints it (`protocol::WorkerSnapshot`,
+ * `specs/WORKER_PRD.md` W15/W27/W29, `remote-control-vjtb`).
+ *
+ * The kept host messages are deliberately **not** here: they are shown once,
+ * as one overlay, by the transport that saw them arrive (`wire/socket.ts`), so
+ * they never become state a later snapshot could re-announce.
+ */
+export interface WorkerInfo {
+  /** `$HOME` on the worker: the picker's root and its boundary (W16). */
+  readonly home: string;
+  /** The worker shell, or `null` when none has been started. */
+  readonly shell: WorkerShell | null;
+  readonly health: WorkerHealth | null;
+  readonly status: WorkerStatus;
+  readonly connections: WorkerConnections;
+}
+
+/** The worker shell's terminal (W15), addressed like any other. */
+export interface WorkerShell {
+  readonly terminalId: string;
+  readonly title: string;
+  readonly alive: boolean;
+  /** `null` while running, or when it did not exit normally. */
+  readonly exitCode: number | null;
+}
+
+/** One health sample (W29). Anything the platform cannot give is `null`. */
+export interface WorkerHealth {
+  readonly version: string;
+  readonly uptimeSecs: number;
+  /** The one-minute load average × 100. */
+  readonly loadCenti: number | null;
+  readonly cpuCount: number;
+  readonly diskFreeHomeBytes: number | null;
+  readonly diskFreeProjectsRootBytes: number | null;
+  readonly agentsTotal: number;
+  readonly agentsRunning: number;
+}
+
+/** `protocol::WorkerStatusView`. */
+export interface WorkerStatus {
+  readonly listening: readonly string[];
+  readonly advertised: string | null;
+  readonly notListeningReason: string | null;
+  readonly unreadMessages: number;
+  readonly projectsRoot: string;
+}
+
+/** `protocol::ConnectionsView`, as seen by this window. */
+export interface WorkerConnections {
+  readonly window: {
+    readonly label: string;
+    readonly address: string | null;
+    readonly sameDevice: boolean;
+  } | null;
+  readonly backgroundLinks: number;
+}
+
+/** `protocol::HostMessage`: a line the worker would have put on its status
+ * bar if it had one. */
+export interface HostMessage {
+  readonly id: number;
+  readonly atMs: number;
+  readonly level: "info" | "warning" | "error";
+  readonly text: string;
 }
 
 /**
@@ -497,6 +591,14 @@ export interface AccessState {
   /** 2b's revoked screen: `withdrew this browser's access 12s ago`. A label,
    * never a computed duration — the reducer has no clock. */
   readonly revokedAgo: string | null;
+  /**
+   * What kind of host refused us, from the refusal body's `host_kind`
+   * (`remote-control-vjtb`). It decides *where* the screens send the reader
+   * for a code: a TUI or Desktop's Web Interface overlay, or `flightdeck
+   * worker pair` on a worker. Absent or `null` means the host did not say,
+   * and the screens read as they always have.
+   */
+  readonly hostKind?: HostKind | null;
 }
 
 /**

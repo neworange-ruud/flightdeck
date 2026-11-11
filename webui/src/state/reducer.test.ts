@@ -65,6 +65,18 @@ describe("createInitialState", () => {
       readOnly: null,
       help: null,
       about: null,
+      /** `remote-control-vjtb`: no host has said it is a worker, so none of
+       * a worker window's state exists yet. */
+      hostKind: null,
+      worker: null,
+      terminalGeometry: {},
+      workerShellTab: false,
+      picker: null,
+      pendingOpen: null,
+      notice: null,
+      takenOverBy: null,
+      /** Nothing has asked the browser yet. */
+      notifications: "unsupported",
     });
   });
 });

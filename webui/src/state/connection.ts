@@ -39,7 +39,9 @@ export interface StripAction {
   readonly key: string;
   readonly label: string;
   /** What the caller should do; the component never decides. */
-  readonly kind: "retry" | "reload" | "code";
+  /** `reclaim` is a worker's "Take it back" (W17): attach as its window
+   * again, taking it from whoever took it from this tab. */
+  readonly kind: "retry" | "reload" | "code" | "reclaim";
   /** The hue the button takes — the same vocabulary as `frame`. */
   readonly tone: StripFrame;
 }
@@ -107,7 +109,10 @@ export function connectionStrip(state: AppState): ConnectionStrip {
   if (state.connection === "revoked") {
     return {
       frame: "stale",
-      message: "access withdrawn from the desktop — the host is fine",
+      message:
+        state.hostKind === "worker"
+          ? "access withdrawn on the worker — the worker is fine"
+          : "access withdrawn from the desktop — the host is fine",
       status: {
         glyph: "dot",
         tone: "fd-tone-stale",
@@ -123,6 +128,9 @@ export function connectionStrip(state: AppState): ConnectionStrip {
       staleChip: staleChipFor(state),
       note: null,
     };
+  }
+  if (state.connection === "taken_over") {
+    return takenOverStrip(state);
   }
   if (state.connection === "stopped" || state.shutdown !== null) {
     return stoppedStrip(state);
@@ -243,6 +251,50 @@ export function connectionStrip(state: AppState): ConnectionStrip {
  * failure. Same terminal state, different sentence, and the difference is the
  * whole reason the flag is on the wire.
  */
+/**
+ * A worker's window that another window took over (PRD W17,
+ * `remote-control-vjtb`). Terminal like `stopped` — nothing is retried — but
+ * not dead: the credential is still good, and the one action offered is the
+ * one that works, taking the worker back.
+ */
+function takenOverStrip(state: AppState): ConnectionStrip {
+  const by = state.takenOverBy ?? "";
+  return {
+    frame: "stopped",
+    message:
+      by === ""
+        ? "another window took this worker over"
+        : `${by} took this worker over`,
+    status: {
+      glyph: "hollow",
+      tone: "fd-tone-quiet",
+      text: "taken over",
+      detail: null,
+    },
+    action: {
+      key: "Enter",
+      label: "Take it back",
+      kind: "reclaim",
+      tone: "stopped",
+    },
+    staleChip: staleChipFor(state),
+    note: null,
+  };
+}
+
+/**
+ * The panel's words for a taken-over worker window — the native window's own
+ * (`desktop/src/remote/window.rs`'s `ended`).
+ */
+export function takenOverTitle(by: string | null): string {
+  return by === null || by === ""
+    ? "Another window took this worker over."
+    : `Taken over by ${by}`;
+}
+
+export const TAKEN_OVER_DETAIL =
+  "A worker serves one window at a time. Take it back to carry on here — the other window then sees this screen.";
+
 function stoppedStrip(state: AppState): ConnectionStrip {
   const shutdown = state.shutdown;
   return {
@@ -257,9 +309,17 @@ function stoppedStrip(state: AppState): ConnectionStrip {
     },
     action: null,
     staleChip: null,
-    note: shutdownNote(shutdown),
+    note:
+      state.hostKind === "worker" && shutdown?.reason === "host_quit"
+        ? WORKER_STOPPED_NOTE
+        : shutdownNote(shutdown),
   };
 }
+
+/** A worker that stopped is started again on its own box — the native
+ * window's words (`desktop/src/remote/window.rs`). */
+export const WORKER_STOPPED_NOTE =
+  "start it again on the worker with `flightdeck worker start`, then reload";
 
 function shutdownMessage(shutdown: ShutdownState | null): string {
   if (shutdown === null) {
@@ -419,7 +479,8 @@ export function isStale(state: AppState): boolean {
     state.connection === "reconnecting" ||
     state.connection === "disconnected" ||
     state.connection === "revoked" ||
-    state.connection === "stopped"
+    state.connection === "stopped" ||
+    state.connection === "taken_over"
   );
 }
 
@@ -448,4 +509,5 @@ export const ALL_CONNECTION_STATUSES: readonly ConnectionStatus[] = [
   "disconnected",
   "revoked",
   "stopped",
+  "taken_over",
 ];
