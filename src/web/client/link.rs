@@ -49,8 +49,9 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::web::protocol::{
     Ack, Attach, ClientInfo, ClientMsg, CloneProgress, CloneResult, ConfigView, ConnectionKind,
     Delta, DirListing, ErrorCode, GitStatusView, HostKind, ImagePaste, ProjectScan, ResizeTerminal,
-    SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId, ViewerId,
-    WireError, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION, WORKER_MIN_CLIENT_VERSION,
+    SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId,
+    UploadPlan, ViewerId, WireError, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION,
+    WORKER_MIN_CLIENT_VERSION,
 };
 use crate::web::server::COOKIE_NAME;
 
@@ -163,6 +164,8 @@ pub enum LinkEvent {
     CloneProgress(CloneProgress),
     /// How a worker's clone ended (v7).
     CloneResult(CloneResult),
+    /// A worker's answer to `begin_upload` (v8).
+    UploadPlan(UploadPlan),
 }
 
 /// What the client asks the link task to send.
@@ -779,8 +782,7 @@ async fn session(
                         events.send(LinkEvent::CloneProgress(progress))
                     }
                     ServerMsg::CloneResult(result) => events.send(LinkEvent::CloneResult(result)),
-                    // A v8 answer this client does not ask for yet.
-                    ServerMsg::UploadPlan(_) => {}
+                    ServerMsg::UploadPlan(plan) => events.send(LinkEvent::UploadPlan(plan)),
                     ServerMsg::TakenOver { by } => {
                         return SessionEnd::Ended(LinkEnd::TakenOver { by });
                     }

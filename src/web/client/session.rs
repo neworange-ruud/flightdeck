@@ -57,6 +57,12 @@
 //!   link with [`LinkEnd::TakenOver`], and [`RemoteSession::reconnect`] takes it
 //!   back.
 //!
+//! - **Uploads (v8).** Files from this machine into a folder on the worker
+//!   ([`UploadPanel`]): the panel is asked over the link, and each granted
+//!   file goes out over `PUT /upload/{ticket}` on the client's runtime, one
+//!   at a time ([`Transfer`]), its progress and end folded back in on
+//!   [`RemoteSession::pump`].
+//!
 //! The host's configuration manager ([`RemoteConfigEditor`]) is offered on
 //! every host kind that forwards it (design A1): staged here, saved in one
 //! command.
@@ -89,10 +95,13 @@ use crate::view::TerminalRef;
 use crate::view::{mission_move, MissionView, PromptReply, SessionKey};
 use crate::web::client::messages;
 use crate::web::client::mission::{self, ActivityWatch};
+use crate::web::client::upload::{self as uploads, Resolution};
+use crate::web::client::upload_http::{Transfer, TransferEvent};
 use crate::web::client::views::{self, DialogDraft, LocalAction, RemoteAction};
 use crate::web::client::worker::OpenedProject;
 use crate::web::client::{CloneEvent, EditorEffect, ProjectPicker, RemoteConfigEditor};
 use crate::web::client::{LinkEnd, LinkState, RemoteClient, RemoteWorkspace};
+use crate::web::client::{LocalFile, UploadPanel};
 use crate::web::protocol::{
     command as names, AckOutcome, ErrorCode, Geometry, HostKind, ImagePaste, MessageLevel,
     NotificationSoundView, NotificationView, ProjectId, SeatRequest, TerminalId, TerminalRole,
@@ -118,6 +127,16 @@ pub type Dialer = Rc<dyn Fn() -> RemoteClient>;
 
 /// Why a worker command could not be sent.
 pub const WORKER_NOT_SENT: &str = "Not connected to the worker — nothing was sent.";
+
+/// Why the upload panel does not open on a host that is not a worker.
+pub const UPLOAD_NOT_A_WORKER: &str = "Only a FlightDeck worker takes uploads.";
+
+/// Why the upload panel does not open on a worker too old to take files.
+pub const UPLOAD_WORKER_TOO_OLD: &str =
+    "This worker cannot take uploads yet: update FlightDeck on it, then reconnect.";
+
+/// Why a granted file could not be sent from a client with no HTTP access.
+pub const UPLOAD_NO_ACCESS: &str = "This connection cannot send files.";
 
 /// Why a host command is refused on the worker shell's tab.
 pub const WORKER_SHELL_COMMAND_REFUSAL: &str = "Switch to a project tab to run host commands: \
@@ -234,6 +253,11 @@ pub struct RemoteSession {
     /// The seq of each `answer_prompt` not acked yet, and the prompt it
     /// answered: a refused answer offers the prompt's buttons again.
     answer_seqs: HashMap<u64, String>,
+    /// The upload panel, while it is open (v8).
+    upload: Option<UploadPanel>,
+    /// The file going out now, and its own events: a channel per transfer,
+    /// so a cancelled one cannot speak into the next.
+    transfer: Option<(Transfer, std::sync::mpsc::Receiver<TransferEvent>)>,
 }
 
 /// How many answered prompt ids are remembered.
@@ -280,6 +304,8 @@ impl RemoteSession {
             watch: ActivityWatch::new(),
             answered: VecDeque::new(),
             answer_seqs: HashMap::new(),
+            upload: None,
+            transfer: None,
         }
     }
 
@@ -437,6 +463,151 @@ impl RemoteSession {
         picker.browse_sent(self.client.browse_dir(cwd.as_deref(), picker.show_hidden));
         self.picker = Some(picker);
         self.local = Local::None;
+    }
+
+    // -- uploads (v8) ----------------------------------------------------------
+
+    /// The upload panel, while it is open.
+    pub fn upload(&self) -> Option<&UploadPanel> {
+        self.upload.as_ref()
+    }
+
+    /// The upload panel, for the front-end's own field edits (the folder).
+    pub fn upload_mut(&mut self) -> Option<&mut UploadPanel> {
+        self.upload.as_mut()
+    }
+
+    /// Open the upload panel, aimed at the folder the person is looking at
+    /// ([`uploads::default_dir`]). Open already, it stays as it is. On a host
+    /// that cannot take files the notice says why and nothing opens.
+    pub fn open_upload(&mut self) {
+        if self.upload.is_some() {
+            return;
+        }
+        if !self.client.is_worker() {
+            self.notice = Some(UPLOAD_NOT_A_WORKER.to_string());
+            return;
+        }
+        if !self.client.supports_upload() {
+            self.notice = Some(UPLOAD_WORKER_TOO_OLD.to_string());
+            return;
+        }
+        self.upload = Some(UploadPanel::new(uploads::default_dir(self.workspace())));
+    }
+
+    /// Open the upload panel with `paths` already picked (files dropped on
+    /// the window).
+    pub fn open_upload_with(&mut self, paths: &[std::path::PathBuf]) {
+        self.open_upload();
+        self.upload_add_paths(paths);
+    }
+
+    /// Close the upload panel, stopping a file that is going out. What was
+    /// written stays written.
+    pub fn close_upload(&mut self) {
+        self.transfer = None;
+        self.upload = None;
+    }
+
+    /// Pick `paths` on this machine: each is looked at here (a file, a
+    /// folder, unreadable) and the panel takes what it can.
+    pub fn upload_add_paths(&mut self, paths: &[std::path::PathBuf]) {
+        let Some(panel) = self.upload.as_mut() else {
+            return;
+        };
+        panel.add(paths.iter().map(|p| uploads::inspect(p)).collect());
+    }
+
+    /// Pick files already looked at.
+    pub fn upload_add_files(&mut self, files: Vec<LocalFile>) {
+        if let Some(panel) = self.upload.as_mut() {
+            panel.add(files.into_iter().map(uploads::Picked::File).collect());
+        }
+    }
+
+    /// Upload: ask the worker for the list, `ask`ing about taken names.
+    pub fn start_upload(&mut self) {
+        let Some(request) = self.upload.as_mut().and_then(UploadPanel::request) else {
+            return;
+        };
+        self.send_upload_request(request);
+    }
+
+    /// The person's answer to taken names: ask again replacing or keeping
+    /// both, or go back to the list.
+    pub fn resolve_upload(&mut self, resolution: Resolution) {
+        let Some(request) = self.upload.as_mut().and_then(|p| p.resolve(resolution)) else {
+            return;
+        };
+        self.send_upload_request(request);
+    }
+
+    fn send_upload_request(&mut self, request: uploads::UploadRequest) {
+        let seq = self
+            .client
+            .begin_upload(&request.dir, &request.files, request.on_conflict);
+        if let Some(panel) = self.upload.as_mut() {
+            panel.requested(seq, request.on_conflict);
+        }
+    }
+
+    /// Stop: the file going out is cut off (the worker drops it), the rest
+    /// are not sent.
+    pub fn cancel_upload(&mut self) {
+        if let Some(panel) = self.upload.as_mut() {
+            panel.cancel();
+        }
+        self.transfer = None;
+    }
+
+    /// Fold in the worker's plan, the transfer's progress and end, and start
+    /// the next file. Returns whether the panel changed.
+    fn pump_upload(&mut self) -> bool {
+        let plan = self.client.take_upload_plan();
+        let Some(panel) = self.upload.as_mut() else {
+            self.transfer = None;
+            return false;
+        };
+        let mut changed = false;
+        if let Some(plan) = plan {
+            changed |= panel.on_plan(plan);
+        }
+        if !self.client.state().is_live() {
+            changed |= panel.link_lost();
+        }
+        let mut ended = false;
+        if let Some((_, events)) = &self.transfer {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    TransferEvent::Progress { index, sent } => {
+                        changed |= panel.progress(index, sent);
+                    }
+                    TransferEvent::Finished { index, result } => {
+                        let result = result.map(|reply| reply.path).map_err(|e| e.sentence());
+                        changed |= panel.finished(index, result);
+                        ended = true;
+                    }
+                }
+            }
+        }
+        if ended || !panel.is_uploading() {
+            self.transfer = None;
+        }
+        if self.transfer.is_none() {
+            if let Some(job) = panel.next_job() {
+                changed = true;
+                match self.client.http_access() {
+                    Some(access) => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.transfer = Some((Transfer::start(access.clone(), job, tx), rx));
+                    }
+                    None => {
+                        panel.finished(job.index, Err(UPLOAD_NO_ACCESS.to_string()));
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Close the project picker. A clone it started carries on; how it ended
@@ -613,6 +784,7 @@ impl RemoteSession {
         let mut changed = self.client.pump();
         changed |= self.track_dialog();
         changed |= self.take_answers();
+        changed |= self.pump_upload();
         changed |= self.take_worker_news();
         changed |= self.follow_host_kind();
         changed |= self.select_opened();
@@ -775,6 +947,9 @@ impl RemoteSession {
         changed |= self.take_configuration();
         for ack in self.client.take_results() {
             changed = true;
+            if self.upload.as_mut().is_some_and(|p| p.on_ack(&ack)) {
+                continue;
+            }
             if self.picker.as_mut().is_some_and(|p| p.on_ack(&ack)) {
                 continue;
             }
@@ -800,6 +975,9 @@ impl RemoteSession {
         }
         for error in self.client.take_errors() {
             changed = true;
+            if self.upload.as_mut().is_some_and(|p| p.on_error(&error)) {
+                continue;
+            }
             if self.picker.as_mut().is_some_and(|p| p.on_error(&error)) {
                 continue;
             }
