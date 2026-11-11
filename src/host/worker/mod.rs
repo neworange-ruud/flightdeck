@@ -1171,7 +1171,7 @@ impl<'a> AppHost<'a> {
                 let planned = upload::plan(fs, &w.confinement, &dir, &files, on_conflict, |p| {
                     probe.disk_free(p)
                 })
-                .map_err(&refused)?;
+                .map_err(refused)?;
                 let (canonical, planned, conflicts) = match planned {
                     upload::Plan::Ready { dir, files } => (dir, files, false),
                     upload::Plan::Conflicts { dir, files } => (dir, files, true),
