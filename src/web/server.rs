@@ -600,6 +600,21 @@ impl
     }
 }
 
+/// Whether a PEM certificate chain and key could be served over HTTPS: the
+/// check [`WebServerHandle::set_certificate`] makes, without a server. `Err`
+/// says why not, and always on a platform without the TLS stack (Windows).
+pub fn check_certificate(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        crate::web::tls::certified_key(cert_pem, key_pem).map(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cert_pem, key_pem);
+        Err("HTTPS is not available on this platform".to_string())
+    }
+}
+
 /// Where a server listens (v7).
 #[derive(Clone)]
 pub enum ListenPlan {

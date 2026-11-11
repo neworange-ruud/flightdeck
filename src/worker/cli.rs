@@ -41,12 +41,13 @@ COMMANDS:
     stop                 Stop the worker; its agents resume on the next start
     restart              Stop, then start (how `flightdeck update` takes effect)
     status [--json]      Running or stopped, listen addresses, devices, projects, agents
-    pair [--json]        Mint a one-time code to pair FlightDeck Desktop
+    pair [--json]        Mint a one-time code to pair FlightDeck Desktop or a
+                         browser (it prints the link a browser opens)
     pair --phone [--json]
                          Pair the FlightDeck iPhone app (needs `phone = true`
                          under [worker]); waits until the phone has paired
-    devices [--json]     List paired Desktops (and, as text, paired phones)
-    revoke <device>      Revoke a Desktop's access, or unpair a phone
+    devices [--json]     List paired devices (and, as text, paired phones)
+    revoke <device>      Revoke a device's access, or unpair a phone
     logs [-f] [-n N]     Print (or follow) the worker log
     enable [--dry-run]   Start the worker on boot (macOS: at login) with launchd
                          or systemd, and start it now; run again to refresh
@@ -420,7 +421,7 @@ fn wait_for_worker(
             let _ = writeln!(
                 out,
                 "The worker is running (pid {pid}, FlightDeck {version}). \
-                 Pair a Desktop with `flightdeck worker pair`."
+                 Pair a Desktop or a browser with `flightdeck worker pair`."
             );
             return 0;
         }

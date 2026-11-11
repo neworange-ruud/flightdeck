@@ -946,3 +946,179 @@ fn a_worker_on_loopback_listens_reports_and_stops() {
     // Idempotent.
     host.stop_worker();
 }
+
+// ---------------------------------------------------------------------------
+// FlightDeck Web on a worker: the browser link, HTTPS, browser labels
+// ---------------------------------------------------------------------------
+
+const TEST_CERT: &str = include_str!("../../../tests/fixtures/tls/cert.pem");
+const TEST_KEY: &str = include_str!("../../../tests/fixtures/tls/key.pem");
+
+/// A Tailscale that names this machine `localhost` (the fixture's name), has
+/// HTTPS enabled for it, and hands out the fixture certificate.
+struct FixtureTailscale;
+
+impl crate::remote::direct::net::TailscaleProbe for FixtureTailscale {
+    fn status(&self) -> Option<crate::remote::direct::net::TailscaleStatus> {
+        Some(crate::remote::direct::net::TailscaleStatus {
+            magic_dns: Some("localhost".to_string()),
+            ips: vec!["127.0.0.1".parse().unwrap()],
+            cert_domains: vec!["localhost".to_string()],
+        })
+    }
+    fn cert(&self, domain: &str) -> std::result::Result<(String, String), String> {
+        assert_eq!(domain, "localhost");
+        Ok((TEST_CERT.to_string(), TEST_KEY.to_string()))
+    }
+}
+
+/// Saved nowhere: the lifecycle's files, for a test that does not read them.
+struct NoFiles;
+
+impl tls::CertFiles for NoFiles {
+    fn load(&self) -> Option<(String, String)> {
+        None
+    }
+    fn save(&self, _: &str, _: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A worker listening on one loopback port, with `edit` applied to its
+/// options first.
+fn loopback_worker<'f>(fakes: &'f Fakes, edit: impl FnOnce(&mut WorkerOptions)) -> AppHost<'f> {
+    let mut opts = worker_options("/home/me");
+    opts.listen = crate::web::server::ListenPlan::Fixed(vec!["127.0.0.1:0".parse().unwrap()]);
+    edit(&mut opts);
+    let mut host = testing::worker_host(fakes.env(), &fakes.notifier, Vec::new(), opts);
+    host.start_worker();
+    host.tick();
+    host
+}
+
+#[test]
+fn a_pairing_code_carries_a_plain_http_link_without_tailscale_https() {
+    let fakes = Fakes::new();
+    let mut host = loopback_worker(&fakes, |_| {});
+    let port = host
+        .web_surface
+        .handle
+        .as_ref()
+        .unwrap()
+        .bound_addr()
+        .port();
+    let code = host.mint_pairing_code();
+    assert_eq!(
+        code.web_url,
+        Some(format!("http://127.0.0.1:{port}/#{}", code.code))
+    );
+    let web = host
+        .worker_report()
+        .web
+        .expect("a worker reports its web app");
+    assert!(web.enabled);
+    assert_eq!(web.url, Some(format!("http://127.0.0.1:{port}")));
+    assert!(!web.https);
+    assert_eq!(web.https_reason.as_deref(), Some(tls::NOT_ON_TAILSCALE));
+    assert_eq!(web.certificate_expires, None);
+    host.stop_worker();
+}
+
+#[test]
+fn with_the_browser_app_off_there_is_no_link_and_status_says_off() {
+    let fakes = Fakes::new();
+    let mut host = loopback_worker(&fakes, |opts| opts.config.web = false);
+    let code = host.mint_pairing_code();
+    assert!(code.listening);
+    assert_eq!(code.web_url, None);
+    let web = host.worker_report().web.unwrap();
+    assert!(!web.enabled);
+    assert_eq!(web.url, None);
+    let text = crate::worker::status::render_text(&crate::worker::status::merge(
+        Some(host.worker_report()),
+        None,
+        true,
+        false,
+    ));
+    assert!(text.contains("Web: off\n"), "{text}");
+    host.stop_worker();
+}
+
+#[test]
+fn a_not_listening_worker_has_no_browser_link() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    host.start_worker();
+    let code = host.mint_pairing_code();
+    assert_eq!(code.web_url, None);
+    assert_eq!(host.worker_report().web.unwrap().url, None);
+}
+
+/// End to end inside the host: Tailscale hands over a certificate, the
+/// server presents it, the pairing link and the status turn HTTPS.
+#[test]
+fn a_worker_serves_https_once_tailscale_hands_it_a_certificate() {
+    let fakes = Fakes::new();
+    let mut host = loopback_worker(&fakes, |opts| {
+        opts.certs = Some(tls::CertSetup {
+            probe: Arc::new(FixtureTailscale),
+            files: Box::new(NoFiles),
+            // Inline: the outcome is still read on a later tick.
+            spawn: Box::new(|job| job()),
+        });
+    });
+    // The first tick started the fetch; the next one applies it.
+    host.tick();
+    let handle = host.web_surface.handle.as_ref().expect("listening");
+    assert!(handle.has_certificate());
+    let port = handle.bound_addr().port();
+    let code = host.mint_pairing_code();
+    assert_eq!(
+        code.web_url,
+        Some(format!("https://localhost:{port}/#{}", code.code))
+    );
+    let web = host.worker_report().web.unwrap();
+    assert!(web.https, "{web:?}");
+    assert_eq!(web.url, Some(format!("https://localhost:{port}")));
+    assert_eq!(web.https_reason, None);
+    assert_eq!(web.certificate_expires, Some(4_947_990_185));
+    let text = crate::worker::status::render_text(&crate::worker::status::merge(
+        Some(host.worker_report()),
+        None,
+        true,
+        false,
+    ));
+    assert!(
+        text.contains(&format!(
+            "Web: https://localhost:{port} (certificate until 2126-10-18)"
+        )),
+        "{text}"
+    );
+    assert!(host
+        .take_log_lines()
+        .iter()
+        .any(|l| l.starts_with("serving HTTPS for localhost")));
+    host.stop_worker();
+}
+
+/// A browser pairs with its raw user-agent; `worker devices` and `worker
+/// status` name it by what it is.
+#[test]
+fn a_paired_browser_is_named_as_a_browser() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    pair(
+        &mut host,
+        "100.64.0.7",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+         Gecko) Chrome/131.0.0.0 Safari/537.36",
+    );
+    pair(&mut host, "100.64.0.2", "FlightDeck Desktop/1.0 (studio)");
+    let labels: Vec<String> = host.devices().into_iter().map(|d| d.label).collect();
+    assert_eq!(labels, vec!["Chrome on macOS (browser)", "studio"]);
+    assert_eq!(
+        device_name(Some("100.64.0.2 · FlightDeck Desktop/1.0 (box)")),
+        "box",
+        "a chip label still names a Desktop by its host"
+    );
+}

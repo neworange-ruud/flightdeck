@@ -45,7 +45,7 @@ use crate::web::server::{
 use crate::worker::control::{DeviceReport, DeviceState, PairingCode};
 use crate::worker::paths::WorkerPaths;
 use crate::worker::status::{
-    AgentReport, AttachedReport, ListenReport, ProjectReport, WorkerRuntimeReport,
+    AgentReport, AttachedReport, ListenReport, ProjectReport, WebReport, WorkerRuntimeReport,
 };
 use crate::{
     apply_update_notice, locate_web_terminal, open_project, resume_active_project_agents,
@@ -59,6 +59,7 @@ pub mod notify;
 pub mod phone;
 pub mod projects;
 pub mod shell;
+pub mod tls;
 
 // The worker is Linux and macOS only (W2); its tests use unix paths.
 #[cfg(all(test, unix))]
@@ -71,6 +72,7 @@ use health::{AgentCounts, HealthProbe, HealthSampler};
 use messages::{level_of, HostMessageLog};
 use projects::Confinement;
 use shell::WorkerShell;
+use tls::{CertLifecycle, CertSetup};
 
 /// The answer to every command that needs a project, on a worker that has
 /// none yet (design A9).
@@ -115,6 +117,10 @@ pub struct WorkerOptions {
     pub listen: ListenPlan,
     pub health: Box<dyn health::HealthProbe + Send>,
     pub cloner: Arc<dyn clone::CloneRunner>,
+    /// What the HTTPS certificate lifecycle needs ([`tls`]): `Some` when the
+    /// worker listens on Tailscale, `None` otherwise (then the browser app is
+    /// plain HTTP).
+    pub certs: Option<CertSetup>,
 }
 
 /// A worker op's answer: `Ok((ack detail, answer frame))` when it applied,
@@ -183,6 +189,13 @@ pub(crate) struct WorkerExt {
     not_listening_reason: Option<String>,
     /// When to try starting the server again, after it could not start.
     listen_retry_at_ms: Option<u64>,
+    /// The HTTPS certificate: fetched, renewed, and what the server presents.
+    certs: CertLifecycle,
+    /// Whether the server's certificate must be set again (it changed, or a
+    /// new server started).
+    cert_dirty: bool,
+    /// The HTTPS name last handed to the server for its redirect.
+    https_host_applied: Option<String>,
     /// Every frame the worker emitted of its own accord (not an answer to a
     /// frame), server or not: what the tests read.
     #[cfg(test)]
@@ -234,6 +247,36 @@ impl WorkerExt {
     }
 }
 
+/// Make the server present what the certificate lifecycle says, and
+/// redirect plain page loads to the name the certificate is for.
+fn sync_certificate(
+    w: &mut WorkerExt,
+    handle: &WebServerHandle,
+    now_ms: u64,
+    magic_dns: Option<String>,
+) {
+    if w.cert_dirty {
+        w.cert_dirty = false;
+        let pem = w
+            .certs
+            .current()
+            .map(|c| (c.cert_pem.clone(), c.key_pem.clone()));
+        let applied = handle.set_certificate(pem.as_ref().map(|(c, k)| (c.as_str(), k.as_str())));
+        if let (Err(e), Some(_)) = (applied, pem.as_ref()) {
+            w.certs.rejected(e, now_ms);
+            let _ = handle.set_certificate(None);
+        }
+    }
+    let host = w
+        .certs
+        .current()
+        .and_then(|c| c.domain.clone().or(magic_dns));
+    if host != w.https_host_applied {
+        handle.set_https_host(host.clone());
+        w.https_host_applied = host;
+    }
+}
+
 fn level_label(level: MessageLevel) -> &'static str {
     match level {
         MessageLevel::Info => "info",
@@ -259,10 +302,18 @@ fn notification_view(note: &Notification, at_ms: i64) -> NotificationView {
     }
 }
 
-/// The device name a Desktop's label carries: `FlightDeck Desktop/1.2 (box)`
-/// names `box` (design A11); any other label is shown as it is.
+/// The name a paired device is shown by, from the label it paired (or
+/// attached) with: `FlightDeck Desktop/1.2 (box)` names `box` (design A11);
+/// a browser's user-agent names it `Chrome on macOS (browser)`; any other
+/// label is shown as it is.
 pub fn device_name(label: Option<&str>) -> String {
     let label = label.map(str::trim).unwrap_or("");
+    let native = crate::web::server::NATIVE_CLIENT_AGENTS
+        .iter()
+        .any(|name| label.contains(name));
+    if !native && !crate::web::server::coarse_user_agent(label).is_empty() {
+        return crate::web::server::browser_device_name(label);
+    }
     if let Some(inner) = label
         .strip_suffix(')')
         .and_then(|rest| rest.rfind('(').map(|i| rest[i + 1..].trim()))
@@ -404,6 +455,7 @@ impl<'a> AppHost<'a> {
             p.state.set_pty_size(size);
         }
         let projects_root = opts.config.projects_root_path(confinement.home());
+        let certs = CertLifecycle::new(opts.config.web, opts.config.https, opts.certs);
         host.worker = Some(Box::new(WorkerExt {
             home: opts.home,
             projects_root,
@@ -429,6 +481,9 @@ impl<'a> AppHost<'a> {
             last_listen: None,
             not_listening_reason: None,
             listen_retry_at_ms: None,
+            certs,
+            cert_dirty: true,
+            https_host_applied: None,
             #[cfg(test)]
             sent: Vec::new(),
         }));
@@ -445,9 +500,10 @@ impl<'a> AppHost<'a> {
         }
     }
 
-    /// Start the web server (Tailscale listeners, no browser assets) and the
-    /// worker shell. A bind failure is not fatal: the worker keeps running,
-    /// not listening, and retries. Idempotent.
+    /// Start the web server (Tailscale listeners; the browser app when
+    /// `[worker] web` is on) and the worker shell. A bind failure is not
+    /// fatal: the worker keeps running, not listening, and retries.
+    /// Idempotent. The HTTPS certificate follows on later ticks ([`tls`]).
     pub fn start_worker(&mut self) {
         let now0 = self.env.clock.now_millis();
         let update_check = match self.worker.as_mut() {
@@ -495,14 +551,19 @@ impl<'a> AppHost<'a> {
     /// Start the server on the worker's listen plan. A failure is logged and
     /// retried after [`LISTEN_RETRY_MS`].
     fn start_listening(&mut self, now_ms: u64) {
-        let Some(listen) = self.worker.as_ref().map(|w| w.listen.clone()) else {
+        let Some((listen, web)) = self
+            .worker
+            .as_ref()
+            .map(|w| (w.listen.clone(), w.config.web))
+        else {
             return;
         };
         let options = ServerOptions {
             host_kind: HostKind::Worker,
             listen,
-            // Design A5: the protocol routes only, no browser SPA.
-            serve_assets: false,
+            // The browser app beside the protocol routes, unless `[worker]
+            // web` is off (then the protocol routes only, design A5).
+            serve_assets: web,
         };
         let mut initial = web_host_state_now(
             &self.workspace,
@@ -520,6 +581,9 @@ impl<'a> AppHost<'a> {
             Ok(()) => {
                 w.not_listening_reason = None;
                 w.listen_retry_at_ms = None;
+                // A new server presents nothing until told.
+                w.cert_dirty = true;
+                w.https_host_applied = None;
             }
             Err(e) => {
                 w.log(format!("not listening: {e}"));
@@ -590,6 +654,19 @@ impl<'a> AppHost<'a> {
                 w.log(line);
                 w.last_listen = Some(status);
             }
+        }
+
+        // --- HTTPS: the certificate lifecycle (never blocks: fetches run on
+        //     their own thread), and what the server presents. ---
+        let magic_dns = handle.and_then(|h| h.listen_status().magic_dns);
+        if w.certs.poll(now_ms, magic_dns.as_deref()).is_some() {
+            w.cert_dirty = true;
+        }
+        if let Some(handle) = handle {
+            sync_certificate(w, handle, now_ms, magic_dns);
+        }
+        for line in w.certs.take_log() {
+            w.log(line);
         }
 
         // --- Notifications: what an OS notification would have said, to
@@ -1107,6 +1184,7 @@ impl<'a> AppHost<'a> {
                     .collect(),
             })
             .collect();
+        let web = self.worker.as_ref().map(|w| web_report(w, &listen));
         WorkerRuntimeReport {
             version: crate::VERSION.to_string(),
             pid: std::process::id(),
@@ -1124,6 +1202,7 @@ impl<'a> AppHost<'a> {
             projects,
             unread_messages,
             phone: self.phone_status(),
+            web,
         }
     }
 
@@ -1149,6 +1228,13 @@ impl<'a> AppHost<'a> {
                     .or_else(|| status.bound.first().map(|a| a.to_string()))
             })
             .flatten();
+        // The code rides in the URL's fragment, which a browser never sends
+        // anywhere: the SPA reads it and exchanges it in a POST body.
+        let web_url = self
+            .worker
+            .as_ref()
+            .and_then(|w| web_base_url(w, &status).0)
+            .map(|base| format!("{base}/#{code}"));
         if let Some(w) = self.worker.as_mut() {
             w.log("pairing code minted");
         }
@@ -1158,10 +1244,11 @@ impl<'a> AppHost<'a> {
             address,
             listening,
             not_listening_reason: (!listening).then_some(status.reason).flatten(),
+            web_url,
         }
     }
 
-    /// Every paired Desktop, with its connection state.
+    /// Every paired device (Desktop or browser), with its connection state.
     pub fn devices(&self) -> Vec<DeviceReport> {
         let connections = self
             .web_surface
@@ -1180,7 +1267,7 @@ impl<'a> AppHost<'a> {
             .collect()
     }
 
-    /// Revoke the Desktop `selector` names (an exact id, an exact label, or a
+    /// Revoke the device `selector` names (an exact id, an exact label, or a
     /// unique id prefix) and close its connections; returns the device and
     /// how many connections were closed. `Err` names the candidates when the
     /// selector is ambiguous.
@@ -1315,6 +1402,54 @@ impl<'a> AppHost<'a> {
             .as_mut()
             .map(|w| std::mem::take(&mut w.log_lines))
             .unwrap_or_default()
+    }
+}
+
+/// Where a browser opens FlightDeck Web on this worker (no trailing slash),
+/// and the HTTPS facts behind it: `https://<MagicDNS name>:<port>` while a
+/// certificate is served, else `http://<advertised address>`; `None` while
+/// `[worker] web` is off or nothing is listening.
+fn web_base_url(w: &WorkerExt, status: &ListenStatus) -> (Option<String>, tls::CertReport) {
+    let mut certs = w.certs.report();
+    let Some(first) = status.bound.first().filter(|_| w.config.web) else {
+        return (None, certs);
+    };
+    if certs.https {
+        let name = certs.domain.clone().or_else(|| status.magic_dns.clone());
+        match name {
+            Some(name) => return (Some(format!("https://{name}:{}", first.port())), certs),
+            None => {
+                certs.https = false;
+                certs.reason = Some("this machine's MagicDNS name is not known yet".to_string());
+            }
+        }
+    }
+    let address = status
+        .advertised
+        .clone()
+        .unwrap_or_else(|| first.to_string());
+    (Some(format!("http://{address}")), certs)
+}
+
+/// FlightDeck Web as `worker status` reports it.
+fn web_report(w: &WorkerExt, status: &ListenStatus) -> WebReport {
+    if !w.config.web {
+        return WebReport {
+            enabled: false,
+            url: None,
+            https: false,
+            https_reason: None,
+            certificate_expires: None,
+        };
+    }
+    let (url, certs) = web_base_url(w, status);
+    let https = certs.https && url.as_deref().is_some_and(|u| u.starts_with("https://"));
+    WebReport {
+        enabled: true,
+        url,
+        https,
+        https_reason: (!https).then_some(certs.reason).flatten(),
+        certificate_expires: https.then_some(certs.expires).flatten(),
     }
 }
 

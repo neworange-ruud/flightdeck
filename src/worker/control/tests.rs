@@ -66,11 +66,13 @@ fn response_wire_shapes() {
                 address: Some("box.ts.net:7420".to_string()),
                 listening: true,
                 not_listening_reason: None,
+                web_url: Some("https://box.ts.net:7420/#1234".to_string()),
             }),
             json!({
                 "result": "paired", "code": "1234", "expires_in_secs": 120,
                 "address": "box.ts.net:7420", "listening": true,
-                "not_listening_reason": null
+                "not_listening_reason": null,
+                "web_url": "https://box.ts.net:7420/#1234"
             }),
         ),
         (
