@@ -25,6 +25,7 @@
 //! | [`commands`] | D3, D13, D16 | wire name to palette action, one table |
 //! | [`client`] | R1–R7 | a native client: FlightDeck Desktop controlling another instance |
 //! | [`cert`] | §33 | reading a PEM certificate's expiry (every platform) |
+//! | [`upload`] | v8 | a worker's upload grants: one ticket per file, single use |
 //! | `tls` | §33 | HTTPS beside plain HTTP on one port (worker; unix only) |
 
 pub mod access;
@@ -40,6 +41,7 @@ pub mod protocol;
 pub mod replay;
 pub mod server;
 pub mod stream;
+pub mod upload;
 // The TLS half of the server rides on rustls, which is only in the dependency
 // graph off Windows (see Cargo.toml). The worker that uses it is unix-only.
 #[cfg(unix)]

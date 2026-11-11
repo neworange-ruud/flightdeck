@@ -856,6 +856,7 @@ fn test_shared_for(host_kind: HostKind) -> Arc<Shared> {
             .then(|| crate::web::tls::Tls::new().ok().map(Arc::new))
             .flatten(),
         https_host: Mutex::new(None),
+        uploads: Mutex::new(crate::web::upload::UploadGrants::default()),
     })
 }
 
@@ -1223,13 +1224,15 @@ fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_tui_host_serves_v6_and_v7_and_a_worker_only_v7() {
+fn a_tui_host_serves_v6_to_v8_and_a_worker_v7_and_v8() {
     assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
+    assert_eq!(accept_version(HostKind::Tui, 8), Ok(8));
     assert_eq!(accept_version(HostKind::Desktop, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Worker, 7), Ok(7));
+    assert_eq!(accept_version(HostKind::Worker, 8), Ok(8));
 
-    for peer in [5, 6, 8] {
+    for peer in [5, 6, 9] {
         let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
         assert_eq!(refused.peer, peer);
         assert_eq!(refused.min_supported, 7, "the worker's own floor");
@@ -1447,6 +1450,63 @@ fn the_background_filter_denies_the_window_only_frames_and_allows_the_rest() {
         Delta::Connections(ConnectionsView::default())
     )));
     assert!(background_may_receive(&revoked_frame()));
+    assert!(!background_may_receive(&upload_plan_frame()));
+}
+
+fn upload_plan_frame() -> ServerMsg {
+    ServerMsg::UploadPlan(crate::web::protocol::UploadPlan {
+        seq: 1,
+        dir: "/home/u".to_string(),
+        files: Vec::new(),
+        conflicts: false,
+        refusal: None,
+    })
+}
+
+/// An upload plan is a v8 frame: a v7 window (a worker still serves one) is
+/// never sent it, whatever addressed it; a v8 window is.
+#[test]
+fn an_upload_plan_never_reaches_a_peer_below_v8() {
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let (tx7, mut rx7) = mpsc::channel::<ServerMsg>(8);
+    registry.register(
+        viewer("old"),
+        ViewerIdentity {
+            address: IpAddr::V4(Ipv4Addr::new(100, 64, 1, 9)),
+            user_agent_label: Some("FlightDeck Desktop/1.0 (old)".to_string()),
+            token: token(),
+        },
+        5_000,
+        7,
+        ConnectionKind::Window,
+        tx7,
+    );
+    registry.send_to(&viewer("old"), upload_plan_frame());
+    registry.send_to(
+        &viewer("old"),
+        ServerMsg::Delta(Delta::Connections(ConnectionsView::default())),
+    );
+    assert!(
+        matches!(drained(&mut rx7).as_slice(), [ServerMsg::Delta(_)]),
+        "the v7 window gets everything but the plan"
+    );
+    assert!(
+        registry.viewer(&viewer("old")).is_some(),
+        "filtered, not evicted"
+    );
+
+    let mut rx8 = register_as(
+        &mut registry,
+        "new",
+        ConnectionKind::Window,
+        &token(),
+        "FlightDeck Desktop/2.0 (new)",
+    );
+    registry.send_to(&viewer("new"), upload_plan_frame());
+    assert!(matches!(
+        drained(&mut rx8).as_slice(),
+        [ServerMsg::UploadPlan(_)]
+    ));
 }
 
 /// `same_device` is relative to the recipient's own credential.

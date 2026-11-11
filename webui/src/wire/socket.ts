@@ -1213,6 +1213,10 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
           result: cloneResultOf(frame as WireCloneResult),
         });
         return;
+      /* --- v8 ------------------------------------------------------------- */
+      case "upload_plan":
+        /** The answer to a `begin_upload` this tab does not send yet. */
+        return;
       default:
         /** A frame this build has never heard of. Ignored on purpose. */
         return;

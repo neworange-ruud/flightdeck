@@ -150,15 +150,63 @@ fn command(seq: u64, name: &str, args: Option<serde_json::Value>) -> WebInbound 
 }
 
 fn worker_op(seq: u64, name: &str) -> WebInbound {
-    let args = json!({ "path": "projects/x", "url": "https://example.invalid/r.git" });
+    let args = json!({
+        "path": "projects/x",
+        "url": "https://example.invalid/r.git",
+        "dir": "~",
+        "files": [{ "name": "a.txt", "size": 1 }],
+    });
     let op = WorkerOp::parse(name, Some(&args))
         .expect("a worker command")
         .expect("valid args");
     WebInbound::WorkerOp {
         viewer_id: viewer(),
+        token: token(),
         seq,
         op,
     }
+}
+
+/// The credential every test window authenticated with.
+fn token() -> TokenId {
+    use std::sync::OnceLock;
+    static TOKEN: OnceLock<TokenId> = OnceLock::new();
+    TOKEN.get_or_init(TokenId::generate).clone()
+}
+
+/// A `begin_upload` from the test window.
+fn begin_upload(seq: u64, dir: &str, names: &[&str], on_conflict: &str) -> WebInbound {
+    let files: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| json!({ "name": name, "size": 5 }))
+        .collect();
+    let args = json!({ "dir": dir, "files": files, "on_conflict": on_conflict });
+    worker_op_with(seq, worker_command::BEGIN_UPLOAD, args)
+}
+
+fn worker_op_with(seq: u64, name: &str, args: serde_json::Value) -> WebInbound {
+    let op = WorkerOp::parse(name, Some(&args))
+        .expect("a worker command")
+        .expect("valid args");
+    WebInbound::WorkerOp {
+        viewer_id: viewer(),
+        token: token(),
+        seq,
+        op,
+    }
+}
+
+/// The upload plan among a routed op's answers.
+fn plan_in(out: &[WebOutbound]) -> &crate::web::protocol::UploadPlan {
+    out.iter()
+        .find_map(|f| match f {
+            WebOutbound::Viewer {
+                msg: ServerMsg::UploadPlan(plan),
+                ..
+            } => Some(plan),
+            _ => None,
+        })
+        .expect("an upload plan frame")
 }
 
 fn attached(kind: ConnectionKind) -> WebInbound {
@@ -170,7 +218,7 @@ fn attached(kind: ConnectionKind) -> WebInbound {
         cursors: Vec::new(),
         resume_viewer: None,
         kind,
-        protocol_version: 7,
+        protocol_version: crate::web::protocol::PROTOCOL_VERSION,
     }
 }
 
@@ -1120,5 +1168,202 @@ fn a_paired_browser_is_named_as_a_browser() {
         device_name(Some("100.64.0.2 · FlightDeck Desktop/1.0 (box)")),
         "box",
         "a chip label still names a Desktop by its host"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Uploads (v8)
+// ---------------------------------------------------------------------------
+
+use crate::contracts::FileSystem as _;
+
+#[test]
+fn an_upload_outside_home_is_refused_in_its_own_frame() {
+    let fakes = Fakes::new();
+    fakes.fs.create_dir_all(Path::new("/etc/x")).unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_upload(3, "/etc/x", &["a.txt"], "ask"));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(
+        ack.detail
+            .as_deref()
+            .unwrap()
+            .contains("outside your home folder"),
+        "{ack:?}"
+    );
+    let plan = plan_in(&out);
+    assert_eq!(plan.seq, 3);
+    assert_eq!(plan.refusal, ack.detail);
+    assert!(plan.files.iter().all(|f| f.ticket.is_none()));
+}
+
+#[test]
+fn a_bad_name_and_a_full_disk_are_refused_before_anything_is_granted() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_upload(1, "~", &["../escape"], "ask"));
+    assert!(plan_in(&out)
+        .refusal
+        .as_deref()
+        .is_some_and(|r| r.contains("not a file name")));
+
+    let mut opts = worker_options("/home/me");
+    opts.health = Box::new(health::FakeHealthProbe {
+        cpu_count: 1,
+        disk_free: Some(upload::DISK_MARGIN_BYTES + 6),
+        ..Default::default()
+    });
+    let mut host = testing::worker_host(fakes.env(), &fakes.notifier, Vec::new(), opts);
+    let out = host.route_inbound(begin_upload(2, "~", &["a", "b"], "ask"));
+    let refusal = plan_in(&out).refusal.clone().unwrap_or_default();
+    assert!(refusal.contains("Not enough free space"), "{refusal}");
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Rejected);
+}
+
+#[test]
+fn ask_answers_with_the_names_already_there() {
+    let fakes = Fakes::new();
+    fakes
+        .fs
+        .create_dir_all(Path::new("/home/me/assets"))
+        .unwrap();
+    fakes
+        .fs
+        .write(Path::new("/home/me/assets/logo.png"), "old")
+        .unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_upload(4, "~/assets", &["logo.png", "new.png"], "ask"));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    let plan = plan_in(&out);
+    assert!(plan.conflicts);
+    assert_eq!(plan.dir, "/home/me/assets");
+    assert_eq!(plan.refusal, None);
+    let taken: Vec<(&str, bool)> = plan
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.exists))
+        .collect();
+    assert_eq!(taken, vec![("logo.png", true), ("new.png", false)]);
+    assert!(
+        plan.files.iter().all(|f| f.ticket.is_none()),
+        "nothing granted"
+    );
+}
+
+#[test]
+fn a_worker_that_is_not_listening_grants_nothing() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_upload(5, "~", &["a.txt"], "ask"));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Rejected);
+    assert!(plan_in(&out)
+        .refusal
+        .as_deref()
+        .is_some_and(|r| r.contains("not listening")));
+}
+
+#[test]
+fn a_granted_batch_posts_one_message_when_every_file_has_reported() {
+    let fakes = Fakes::new();
+    fakes.fs.create_dir_all(Path::new("/home/me/proj")).unwrap();
+    fakes
+        .fs
+        .write(Path::new("/home/me/proj/a.txt"), "old")
+        .unwrap();
+    let mut host = loopback_worker(&fakes, |_| {});
+    let out = host.route_inbound(begin_upload(
+        6,
+        "~/proj",
+        &["a.txt", "b.txt", "c.txt"],
+        "keep_both",
+    ));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    let plan = plan_in(&out).clone();
+    assert!(!plan.conflicts && plan.refusal.is_none(), "{plan:?}");
+    let finals: Vec<&str> = plan.files.iter().map(|f| f.final_name.as_str()).collect();
+    assert_eq!(finals, vec!["a (1).txt", "b.txt", "c.txt"]);
+    assert!(plan.files.iter().all(|f| f.ticket.is_some()));
+    assert_eq!(w(&host).uploads.len(), 1);
+    host.take_log_lines();
+
+    let done = |name: &str, ok: bool| {
+        WebInbound::UploadFinished(crate::web::server::UploadFinished {
+            token: token(),
+            batch: 1,
+            path: PathBuf::from("/home/me/proj").join(name),
+            bytes: if ok { 5 } else { 2 },
+            ok,
+            reason: (!ok).then(|| "The upload was interrupted.".to_string()),
+        })
+    };
+    host.route_inbound(done("a (1).txt", true));
+    host.route_inbound(done("b.txt", true));
+    let lines = host.take_log_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "uploaded ~/proj/a (1).txt (5 bytes)"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("message")),
+        "no message until the batch is complete: {lines:?}"
+    );
+    host.route_inbound(done("c.txt", false));
+    let lines = host.take_log_lines();
+    assert!(
+        lines.iter().any(|l| l
+            == "message (warning): Uploaded 2 of 3 files to ~/proj. c.txt: The upload was interrupted."),
+        "{lines:?}"
+    );
+    assert!(w(&host).uploads.is_empty());
+    host.stop_worker();
+}
+
+#[test]
+fn a_whole_batch_written_is_an_info_message() {
+    let batch = UploadBatch {
+        dir: PathBuf::from("/home/me/proj/assets"),
+        expected: 3,
+        written: vec!["a".into(), "b".into(), "c".into()],
+        failed: Vec::new(),
+    };
+    assert_eq!(
+        batch.message(Path::new("/home/me")),
+        (
+            MessageLevel::Info,
+            "Uploaded 3 files to ~/proj/assets.".to_string()
+        )
+    );
+    let one = UploadBatch {
+        dir: PathBuf::from("/home/me"),
+        expected: 1,
+        written: vec!["notes.md".into()],
+        failed: Vec::new(),
+    };
+    assert_eq!(
+        one.message(Path::new("/home/me")).1,
+        "Uploaded notes.md to ~."
+    );
+    let none = UploadBatch {
+        dir: PathBuf::from("/home/me"),
+        expected: 2,
+        written: Vec::new(),
+        failed: vec![
+            (
+                "a".into(),
+                "The upload did not start in time; send it again.".into(),
+            ),
+            ("b".into(), "x".into()),
+        ],
+    };
+    assert_eq!(
+        none.message(Path::new("/home/me")),
+        (
+            MessageLevel::Warning,
+            "Nothing was uploaded to ~. a: The upload did not start in time; send it again (and 1 more).".to_string()
+        )
     );
 }

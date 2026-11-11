@@ -5332,13 +5332,14 @@ mod worker {
             let version = error.version.expect("the numbers");
             assert_eq!(version.peer, 6);
             assert_eq!(version.min_supported, 7);
-            assert_eq!(version.max_supported, 7);
+            assert_eq!(version.max_supported, PROTOCOL_VERSION);
             assert!(next_frame(&mut ws).await.is_none(), "the socket closes");
 
-            // A v7 client is served, at v7, with the worker's own state.
+            // A current client is served, at its version, with the worker's
+            // own state.
             let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
             let snapshot = attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
-            assert_eq!(snapshot.protocol_version, 7);
+            assert_eq!(snapshot.protocol_version, PROTOCOL_VERSION);
             assert_eq!(snapshot.host_kind, Some(HostKind::Worker));
             let worker = snapshot.worker.expect("a worker snapshot");
             assert_eq!(worker.home, "/home/ruud");
@@ -5358,9 +5359,10 @@ mod worker {
         });
     }
 
-    /// A v7 client on a TUI host is answered at v7 and told it is a TUI.
+    /// A current client on a TUI host is answered at its version and told it
+    /// is a TUI.
     #[test]
-    fn a_v7_client_on_a_tui_host_is_answered_at_v7() {
+    fn a_current_client_on_a_tui_host_is_answered_at_its_version() {
         let harness = Harness::start();
         let addr = harness.addr();
         let cookie = on_runtime(harness.authenticate());
@@ -5368,7 +5370,7 @@ mod worker {
             let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
             attach(&mut ws, SeatRequest::Write).await;
             let snapshot = await_snapshot(&mut ws).await;
-            assert_eq!(snapshot.protocol_version, 7);
+            assert_eq!(snapshot.protocol_version, PROTOCOL_VERSION);
             assert_eq!(snapshot.host_kind, Some(HostKind::Tui));
             assert_eq!(snapshot.worker, None);
         });
@@ -5823,5 +5825,711 @@ mod worker {
             )),
             "{events:?}"
         );
+    }
+
+    /// Uploads (v8, `remote-control-usem`): the grant over the socket, the
+    /// bytes over `PUT /upload/{ticket}`. The route is unix-only, like the
+    /// worker.
+    #[cfg(unix)]
+    mod upload {
+        use super::*;
+        use flightdeck::web::credentials::TokenId;
+        use flightdeck::web::server::{UploadFinished, UploadGrantRequest};
+
+        // -- uploads (v8, `remote-control-usem`) ---------------------------------
+
+        /// A worker on loopback whose server reads `clock` (for grant expiry).
+        fn start_worker_on(clock: Arc<dyn Clock + Send + Sync>) -> Harness {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let store =
+                CredentialStore::open(Arc::new(RealFs), clock.clone(), dir.path().join("web.json"));
+            let credentials = Arc::new(Mutex::new(store));
+            let (tx, inbound) = std::sync::mpsc::channel::<WebInbound>();
+            let handle = server::start_with(
+                ServerOptions {
+                    host_kind: HostKind::Worker,
+                    listen: ListenPlan::Fixed(vec!["127.0.0.1:0".parse().expect("an address")]),
+                    serve_assets: false,
+                },
+                262_144,
+                Arc::clone(&credentials),
+                clock,
+                worker_state(),
+                tx,
+            )
+            .expect("the test host starts");
+            Harness {
+                handle,
+                credentials,
+                inbound,
+                _dir: dir,
+            }
+        }
+
+        /// A home for the upload to land in, canonical (macOS's temp dir is
+        /// behind a symlink), with `sub` made inside it.
+        fn upload_home(sub: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let home = tempfile::tempdir().expect("a temp home");
+            let canonical = home.path().canonicalize().expect("canonical");
+            let dir = canonical.join(sub);
+            std::fs::create_dir_all(&dir).expect("the target folder");
+            (home, canonical, dir)
+        }
+
+        /// Everything in `dir`, sorted.
+        fn listing(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("readable")
+                .map(|e| {
+                    e.expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn no_temp_left(dir: &std::path::Path) {
+            let names = listing(dir);
+            assert!(
+                !names.iter().any(|n| n.contains(".fdupload-")),
+                "a temp file was left behind: {names:?}"
+            );
+        }
+
+        /// Ask for an upload over a window socket the way the Desktop does, and
+        /// return the credential the server forwarded with it: what the worker
+        /// host binds the grant to.
+        async fn begin_upload_over(
+            ws: &mut Ws,
+            harness: &Harness,
+            seq: u64,
+            names: &[&str],
+        ) -> TokenId {
+            let files: Vec<serde_json::Value> = names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "size": 5 }))
+                .collect();
+            command(
+                ws,
+                seq,
+                worker_command::BEGIN_UPLOAD,
+                Some(serde_json::json!({ "dir": "~/in", "files": files, "on_conflict": "ask" })),
+            )
+            .await;
+            wait_for(harness, |event| match event {
+                WebInbound::WorkerOp {
+                    token,
+                    seq: got,
+                    op: WorkerOp::BeginUpload { files, .. },
+                    ..
+                } if got == seq => {
+                    assert_eq!(files.len(), names.len());
+                    Some(token)
+                }
+                _ => None,
+            })
+        }
+
+        fn grant(name: &str, size: u64, replace: bool) -> UploadGrantRequest {
+            UploadGrantRequest {
+                final_name: name.to_string(),
+                size,
+                replace,
+            }
+        }
+
+        /// `PUT /upload/{ticket}` with `body`, declaring `length` (none: no
+        /// `Content-Length` at all), plus `extra` header lines.
+        async fn put_upload(
+            addr: &str,
+            ticket: &str,
+            cookie: Option<&str>,
+            length: Option<usize>,
+            extra: &[&str],
+            body: &[u8],
+        ) -> HttpResponse {
+            let mut stream = TcpStream::connect(addr).await.expect("the server is up");
+            let mut head =
+                format!("PUT /upload/{ticket} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+            if let Some(cookie) = cookie {
+                head.push_str(&format!("Cookie: {cookie}\r\n"));
+            }
+            if let Some(length) = length {
+                head.push_str(&format!("Content-Length: {length}\r\n"));
+            }
+            for line in extra {
+                head.push_str(line);
+                head.push_str("\r\n");
+            }
+            head.push_str("\r\n");
+            stream.write_all(head.as_bytes()).await.expect("writable");
+            // A refusal may close the socket before the body is all out.
+            let _ = stream.write_all(body).await;
+            read_response(stream).await
+        }
+
+        async fn read_response<S>(mut stream: S) -> HttpResponse
+        where
+            S: tokio::io::AsyncRead + Unpin,
+        {
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+            let mut lines = head.split("\r\n");
+            let status = lines
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .unwrap_or(0);
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                .collect();
+            HttpResponse {
+                status,
+                headers,
+                body: body.to_string(),
+            }
+        }
+
+        fn finished(harness: &Harness) -> UploadFinished {
+            wait_for(harness, |event| match event {
+                WebInbound::UploadFinished(done) => Some(done),
+                _ => None,
+            })
+        }
+
+        /// The whole path: `begin_upload` over the window's socket carries the
+        /// window's credential to the host, the host's grant is a ticket, and a
+        /// `PUT` with that credential writes exactly the bytes sent — once.
+        #[test]
+        fn a_granted_upload_writes_exactly_the_bytes_sent_once() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            let (token, ws) = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                let token = begin_upload_over(&mut ws, &harness, 7, &["hello.bin"]).await;
+                (token, ws)
+            });
+            let body: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+            let tickets = harness.handle.grant_uploads(
+                &token,
+                42,
+                &home,
+                &dir,
+                &[grant("hello.bin", body.len() as u64, false)],
+            );
+            assert_eq!(tickets.len(), 1);
+
+            on_runtime(async {
+                let put = put_upload(
+                    &addr,
+                    &tickets[0],
+                    Some(&cookie),
+                    Some(body.len()),
+                    &[],
+                    &body,
+                )
+                .await;
+                assert_eq!(put.status, 200, "{}", put.body);
+                assert_eq!(put.header("cache-control"), Some("no-store"));
+                assert_eq!(put.json()["ok"], true);
+                assert_eq!(put.json()["bytes"], body.len() as u64);
+                assert_eq!(
+                    put.json()["path"],
+                    dir.join("hello.bin").display().to_string()
+                );
+            });
+            assert_eq!(std::fs::read(dir.join("hello.bin")).expect("written"), body);
+            no_temp_left(&dir);
+            let done = finished(&harness);
+            assert!(done.ok, "{done:?}");
+            assert_eq!((done.batch, done.bytes), (42, body.len() as u64));
+            assert_eq!(done.token, token);
+            assert_eq!(done.path, dir.join("hello.bin"));
+
+            // Single use.
+            on_runtime(async {
+                let again =
+                    put_upload(&addr, &tickets[0], Some(&cookie), Some(3), &[], b"abc").await;
+                assert_eq!(again.status, 403, "{}", again.body);
+                assert_eq!(again.json()["reason"], "invalid_ticket");
+                drop(ws);
+            });
+            assert_eq!(std::fs::read(dir.join("hello.bin")).expect("kept"), body);
+        }
+
+        /// A ticket answers only to the credential it was granted to: another
+        /// paired device is told nothing (and spends nothing), no cookie is the
+        /// ordinary refusal, and the owner can still use it afterwards.
+        #[test]
+        fn a_ticket_is_refused_to_any_other_credential() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let other = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["a.txt"]).await
+            });
+            let tickets =
+                harness
+                    .handle
+                    .grant_uploads(&token, 1, &home, &dir, &[grant("a.txt", 5, false)]);
+            on_runtime(async {
+                let theirs =
+                    put_upload(&addr, &tickets[0], Some(&other), Some(5), &[], b"evil!").await;
+                assert_eq!(theirs.status, 403, "{}", theirs.body);
+                assert_eq!(theirs.json()["reason"], "invalid_ticket");
+                let nobody = put_upload(&addr, &tickets[0], None, Some(5), &[], b"evil!").await;
+                assert_eq!(nobody.status, 401, "{}", nobody.body);
+                let forged = put_upload(
+                    &addr,
+                    &tickets[0],
+                    Some("flightdeck_web=forged"),
+                    Some(5),
+                    &[],
+                    b"evil!",
+                )
+                .await;
+                assert_eq!(forged.status, 401, "{}", forged.body);
+                assert!(listing(&dir).is_empty(), "nothing written");
+
+                let mine =
+                    put_upload(&addr, &tickets[0], Some(&cookie), Some(5), &[], b"hello").await;
+                assert_eq!(mine.status, 200, "{}", mine.body);
+            });
+            assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"hello");
+        }
+
+        /// The length is part of the grant: missing, wrong, chunked, short or
+        /// long, nothing but the granted bytes is ever written, and no temp file
+        /// outlives the request.
+        #[test]
+        fn a_wrong_length_is_refused_and_leaves_nothing_behind() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["a"]).await
+            });
+            let tickets = harness.handle.grant_uploads(
+                &token,
+                9,
+                &home,
+                &dir,
+                &[grant("short", 10, false), grant("long", 4, false)],
+            );
+            on_runtime(async {
+                let none = put_upload(&addr, &tickets[0], Some(&cookie), None, &[], b"").await;
+                assert_eq!(none.status, 411, "{}", none.body);
+                assert_eq!(none.json()["reason"], "length_required");
+
+                let wrong = put_upload(
+                    &addr,
+                    &tickets[0],
+                    Some(&cookie),
+                    Some(11),
+                    &[],
+                    &[b'x'; 11],
+                )
+                .await;
+                assert_eq!(wrong.status, 400, "{}", wrong.body);
+                assert_eq!(wrong.json()["reason"], "size_mismatch");
+
+                let chunked = put_upload(
+                    &addr,
+                    &tickets[0],
+                    Some(&cookie),
+                    None,
+                    &["Transfer-Encoding: chunked"],
+                    b"a\r\n0123456789\r\n0\r\n\r\n",
+                )
+                .await;
+                assert_eq!(chunked.status, 400, "{}", chunked.body);
+                assert!(
+                    listing(&dir).is_empty(),
+                    "refused before a byte: {:?}",
+                    listing(&dir)
+                );
+
+                // The grant survived those: now four bytes of ten, and hang up.
+                let mut stream = TcpStream::connect(&addr).await.expect("up");
+                let head = format!(
+                    "PUT /upload/{} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nCookie: {cookie}\r\nContent-Length: 10\r\n\r\n0123",
+                    tickets[0]
+                );
+                stream.write_all(head.as_bytes()).await.expect("writable");
+                stream.shutdown().await.expect("half-closed");
+                let short = read_response(stream).await;
+                assert_ne!(short.status, 200, "{}", short.body);
+
+                // Four bytes declared, nine sent: HTTP framing ends the body at
+                // four, and not a byte past it is written.
+                let long = put_upload(
+                    &addr,
+                    &tickets[1],
+                    Some(&cookie),
+                    Some(4),
+                    &[],
+                    b"abcdEXTRA",
+                )
+                .await;
+                assert_eq!(long.status, 200, "{}", long.body);
+            });
+            let done = finished(&harness);
+            assert!(!done.ok, "the short upload failed: {done:?}");
+            assert_eq!(done.path, dir.join("short"));
+            assert!(!dir.join("short").exists());
+            assert_eq!(std::fs::read(dir.join("long")).unwrap(), b"abcd");
+            no_temp_left(&dir);
+            assert_eq!(listing(&dir), vec!["long".to_string()]);
+        }
+
+        /// Without `replace` the name is claimed only if it is still free when
+        /// the file is committed; with it, what is there is overwritten.
+        #[test]
+        fn keep_both_never_overwrites_and_replace_does() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            std::fs::write(dir.join("taken.txt"), b"original").unwrap();
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["taken.txt"]).await
+            });
+            // The plan said it was free; something took the name meanwhile.
+            let tickets = harness.handle.grant_uploads(
+                &token,
+                1,
+                &home,
+                &dir,
+                &[grant("taken.txt", 5, false), grant("taken.txt", 5, true)],
+            );
+            on_runtime(async {
+                let raced =
+                    put_upload(&addr, &tickets[0], Some(&cookie), Some(5), &[], b"fresh").await;
+                assert_eq!(raced.status, 409, "{}", raced.body);
+                assert_eq!(raced.json()["reason"], "exists");
+                assert!(raced.json()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("taken.txt"));
+            });
+            assert_eq!(std::fs::read(dir.join("taken.txt")).unwrap(), b"original");
+            no_temp_left(&dir);
+            on_runtime(async {
+                let replaced =
+                    put_upload(&addr, &tickets[1], Some(&cookie), Some(5), &[], b"fresh").await;
+                assert_eq!(replaced.status, 200, "{}", replaced.body);
+            });
+            assert_eq!(std::fs::read(dir.join("taken.txt")).unwrap(), b"fresh");
+            no_temp_left(&dir);
+            assert_eq!(listing(&dir), vec!["taken.txt".to_string()]);
+        }
+
+        /// A folder swapped for a link out of home between the grant and the
+        /// write is refused, and nothing lands at the link's target.
+        #[test]
+        fn a_folder_swapped_for_a_link_after_the_grant_is_refused() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            let outside = tempfile::tempdir().unwrap();
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["a"]).await
+            });
+            let tickets =
+                harness
+                    .handle
+                    .grant_uploads(&token, 1, &home, &dir, &[grant("a", 5, false)]);
+            std::fs::remove_dir(&dir).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+            on_runtime(async {
+                let put =
+                    put_upload(&addr, &tickets[0], Some(&cookie), Some(5), &[], b"hello").await;
+                assert_eq!(put.status, 409, "{}", put.body);
+                assert_eq!(put.json()["reason"], "folder_changed");
+            });
+            assert!(listing(outside.path()).is_empty());
+            assert!(!finished(&harness).ok);
+        }
+
+        /// An unused grant is gone after two minutes of the server's clock, and
+        /// the host hears that it ended, so the batch can finish.
+        #[test]
+        fn an_expired_ticket_is_refused_and_the_host_is_told() {
+            let clock = Arc::new(flightdeck::testing::FakeClock::default());
+            clock.set_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+            let harness = start_worker_on(clock.clone());
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("in");
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["a", "b"]).await
+            });
+            let tickets = harness.handle.grant_uploads(
+                &token,
+                3,
+                &home,
+                &dir,
+                &[grant("a", 5, false), grant("b", 5, false)],
+            );
+            clock.advance_millis(server::UPLOAD_GRANT_TTL_MS as u64 + 1);
+            on_runtime(async {
+                let late =
+                    put_upload(&addr, &tickets[0], Some(&cookie), Some(5), &[], b"hello").await;
+                assert_eq!(late.status, 403, "{}", late.body);
+                assert_eq!(late.json()["reason"], "invalid_ticket");
+            });
+            let mut ended = Vec::new();
+            let deadline = std::time::Instant::now() + WAIT;
+            while ended.len() < 2 && std::time::Instant::now() < deadline {
+                ended.extend(harness.inbound().into_iter().filter_map(|e| match e {
+                    WebInbound::UploadFinished(done) => Some(done),
+                    _ => None,
+                }));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(ended.len(), 2, "both grants of the batch end: {ended:?}");
+            for done in &ended {
+                assert!(!done.ok);
+                assert_eq!(done.batch, 3);
+                assert!(
+                    done.reason
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("did not start in time"),
+                    "{done:?}"
+                );
+            }
+            harness.handle.expire_uploads();
+            assert!(
+                !harness
+                    .inbound()
+                    .iter()
+                    .any(|e| matches!(e, WebInbound::UploadFinished(_))),
+                "each grant ends once"
+            );
+            assert!(listing(&dir).is_empty());
+        }
+
+        /// Only the worker's window may ask: a background link and an observing
+        /// window are read-only, and a v7 window — which would drop the answer —
+        /// is told to update. None of them reaches the host.
+        #[test]
+        fn only_a_v8_window_may_begin_an_upload() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let args = serde_json::json!({
+                "dir": "~",
+                "files": [{ "name": "a", "size": 1 }],
+            });
+            on_runtime(async {
+                let mut bg = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut bg, ConnectionKind::Background, "box-a", None).await;
+                command(&mut bg, 1, worker_command::BEGIN_UPLOAD, Some(args.clone())).await;
+                let refused = frame_matching(&mut bg, |frame| match frame {
+                    ServerMsg::Error(error) if error.seq == Some(1) => Some(error),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(refused.code, ErrorCode::ReadOnly);
+
+                let mut old = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                send(
+                    &mut old,
+                    &ClientMsg::Attach(Attach {
+                        protocol_version: 7,
+                        seat: SeatRequest::Write,
+                        cursors: Vec::new(),
+                        resume_viewer: None,
+                        viewport: None,
+                        client: None,
+                        connection: ConnectionKind::Window,
+                    }),
+                )
+                .await;
+                let snapshot = await_snapshot(&mut old).await;
+                assert_eq!(snapshot.protocol_version, 7);
+                command(
+                    &mut old,
+                    2,
+                    worker_command::BEGIN_UPLOAD,
+                    Some(args.clone()),
+                )
+                .await;
+                let refused = frame_matching(&mut old, |frame| match frame {
+                    ServerMsg::Error(error) if error.seq == Some(2) => Some(error),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(refused.code, ErrorCode::NotSupported);
+                assert!(refused.message.contains("newer FlightDeck"), "{refused:?}");
+
+                // A worker's window is always seated to write; one that gave
+                // its seat up has said it will not drive.
+                let mut watching = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut watching, ConnectionKind::Window, "box-a", None).await;
+                command(&mut watching, 3, names::RELEASE_SEAT, None).await;
+                let released = frame_matching(&mut watching, |frame| match frame {
+                    ServerMsg::Ack(ack) if ack.seq == 3 => Some(ack),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(released.outcome, AckOutcome::Applied);
+                command(
+                    &mut watching,
+                    4,
+                    worker_command::BEGIN_UPLOAD,
+                    Some(args.clone()),
+                )
+                .await;
+                let refused = frame_matching(&mut watching, |frame| match frame {
+                    ServerMsg::Error(error) if error.seq == Some(4) => Some(error),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(refused.code, ErrorCode::ReadOnly);
+            });
+            let events = harness.inbound();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, WebInbound::WorkerOp { .. })),
+                "{events:?}"
+            );
+        }
+
+        /// The host's plan reaches the v8 window that asked, and never a v7 one
+        /// or a background link, whatever it is addressed to.
+        #[test]
+        fn an_upload_plan_reaches_only_v8_windows() {
+            use flightdeck::web::protocol::UploadPlan;
+            use flightdeck::web::server::WebOutbound;
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let plan = ServerMsg::UploadPlan(UploadPlan {
+                seq: 1,
+                dir: "/home/ruud".to_string(),
+                files: Vec::new(),
+                conflicts: false,
+                refusal: Some("no".to_string()),
+            });
+            on_runtime(async {
+                let mut bg = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut bg, ConnectionKind::Background, "box-a", None).await;
+                let mut window = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
+                harness.handle.send(WebOutbound::All(plan.clone()));
+                let got = frame_matching(&mut window, |frame| match frame {
+                    ServerMsg::UploadPlan(plan) => Some(plan),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(got.refusal.as_deref(), Some("no"));
+                let (frames, _) = drain_frames(&mut bg, Duration::from_millis(300)).await;
+                assert!(
+                    !frames.iter().any(|f| matches!(f, ServerMsg::UploadPlan(_))),
+                    "{frames:?}"
+                );
+            });
+        }
+
+        /// `/upload` is protocol, not a page: with a certificate and an HTTPS
+        /// name, a plain-HTTP upload (or any request there) is never redirected.
+        #[cfg(unix)]
+        #[test]
+        fn a_plain_http_upload_is_never_redirected() {
+            let harness = start_https_worker();
+            harness
+                .handle
+                .set_https_host(Some("box.tail1234.ts.net".to_string()));
+            let addr = harness.addr();
+            on_runtime(async {
+                let root = get(&addr, "/", &[]).await;
+                assert_eq!(root.status, 308, "pages are redirected");
+                let put = put_upload(&addr, "abc", None, Some(1), &[], b"x").await;
+                assert_eq!(put.status, 401, "{}", put.body);
+                let looked_at = get(&addr, "/upload/abc", &[]).await;
+                assert_ne!(looked_at.status, 308, "{}", looked_at.status);
+                let bare = get(&addr, "/upload", &[]).await;
+                assert_ne!(bare.status, 308, "{}", bare.status);
+            });
+            harness.handle.stop(ShutdownNotice::server_stopped());
+        }
+
+        /// The same upload over HTTPS, with a cookie issued over HTTPS — what the
+        /// browser app does.
+        #[cfg(unix)]
+        #[test]
+        fn an_upload_over_tls_writes_the_file() {
+            let harness = start_https_worker();
+            let addr = harness.addr();
+            let secure = on_runtime(async {
+                let tls = tls_connect(&addr).await.expect("the handshake completes");
+                exchange_over(tls, &harness).await
+            });
+            let pair = secure.split(';').next().expect("name=value").to_string();
+            let (_home, home, dir) = upload_home("in");
+            let token = on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(&pair)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_upload_over(&mut ws, &harness, 1, &["tls.txt"]).await
+            });
+            let tickets = harness.handle.grant_uploads(
+                &token,
+                1,
+                &home,
+                &dir,
+                &[grant("tls.txt", 11, false)],
+            );
+            on_runtime(async {
+                let mut tls = tls_connect(&addr).await.expect("the handshake completes");
+                let head = format!(
+                    "PUT /upload/{} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nCookie: {pair}\r\nContent-Length: 11\r\n\r\nhello world",
+                    tickets[0]
+                );
+                tls.write_all(head.as_bytes()).await.expect("writable");
+                let put = read_response(tls).await;
+                assert_eq!(put.status, 200, "{}", put.body);
+                assert_eq!(put.json()["ok"], true);
+            });
+            assert_eq!(std::fs::read(dir.join("tls.txt")).unwrap(), b"hello world");
+            no_temp_left(&dir);
+            harness.handle.stop(ShutdownNotice::server_stopped());
+        }
     }
 }

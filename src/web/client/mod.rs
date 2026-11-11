@@ -22,6 +22,8 @@
 //! | [`terminals`] | [`StreamPty`]: a remote terminal behind `PtySession` |
 //! | [`views`] | the core's view structs, built from the mirror |
 //! | [`worker`] | [`ProjectPicker`]: a worker's browse / scan / clone picker (v7) |
+//! | [`upload`] | [`UploadPanel`]: uploading files to a worker, as a reducer (v8) |
+//! | [`upload_http`] | `PUT /upload/{ticket}`: streaming one file's bytes (v8) |
 //! | [`config`] | [`RemoteConfigEditor`]: the host's configuration manager, staged here |
 //!
 //! [`RemoteClient`] ties them together for a synchronous front-end: start it,
@@ -44,6 +46,8 @@ pub mod mission;
 pub mod session;
 pub mod store;
 pub mod terminals;
+pub mod upload;
+pub mod upload_http;
 pub mod views;
 pub mod worker;
 
@@ -52,8 +56,8 @@ use std::sync::mpsc::{channel, Receiver};
 use crate::contracts::{PtySize, TabId};
 use crate::web::protocol::{
     command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, GitStatusView,
-    HostMessage, NotificationView, ProjectId, ProjectScan, ResizeTerminal, SeatRequest, TerminalId,
-    WireError,
+    HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan, ResizeTerminal, SeatRequest,
+    TerminalId, UploadFile, UploadPlan, WireError, UPLOAD_MIN_VERSION,
 };
 
 pub use config::{EditorEffect, RemoteConfigEditor};
@@ -62,6 +66,7 @@ pub use input::AckFor;
 pub use link::{LinkConfig, LinkEnd, LinkEvent, LinkHandle, LinkOut, LinkState, Outbound};
 pub use mirror::{RemoteWorkspace, WorkerMirror};
 pub use terminals::{RemoteTerminals, StreamPty};
+pub use upload::{LocalFile, UploadPanel};
 pub use worker::{CloneEvent, ProjectPicker};
 
 /// The web interface's default port (`[web] port`).
@@ -247,6 +252,11 @@ pub struct RemoteClient {
     project_scan: Option<ProjectScan>,
     /// A worker's clone progress and results, until taken (v7).
     clone_events: Vec<CloneEvent>,
+    /// A worker's latest upload plan, until taken (v8).
+    upload_plan: Option<UploadPlan>,
+    /// Where and as whom an upload's `PUT` goes: the link's own address,
+    /// token and agent. `None` for a scripted client.
+    http_access: Option<upload_http::HttpAccess>,
     /// The seq of an outstanding `request_snapshot`, so a burst of deltas the
     /// mirror cannot describe asks once.
     resync: Option<u64>,
@@ -256,6 +266,11 @@ impl RemoteClient {
     /// Start dialling. Nothing blocks: the link runs on the shared runtime.
     pub fn connect(config: LinkConfig) -> RemoteClient {
         let (tx, events) = channel();
+        let http_access = upload_http::HttpAccess {
+            address: config.address.clone(),
+            token: config.token.clone(),
+            user_agent: config.user_agent.clone(),
+        };
         let (link, outbound) = LinkHandle::start(config, tx);
         RemoteClient {
             link: Some(link),
@@ -272,6 +287,8 @@ impl RemoteClient {
             dir_listing: None,
             project_scan: None,
             clone_events: Vec::new(),
+            upload_plan: None,
+            http_access: Some(http_access),
             resync: None,
         }
     }
@@ -298,6 +315,8 @@ impl RemoteClient {
             dir_listing: None,
             project_scan: None,
             clone_events: Vec::new(),
+            upload_plan: None,
+            http_access: None,
             resync: None,
         };
         (
@@ -391,6 +410,10 @@ impl RemoteClient {
             }
             LinkEvent::CloneResult(result) => {
                 self.clone_events.push(CloneEvent::Result(result));
+                true
+            }
+            LinkEvent::UploadPlan(plan) => {
+                self.upload_plan = Some(plan);
                 true
             }
         }
@@ -553,6 +576,51 @@ impl RemoteClient {
             cols: size.cols,
             rows: size.rows,
         })
+    }
+
+    /// Whether this worker takes uploads: a worker, attached at protocol v8
+    /// or later ([`UPLOAD_MIN_VERSION`]). A v7 worker has no upload door, and
+    /// a TUI or Desktop host never offers one.
+    pub fn supports_upload(&self) -> bool {
+        self.is_worker() && self.workspace.protocol_version >= UPLOAD_MIN_VERSION
+    }
+
+    /// Ask the worker to take `files` into `dir` (v8). The answer arrives as
+    /// [`RemoteClient::take_upload_plan`]: tickets for
+    /// [`upload_http::put_file`], the names already taken (`on_conflict:
+    /// ask`), or a refusal. `None` — nothing sent — unless
+    /// [`RemoteClient::supports_upload`] and the link is up.
+    pub fn begin_upload(
+        &self,
+        dir: &str,
+        files: &[UploadFile],
+        on_conflict: OnConflict,
+    ) -> Option<u64> {
+        if !self.supports_upload() {
+            return None;
+        }
+        let args = serde_json::json!({
+            "dir": dir,
+            "files": files,
+            "on_conflict": on_conflict,
+        });
+        self.worker_command(worker_command::BEGIN_UPLOAD, Some(args))
+    }
+
+    /// The upload plan the last `begin_upload` produced, once.
+    pub fn take_upload_plan(&mut self) -> Option<UploadPlan> {
+        self.upload_plan.take()
+    }
+
+    /// Where an upload's bytes go, as whom: this link's address, token and
+    /// agent ([`upload_http::put_file`]). `None` for a scripted client.
+    pub fn http_access(&self) -> Option<&upload_http::HttpAccess> {
+        self.http_access.as_ref()
+    }
+
+    /// Give a scripted client somewhere to upload to (tests).
+    pub fn set_http_access(&mut self, access: Option<upload_http::HttpAccess>) {
+        self.http_access = access;
     }
 
     /// The directory listing the last `browse_dir` produced, once.
