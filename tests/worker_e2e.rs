@@ -628,6 +628,13 @@ fn a_cli_minted_code_pairs_and_the_window_attaches_to_a_worker() {
 
     // A code is single use.
     let code: PairingCode = worker.cli_json(&["worker", "pair", "--json"]);
+    // The same code pairs a browser: the link carries it in the fragment.
+    // Plain HTTP here, with no Tailscale to issue a certificate.
+    assert_eq!(
+        code.web_url,
+        Some(format!("http://{}/#{}", worker.addr, code.code)),
+        "{code:?}"
+    );
     on_runtime(exchange_code(&worker.addr, &code.code, &desktop("studio")))
         .expect("the first exchange succeeds");
     assert!(
@@ -635,6 +642,66 @@ fn a_cli_minted_code_pairs_and_the_window_attaches_to_a_worker() {
         "a used code is refused"
     );
     client.stop();
+}
+
+/// `GET <path>` over plain HTTP: the status code and the `Content-Type`.
+fn http_get(addr: &str, path: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).expect("the worker accepts");
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let content_type = text
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, content_type)
+}
+
+/// The worker serves FlightDeck Web (the browser app) on its one port by
+/// default, says where in `worker status`, and not at all with
+/// `[worker] web = false`.
+#[test]
+fn the_worker_serves_the_browser_app_unless_turned_off() {
+    let worker = Worker::start();
+    let (status, content_type) = http_get(&worker.addr, "/");
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    let report = worker.status();
+    let web = report.web.expect("a running worker reports its web app");
+    assert!(web.enabled);
+    assert_eq!(web.url, Some(format!("http://{}", worker.addr)));
+    assert!(!web.https, "no Tailscale here, so no certificate");
+    let text = String::from_utf8_lossy(&worker.cli(&["worker", "status"]).stdout).to_string();
+    assert!(
+        text.contains(&format!("Web: http://{} (HTTPS unavailable:", worker.addr)),
+        "{text}"
+    );
+    drop(worker);
+
+    let mut off = Worker::prepare_with(|config| config.worker.web = false);
+    off.run();
+    let (status, _) = http_get(&off.addr, "/");
+    assert_eq!(status, 404, "the protocol routes only");
+    let code: PairingCode = off.cli_json(&["worker", "pair", "--json"]);
+    assert_eq!(code.web_url, None);
+    let text = String::from_utf8_lossy(&off.cli(&["worker", "status"]).stdout).to_string();
+    assert!(text.contains("Web: off\n"), "{text}");
 }
 
 // ---------------------------------------------------------------------------

@@ -66,8 +66,8 @@ fn registry_with(count: usize) -> (SeatRegistry, Vec<mpsc::Receiver<ServerMsg>>)
 /// The exact attribute set, spelled out, because every one of them is a decision
 /// and a silent change to any of them is a security change.
 #[test]
-fn cookie_is_httponly_lax_and_long_lived_but_never_secure() {
-    let header = set_cookie_value("s3cret-token-value");
+fn cookie_is_httponly_lax_and_long_lived_and_not_secure_over_plain_http() {
+    let header = set_cookie_value("s3cret-token-value", false);
 
     assert!(header.starts_with("flightdeck_web=s3cret-token-value;"));
     assert!(
@@ -87,8 +87,9 @@ fn cookie_is_httponly_lax_and_long_lived_but_never_secure() {
         header.contains(&format!("Max-Age={COOKIE_MAX_AGE_SECS}")),
         "{header}"
     );
-    // The one that would break the feature: this server is plain HTTP on
-    // loopback/LAN (D1), so a `Secure` cookie would never be sent back at all.
+    // The one that would break the feature: an exchange over plain HTTP
+    // (loopback/LAN, D1; a worker's `ws://` Desktop) must not get a `Secure`
+    // cookie, which would never be sent back at all.
     assert!(
         !header.contains("Secure"),
         "a Secure cookie is never sent over http:// — it would break auth, not \
@@ -96,6 +97,17 @@ fn cookie_is_httponly_lax_and_long_lived_but_never_secure() {
     );
     // `SameSite=None` requires Secure, so it cannot appear either.
     assert!(!header.contains("SameSite=None"), "{header}");
+}
+
+/// Over HTTPS (a worker with a Tailscale certificate) the same cookie is
+/// marked `Secure`, and nothing else about it changes.
+#[test]
+fn cookie_issued_over_tls_is_secure_and_otherwise_identical() {
+    let plain = set_cookie_value("s3cret-token-value", false);
+    let secure = set_cookie_value("s3cret-token-value", true);
+    assert_eq!(secure, format!("{plain}; Secure"));
+    assert!(secure.contains("HttpOnly") && secure.contains("SameSite=Lax"));
+    assert!(!secure.contains("SameSite=None"), "{secure}");
 }
 
 #[test]
@@ -838,6 +850,12 @@ fn test_shared_for(host_kind: HostKind) -> Arc<Shared> {
         drain: Arc::new(Drain::default()),
         host_kind,
         serve_assets: host_kind != HostKind::Worker,
+        // As `start_with` gives a worker plan its TLS half.
+        #[cfg(unix)]
+        tls: (host_kind == HostKind::Worker)
+            .then(|| crate::web::tls::Tls::new().ok().map(Arc::new))
+            .flatten(),
+        https_host: Mutex::new(None),
     })
 }
 
@@ -1488,11 +1506,146 @@ fn a_device_label_is_a_desktops_hostname_or_else_the_chip_label() {
         crate::web::server::coarse_user_agent("FlightDeck Terminal/1.33.0 (build-box)"),
         "FlightDeck Terminal"
     );
+    // A browser is named by what it is, whether its label is already the
+    // chip's reduction or the raw user-agent an `Attach` claim carried.
     assert_eq!(
         identity(Some("Chrome on macOS")).device_label(),
-        "100.64.1.9 · Chrome on macOS"
+        "Chrome on macOS (browser)"
+    );
+    assert_eq!(
+        identity(Some(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 \
+             (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ))
+        .device_label(),
+        "Safari on iOS (browser)"
     );
     assert_eq!(identity(None).device_label(), "100.64.1.9");
+}
+
+#[test]
+fn a_browser_device_name_reduces_the_user_agent() {
+    assert_eq!(
+        browser_device_name(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+             Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Chrome on macOS (browser)"
+    );
+    assert_eq!(browser_device_name("Firefox"), "Firefox (browser)");
+    assert_eq!(browser_device_name("  "), "browser");
+    assert_eq!(
+        browser_device_name(&"x".repeat(500)).chars().count(),
+        MAX_LABEL_CHARS + " (browser)".len(),
+        "an unreducible label is capped"
+    );
+}
+
+/// The redirect a plain-HTTP page load gets once a certificate is loaded:
+/// the server's own name, the port it came in on, never `/ws` or `/auth/*`,
+/// never a TLS request, never a POST.
+#[test]
+fn https_redirect_is_for_plain_page_loads_only() {
+    use axum::http::{Method, Uri};
+    let plain = PeerInfo {
+        addr: peer("100.64.0.2", 50_000),
+        local_port: 7420,
+        tls: false,
+    };
+    let uri = |s: &str| s.parse::<Uri>().expect("a uri");
+
+    // No server-side name and no certificate: never.
+    let shared = worker_shared();
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::GET, &uri("/")),
+        None
+    );
+    *shared.https_host.lock().unwrap() = Some("box.tail1234.ts.net".to_string());
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::GET, &uri("/")),
+        None,
+        "a name without a certificate redirects to nothing"
+    );
+}
+
+/// A worker's `Shared`, with no certificate loaded.
+fn worker_shared() -> Arc<Shared> {
+    test_shared_for(HostKind::Worker)
+}
+
+/// With the fixture certificate loaded, the same requests split as the
+/// redirect rule says.
+#[cfg(unix)]
+#[test]
+fn https_redirect_follows_the_certificate() {
+    use axum::http::{Method, Uri};
+    let plain = PeerInfo {
+        addr: peer("100.64.0.2", 50_000),
+        local_port: 7420,
+        tls: false,
+    };
+    let tls = PeerInfo { tls: true, ..plain };
+    let uri = |s: &str| s.parse::<Uri>().expect("a uri");
+    let shared = worker_shared();
+    *shared.https_host.lock().unwrap() = Some("box.tail1234.ts.net".to_string());
+    let key = crate::web::tls::certified_key(
+        include_str!("../../../tests/fixtures/tls/cert.pem"),
+        include_str!("../../../tests/fixtures/tls/key.pem"),
+    )
+    .expect("the fixture loads");
+    shared
+        .tls
+        .as_ref()
+        .expect("a worker has a TLS half")
+        .resolver()
+        .set(Some(Arc::new(key)));
+
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::GET, &uri("/assets/app.js?v=2")).as_deref(),
+        Some("https://box.tail1234.ts.net:7420/assets/app.js?v=2")
+    );
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::HEAD, &uri("/")).as_deref(),
+        Some("https://box.tail1234.ts.net:7420/")
+    );
+    for never in ["/ws", "/auth/session", "/auth/exchange", "/auth"] {
+        assert_eq!(
+            https_redirect(&shared, &plain, &Method::GET, &uri(never)),
+            None,
+            "{never}"
+        );
+    }
+    assert_eq!(https_redirect(&shared, &tls, &Method::GET, &uri("/")), None);
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::POST, &uri("/")),
+        None
+    );
+    // Taken away again: no redirect.
+    shared.tls.as_ref().unwrap().resolver().set(None);
+    assert_eq!(
+        https_redirect(&shared, &plain, &Method::GET, &uri("/")),
+        None
+    );
+}
+
+/// `/auth/session` tells the SPA what it is talking to (the contract with
+/// `webui/`): `"worker"`, else what the host published.
+#[test]
+fn the_effective_host_kind_is_the_workers_or_the_hosts() {
+    let shared = worker_shared();
+    assert_eq!(shared.effective_host_kind(), HostKind::Worker);
+    assert_eq!(
+        serde_json::to_value(HostKind::Worker).unwrap(),
+        serde_json::json!("worker")
+    );
+    assert_eq!(
+        serde_json::to_value(HostKind::Tui).unwrap(),
+        serde_json::json!("tui")
+    );
+    assert_eq!(
+        serde_json::to_value(HostKind::Desktop).unwrap(),
+        serde_json::json!("desktop")
+    );
 }
 
 // ---------------------------------------------------------------------------

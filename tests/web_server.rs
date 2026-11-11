@@ -4822,36 +4822,416 @@ mod worker {
 
     // -- listeners -----------------------------------------------------------
 
-    /// `Fixed` binds every address it is given, and a worker serves only the
-    /// protocol routes: every other path is a 404 (design A5).
+    /// `Fixed` binds every address it is given, and a worker serves the SPA
+    /// exactly when asked (`[worker] web`): with it off, only the protocol
+    /// routes are served and every other path is a 404 (design A5).
     #[test]
-    fn a_worker_binds_every_fixed_address_and_serves_no_spa() {
+    fn a_worker_binds_every_fixed_address_and_serves_the_spa_only_when_asked() {
+        for serve_assets in [true, false] {
+            let harness = start(
+                ServerOptions {
+                    host_kind: HostKind::Worker,
+                    listen: ListenPlan::Fixed(vec![
+                        "127.0.0.1:0".parse().expect("an address"),
+                        "127.0.0.1:0".parse().expect("an address"),
+                    ]),
+                    serve_assets,
+                },
+                worker_state(),
+            );
+            let bound = harness.handle.bound_addrs();
+            assert_eq!(bound.len(), 2, "{bound:?}");
+            assert_eq!(harness.handle.bound_addr(), bound[0]);
+            assert_eq!(harness.handle.listen_status().bound, bound);
+            assert_eq!(harness.handle.listen_status().reason, None);
+
+            on_runtime(async {
+                for addr in &bound {
+                    let root = get(&addr.to_string(), "/", &[]).await;
+                    if serve_assets {
+                        assert_eq!(root.status, 200, "{}", root.body);
+                        assert!(
+                            root.header("content-type")
+                                .is_some_and(|t| t.starts_with("text/html")),
+                            "{:?}",
+                            root.headers
+                        );
+                    } else {
+                        assert_eq!(root.status, 404, "no SPA: {}", root.body);
+                    }
+                    let session = get(&addr.to_string(), "/auth/session", &[]).await;
+                    assert_eq!(session.status, 401, "the protocol routes are served");
+                    // The SPA's first question: what is this host?
+                    assert_eq!(session.json()["host_kind"], "worker", "{}", session.body);
+                }
+            });
+            harness.handle.stop(ShutdownNotice::server_stopped());
+        }
+    }
+
+    /// A TUI's `/auth/session` names it a TUI, signed in or not.
+    #[test]
+    fn the_session_probe_names_the_host_kind() {
+        let harness = Harness::start();
+        let addr = harness.addr();
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let refused = get(&addr, "/auth/session", &[]).await;
+            assert_eq!(refused.status, 401);
+            assert_eq!(refused.json()["host_kind"], "tui", "{}", refused.body);
+            let ok = get(&addr, "/auth/session", &[("Cookie", &cookie)]).await;
+            assert_eq!(ok.status, 200);
+            assert_eq!(ok.json()["authenticated"], true);
+            assert_eq!(ok.json()["host_kind"], "tui", "{}", ok.body);
+        });
+    }
+
+    // -- HTTPS beside HTTP on one port ---------------------------------------
+
+    /// The committed test certificate (`tests/fixtures/tls/README.md`).
+    #[cfg(unix)]
+    const TEST_CERT: &str = include_str!("fixtures/tls/cert.pem");
+    #[cfg(unix)]
+    const TEST_KEY: &str = include_str!("fixtures/tls/key.pem");
+
+    /// A worker serving the SPA on one loopback port, with the fixture
+    /// certificate loaded.
+    #[cfg(unix)]
+    fn start_https_worker() -> Harness {
         let harness = start(
             ServerOptions {
                 host_kind: HostKind::Worker,
-                listen: ListenPlan::Fixed(vec![
-                    "127.0.0.1:0".parse().expect("an address"),
-                    "127.0.0.1:0".parse().expect("an address"),
-                ]),
-                serve_assets: false,
+                listen: ListenPlan::Fixed(vec!["127.0.0.1:0".parse().expect("an address")]),
+                serve_assets: true,
             },
             worker_state(),
         );
-        let bound = harness.handle.bound_addrs();
-        assert_eq!(bound.len(), 2, "{bound:?}");
-        assert_eq!(harness.handle.bound_addr(), bound[0]);
-        assert_eq!(harness.handle.listen_status().bound, bound);
-        assert_eq!(harness.handle.listen_status().reason, None);
+        harness
+            .handle
+            .set_certificate(Some((TEST_CERT, TEST_KEY)))
+            .expect("the fixture loads");
+        assert!(harness.handle.has_certificate());
+        harness
+    }
 
-        on_runtime(async {
-            for addr in &bound {
-                let root = get(&addr.to_string(), "/", &[]).await;
-                assert_eq!(root.status, 404, "no SPA on a worker: {}", root.body);
-                let session = get(&addr.to_string(), "/auth/session", &[]).await;
-                assert_eq!(session.status, 401, "the protocol routes are served");
+    /// A TLS client that trusts exactly the fixture certificate, connected to
+    /// `addr` as `localhost`.
+    #[cfg(unix)]
+    async fn tls_connect(
+        addr: &str,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, ServerName};
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(TEST_CERT.as_bytes()) {
+            roots
+                .add(cert.expect("the fixture parses"))
+                .expect("the fixture is a usable root");
+        }
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS 1.2/1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = TcpStream::connect(addr).await?;
+        let name = ServerName::try_from("localhost").expect("a name");
+        connector.connect(name, tcp).await
+    }
+
+    /// One HTTP/1.1 request over an already-open stream (TLS or not), read to
+    /// the server's close.
+    #[cfg(unix)]
+    async fn request_over<S>(
+        mut stream: S,
+        addr: &str,
+        method: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> HttpResponse
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+        for (name, value) in extra_headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if let Some(body) = body {
+            head.push_str("Content-Type: application/json\r\n");
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        head.push_str("\r\n");
+        head.push_str(body.unwrap_or(""));
+        stream.write_all(head.as_bytes()).await.expect("writable");
+        // A TLS peer may close without a close_notify; what arrived is the
+        // response either way.
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
             }
+        }
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .collect();
+        HttpResponse {
+            status,
+            headers,
+            body: body.to_string(),
+        }
+    }
+
+    /// Exchange a fresh code over `stream`, returning the raw `Set-Cookie`.
+    #[cfg(unix)]
+    async fn exchange_over<S>(stream: S, harness: &Harness) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let code = harness
+            .credentials
+            .lock()
+            .expect("the store lock")
+            .mint_bootstrap_code()
+            .reveal()
+            .to_string();
+        let response = request_over(
+            stream,
+            &harness.addr(),
+            "POST",
+            "/auth/exchange",
+            &[],
+            Some(&serde_json::json!({ "code": code, "label": "Chrome on macOS" }).to_string()),
+        )
+        .await;
+        assert_eq!(response.status, 200, "exchange failed: {}", response.body);
+        response
+            .header("set-cookie")
+            .expect("a cookie is issued")
+            .to_string()
+    }
+
+    /// One port, two protocols: a browser completes a TLS handshake and gets
+    /// the page, while FlightDeck Desktop's plain `/auth/*` and `ws://` keep
+    /// working on the very same port.
+    #[cfg(unix)]
+    #[test]
+    fn one_port_serves_https_and_plain_http() {
+        let harness = start_https_worker();
+        let addr = harness.addr();
+        on_runtime(async {
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            let page = request_over(tls, &addr, "GET", "/", &[], None).await;
+            assert_eq!(page.status, 200, "{}", page.body);
+            assert!(
+                page.header("content-type")
+                    .is_some_and(|t| t.starts_with("text/html")),
+                "{:?}",
+                page.headers
+            );
+
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            let session = request_over(tls, &addr, "GET", "/auth/session", &[], None).await;
+            assert_eq!(session.status, 401);
+            assert_eq!(session.json()["host_kind"], "worker");
+
+            // Plain HTTP on the same port: the protocol routes, unchanged.
+            let session = get(&addr, "/auth/session", &[]).await;
+            assert_eq!(session.status, 401, "{}", session.body);
+        });
+        // And the plain WebSocket a Desktop dials.
+        let cookie = on_runtime(harness.authenticate());
+        on_runtime(async {
+            let mut ws = ws_connect(&addr, Some(&cookie))
+                .await
+                .expect("ws:// upgrades");
+            let snapshot = attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+            assert_eq!(snapshot.host_kind, Some(HostKind::Worker));
+        });
+
+        // And `wss://` with a cookie issued over HTTPS.
+        let secure = on_runtime(async {
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            exchange_over(tls, &harness).await
+        });
+        let pair = secure.split(';').next().expect("name=value").to_string();
+        on_runtime(async {
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            let mut request = format!("wss://localhost:{}/ws", harness.handle.bound_addr().port())
+                .into_client_request()
+                .expect("a ws url");
+            request
+                .headers_mut()
+                .insert("cookie", pair.parse().expect("a header value"));
+            let (ws, _) = tokio_tungstenite::client_async(request, tls)
+                .await
+                .expect("wss:// upgrades over the sniffed TLS");
+            drop(ws);
         });
         harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    /// The cookie is `Secure` exactly when it was issued over HTTPS.
+    #[cfg(unix)]
+    #[test]
+    fn the_cookie_is_secure_over_tls_and_not_over_plain_http() {
+        let harness = start_https_worker();
+        let addr = harness.addr();
+        on_runtime(async {
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            let secure = exchange_over(tls, &harness).await;
+            assert!(secure.contains("; Secure"), "{secure}");
+            assert!(secure.contains("HttpOnly"), "{secure}");
+
+            let plain = TcpStream::connect(&addr).await.expect("the server is up");
+            let plain = exchange_over(plain, &harness).await;
+            assert!(!plain.contains("Secure"), "{plain}");
+        });
+        harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    /// With a certificate and an HTTPS name, a plain page load is sent to
+    /// `https://<name>:<port>`; `/ws` and `/auth/*` never are, nor is anything
+    /// before the certificate is loaded or after it is taken away.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_page_load_is_redirected_to_https_and_the_protocol_never_is() {
+        let harness = start(
+            ServerOptions {
+                host_kind: HostKind::Worker,
+                listen: ListenPlan::Fixed(vec!["127.0.0.1:0".parse().expect("an address")]),
+                serve_assets: true,
+            },
+            worker_state(),
+        );
+        let addr = harness.addr();
+        let port = harness.handle.bound_addr().port();
+        harness
+            .handle
+            .set_https_host(Some("box.tail1234.ts.net".to_string()));
+        on_runtime(async {
+            let root = get(&addr, "/", &[]).await;
+            assert_eq!(root.status, 200, "no certificate yet: no redirect");
+        });
+
+        harness
+            .handle
+            .set_certificate(Some((TEST_CERT, TEST_KEY)))
+            .expect("the fixture loads");
+        on_runtime(async {
+            let root = get(&addr, "/?x=1", &[]).await;
+            assert_eq!(root.status, 308, "{}", root.body);
+            assert_eq!(
+                root.header("location"),
+                Some(format!("https://box.tail1234.ts.net:{port}/?x=1").as_str())
+            );
+            assert_eq!(root.header("cache-control"), Some("no-store"));
+            let asset = get(&addr, "/assets/index.js", &[]).await;
+            assert_eq!(asset.status, 308);
+
+            let session = get(&addr, "/auth/session", &[]).await;
+            assert_eq!(session.status, 401, "/auth/* is never redirected");
+            let exchange = post_json(&addr, "/auth/exchange", &[], "{\"code\":\"0000\"}").await;
+            assert_ne!(exchange.status, 308);
+            let ws = get(&addr, "/ws", &[]).await;
+            assert_ne!(ws.status, 308, "/ws is never redirected: {}", ws.status);
+
+            // Over TLS the page is served, not redirected.
+            let tls = tls_connect(&addr).await.expect("the handshake completes");
+            let page = request_over(tls, &addr, "GET", "/", &[], None).await;
+            assert_eq!(page.status, 200);
+        });
+
+        harness.handle.set_certificate(None).expect("cleared");
+        on_runtime(async {
+            let root = get(&addr, "/", &[]).await;
+            assert_eq!(root.status, 200, "the certificate is gone: no redirect");
+        });
+        harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    /// A TLS ClientHello while no certificate is loaded is closed — there is
+    /// nothing honest to present — and plain HTTP is unaffected.
+    #[cfg(unix)]
+    #[test]
+    fn a_tls_hello_with_no_certificate_is_closed() {
+        let harness = start(
+            ServerOptions {
+                host_kind: HostKind::Worker,
+                listen: ListenPlan::Fixed(vec!["127.0.0.1:0".parse().expect("an address")]),
+                serve_assets: true,
+            },
+            worker_state(),
+        );
+        let addr = harness.addr();
+        assert!(!harness.handle.has_certificate());
+        on_runtime(async {
+            assert!(tls_connect(&addr).await.is_err(), "the handshake must fail");
+            let root = get(&addr, "/", &[]).await;
+            assert_eq!(root.status, 200);
+        });
+        harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    /// A TUI/Desktop server (`Configured`) never serves HTTPS (PRD W23): it
+    /// refuses a certificate rather than half-taking it.
+    #[test]
+    fn a_configured_server_refuses_a_certificate() {
+        let harness = Harness::start();
+        let cert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert!(harness.handle.set_certificate(Some((cert, cert))).is_err());
+        assert!(!harness.handle.has_certificate());
+        harness.handle.stop(ShutdownNotice::server_stopped());
+    }
+
+    /// A browser that takes the worker's window over is named as a browser.
+    #[test]
+    fn a_browser_is_named_as_a_browser_in_takeover() {
+        let harness = start_worker();
+        let addr = harness.addr();
+        let (desktop_cookie, browser_cookie) =
+            on_runtime(async { (harness.authenticate().await, harness.authenticate().await) });
+        on_runtime(async {
+            let mut desktop = ws_connect(&addr, Some(&desktop_cookie))
+                .await
+                .expect("upgrade");
+            attach_as(&mut desktop, ConnectionKind::Window, "box-a", None).await;
+            // `ws_connect` sends a Chrome-on-macOS user-agent and the attach
+            // claims nothing of its own.
+            let mut browser = ws_connect(&addr, Some(&browser_cookie))
+                .await
+                .expect("upgrade");
+            attach(&mut browser, SeatRequest::Write).await;
+            let snapshot = await_snapshot(&mut browser).await;
+            assert_eq!(
+                snapshot
+                    .worker
+                    .and_then(|w| w.connections.window)
+                    .map(|w| w.label)
+                    .as_deref(),
+                Some("Chrome on macOS (browser)")
+            );
+            let (frames, _) = drain_frames(&mut desktop, WAIT).await;
+            assert_eq!(
+                taken_over_in(&frames).as_deref(),
+                Some("Chrome on macOS (browser)"),
+                "{frames:?}"
+            );
+        });
     }
 
     #[test]
@@ -4886,6 +5266,7 @@ mod worker {
             FixedTailscaleProbe(Some(TailscaleStatus {
                 magic_dns: Some("box.tail1234.ts.net".to_string()),
                 ips: vec!["127.0.0.1".parse().expect("an address")],
+                cert_domains: Vec::new(),
             })),
         ] {
             let harness = start(

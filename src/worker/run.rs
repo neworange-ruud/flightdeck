@@ -179,6 +179,7 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
             crate::VERSION
         ),
     );
+    let certs = cert_setup(&listen, paths);
     let opts = WorkerOptions {
         paths: paths.clone(),
         home: paths.home.clone(),
@@ -187,6 +188,7 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
         health: Box::new(RealHealthProbe),
         cloner: std::sync::Arc::new(RealGitCloner),
         listen,
+        certs,
     };
     let mut host = match AppHost::open_worker(env, &notifier, opts) {
         Ok(host) => host,
@@ -369,6 +371,30 @@ fn tailscale_plan(port: u16) -> ListenPlan {
         source: std::sync::Arc::new(RealAddressSource),
         probe: std::sync::Arc::new(CliTailscaleProbe),
         poll: LISTEN_POLL,
+    }
+}
+
+#[cfg(unix)]
+/// The HTTPS certificate's lifecycle on a Tailscale plan: the same probe the
+/// listener asks, the files under `~/.flightdeck/worker/tls`, and a thread
+/// per fetch. `None` on any other plan (the test seam): no Tailscale, no
+/// certificate.
+fn cert_setup(
+    listen: &ListenPlan,
+    paths: &WorkerPaths,
+) -> Option<crate::host::worker::tls::CertSetup> {
+    use crate::host::worker::tls::{thread_spawner, CertSetup, DiskCertFiles};
+    match listen {
+        ListenPlan::Tailscale { probe, .. } => Some(CertSetup {
+            probe: std::sync::Arc::clone(probe),
+            files: Box::new(DiskCertFiles::new(
+                paths.tls_dir.clone(),
+                paths.tls_cert.clone(),
+                paths.tls_key.clone(),
+            )),
+            spawn: thread_spawner(),
+        }),
+        ListenPlan::Configured { .. } | ListenPlan::Fixed(_) => None,
     }
 }
 

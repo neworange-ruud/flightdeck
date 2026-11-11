@@ -142,6 +142,7 @@ impl ControlTarget for FakeTarget {
             projects: Vec::new(),
             unread_messages: 0,
             phone: None,
+            web: None,
         }
     }
     fn pair(&mut self) -> PairingCode {
@@ -152,6 +153,7 @@ impl ControlTarget for FakeTarget {
             address: Some("box.ts.net:7420".to_string()),
             listening: true,
             not_listening_reason: None,
+            web_url: Some("https://box.ts.net:7420/#4821".to_string()),
         }
     }
     fn paired_devices(&self) -> Vec<DeviceReport> {

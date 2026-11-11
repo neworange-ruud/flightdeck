@@ -50,7 +50,8 @@ pub fn run_pair_phone(json: bool) -> i32 {
     })
 }
 
-/// `flightdeck worker devices [--json]`: the paired Desktops.
+/// `flightdeck worker devices [--json]`: the paired devices (Desktops and
+/// browsers).
 pub fn run_devices(json: bool) -> i32 {
     with_paths(|paths, out, err| devices_to(paths, json, RealClock.now_unix_secs(), out, err))
 }
@@ -189,7 +190,7 @@ fn pair_to(paths: &WorkerPaths, json: bool, out: &mut dyn Write, err: &mut dyn W
 }
 
 /// `worker pair` for a person (PRD §4.1): the code, how long it lasts, the
-/// address to type and where, and a warning when no Desktop can reach the
+/// address to type, the link a browser opens, and a warning when no device can reach the
 /// worker yet.
 fn render_pair(code: &PairingCode) -> String {
     let mut out = format!(
@@ -200,17 +201,23 @@ fn render_pair(code: &PairingCode) -> String {
         Some(address) => out.push_str(&format!("Address:      {address}\n")),
         None => out.push_str("Address:      none yet (the worker is not listening)\n"),
     }
+    if let Some(url) = &code.web_url {
+        out.push_str(&format!("In a browser: {url}\n"));
+    }
     out.push_str(
         "\nIn FlightDeck Desktop, choose \"Connect to remote…\", enter the address, \
          then the code.\n",
     );
+    if code.web_url.is_some() {
+        out.push_str("In a browser, open the link: it carries the code.\n");
+    }
     if !code.listening {
         let why = code
             .not_listening_reason
             .as_deref()
             .unwrap_or("unknown reason");
         out.push_str(&format!(
-            "\nWarning: the worker is not listening ({why}), so no Desktop can reach it yet.\n\
+            "\nWarning: the worker is not listening ({why}), so no device can reach it yet.\n\
              It starts listening as soon as Tailscale gives this machine an address; \
              mint a new code if this one expires first.\n"
         ));
@@ -400,7 +407,7 @@ fn render_phones(phones: &[PhoneReport]) -> String {
 /// `worker devices` for a person: a table, or how to pair one.
 fn render_devices(devices: &[DeviceReport], now: u64) -> String {
     if devices.is_empty() {
-        return "No paired Desktops. Pair one with `flightdeck worker pair`.\n".to_string();
+        return "No paired devices. Pair one with `flightdeck worker pair`.\n".to_string();
     }
     let header = ["ID", "LABEL", "STATE", "PAIRED", "LAST SEEN", "ADDRESS"].map(String::from);
     let rows: Vec<[String; 6]> = devices

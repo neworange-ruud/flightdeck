@@ -30,9 +30,9 @@ pub enum ControlRequest {
     Status,
     /// Mint a single-use pairing code (`worker pair`).
     Pair,
-    /// Paired Desktops (`worker devices`).
+    /// Paired devices: Desktops and browsers (`worker devices`).
     Devices,
-    /// Revoke a Desktop's token and close its connections, or unpair a
+    /// Revoke a device's token and close its connections, or unpair a
     /// phone (`worker revoke`). `device` is an id, a label or a unique id
     /// prefix.
     Revoke { device: String },
@@ -92,9 +92,16 @@ pub struct PairingCode {
     pub address: Option<String>,
     pub listening: bool,
     pub not_listening_reason: Option<String>,
+    /// The link a browser opens to pair (`https://<name>:<port>/#<code>`
+    /// while HTTPS is served, else `http://<address>/#<code>`); the code
+    /// rides in the fragment, which a browser never sends anywhere. `None`
+    /// while `[worker] web` is off or the worker is not listening, and from
+    /// a worker that predates the browser app.
+    #[serde(default)]
+    pub web_url: Option<String>,
 }
 
-/// One paired Desktop.
+/// One paired device: a FlightDeck Desktop or a browser.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceReport {
     /// The credential's token id: what `worker revoke` takes.
@@ -111,7 +118,7 @@ pub struct DeviceReport {
     pub revoked: bool,
 }
 
-/// Whether a paired Desktop is connected, and how.
+/// Whether a paired device is connected, and how.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceState {

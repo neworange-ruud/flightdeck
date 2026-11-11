@@ -697,6 +697,18 @@ pub struct WorkerConfig {
     /// `flightdeck worker pair --phone`.
     #[serde(default)]
     pub phone: bool,
+    /// Serve FlightDeck Web (the browser app) on `port` too, beside the
+    /// protocol FlightDeck Desktop uses. On by default; off, every path but
+    /// the protocol's is a 404. Pair a browser with `flightdeck worker pair`.
+    #[serde(default = "default_true")]
+    pub web: bool,
+    /// Serve the browser app over HTTPS, with a certificate `tailscale cert`
+    /// issues for this machine's MagicDNS name, on the same port (Desktop
+    /// keeps using plain `ws://`). On by default, but only ever used when the
+    /// tailnet's admin has enabled HTTPS certificates; otherwise, or when
+    /// this is off, the browser app is served over plain HTTP. Needs `web`.
+    #[serde(default = "default_true")]
+    pub https: bool,
 }
 
 impl Default for WorkerConfig {
@@ -707,6 +719,8 @@ impl Default for WorkerConfig {
             default_cols: default_worker_cols(),
             default_rows: default_worker_rows(),
             phone: false,
+            web: true,
+            https: true,
         }
     }
 }
