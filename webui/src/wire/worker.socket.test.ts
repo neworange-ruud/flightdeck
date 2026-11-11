@@ -1,0 +1,337 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createStore } from "../ui/store";
+import { createInitialState } from "../state/types";
+import { fixtureSnapshot } from "../state/fixture";
+import type { WireNotificationView, WireSnapshot } from "./frames";
+import { openSession } from "./socket";
+import { workerProject, workerSnapshotWire, workerWire } from "./workerFixture";
+
+/**
+ * The transport's half of a worker's window (`remote-control-vjtb`), driven
+ * through an injected socket like `socket.test.ts`: takeover is terminal and
+ * only `reconnect()` redials, W5's resize goes only to a worker and only when
+ * the size changed, and the worker's frames land in the store instead of
+ * costing a resync.
+ */
+
+interface FakeSocket {
+  onopen: (() => void) | null;
+  onmessage: ((event: { data: string }) => void) | null;
+  onclose: (() => void) | null;
+  onerror: (() => void) | null;
+  readyState: number;
+  readonly sent: Record<string, unknown>[];
+  send(data: string): void;
+  close(): void;
+}
+
+function fakeSocket(): FakeSocket {
+  const socket: FakeSocket = {
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+    readyState: 1,
+    sent: [],
+    send(data: string) {
+      socket.sent.push(JSON.parse(data) as Record<string, unknown>);
+    },
+    close() {
+      socket.readyState = 3;
+    },
+  };
+  return socket;
+}
+
+function harness(options: { onNotification?: (n: WireNotificationView) => void } = {}) {
+  const store = createStore(createInitialState());
+  const sockets: FakeSocket[] = [];
+  const session = openSession({
+    store,
+    url: "ws://test/ws",
+    socketFactory: () => {
+      const ws = fakeSocket();
+      sockets.push(ws);
+      return ws as unknown as WebSocket;
+    },
+    ...(options.onNotification === undefined
+      ? {}
+      : { onNotification: options.onNotification }),
+  });
+  const current = (): FakeSocket => {
+    const ws = sockets[sockets.length - 1];
+    if (ws === undefined) {
+      throw new Error("no socket");
+    }
+    return ws;
+  };
+  const deliver = (frame: unknown): void => {
+    current().onmessage?.({ data: JSON.stringify(frame) });
+  };
+  const attach = (snapshot: WireSnapshot = workerSnapshotWire()): void => {
+    current().onopen?.();
+    deliver(snapshot);
+  };
+  const sentOfType = (type: string): Record<string, unknown>[] =>
+    sockets.flatMap((ws) => ws.sent).filter((frame) => frame.type === type);
+  return { store, session, sockets, current, deliver, attach, sentOfType };
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("takeover is terminal (W17)", () => {
+  it("does not redial after taken_over, and reconnect() takes the worker back", () => {
+    const h = harness();
+    h.attach();
+    h.deliver({ type: "taken_over", by: "FlightDeck Desktop (laptop)" });
+    h.current().onclose?.();
+
+    expect(h.store.getState().connection).toBe("taken_over");
+    expect(h.store.getState().takenOverBy).toBe("FlightDeck Desktop (laptop)");
+    vi.advanceTimersByTime(60_000);
+    expect(h.sockets).toHaveLength(1);
+
+    h.session.reconnect();
+    expect(h.sockets).toHaveLength(2);
+    expect(h.store.getState().connection).toBe("connecting");
+    h.attach();
+    expect(h.sentOfType("attach")).toHaveLength(2);
+    expect(h.store.getState().connection).toBe("connected");
+  });
+
+  it("an ordinary close still retries, as it always has", () => {
+    const h = harness();
+    h.attach();
+    h.current().onclose?.();
+    vi.advanceTimersByTime(1_000);
+    expect(h.sockets.length).toBeGreaterThan(1);
+  });
+});
+
+describe("resize_terminal (W5)", () => {
+  it("is sent to a worker for the terminal on screen, once per size", () => {
+    const h = harness();
+    h.attach();
+    expect(h.session.resizeTerminal("worker:shell", 120, 40)).toBe(true);
+    expect(h.session.resizeTerminal("worker:shell", 120, 40)).toBe(false);
+    expect(h.session.resizeTerminal("worker:shell", 100, 40)).toBe(true);
+    expect(h.session.resizeTerminal("t-agent", 100, 40)).toBe(true);
+    expect(h.sentOfType("resize_terminal")).toEqual([
+      { type: "resize_terminal", terminal_id: "worker:shell", cols: 120, rows: 40 },
+      { type: "resize_terminal", terminal_id: "worker:shell", cols: 100, rows: 40 },
+      { type: "resize_terminal", terminal_id: "t-agent", cols: 100, rows: 40 },
+    ]);
+  });
+
+  it("is sent again after a reattach — whoever held the worker may have resized it", () => {
+    const h = harness();
+    h.attach();
+    h.session.resizeTerminal("worker:shell", 120, 40);
+    h.deliver({ type: "taken_over", by: "x" });
+    h.session.reconnect();
+    h.attach();
+    expect(h.session.resizeTerminal("worker:shell", 120, 40)).toBe(true);
+  });
+
+  it("is never sent to a TUI or Desktop host (D4)", () => {
+    const h = harness();
+    h.attach({ ...fixtureWire(), host_kind: "tui" });
+    expect(h.session.resizeTerminal("t1", 120, 40)).toBe(false);
+    expect(h.sentOfType("resize_terminal")).toEqual([]);
+  });
+});
+
+describe("a worker's deltas land in the store", () => {
+  it("geometry is per terminal on a worker, and D4's one grid elsewhere", () => {
+    const h = harness();
+    h.attach(workerSnapshotWire({ projects: [workerProject()] }));
+    h.deliver({
+      type: "delta",
+      change: "geometry",
+      terminal_id: "t-agent",
+      geometry: { cols: 150, rows: 50 },
+    });
+    expect(h.store.getState().terminalGeometry["t-agent"]).toEqual({ cols: 150, rows: 50 });
+    expect(h.store.getState().geometry).toEqual({ cols: 80, rows: 24 });
+
+    const tui = harness();
+    tui.attach({ ...fixtureWire(), host_kind: "tui" });
+    tui.deliver({
+      type: "delta",
+      change: "geometry",
+      terminal_id: "t1",
+      geometry: { cols: 150, rows: 50 },
+    });
+    expect(tui.store.getState().geometry).toEqual({ cols: 150, rows: 50 });
+  });
+
+  it("health, the shell, status and connections are applied, not resynced", () => {
+    const h = harness();
+    h.attach();
+    h.deliver({ type: "delta", change: "health", ...workerWire().health, agents_total: 7 });
+    h.deliver({
+      type: "delta",
+      change: "worker_shell",
+      terminal_id: "worker:shell",
+      title: "Worker shell",
+      geometry: { cols: 99, rows: 33 },
+      byte_len: 10,
+      replay_from: 0,
+      alive: false,
+      exit_code: 0,
+    });
+    h.deliver({
+      type: "delta",
+      change: "worker_status",
+      projects_root: "/home/me/src",
+      unread_messages: 2,
+    });
+    h.deliver({
+      type: "delta",
+      change: "connections",
+      window: { label: "this", since_ms: 1, same_device: true },
+      background_links: 2,
+    });
+    const worker = h.store.getState().worker;
+    expect(worker?.health?.agentsTotal).toBe(7);
+    expect(worker?.shell).toEqual({
+      terminalId: "worker:shell",
+      title: "Worker shell",
+      alive: false,
+      exitCode: 0,
+    });
+    expect(h.store.getState().terminalGeometry["worker:shell"]).toEqual({ cols: 99, rows: 33 });
+    expect(worker?.status.projectsRoot).toBe("/home/me/src");
+    expect(worker?.connections.backgroundLinks).toBe(2);
+    vi.advanceTimersByTime(500);
+    /** No resync was asked for any of them. */
+    expect(
+      h.sentOfType("command").filter((c) => c.name === "request_snapshot"),
+    ).toEqual([]);
+  });
+
+  it("a host message is the notice once, however often it arrives", () => {
+    const h = harness();
+    h.attach();
+    const message = { type: "delta", change: "host_message", id: 3, at_ms: 9, level: "info", text: "hi" };
+    h.deliver(message);
+    expect(h.store.getState().notice).toBe("hi");
+    h.store.dispatch({ type: "notice/set", notice: null });
+    h.deliver(message);
+    expect(h.store.getState().notice).toBeNull();
+  });
+
+  it("the kept messages are shown once, as one panel, however many snapshots carry them", () => {
+    const h = harness();
+    const kept = workerSnapshotWire({
+      worker: workerWire({
+        host_messages: [
+          { id: 1, at_ms: 1, level: "info", text: "update available" },
+          { id: 2, at_ms: 2, level: "error", text: "clone failed" },
+        ],
+      }),
+    });
+    h.attach(kept);
+    expect(h.store.getState().readOnly).toEqual({
+      kind: "message",
+      title: "While you were away",
+      text: "2 messages while you were away\nupdate available\nError: clone failed",
+    });
+    h.store.dispatch({ type: "readOnly/close" });
+    h.deliver(kept);
+    expect(h.store.getState().readOnly).toBeNull();
+  });
+
+  it("a notification is handed to the page, which decides where it goes", () => {
+    const seen: WireNotificationView[] = [];
+    const h = harness({ onNotification: (n) => seen.push(n) });
+    h.attach();
+    h.deliver({
+      type: "delta",
+      change: "notification",
+      at_ms: 5,
+      title: "alpha needs you",
+      body: "fix-login is waiting",
+      sound: "input_required",
+    });
+    expect(seen).toEqual([
+      { type: "delta", change: "notification", at_ms: 5, title: "alpha needs you", body: "fix-login is waiting", sound: "input_required" },
+    ]);
+  });
+});
+
+describe("the picker's answers", () => {
+  it("reach the picker, and an error naming its request is its refusal", () => {
+    const h = harness();
+    h.attach();
+    h.store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+    const seq = h.session.sendCommand("browse_dir", { show_hidden: false });
+    h.store.dispatch({ type: "picker/sent", sent: { kind: "browse" }, seq });
+    h.deliver({
+      type: "dir_listing",
+      seq,
+      path: "/home/me",
+      parent: null,
+      home: "/home/me",
+      entries: [{ name: "code", path: "/home/me/code", is_git_repo: true }],
+    });
+    expect(h.store.getState().picker?.entries).toEqual([
+      { name: "code", path: "/home/me/code", isGitRepo: true, isOpenProject: false },
+    ]);
+
+    const bad = h.session.sendCommand("browse_dir", { path: 4 });
+    h.store.dispatch({ type: "picker/sent", sent: { kind: "browse" }, seq: bad });
+    h.deliver({ type: "error", code: "bad_request", message: "`path` must be a string", seq: bad });
+    expect(h.store.getState().picker?.error).toBe("`path` must be a string");
+  });
+
+  it("a scan and a clone's progress reach the picker", () => {
+    const h = harness();
+    h.attach();
+    h.store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+    const scan = h.session.sendCommand("scan_projects");
+    h.store.dispatch({ type: "picker/sent", sent: { kind: "scan" }, seq: scan });
+    h.deliver({
+      type: "project_scan",
+      seq: scan,
+      root: "/home/me/flightdeck",
+      root_exists: true,
+      repos: [{ name: "alpha", path: "/home/me/flightdeck/alpha" }],
+    });
+    expect(h.store.getState().picker?.scanned?.repos.map((r) => r.name)).toEqual(["alpha"]);
+
+    const clone = h.session.sendCommand("clone_project", { url: "u" });
+    h.store.dispatch({ type: "picker/sent", sent: { kind: "clone", url: "u" }, seq: clone });
+    h.deliver({ type: "clone_progress", clone_id: clone, url: "u", phase: "Receiving", percent: 10 });
+    expect(h.store.getState().picker?.clone?.percent).toBe(10);
+    h.deliver({
+      type: "clone_result",
+      clone_id: clone,
+      url: "u",
+      ok: true,
+      path: "/home/me/flightdeck/u",
+      project_id: "p-u",
+    });
+    expect(h.store.getState().picker).toBeNull();
+    expect(h.store.getState().pendingOpen).toEqual({
+      path: "/home/me/flightdeck/u",
+      projectId: "p-u",
+    });
+  });
+});
+
+/** The TUI fixture as a wire snapshot — enough of one for a socket to attach. */
+function fixtureWire(): WireSnapshot {
+  const snapshot = fixtureSnapshot();
+  return {
+    ...workerSnapshotWire(),
+    host_kind: "tui",
+    worker: null,
+    geometry: { cols: snapshot.geometry.cols, rows: snapshot.geometry.rows },
+  };
+}
