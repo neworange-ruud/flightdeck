@@ -325,6 +325,84 @@ describe("the picker's answers", () => {
   });
 });
 
+describe("the upload panel's answers (v8)", () => {
+  function asking(h: ReturnType<typeof harness>): number {
+    h.attach();
+    h.store.dispatch({
+      type: "upload/open",
+      picked: [{ kind: "file", file: { name: "a.txt", size: 3, source: new Blob(["abc"]) } }],
+    });
+    const seq = h.session.sendCommand("begin_upload", {
+      dir: "/home/me",
+      files: [{ name: "a.txt", size: 3 }],
+      on_conflict: "ask",
+    });
+    h.store.dispatch({ type: "upload/requested", seq, onConflict: "ask" });
+    return seq;
+  }
+
+  it("an upload_plan reaches the panel, and its ack does not unsettle it", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({
+      type: "upload_plan",
+      seq,
+      dir: "/home/me",
+      files: [{ name: "a.txt", final_name: "a.txt", ticket: "t-1" }],
+    });
+    h.deliver({ type: "ack", seq, outcome: "applied" });
+    const upload = h.store.getState().upload;
+    expect(upload?.phase.kind).toBe("uploading");
+    if (upload?.phase.kind !== "uploading") {
+      throw new Error("uploading");
+    }
+    expect(upload.phase.items[0]?.ticket).toBe("t-1");
+  });
+
+  it("a conflicts plan asks, naming the taken files", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({ type: "ack", seq, outcome: "applied", detail: "1 name is taken" });
+    h.deliver({
+      type: "upload_plan",
+      seq,
+      dir: "/home/me",
+      files: [{ name: "a.txt", final_name: "a.txt", exists: true }],
+      conflicts: true,
+    });
+    expect(h.store.getState().upload?.phase).toEqual({
+      kind: "asking",
+      dir: "/home/me",
+      conflicts: ["a.txt"],
+    });
+  });
+
+  it("a refusal, by ack or by error, is the panel's note", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({
+      type: "ack",
+      seq,
+      outcome: "rejected",
+      detail: "That folder is outside your home folder.",
+    });
+    h.deliver({
+      type: "upload_plan",
+      seq,
+      dir: "/home/me",
+      files: [],
+      refusal: "That folder is outside your home folder.",
+    });
+    expect(h.store.getState().upload?.phase).toEqual({ kind: "choosing" });
+    expect(h.store.getState().upload?.note).toBe("That folder is outside your home folder.");
+
+    const again = h.session.sendCommand("begin_upload", {});
+    h.store.dispatch({ type: "upload/requested", seq: again, onConflict: "ask" });
+    h.deliver({ type: "error", code: "not_supported", message: "`dir` is missing", seq: again });
+    expect(h.store.getState().upload?.note).toBe("`dir` is missing");
+  });
+});
+
 /** The TUI fixture as a wire snapshot — enough of one for a socket to attach. */
 function fixtureWire(): WireSnapshot {
   const snapshot = fixtureSnapshot();

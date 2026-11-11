@@ -144,6 +144,10 @@ export interface WireSessionView {
   readonly lifecycle_reporting: boolean;
   readonly recovered?: boolean;
   readonly attached_existing_branch?: boolean;
+  /** The absolute folder the session runs in on the host: its worktree, or
+   * the project root for a session on the base branch. Empty (or absent) from
+   * a host that predates the field. */
+  readonly worktree_path?: string;
 }
 
 export interface WireProjectView {

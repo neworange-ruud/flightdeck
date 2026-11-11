@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { expect, test, type Browser, type Page } from "@playwright/test";
 
 import {
@@ -14,7 +17,7 @@ import {
  * `remote-control-vjtb`) — end to end, against the real `flightdeck worker run`
  * serving this SPA from its own binary.
  *
- * Three things only a real worker and a real browser can prove together:
+ * Four things only a real worker and a real browser can prove together:
  *
  * 1. **W5/W15, the shell is sized to the window.** A worker has no pane of
  *    its own, so the browser measures its pane and the worker sizes the PTY to
@@ -23,7 +26,11 @@ import {
  * 2. **W9, Open Project is the picker.** Browse `$HOME` into the projects
  *    root, see the fixture repository listed as a git repository, open it from
  *    the scan, and land on its tab.
- * 3. **W17, takeover is terminal.** A second window takes the worker; the
+ * 3. **W34, Upload files.** Two files chosen in the browser land in the
+ *    selected project with their exact bytes, over the real `PUT /upload`;
+ *    the same names again are a conflict, and Keep both writes `name (1).ext`
+ *    beside them. A dropped file opens the same panel.
+ * 4. **W17, takeover is terminal.** A second window takes the worker; the
  *    first shows who took it and does **not** take it back on its own — then
  *    "Take it back" does, and the other window is the one that stops.
  *
@@ -200,6 +207,104 @@ test("Open Project browses and scans the worker, and opens a repository (W9)", a
   await expect(tab).toHaveAttribute("aria-selected", "true");
   await expect(page.locator(".fd-workercard[data-kind='empty']")).toBeHidden();
 
+  await page.context().close();
+});
+
+/**
+ * W34 / R30: Upload files, against the real `PUT /upload/<ticket>`. Runs after
+ * Open Project, so the fixture repository is the selected project and so the
+ * default folder.
+ */
+const NOTES = "hello from the browser\n";
+/** Big enough to take more than one progress event; deterministic bytes. */
+const DATA = Buffer.from(Array.from({ length: 300_000 }, (_, i) => (i * 31 + 7) % 251));
+
+function onDisk(name: string): Buffer {
+  return readFileSync(join(running().repoDir, name));
+}
+
+async function uploadInto(page: Page): Promise<void> {
+  await page.locator("[data-upload-input]").setInputFiles([
+    { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from(NOTES) },
+    { name: "data.bin", mimeType: "application/octet-stream", buffer: DATA },
+  ]);
+}
+
+test("Upload files puts their bytes in the selected project (W34)", async ({ browser }) => {
+  const page = await openWindow(browser);
+  const tab = page.getByRole("tab", { name: FIXTURE_REPO });
+  await expect(tab).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator('[data-action="upload-files"]')).toBeVisible();
+
+  await uploadInto(page);
+  const panel = page.locator(".fd-upload");
+  await expect(panel).toBeVisible();
+  await expect(panel.locator('[data-list="files"] li')).toHaveCount(2);
+  await expect(panel.locator(".fd-upload__dir")).toHaveValue(new RegExp(`/${FIXTURE_REPO}$`));
+
+  await panel.locator('[data-action="upload"]').click();
+  await expect(panel.locator("[data-summary]")).toHaveText(/^Uploaded 2 files to /, {
+    timeout: 30_000,
+  });
+  expect(onDisk("notes.txt").toString("utf8")).toBe(NOTES);
+  expect(onDisk("data.bin").equals(DATA)).toBe(true);
+
+  /** The same names again: nothing is overwritten until asked, and Keep both
+   * saves the new files beside the old under numbered names. */
+  await panel.locator('[data-action="upload-more"]').click();
+  await uploadInto(page);
+  await panel.locator('[data-action="upload"]').click();
+  const conflicts = panel.locator('[data-list="conflicts"] li');
+  await expect(conflicts).toHaveCount(2);
+  await expect(panel.locator('[data-list="conflicts"]')).toContainText("notes.txt");
+  await panel.locator('[data-action="keep-both"]').click();
+  await expect(panel.locator("[data-summary]")).toHaveText(/^Uploaded 2 files to /, {
+    timeout: 30_000,
+  });
+  expect(onDisk("notes (1).txt").toString("utf8")).toBe(NOTES);
+  expect(onDisk("data (1).bin").equals(DATA)).toBe(true);
+  expect(onDisk("notes.txt").toString("utf8")).toBe(NOTES);
+
+  await panel.locator('[data-action="close-done"]').click();
+  await expect(panel).toBeHidden();
+  await page.context().close();
+});
+
+test("dropping a file on the window opens the upload panel (R30)", async ({ browser }) => {
+  const page = await openWindow(browser);
+  /** A real `DragEvent` carrying a real `DataTransfer` with a `File` — what a
+   * drop from the desktop delivers, short of the operating system. */
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.items.add(new File(["dropped bytes\n"], "dropped.txt", { type: "text/plain" }));
+    const frame = document.querySelector(".fd-frame");
+    frame?.dispatchEvent(
+      new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: data }),
+    );
+    (window as unknown as { fdDrop: DataTransfer }).fdDrop = data;
+  });
+  await expect(page.locator(".fd-dropzone")).toBeVisible();
+  await expect(page.locator(".fd-dropzone")).toContainText("Drop files to upload to");
+  await page.evaluate(() => {
+    const data = (window as unknown as { fdDrop: DataTransfer }).fdDrop;
+    document
+      .querySelector(".fd-frame")
+      ?.dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }),
+      );
+  });
+  await expect(page.locator(".fd-dropzone")).toBeHidden();
+  const panel = page.locator(".fd-upload");
+  await expect(panel).toBeVisible();
+  await expect(panel.locator('[data-list="files"] li[data-name="dropped.txt"]')).toBeVisible();
+
+  await panel.locator('[data-action="upload"]').click();
+  await expect(panel.locator("[data-summary]")).toHaveText(/^Uploaded 1 file to /, {
+    timeout: 30_000,
+  });
+  expect(onDisk("dropped.txt").toString("utf8")).toBe("dropped bytes\n");
+  await page.keyboard.press("Escape");
+  await expect(panel).toBeHidden();
   await page.context().close();
 });
 

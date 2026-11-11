@@ -7,6 +7,7 @@ import {
   hostMessageOf,
   projectScanOf,
   snapshotFromWire,
+  uploadPlanOf,
 } from "./adapt";
 import type { WireHostMessage } from "./frames";
 import { workerProject, workerSnapshotWire, workerWire } from "./workerFixture";
@@ -48,6 +49,67 @@ describe("a worker's snapshot", () => {
       "worker:shell": { cols: 80, rows: 24 },
     });
     expect(snapshot.projects[0]?.root).toBe("/home/me/flightdeck/alpha");
+  });
+
+  it("keeps each session's worktree, and the version it was answered at (R30)", () => {
+    const project = workerProject();
+    const session = project.sessions[0];
+    if (session === undefined) {
+      throw new Error("a session");
+    }
+    const snapshot = snapshotFromWire(
+      workerSnapshotWire({
+        projects: [
+          {
+            ...project,
+            sessions: [
+              { ...session, worktree_path: "/home/me/wt/fix-login" },
+              { ...session, session_id: "s-2", worktree_path: "" },
+              { ...session, session_id: "s-3" },
+            ],
+          },
+        ],
+      }),
+    );
+    const sessions = snapshot.projects[0]?.sessions ?? [];
+    expect(sessions[0]?.worktreePath).toBe("/home/me/wt/fix-login");
+    /** Empty or absent — a host that predates the field — is no folder. */
+    expect(sessions[1] !== undefined && "worktreePath" in sessions[1]).toBe(false);
+    expect(sessions[2]?.worktreePath).toBeUndefined();
+    expect(snapshot.protocolVersion).toBe(8);
+  });
+
+  it("an upload plan keeps every field, and reads each absence as one", () => {
+    expect(
+      uploadPlanOf({
+        type: "upload_plan",
+        seq: 3,
+        dir: "/home/me/dir",
+        files: [
+          { name: "a.txt", final_name: "a (1).txt", ticket: "t-a", exists: true },
+          { name: "b.bin", final_name: "b.bin" },
+        ],
+      }),
+    ).toEqual({
+      seq: 3,
+      dir: "/home/me/dir",
+      files: [
+        { name: "a.txt", finalName: "a (1).txt", ticket: "t-a", exists: true },
+        { name: "b.bin", finalName: "b.bin", ticket: null, exists: false },
+      ],
+      conflicts: false,
+      refusal: null,
+    });
+    expect(
+      uploadPlanOf({
+        type: "upload_plan",
+        seq: 4,
+        dir: "/home/me",
+        files: [],
+        conflicts: true,
+        refusal: "No.",
+      }),
+    ).toMatchObject({ conflicts: true, refusal: "No." });
   });
 
   it("a worker with no shell and no health sample says so", () => {

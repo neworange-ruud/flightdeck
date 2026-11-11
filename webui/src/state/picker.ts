@@ -148,10 +148,19 @@ export interface PickerState {
    * closes the picker and goes there. */
   readonly opened: OpenedProject | null;
   readonly pending: PickerPending;
+  /**
+   * `open` — Open Project: scan, browse, clone, open. `choose_folder` — the
+   * upload panel's Choose… (R30): browse only, and "Choose this folder"
+   * hands the folder listed back to the panel instead of opening anything.
+   */
+  readonly purpose: PickerPurpose;
 }
 
-export function newPicker(home: string): PickerState {
+export type PickerPurpose = "open" | "choose_folder";
+
+export function newPicker(home: string, purpose: PickerPurpose = "open"): PickerState {
   return {
+    purpose,
     home,
     cwd: null,
     parent: null,
@@ -198,7 +207,10 @@ export type PickerIntent =
   /** Open the repository at `path` as a project. */
   | { readonly kind: "open_path"; readonly path: string }
   /** Clone what the URL field says, into the name field's folder if any. */
-  | { readonly kind: "clone" };
+  | { readonly kind: "clone" }
+  /** Open the picker to choose a folder for the upload panel, listing `path`
+   * first (the panel's folder). Nothing is scanned or opened. */
+  | { readonly kind: "choose_folder"; readonly path: string };
 
 /** A request that went out, so its answers can be told apart from others. */
 export type PickerSent =

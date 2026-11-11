@@ -16,6 +16,14 @@ import {
 } from "./state/picker";
 import type { PickerIntent, PickerRequest } from "./state/picker";
 import {
+  beginUploadCommand,
+  nextUploadJob,
+  uploadRequest,
+  uploadResolve,
+} from "./state/upload";
+import type { Resolution, UploadRequest } from "./state/upload";
+import { putUpload, type UploadTransfer } from "./wire/upload";
+import {
   cellsFor,
   onScreenTerminalId,
   WORKER_COMMAND,
@@ -166,6 +174,17 @@ const app = createApp({
         return;
       case "workerShell/restart":
         session.sendCommand(WORKER_COMMAND.RESTART_WORKER_SHELL);
+        return;
+      /** Uploading files to a worker (v8, R30): the requests the panel's
+       * buttons mean, and Cancel's abort. */
+      case "upload/submit":
+        submitUpload();
+        return;
+      case "upload/resolve":
+        resolveUpload(action.resolution);
+        return;
+      case "upload/cancel":
+        abortTransfer();
         return;
       default:
         return;
@@ -540,8 +559,122 @@ function runPickerIntent(intent: PickerIntent): void {
       send(request);
       return;
     }
+    case "choose_folder":
+      /** The upload panel's Choose…: list the panel's folder, nothing else. */
+      send(browseRequest(picker, intent.path));
+      return;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Uploading files to a worker (v8, W34, R30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a `begin_upload` and hand its seq back to the panel — `null` when the
+ * link is down, since a command sent then is never answered.
+ */
+function sendUploadRequest(request: UploadRequest): void {
+  const state = app.store.getState();
+  if (session === null || state.connection !== "connected") {
+    app.store.dispatch({
+      type: "upload/requested",
+      seq: null,
+      onConflict: request.onConflict,
+    });
+    return;
+  }
+  const command = beginUploadCommand(request);
+  const seq = session.sendCommand(command.name, command.args);
+  app.store.dispatch({ type: "upload/requested", seq, onConflict: request.onConflict });
+}
+
+/** Upload pressed: what the list and the folder mean, or why nothing. */
+function submitUpload(): void {
+  const upload = app.store.getState().upload;
+  if (upload === null) {
+    return;
+  }
+  const request = uploadRequest(upload);
+  if (request === null) {
+    return;
+  }
+  if ("note" in request) {
+    app.store.dispatch({ type: "upload/note", note: request.note });
+    return;
+  }
+  sendUploadRequest(request);
+}
+
+/** Replace or Keep both: the same files again, with that answer. */
+function resolveUpload(resolution: Resolution): void {
+  const upload = app.store.getState().upload;
+  if (upload === null || resolution === "cancel") {
+    return;
+  }
+  const { request } = uploadResolve(upload, resolution);
+  if (request !== null) {
+    sendUploadRequest(request);
+  }
+}
+
+/**
+ * The one transfer under way, if any. Files go one at a time, in list order,
+ * right after the plan: each ticket lapses two minutes after it was granted.
+ */
+let transfer: UploadTransfer | null = null;
+let pumpScheduled = false;
+
+function abortTransfer(): void {
+  const running = transfer;
+  transfer = null;
+  running?.abort();
+}
+
+/** Start the next file when the panel is uploading and nothing is sending.
+ * Deferred to a microtask so it never dispatches from inside the store's own
+ * notification pass. */
+function pumpUploads(): void {
+  if (pumpScheduled || transfer !== null) {
+    return;
+  }
+  const upload = app.store.getState().upload;
+  if (upload === null || nextUploadJob(upload) === null) {
+    return;
+  }
+  pumpScheduled = true;
+  queueMicrotask(() => {
+    pumpScheduled = false;
+    const current = app.store.getState().upload;
+    const job = current === null ? null : nextUploadJob(current);
+    if (job === null || transfer !== null) {
+      return;
+    }
+    app.store.dispatch({ type: "upload/started", index: job.index });
+    /** The slot is `transfer` before the request exists, so an answer can
+     * never arrive for a transfer this file does not know about yet. */
+    let inner: UploadTransfer | null = null;
+    const mine: UploadTransfer = { abort: () => inner?.abort() };
+    transfer = mine;
+    inner = putUpload({
+      ticket: job.ticket,
+      body: job.source,
+      onProgress: (sent) => {
+        if (transfer === mine) {
+          app.store.dispatch({ type: "upload/progress", index: job.index, sent });
+        }
+      },
+      onDone: (result) => {
+        if (transfer !== mine) {
+          return; /** Cancelled: the panel has moved on already. */
+        }
+        transfer = null;
+        app.store.dispatch({ type: "upload/finished", index: job.index, result });
+      },
+    });
+  });
+}
+app.store.subscribe(pumpUploads);
 
 /**
  * Go to the project the picker had the worker open, once it shows up in a

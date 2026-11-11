@@ -5,6 +5,10 @@ import { append, clear, el, hint } from "./dom";
 import type { Child, Region } from "./dom";
 import type { Store } from "./store";
 
+const OPEN_TITLE = "Open a project on the worker";
+/** The upload panel's Choose… (R30). */
+const CHOOSE_TITLE = "Choose a folder on the worker";
+
 /**
  * Open Project on a worker: the project picker (`specs/WORKER_PRD.md` W9,
  * W13, W16; `remote-control-vjtb`).
@@ -81,18 +85,29 @@ export function createProjectPicker(store: Store): Region {
   const cloneTools = el("div", { class: "fd-picker__tools" });
   const cloneLineEl = el("p", { class: "fd-picker__clone-line" });
 
+  const titleEl = el("span", { class: "fd-picker__title" });
+  const scanSection = el(
+    "section",
+    { class: "fd-picker__section", attrs: { "data-section": "scan" } },
+    [el("div", { class: "fd-picker__section-head" }, [scanHead]), scanList],
+  );
+  const cloneSection = el(
+    "section",
+    { class: "fd-picker__section", attrs: { "data-section": "clone" } },
+    [
+      el("div", { class: "fd-picker__section-head" }, [
+        el("span", { class: "fd-picker__section-title", text: "CLONE" }),
+      ]),
+      el("div", { class: "fd-picker__row" }, [urlInput, nameInput, cloneTools]),
+      cloneLineEl,
+    ],
+  );
+
   const panel = el("div", { class: "fd-picker__panel" }, [
-    el("div", { class: "fd-picker__head" }, [
-      el("span", { class: "fd-picker__title", text: "Open a project on the worker" }),
-      busyEl,
-      closeEl,
-    ]),
+    el("div", { class: "fd-picker__head" }, [titleEl, busyEl, closeEl]),
     errorEl,
     statusEl,
-    el("section", { class: "fd-picker__section", attrs: { "data-section": "scan" } }, [
-      el("div", { class: "fd-picker__section-head" }, [scanHead]),
-      scanList,
-    ]),
+    scanSection,
     el("section", { class: "fd-picker__section", attrs: { "data-section": "browse" } }, [
       el("div", { class: "fd-picker__section-head" }, [
         el("span", { class: "fd-picker__section-title", text: "BROWSE" }),
@@ -100,13 +115,7 @@ export function createProjectPicker(store: Store): Region {
       el("div", { class: "fd-picker__row" }, [pathInput, browseTools]),
       browseList,
     ]),
-    el("section", { class: "fd-picker__section", attrs: { "data-section": "clone" } }, [
-      el("div", { class: "fd-picker__section-head" }, [
-        el("span", { class: "fd-picker__section-title", text: "CLONE" }),
-      ]),
-      el("div", { class: "fd-picker__row" }, [urlInput, nameInput, cloneTools]),
-      cloneLineEl,
-    ]),
+    cloneSection,
     el("div", { class: "fd-picker__foot" }, [
       hint("Enter", "go / clone"),
       hint("Esc", "close"),
@@ -117,7 +126,7 @@ export function createProjectPicker(store: Store): Region {
     "div",
     {
       class: "fd-picker",
-      attrs: { role: "dialog", "aria-label": "Open a project on the worker" },
+      attrs: { role: "dialog", "aria-label": OPEN_TITLE },
     },
     [panel],
   );
@@ -131,6 +140,15 @@ export function createProjectPicker(store: Store): Region {
       wasOpen = false;
       return;
     }
+    /** The upload panel's Choose… (R30) is this picker browsing only: no
+     * scan, no clone, and the folder listed is the answer. */
+    const choosing = picker.purpose === "choose_folder";
+    const title = choosing ? CHOOSE_TITLE : OPEN_TITLE;
+    titleEl.textContent = title;
+    layer.setAttribute("aria-label", title);
+    layer.setAttribute("data-purpose", picker.purpose);
+    scanSection.hidden = choosing;
+    cloneSection.hidden = choosing;
     syncField(pathInput, "path", picker.pathField);
     syncField(urlInput, "url", picker.urlField);
     syncField(nameInput, "name", picker.nameField);
@@ -152,16 +170,27 @@ export function createProjectPicker(store: Store): Region {
     browseTools.append(
       toolButton("Go", "go", () => request({ kind: "browse", path: pathInput.value })),
       toolButton("Up", "up", () => request({ kind: "up" }), picker.parent === null),
-      toolButton(
-        "Open this folder",
-        "open-here",
-        () => {
-          if (picker.cwd !== null) {
-            request({ kind: "open_path", path: picker.cwd });
-          }
-        },
-        picker.cwd === null,
-      ),
+      choosing
+        ? toolButton(
+            "Choose this folder",
+            "choose-here",
+            () => {
+              if (picker.cwd !== null) {
+                store.dispatch({ type: "picker/chosen", path: picker.cwd });
+              }
+            },
+            picker.cwd === null,
+          )
+        : toolButton(
+            "Open this folder",
+            "open-here",
+            () => {
+              if (picker.cwd !== null) {
+                request({ kind: "open_path", path: picker.cwd });
+              }
+            },
+            picker.cwd === null,
+          ),
       toolButton(
         picker.showHidden ? "Hide hidden" : "Show hidden",
         "toggle-hidden",
@@ -275,12 +304,16 @@ function browseRows(
   if (picker.cwd === null) {
     return [muted(picker.pending.browse?.waiting === true ? "Listing…" : "")];
   }
+  /** Choosing a folder opens nothing, so no row offers Open (or says open). */
+  const choosing = picker.purpose === "choose_folder";
   const rows: Child[] = picker.entries.map((entry) =>
     row(
       entry.name,
       null,
-      entry.isOpenProject,
-      entry.isGitRepo ? () => request({ kind: "open_path", path: entry.path }) : null,
+      !choosing && entry.isOpenProject,
+      entry.isGitRepo && !choosing
+        ? () => request({ kind: "open_path", path: entry.path })
+        : null,
       () => request({ kind: "browse", path: entry.path }),
     ),
   );

@@ -448,6 +448,8 @@ fn a_worker_refuses_what_only_the_box_may_do() {
         names::PAIR_PHONE,
         names::UNPAIR_PHONE,
         names::OPEN_PROJECT,
+        // v8: the window's own upload panel, never a host action.
+        crate::web::commands::UPLOAD_FILES,
     ] {
         let out = host.route_inbound(command(1, name, None));
         let ack = first_ack(&out);

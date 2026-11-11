@@ -28,11 +28,37 @@ export const WORKER_COMMAND = {
   OPEN_PROJECT_PATH: "open_project_path",
   CLONE_PROJECT: "clone_project",
   RESTART_WORKER_SHELL: "restart_worker_shell",
+  /** v8: ask to upload files into one folder (`state/upload.ts`). */
+  BEGIN_UPLOAD: "begin_upload",
 } as const;
 
 /** The palette row a worker refuses and this window answers itself, with the
  * project picker. */
 export const OPEN_PROJECT_COMMAND = "open_project";
+
+/**
+ * v8: the palette row only a worker lists (`commands::UPLOAD_FILES`), which
+ * the worker refuses as a frame and this window runs itself, by opening the
+ * file chooser (`ui/uploadPanel.ts`).
+ */
+export const UPLOAD_FILES_COMMAND = "upload_files";
+
+/** The protocol version that can upload (`protocol::UPLOAD_MIN_VERSION`). */
+export const UPLOAD_MIN_VERSION = 8;
+
+/**
+ * Whether this window can upload at all: a worker, spoken to at v8 or later.
+ * Every entry point — the tab-bar button, the palette row, a drop — checks
+ * it. The SPA ships inside the binary it talks to, so this is a guard rather
+ * than a negotiation.
+ */
+export function uploadAvailable(state: AppState): boolean {
+  return (
+    state.hostKind === "worker" &&
+    state.protocolVersion !== null &&
+    state.protocolVersion >= UPLOAD_MIN_VERSION
+  );
+}
 
 /**
  * The palette rows a worker refuses (`commands::worker_refusal`) that a
@@ -72,6 +98,11 @@ export function workerPaletteRow(
   }
   if (row.run.name === OPEN_PROJECT_COMMAND) {
     return { ...row, refusal: null, hostOnly: false };
+  }
+  /** Upload Files… is this window's file chooser — offered only where this
+   * window can upload, never as a refused row. */
+  if (row.run.name === UPLOAD_FILES_COMMAND) {
+    return uploadAvailable(state) ? { ...row, refusal: null, hostOnly: false } : null;
   }
   return row;
 }

@@ -82,7 +82,9 @@ import type {
   WireSessionView,
   WireSnapshot,
   WireTerminalView,
+  WireUploadPlan,
 } from "./frames";
+import type { UploadPlan } from "../state/upload";
 
 /**
  * FlightDeck's interpreted labels (`status_keyword_to_interpreted`, mirrored in
@@ -228,6 +230,11 @@ export function sessionOf(session: WireSessionView, base: string): Session {
     git: gitOf(session.git, session.recovered ?? false),
     gitBar: gitBarOf(session.git, base),
     terminals: session.terminals.map(terminalOf),
+    /** R30: the upload panel's default folder. Empty (a host that predates
+     * the field) is left out rather than offered as a folder. */
+    ...(session.worktree_path === undefined || session.worktree_path === ""
+      ? {}
+      : { worktreePath: session.worktree_path }),
   };
 }
 
@@ -452,6 +459,7 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
         ? null
         : workerOf(wire.worker),
     terminalGeometry: terminalGeometryOf(wire),
+    protocolVersion: wire.protocol_version,
   };
 }
 
@@ -619,6 +627,24 @@ export function cloneResultOf(wire: WireCloneResult): CloneResult {
     path: wire.path ?? null,
     projectId: wire.project_id ?? null,
     error: wire.error ?? null,
+  };
+}
+
+/** `ServerMsg::UploadPlan` (v8) as the upload panel takes it. Every optional
+ * field reads as its absence: no ticket, not taken, no conflicts, no
+ * refusal. */
+export function uploadPlanOf(wire: WireUploadPlan): UploadPlan {
+  return {
+    seq: wire.seq,
+    dir: wire.dir,
+    files: wire.files.map((file) => ({
+      name: file.name,
+      finalName: file.final_name,
+      ticket: file.ticket ?? null,
+      exists: file.exists ?? false,
+    })),
+    conflicts: wire.conflicts ?? false,
+    refusal: wire.refusal ?? null,
   };
 }
 
