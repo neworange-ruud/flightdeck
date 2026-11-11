@@ -514,3 +514,30 @@ fn a_refused_upload_is_the_panels_note_not_a_message_overlay() {
         "the panel says it"
     );
 }
+
+#[test]
+fn the_folder_picker_lists_the_folder_asked_for_and_scans_nothing() {
+    let (mut session, mut script) = open(snapshot(true, Vec::new()));
+    script.sent();
+    session.open_folder_picker("/repo/.flightdeck/worktrees/search");
+    let sent = commands_sent(&mut script);
+    let names: Vec<&str> = sent.iter().map(|(_, name, _)| name.as_str()).collect();
+    assert_eq!(names, ["browse_dir"], "no scan: it chooses a folder");
+    assert_eq!(
+        sent[0].2.as_ref().unwrap()["path"],
+        "/repo/.flightdeck/worktrees/search"
+    );
+    let picker = session.picker().expect("the picker is open");
+    assert_eq!(picker.home, "/home/dev");
+    assert!(picker.scanned.is_none());
+
+    // `~` or nothing lists the worker's home.
+    for start in ["~", "  "] {
+        session.open_folder_picker(start);
+        let sent = commands_sent(&mut script);
+        assert!(
+            sent[0].2.as_ref().unwrap().get("path").is_none(),
+            "{start:?}"
+        );
+    }
+}

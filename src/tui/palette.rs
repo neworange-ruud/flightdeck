@@ -112,6 +112,11 @@ pub enum FrontEndAction {
     /// Rename the saved remote a remote window is on. A remote window's row
     /// alone ([`remote_window_rows`]).
     RenameRemote,
+    /// Upload files from this machine into a folder on a worker
+    /// (`specs/WORKER_PRD.md` W34): the platform's file chooser, then the
+    /// upload panel. A remote window's row alone ([`remote_window_rows`]),
+    /// offered only on a worker that takes uploads (protocol v8).
+    UploadFiles,
 }
 
 impl PaletteAction {
@@ -369,11 +374,18 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
 
 /// The rows only a desktop remote window adds, after the front-end rows: they
 /// act on the remote the window is on, which a local window does not have.
-const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[PaletteEntry {
-    group: "Remote",
-    label: "Rename Remote",
-    action: PaletteAction::FrontEnd(FrontEndAction::RenameRemote),
-}];
+const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[
+    PaletteEntry {
+        group: "Projects",
+        label: "Upload Files…",
+        action: PaletteAction::FrontEnd(FrontEndAction::UploadFiles),
+    },
+    PaletteEntry {
+        group: "Remote",
+        label: "Rename Remote",
+        action: PaletteAction::FrontEnd(FrontEndAction::RenameRemote),
+    },
+];
 
 /// The front-end rows, for the tests and for a front-end that lists them.
 pub fn front_end_entries() -> &'static [PaletteEntry] {
@@ -794,6 +806,34 @@ mod tests {
             remote_window_rows().count(),
             rows(true).count() + REMOTE_WINDOW_ENTRIES.len()
         );
+    }
+
+    /// Upload Files… is a remote window's row (W34), at the end of Projects
+    /// next to Open Project; the local palette and the TUI never offer it.
+    #[test]
+    fn upload_files_is_a_remote_window_row_only() {
+        let is_upload =
+            |e: &&PaletteEntry| e.action == PaletteAction::FrontEnd(FrontEndAction::UploadFiles);
+        assert!(!rows(true).any(|e| is_upload(&e)));
+        assert!(!rows(false).any(|e| is_upload(&e)));
+        let projects: Vec<&str> = remote_window_rows()
+            .filter(|e| e.group == "Projects")
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(projects.first().copied(), Some("Open Project"));
+        assert_eq!(
+            projects.last().copied(),
+            Some("Upload Files…"),
+            "{projects:?}"
+        );
+        // Its group stays one contiguous section.
+        let groups: Vec<&str> = remote_window_rows().map(|e| e.group).collect();
+        let starts = groups
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| **g == "Projects" && (*i == 0 || groups[i - 1] != "Projects"))
+            .count();
+        assert_eq!(starts, 1);
     }
 
     /// Each front-end row joins the end of a group the palette already has, so

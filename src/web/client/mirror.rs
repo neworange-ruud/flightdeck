@@ -441,6 +441,12 @@ impl RemoteWorkspace {
         self.host_kind == Some(HostKind::Worker)
     }
 
+    /// Whether the host takes uploads (W34): a worker attached at protocol v8
+    /// or later ([`crate::web::protocol::UPLOAD_MIN_VERSION`]).
+    pub fn takes_uploads(&self) -> bool {
+        self.is_worker() && self.protocol_version >= crate::web::protocol::UPLOAD_MIN_VERSION
+    }
+
     /// The worker's shell, when the host is a worker that has one.
     pub fn worker_shell(&self) -> Option<&WorkerShellView> {
         self.worker.as_ref()?.shell.as_ref()
