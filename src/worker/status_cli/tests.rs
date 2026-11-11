@@ -42,6 +42,7 @@ fn code(listening: bool) -> PairingCode {
         address: listening.then(|| "box.tail1234.ts.net:7420".to_string()),
         listening,
         not_listening_reason: (!listening).then(|| "no Tailscale address".to_string()),
+        web_url: listening.then(|| "https://box.tail1234.ts.net:7420/#4821".to_string()),
     }
 }
 
@@ -111,7 +112,32 @@ fn pair_text_names_the_code_the_address_and_where_to_type_them() {
         "{text}"
     );
     assert!(text.contains("Connect to remote…"), "{text}");
+    assert!(
+        text.contains("In a browser: https://box.tail1234.ts.net:7420/#4821\n"),
+        "{text}"
+    );
     assert!(!text.contains("Warning"), "{text}");
+}
+
+#[test]
+fn pair_text_has_no_browser_link_while_the_browser_app_is_off() {
+    let mut off = code(true);
+    off.web_url = None;
+    let text = render_pair(&off);
+    assert!(!text.contains("In a browser"), "{text}");
+    assert!(text.contains("Connect to remote…"), "{text}");
+}
+
+/// `worker pair --json` carries `web_url`, and an older worker's answer
+/// (without it) still reads.
+#[test]
+fn pair_json_carries_the_browser_link() {
+    let json = serde_json::to_value(code(true)).unwrap();
+    assert_eq!(json["web_url"], "https://box.tail1234.ts.net:7420/#4821");
+    let mut older = json;
+    older.as_object_mut().unwrap().remove("web_url");
+    let back: PairingCode = serde_json::from_value(older).unwrap();
+    assert_eq!(back.web_url, None);
 }
 
 #[test]
@@ -153,7 +179,7 @@ fn devices_render_as_a_table() {
 fn no_devices_says_how_to_pair_one() {
     assert_eq!(
         render_devices(&[], 0),
-        "No paired Desktops. Pair one with `flightdeck worker pair`.\n"
+        "No paired devices. Pair one with `flightdeck worker pair`.\n"
     );
 }
 
@@ -488,7 +514,7 @@ mod over_the_socket {
         });
         let (status, out, _) = run(|o, e| devices_to(&h.paths, false, 0, o, e));
         assert_eq!(status, 0);
-        assert!(out.starts_with("No paired Desktops."), "{out}");
+        assert!(out.starts_with("No paired devices."), "{out}");
         assert!(out.contains("pair_1  direct  offline"), "{out}");
     }
 

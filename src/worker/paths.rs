@@ -34,7 +34,7 @@ pub struct WorkerPaths {
     /// The worker's open projects (`workspace.json`), separate from the
     /// TUI's `~/.flightdeck/workspace.json`.
     pub workspace: PathBuf,
-    /// Paired Desktops' tokens (`devices.json`), separate from the web
+    /// Paired devices' tokens (`devices.json`), separate from the web
     /// interface's `~/.flightdeck/web.json`.
     pub credentials: PathBuf,
     /// The worker's FlightDeck Remote state (`remote.json`): its own relay
@@ -42,6 +42,13 @@ pub struct WorkerPaths {
     /// `~/.flightdeck/remote.json`. Its lock (`remote.lock`) and the direct
     /// link's outboxes (`remote-direct/`) sit beside it.
     pub phone_state: PathBuf,
+    /// `~/.flightdeck/worker/tls`: the HTTPS certificate `tailscale cert`
+    /// issued for this machine, kept so a restart serves HTTPS at once.
+    pub tls_dir: PathBuf,
+    /// `tls/cert.pem`: the certificate chain.
+    pub tls_cert: PathBuf,
+    /// `tls/key.pem`: its private key (mode 0600 on unix).
+    pub tls_key: PathBuf,
     /// `~/.flightdeck/logs`.
     pub logs_dir: PathBuf,
     /// `~/.flightdeck/logs/worker.log` (rotated by the supervisor).
@@ -54,6 +61,7 @@ impl WorkerPaths {
         let base = home.join(".flightdeck");
         let dir = base.join("worker");
         let logs_dir = base.join("logs");
+        let tls_dir = dir.join("tls");
         WorkerPaths {
             home: home.to_path_buf(),
             control_socket: dir.join("control.sock"),
@@ -66,6 +74,9 @@ impl WorkerPaths {
             workspace: dir.join("workspace.json"),
             credentials: dir.join("devices.json"),
             phone_state: dir.join("remote.json"),
+            tls_cert: tls_dir.join("cert.pem"),
+            tls_key: tls_dir.join("key.pem"),
+            tls_dir,
             log_file: logs_dir.join("worker.log"),
             logs_dir,
             dir,
@@ -113,6 +124,9 @@ mod tests {
         assert_eq!(p.workspace, dir.join("workspace.json"));
         assert_eq!(p.credentials, dir.join("devices.json"));
         assert_eq!(p.phone_state, dir.join("remote.json"));
+        assert_eq!(p.tls_dir, dir.join("tls"));
+        assert_eq!(p.tls_cert, dir.join("tls").join("cert.pem"));
+        assert_eq!(p.tls_key, dir.join("tls").join("key.pem"));
         assert_ne!(
             p.phone_state,
             home.join(".flightdeck").join("remote.json"),

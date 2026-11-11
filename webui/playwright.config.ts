@@ -82,6 +82,20 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      /** The worker spec runs against its own worker, in its own project. */
+      testIgnore: /worker\.spec\.ts/,
+    },
+    {
+      /**
+       * `remote-control-vjtb`: the browser driving a FlightDeck Worker. The
+       * spec starts and stops its own `flightdeck worker run`
+       * (`e2e/support/worker.ts`), so the TUI host `globalSetup` boots is
+       * neither used nor disturbed by it. Run alone with
+       * `npx playwright test --project worker`.
+       */
+      name: "worker",
+      use: { ...devices["Desktop Chrome"], viewport: { width: 1600, height: 1000 } },
+      testMatch: /worker\.spec\.ts/,
     },
   ],
 });

@@ -92,6 +92,7 @@
 //! | [`WorkerSnapshot`], [`Delta::Health`], [`Delta::WorkerShell`], [`Delta::WorkerStatus`], [`Delta::HostMessage`], [`Delta::Notification`] | PRD W15/W18/W27/W29 — the worker's shell, status, health, messages and notifications |
 //! | [`worker_command`], [`WorkerOp`], [`DirListing`], [`ProjectScan`], [`CloneProgress`], [`CloneResult`] | PRD W9/W16 — the worker's project picker: browse, scan, open, clone |
 //! | [`ResizeTerminal`] | PRD W5 — a worker has no pane of its own, so its one window sizes the PTYs |
+//! | [`worker_command::BEGIN_UPLOAD`], [`UploadPlan`], [`UPLOAD_MIN_VERSION`] | uploading files to a worker: a grant over the socket, the bytes over `PUT /upload/{ticket}` (v8) |
 //!
 //! # Forward compatibility
 //!
@@ -225,6 +226,16 @@ mod tests;
 /// older than [`WORKER_MIN_CLIENT_VERSION`], because a v6 client would drop
 /// every frame the worker exists to send.
 ///
+/// **v8 is uploading files to a worker** (`remote-control-usem`). A window
+/// asks with [`worker_command::BEGIN_UPLOAD`] and the worker answers with a
+/// new frame, [`ServerMsg::UploadPlan`] — the target folder, the final name of
+/// every file, and one single-use ticket each for `PUT /upload/{ticket}`, or
+/// the names already taken (`on_conflict: "ask"`), or why it refused. A new
+/// frame kind a peer must understand, hence the bump. A worker still serves a
+/// v7 window — everything else it does is unchanged — but never sends it an
+/// upload plan: the command is refused for a peer below
+/// [`UPLOAD_MIN_VERSION`], and the frame is dropped on the way out.
+///
 /// That co-shipping is exactly why the constant matters. The SPA is baked in, so
 /// `flightdeck update` on the host while a tab is open leaves that tab running
 /// **last version's JavaScript against this version's server**. The browser
@@ -236,16 +247,21 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
-/// Oldest version this build can serve. One below [`PROTOCOL_VERSION`]: the
-/// browser SPA co-ships with the server (D9), but a FlightDeck Desktop driving
-/// a TUI or Desktop host does not, and a v6 Desktop keeps working against a v7
-/// host. A worker host raises the floor to [`WORKER_MIN_CLIENT_VERSION`].
+/// Oldest version this build can serve. The browser SPA co-ships with the
+/// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
+/// not, and a v6 Desktop keeps working against a v7 or v8 host — neither ever
+/// sends a TUI's or Desktop's viewers a frame newer than v6. A worker host
+/// raises the floor to [`WORKER_MIN_CLIENT_VERSION`].
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 7;
+pub const MAX_SUPPORTED_VERSION: u16 = 8;
+
+/// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
+/// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
+pub const UPLOAD_MIN_VERSION: u16 = 8;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -2016,6 +2032,82 @@ pub struct CloneResult {
     pub error: Option<String>,
 }
 
+/// What a worker does with an uploaded file whose name is already taken in
+/// the target folder ([`worker_command::BEGIN_UPLOAD`], v8). Closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnConflict {
+    /// Grant nothing and answer with the names that are taken, so the person
+    /// can choose.
+    #[default]
+    Ask,
+    /// Overwrite what is there.
+    Replace,
+    /// Keep what is there and give the upload the first free `name (n).ext`.
+    KeepBoth,
+}
+
+impl OnConflict {
+    /// The wire spelling (`ask`, `replace`, `keep_both`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnConflict::Ask => "ask",
+            OnConflict::Replace => "replace",
+            OnConflict::KeepBoth => "keep_both",
+        }
+    }
+}
+
+/// One file a window wants to upload: its name and its exact size in bytes
+/// ([`worker_command::BEGIN_UPLOAD`]'s `files`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadFile {
+    /// The file's name — one path component, no folder.
+    pub name: String,
+    /// Its size, which the `PUT` must match exactly.
+    pub size: u64,
+}
+
+/// A worker's answer to [`worker_command::BEGIN_UPLOAD`] (v8), to the window
+/// that asked, beside the [`Ack`] for the same `seq`.
+///
+/// Exactly one of three things: every file has a `ticket` (granted — `PUT`
+/// each file's bytes to `/upload/{ticket}` within two minutes), `conflicts`
+/// is true (`on_conflict` was `ask` and some names are taken — `exists` says
+/// which; nothing was granted), or `refusal` says why nothing was granted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadPlan {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The target folder, canonical and absolute on the worker (as asked,
+    /// when the refusal is that it cannot be used).
+    pub dir: String,
+    /// One row per file asked for, in the order asked.
+    pub files: Vec<UploadPlanFile>,
+    /// True when names are taken and the window must choose (`ask`).
+    #[serde(default)]
+    pub conflicts: bool,
+    /// Why nothing was granted, in words for a person.
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+/// One file of an [`UploadPlan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadPlanFile {
+    /// The name asked for.
+    pub name: String,
+    /// The name it will have on the worker: the same, or a free
+    /// `name (n).ext` under `keep_both`.
+    pub final_name: String,
+    /// The single-use ticket for `PUT /upload/{ticket}`, when granted.
+    #[serde(default)]
+    pub ticket: Option<String>,
+    /// Whether a file (or folder) by the asked name is already there.
+    #[serde(default)]
+    pub exists: bool,
+}
+
 // ===========================================================================
 // Server -> browser
 // ===========================================================================
@@ -2800,6 +2892,10 @@ pub enum ServerMsg {
     CloneProgress(CloneProgress),
     /// How a clone ended (v7), to the window.
     CloneResult(CloneResult),
+    /// The worker's answer to this window's [`worker_command::BEGIN_UPLOAD`]
+    /// (v8): tickets, the conflicts to resolve, or a refusal. Never sent to a
+    /// peer below [`UPLOAD_MIN_VERSION`].
+    UploadPlan(UploadPlan),
     /// Another window attached to this worker and took it over (v7, PRD W17).
     /// The socket closes right after this frame. The credential stays valid:
     /// the recipient may reconnect, and then takes it back.
@@ -3095,6 +3191,11 @@ pub mod worker_command {
     pub const CLONE_PROJECT: &str = "clone_project";
     /// Restart the worker shell. No args.
     pub const RESTART_WORKER_SHELL: &str = "restart_worker_shell";
+    /// Ask to upload files into one folder under `$HOME` (v8). Args `{dir:
+    /// string, files: [{name: string, size: number}], on_conflict?: "ask" |
+    /// "replace" | "keep_both"}` (`ask` when absent). Answered with
+    /// [`super::ServerMsg::UploadPlan`].
+    pub const BEGIN_UPLOAD: &str = "begin_upload";
     /// Every worker command name.
     pub const ALL: &[&str] = &[
         BROWSE_DIR,
@@ -3102,6 +3203,7 @@ pub mod worker_command {
         OPEN_PROJECT_PATH,
         CLONE_PROJECT,
         RESTART_WORKER_SHELL,
+        BEGIN_UPLOAD,
     ];
 }
 
@@ -3131,6 +3233,15 @@ pub enum WorkerOp {
     },
     /// [`worker_command::RESTART_WORKER_SHELL`].
     RestartWorkerShell,
+    /// [`worker_command::BEGIN_UPLOAD`] (v8).
+    BeginUpload {
+        /// The target folder, as asked (`~`, `~/x`, relative or absolute).
+        dir: String,
+        /// The files, in the order asked.
+        files: Vec<UploadFile>,
+        /// What to do about names already taken.
+        on_conflict: OnConflict,
+    },
 }
 
 impl WorkerOp {
@@ -3171,6 +3282,14 @@ impl WorkerOp {
                 })
             }
             worker_command::RESTART_WORKER_SHELL => Ok(WorkerOp::RestartWorkerShell),
+            worker_command::BEGIN_UPLOAD => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::BeginUpload {
+                    dir: args.required_str("dir")?,
+                    files: args.upload_files("files")?,
+                    on_conflict: args.on_conflict("on_conflict")?,
+                })
+            }
             _ => Err(format!("`{name}` is not a worker command")),
         }
     }
@@ -3222,6 +3341,50 @@ impl<'a> WorkerArgs<'a> {
             None => Ok(None),
             Some(serde_json::Value::Bool(flag)) => Ok(Some(*flag)),
             Some(_) => Err(format!("`{}`: `{key}` must be true or false", self.name)),
+        }
+    }
+
+    /// A required array of `{name: string, size: number}`. Whether the names
+    /// and sizes are acceptable is the worker's to judge, in its own words.
+    fn upload_files(&self, key: &str) -> Result<Vec<UploadFile>, String> {
+        let shape = || {
+            format!(
+                "`{}`: `{key}` must be a list of {{name, size}} objects",
+                self.name
+            )
+        };
+        let Some(serde_json::Value::Array(items)) = self.get(key) else {
+            return match self.get(key) {
+                None => Err(format!("`{}` needs `{key}`", self.name)),
+                Some(_) => Err(shape()),
+            };
+        };
+        items
+            .iter()
+            .map(|item| {
+                let name = item.get("name").and_then(serde_json::Value::as_str);
+                let size = item.get("size").and_then(serde_json::Value::as_u64);
+                match (name, size) {
+                    (Some(name), Some(size)) => Ok(UploadFile {
+                        name: name.to_string(),
+                        size,
+                    }),
+                    _ => Err(shape()),
+                }
+            })
+            .collect()
+    }
+
+    /// An optional [`OnConflict`]; absent is [`OnConflict::Ask`].
+    fn on_conflict(&self, key: &str) -> Result<OnConflict, String> {
+        match self.optional_str(key)?.as_deref() {
+            None | Some("ask") => Ok(OnConflict::Ask),
+            Some("replace") => Ok(OnConflict::Replace),
+            Some("keep_both") => Ok(OnConflict::KeepBoth),
+            Some(_) => Err(format!(
+                "`{}`: `{key}` must be \"ask\", \"replace\" or \"keep_both\"",
+                self.name
+            )),
         }
     }
 }

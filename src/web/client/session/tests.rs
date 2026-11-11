@@ -405,3 +405,139 @@ fn a_tiles_answer_goes_to_the_host_and_a_refusal_offers_it_again() {
         Some(OverlayView::Message(m)) if m.text.contains("typing")
     ));
 }
+
+// -- uploads (v8, `remote-control-usem`) ----------------------------------------
+
+#[test]
+fn the_upload_panel_opens_only_on_a_worker_that_takes_files() {
+    let (mut session, _script) = open(snapshot(false, Vec::new()));
+    session.open_upload();
+    assert!(session.upload().is_none());
+    assert_eq!(session.notice(), Some(UPLOAD_NOT_A_WORKER));
+
+    let mut v7 = snapshot(true, Vec::new());
+    v7.protocol_version = 7;
+    let (mut session, _script) = open(v7);
+    session.open_upload();
+    assert!(session.upload().is_none());
+    assert_eq!(session.notice(), Some(UPLOAD_WORKER_TOO_OLD));
+
+    let (mut session, _script) = open(snapshot(true, Vec::new()));
+    session.open_upload();
+    let panel = session.upload().expect("the panel opens");
+    assert_eq!(
+        panel.dir, "/repo/.flightdeck/worktrees/search",
+        "aimed at the session on screen"
+    );
+}
+
+#[test]
+fn an_upload_asks_the_worker_and_folds_in_its_answer() {
+    use crate::web::client::upload::UploadPhase;
+    use crate::web::protocol::{worker_command, UploadPlan, UploadPlanFile};
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.md");
+    std::fs::write(&file, "hello").unwrap();
+
+    let (mut session, mut script) = open(snapshot(true, Vec::new()));
+    script.sent();
+    session.open_upload_with(&[file.clone(), dir.path().to_path_buf()]);
+    let panel = session.upload().unwrap();
+    assert_eq!(panel.files.len(), 1, "the folder is refused");
+    assert!(panel.note.as_deref().unwrap().contains("Folders"));
+
+    session.start_upload();
+    let sent = commands_sent(&mut script);
+    let [(seq, name, Some(args))] = sent.as_slice() else {
+        panic!("one begin_upload: {sent:?}");
+    };
+    assert_eq!(name, worker_command::BEGIN_UPLOAD);
+    assert_eq!(args["dir"], "/repo/.flightdeck/worktrees/search");
+    assert_eq!(args["files"][0]["name"], "notes.md");
+    assert_eq!(args["files"][0]["size"], 5);
+    assert_eq!(args["on_conflict"], "ask");
+
+    // The worker grants it. This scripted client has nowhere to send bytes,
+    // so the file fails — in words, without a panic or a stuck panel.
+    script.send(LinkEvent::UploadPlan(UploadPlan {
+        seq: *seq,
+        dir: "/repo/.flightdeck/worktrees/search".into(),
+        files: vec![UploadPlanFile {
+            name: "notes.md".into(),
+            final_name: "notes.md".into(),
+            ticket: Some("t".into()),
+            exists: false,
+        }],
+        conflicts: false,
+        refusal: None,
+    }));
+    session.pump();
+    let panel = session.upload().unwrap();
+    assert!(
+        matches!(&panel.phase, UploadPhase::Done { failed, .. }
+            if failed == &vec![("notes.md".to_string(), UPLOAD_NO_ACCESS.to_string())]),
+        "{:?}",
+        panel.phase
+    );
+    session.close_upload();
+    assert!(session.upload().is_none());
+}
+
+#[test]
+fn a_refused_upload_is_the_panels_note_not_a_message_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "x").unwrap();
+    let (mut session, mut script) = open(snapshot(true, Vec::new()));
+    script.sent();
+    session.open_upload_with(&[file]);
+    session.start_upload();
+    let (seq, _, _) = commands_sent(&mut script).remove(0);
+    script.send(LinkEvent::Ack(
+        crate::web::protocol::Ack {
+            seq,
+            outcome: AckOutcome::Rejected,
+            detail: Some("~/x is outside your home folder.".into()),
+        },
+        crate::web::client::AckFor::Command,
+    ));
+    session.pump();
+    let panel = session.upload().unwrap();
+    assert!(panel.is_choosing());
+    assert_eq!(
+        panel.note.as_deref(),
+        Some("~/x is outside your home folder.")
+    );
+    assert!(
+        !matches!(session.overlay(), Some(OverlayView::Message(_))),
+        "the panel says it"
+    );
+}
+
+#[test]
+fn the_folder_picker_lists_the_folder_asked_for_and_scans_nothing() {
+    let (mut session, mut script) = open(snapshot(true, Vec::new()));
+    script.sent();
+    session.open_folder_picker("/repo/.flightdeck/worktrees/search");
+    let sent = commands_sent(&mut script);
+    let names: Vec<&str> = sent.iter().map(|(_, name, _)| name.as_str()).collect();
+    assert_eq!(names, ["browse_dir"], "no scan: it chooses a folder");
+    assert_eq!(
+        sent[0].2.as_ref().unwrap()["path"],
+        "/repo/.flightdeck/worktrees/search"
+    );
+    let picker = session.picker().expect("the picker is open");
+    assert_eq!(picker.home, "/home/dev");
+    assert!(picker.scanned.is_none());
+
+    // `~` or nothing lists the worker's home.
+    for start in ["~", "  "] {
+        session.open_folder_picker(start);
+        let sent = commands_sent(&mut script);
+        assert!(
+            sent[0].2.as_ref().unwrap().get("path").is_none(),
+            "{start:?}"
+        );
+    }
+}

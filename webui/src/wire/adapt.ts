@@ -30,6 +30,8 @@ import type {
   GitStatusPanel,
   HelpDoc,
   HostCommand,
+  HostKind,
+  HostMessage,
   Project,
   Seat,
   SeatInfo,
@@ -38,13 +40,35 @@ import type {
   SessionStatus,
   Snapshot,
   TerminalTab,
+  WorkerConnections,
+  WorkerHealth,
+  WorkerInfo,
+  WorkerShell,
+  WorkerStatus,
 } from "../state/model";
+import type {
+  CloneProgress,
+  CloneResult,
+  PickerListing,
+  PickerScanAnswer,
+} from "../state/picker";
 import type { ConfigDoc, ConfigRow } from "../state/config";
 import type { DialogState } from "../state/types";
 import type {
   WireAboutDoc,
   WireActivityEvent,
   WireBucket,
+  WireCloneProgress,
+  WireCloneResult,
+  WireConnectionsView,
+  WireDirListing,
+  WireHealth,
+  WireHostKind,
+  WireHostMessage,
+  WireProjectScan,
+  WireWorkerShellView,
+  WireWorkerSnapshot,
+  WireWorkerStatusView,
   WireCommandView,
   WireDialogView,
   WireConfigRow,
@@ -58,7 +82,9 @@ import type {
   WireSessionView,
   WireSnapshot,
   WireTerminalView,
+  WireUploadPlan,
 } from "./frames";
+import type { UploadPlan } from "../state/upload";
 
 /**
  * FlightDeck's interpreted labels (`status_keyword_to_interpreted`, mirrored in
@@ -204,6 +230,11 @@ export function sessionOf(session: WireSessionView, base: string): Session {
     git: gitOf(session.git, session.recovered ?? false),
     gitBar: gitBarOf(session.git, base),
     terminals: session.terminals.map(terminalOf),
+    /** R30: the upload panel's default folder. Empty (a host that predates
+     * the field) is left out rather than offered as a folder. */
+    ...(session.worktree_path === undefined || session.worktree_path === ""
+      ? {}
+      : { worktreePath: session.worktree_path }),
   };
 }
 
@@ -212,6 +243,7 @@ export function projectOf(project: WireProjectView): Project {
     id: project.project_id,
     name: project.name,
     sessions: project.sessions.map((s) => sessionOf(s, project.base_branch)),
+    root: project.root,
   };
 }
 
@@ -416,6 +448,203 @@ export function snapshotFromWire(wire: WireSnapshot): Snapshot {
      * unrecognised word cannot make the two surfaces disagree.
      */
     sidebarPosition: wire.sidebar_position === "right" ? "right" : "left",
+    /**
+     * v7 (`remote-control-vjtb`). An unknown word is `null`, which every
+     * reader treats as "not a worker" — the safe reading, because a worker
+     * branch is the one that sends a PTY size (W5).
+     */
+    hostKind: hostKindOf(wire.host_kind),
+    worker:
+      wire.worker === undefined || wire.worker === null
+        ? null
+        : workerOf(wire.worker),
+    terminalGeometry: terminalGeometryOf(wire),
+    protocolVersion: wire.protocol_version,
+  };
+}
+
+const HOST_KINDS: readonly WireHostKind[] = ["tui", "desktop", "worker"];
+
+export function hostKindOf(value: unknown): HostKind | null {
+  return HOST_KINDS.find((kind) => kind === value) ?? null;
+}
+
+/**
+ * Every terminal's own grid, by id, the worker shell's included. Only a
+ * worker's window draws from it (W5); on any other host it is built and never
+ * read, because D4's one grid is `geometry`.
+ */
+function terminalGeometryOf(
+  wire: WireSnapshot,
+): Record<string, { cols: number; rows: number }> {
+  const grids: Record<string, { cols: number; rows: number }> = {};
+  for (const project of wire.projects) {
+    for (const session of project.sessions) {
+      for (const terminal of session.terminals) {
+        grids[terminal.terminal_id] = {
+          cols: terminal.geometry.cols,
+          rows: terminal.geometry.rows,
+        };
+      }
+    }
+  }
+  const shell = wire.worker?.shell;
+  if (shell !== undefined && shell !== null) {
+    grids[shell.terminal_id] = {
+      cols: shell.geometry.cols,
+      rows: shell.geometry.rows,
+    };
+  }
+  return grids;
+}
+
+/** `protocol::WorkerSnapshot` → the window's worker model. The kept host
+ * messages are left out on purpose: the transport shows them once
+ * (`hostMessageOf`), so they never become state a resync could re-announce. */
+export function workerOf(wire: WireWorkerSnapshot): WorkerInfo {
+  return {
+    home: wire.home,
+    shell:
+      wire.shell === undefined || wire.shell === null
+        ? null
+        : workerShellOf(wire.shell),
+    health:
+      wire.health === undefined || wire.health === null
+        ? null
+        : healthOf(wire.health),
+    status: workerStatusOf(wire.status),
+    connections: connectionsOf(wire.connections),
+  };
+}
+
+export function workerShellOf(wire: WireWorkerShellView): WorkerShell {
+  return {
+    terminalId: wire.terminal_id,
+    title: wire.title,
+    alive: wire.alive,
+    exitCode: wire.exit_code ?? null,
+  };
+}
+
+export function healthOf(wire: WireHealth): WorkerHealth {
+  return {
+    version: wire.version,
+    uptimeSecs: wire.uptime_secs,
+    loadCenti: wire.load_avg_1m_centi ?? null,
+    cpuCount: wire.cpu_count,
+    diskFreeHomeBytes: wire.disk_free_home_bytes ?? null,
+    diskFreeProjectsRootBytes: wire.disk_free_projects_root_bytes ?? null,
+    agentsTotal: wire.agents_total,
+    agentsRunning: wire.agents_running,
+  };
+}
+
+export function workerStatusOf(wire: WireWorkerStatusView): WorkerStatus {
+  return {
+    listening: [...(wire.listening ?? [])],
+    advertised: wire.advertised ?? null,
+    notListeningReason: wire.not_listening_reason ?? null,
+    unreadMessages: wire.unread_messages ?? 0,
+    projectsRoot: wire.projects_root,
+  };
+}
+
+export function connectionsOf(wire: WireConnectionsView): WorkerConnections {
+  const window = wire.window ?? null;
+  return {
+    window:
+      window === null
+        ? null
+        : {
+            label: window.label,
+            address: window.address ?? null,
+            sameDevice: window.same_device ?? false,
+          },
+    backgroundLinks: wire.background_links ?? 0,
+  };
+}
+
+const MESSAGE_LEVELS: readonly HostMessage["level"][] = ["info", "warning", "error"];
+
+/** One host message. A level this build does not know is read as `info`,
+ * the quietest — never as an error that would put a panel in front of the
+ * reader for words it cannot classify. */
+export function hostMessageOf(wire: WireHostMessage): HostMessage {
+  return {
+    id: wire.id,
+    atMs: wire.at_ms,
+    level: MESSAGE_LEVELS.find((level) => level === wire.level) ?? "info",
+    text: wire.text,
+  };
+}
+
+/** `ServerMsg::DirListing` → the picker's listing. */
+export function dirListingOf(wire: WireDirListing): PickerListing {
+  return {
+    seq: wire.seq,
+    path: wire.path,
+    parent: wire.parent ?? null,
+    home: wire.home,
+    entries: wire.entries.map((entry) => ({
+      name: entry.name,
+      path: entry.path,
+      isGitRepo: entry.is_git_repo ?? false,
+      isOpenProject: entry.is_open_project ?? false,
+    })),
+    truncated: wire.truncated ?? false,
+  };
+}
+
+/** `ServerMsg::ProjectScan` → the picker's scan. */
+export function projectScanOf(wire: WireProjectScan): PickerScanAnswer {
+  return {
+    seq: wire.seq,
+    root: wire.root,
+    rootExists: wire.root_exists,
+    repos: wire.repos.map((repo) => ({
+      name: repo.name,
+      path: repo.path,
+      isOpenProject: repo.is_open_project ?? false,
+    })),
+    refusal: wire.refusal ?? null,
+  };
+}
+
+export function cloneProgressOf(wire: WireCloneProgress): CloneProgress {
+  return {
+    cloneId: wire.clone_id,
+    url: wire.url,
+    phase: wire.phase,
+    percent: wire.percent ?? null,
+  };
+}
+
+export function cloneResultOf(wire: WireCloneResult): CloneResult {
+  return {
+    cloneId: wire.clone_id,
+    url: wire.url,
+    ok: wire.ok,
+    path: wire.path ?? null,
+    projectId: wire.project_id ?? null,
+    error: wire.error ?? null,
+  };
+}
+
+/** `ServerMsg::UploadPlan` (v8) as the upload panel takes it. Every optional
+ * field reads as its absence: no ticket, not taken, no conflicts, no
+ * refusal. */
+export function uploadPlanOf(wire: WireUploadPlan): UploadPlan {
+  return {
+    seq: wire.seq,
+    dir: wire.dir,
+    files: wire.files.map((file) => ({
+      name: file.name,
+      finalName: file.final_name,
+      ticket: file.ticket ?? null,
+      exists: file.exists ?? false,
+    })),
+    conflicts: wire.conflicts ?? false,
+    refusal: wire.refusal ?? null,
   };
 }
 

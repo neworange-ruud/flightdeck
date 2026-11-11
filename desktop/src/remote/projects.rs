@@ -13,6 +13,11 @@
 //! +----------------------------------------------------------+
 //! ```
 //!
+//! Opened from the upload panel's Choose… it is a folder chooser instead
+//! ([`RemoteModel::choosing_upload_dir`]): only BROWSE, with **Choose this
+//! folder** where Open this folder was, a Home button, no Open on the
+//! repositories, and **Back** to the panel.
+//!
 //! The state is the core's [`flightdeck::web::client::ProjectPicker`], held
 //! by the [`RemoteModel`] (which sends the commands and feeds it the
 //! worker's answers); this view only draws it and turns clicks and Enter
@@ -189,6 +194,7 @@ impl Render for ProjectPickerView {
         };
         self.follow_cwd(&picker, window, cx);
         let label = self.remote.read(cx).label().to_string();
+        let choosing = self.remote.read(cx).choosing_upload_dir();
         let remote = self.remote.clone();
         let this = cx.entity();
 
@@ -200,14 +206,20 @@ impl Render for ProjectPickerView {
                     .flex_1()
                     .text_size(px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Open a project on {label}")),
+                    .child(if choosing {
+                        format!("Choose a folder on {label}")
+                    } else {
+                        format!("Open a project on {label}")
+                    }),
             )
             .when(picker.is_busy(), |h| {
                 h.child(muted(&p, "Working…".to_string()))
             })
             .child({
                 let remote = remote.clone();
-                button(&p, "remote-picker-close", "Close", false).on_click(move |_, _, cx| {
+                // From the upload panel, Back returns to it unchanged.
+                let close = if choosing { "Back" } else { "Close" };
+                button(&p, "remote-picker-close", close, false).on_click(move |_, _, cx| {
                     remote.update(cx, |model, cx| {
                         model.close_picker();
                         cx.notify();
@@ -312,7 +324,31 @@ impl Render for ProjectPickerView {
                     }),
                 )
             })
-            .when_some(picker.cwd.clone(), |bar, cwd| {
+            .when(choosing, |bar| {
+                let remote = remote.clone();
+                bar.child(button(&p, "remote-picker-home", "Home", false).on_click(
+                    move |_, _, cx| {
+                        remote.update(cx, |model, cx| {
+                            model.picker_browse(None);
+                            cx.notify();
+                        })
+                    },
+                ))
+            })
+            .when_some(picker.cwd.clone().filter(|_| choosing), |bar, cwd| {
+                let remote = remote.clone();
+                bar.child(
+                    button(&p, "remote-picker-choose-here", "Choose this folder", true).on_click(
+                        move |_, _, cx| {
+                            remote.update(cx, |model, cx| {
+                                model.upload_dir_chosen(&cwd);
+                                cx.notify();
+                            })
+                        },
+                    ),
+                )
+            })
+            .when_some(picker.cwd.clone().filter(|_| !choosing), |bar, cwd| {
                 let remote = remote.clone();
                 bar.child(
                     button(&p, "remote-picker-open-here", "Open this folder", false).on_click(
@@ -355,7 +391,7 @@ impl Render for ProjectPickerView {
                     })
                 }
             };
-            let open = (entry.is_git_repo && !entry.is_open_project).then(|| {
+            let open = (entry.is_git_repo && !entry.is_open_project && !choosing).then(|| {
                 let remote = remote.clone();
                 let path = entry.path.clone();
                 button(&p, format!("remote-picker-open-{i}"), "Open", true).on_click(
@@ -449,15 +485,18 @@ impl Render for ProjectPickerView {
                 .child(header)
                 .children(error)
                 .children(picker.status.clone().map(|s| muted(&p, s)))
-                .child(section(&p, scan_title))
-                .children(scanned)
+                .when(!choosing, |col| {
+                    col.child(section(&p, scan_title)).children(scanned)
+                })
                 .child(section(&p, "BROWSE".to_string()))
                 .child(bar)
                 .children(entries)
                 .children(browse_note)
-                .child(section(&p, "CLONE".to_string()))
-                .child(clone_form)
-                .children(clone_status),
+                .when(!choosing, |col| {
+                    col.child(section(&p, "CLONE".to_string()))
+                        .child(clone_form)
+                        .children(clone_status)
+                }),
         )
     }
 }

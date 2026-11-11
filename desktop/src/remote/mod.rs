@@ -51,6 +51,10 @@
 //!   Other hosts keep D4: their grid is letterboxed or panned here.
 //! - **Projects.** Open Project is the project picker ([`projects`]): scan,
 //!   browse, clone.
+//! - **Uploads (W34, v8).** Upload files… (the titlebar button, the palette
+//!   row, or files dropped on the window) opens the upload panel
+//!   ([`upload`]): files from this machine into a folder on the worker, its
+//!   Choose… the project picker in a choose-a-folder mode.
 //! - **Host messages and notifications** ([`messages`]): a message is a
 //!   status-bar notice (an error also an overlay); the ones kept while no
 //!   window was attached come back together as one overlay; notifications
@@ -79,8 +83,9 @@ use flightdeck::web::client::session::RemoteSession;
 pub use flightdeck::web::client::session::WORKER_SHELL_COMMAND_REFUSAL;
 pub use flightdeck::web::client::session::{Dialer, Tab};
 use flightdeck::web::client::store::SavedRemote;
+use flightdeck::web::client::upload::Resolution;
 use flightdeck::web::client::{client_label, LinkConfig};
-use flightdeck::web::client::{LinkEnd, ProjectPicker, RemoteClient, RemoteWorkspace};
+use flightdeck::web::client::{LinkEnd, ProjectPicker, RemoteClient, RemoteWorkspace, UploadPanel};
 use flightdeck::web::protocol::SeatRequest;
 use gpui::{App, AppContext, Context, Global, Subscription, Task};
 
@@ -91,6 +96,7 @@ pub mod connect;
 pub mod messages;
 pub mod projects;
 pub mod shell;
+pub mod upload;
 pub mod window;
 
 #[cfg(test)]
@@ -146,6 +152,11 @@ pub struct RemoteModel {
     renaming: bool,
     /// Why the name typed there was refused.
     rename_error: Option<String>,
+    /// Upload Files was chosen: the platform's file chooser opens once the
+    /// update is done ([`RemoteModel::dispatch`]).
+    pick_files: bool,
+    /// The project picker is open to choose the upload panel's folder.
+    choosing_upload_dir: bool,
 }
 
 impl RemoteModel {
@@ -172,6 +183,8 @@ impl RemoteModel {
             _renames: None,
             renaming: false,
             rename_error: None,
+            pick_files: false,
+            choosing_upload_dir: false,
         }
     }
 
@@ -373,12 +386,14 @@ impl RemoteModel {
     /// Open the project picker (Open Project on a worker): scan the projects
     /// root and list `$HOME`. Open already, it is refreshed.
     pub fn open_picker(&mut self) {
+        self.choosing_upload_dir = false;
         self.session.open_picker();
     }
 
     /// Close the project picker. A clone it started carries on; how it ended
     /// is said in the status bar.
     pub fn close_picker(&mut self) {
+        self.choosing_upload_dir = false;
         self.session.close_picker();
     }
 
@@ -405,6 +420,129 @@ impl RemoteModel {
     /// Clone `url` (into `name`, if one is given) and open it.
     pub fn picker_clone(&mut self, url: &str, name: &str) {
         self.session.picker_clone(url, name);
+    }
+
+    // -- uploads (W34, v8) ---------------------------------------------------
+
+    /// Whether this worker takes uploads: the entry points exist only then.
+    pub fn supports_upload(&self) -> bool {
+        self.session.client().supports_upload()
+    }
+
+    /// The upload panel, while it is open.
+    pub fn upload(&self) -> Option<&UploadPanel> {
+        self.session.upload()
+    }
+
+    /// Open the upload panel with `paths` picked — or, open already and
+    /// still choosing, add them to its list. Folders are left out with the
+    /// panel's note.
+    pub fn open_upload_with(&mut self, paths: &[std::path::PathBuf]) {
+        self.session.open_upload_with(paths);
+    }
+
+    /// Ask the platform for files to upload, then open the panel with them
+    /// (or add them to it). A cancelled chooser opens nothing.
+    pub fn pick_upload_files(&mut self, cx: &mut Context<Self>) {
+        if !self.supports_upload() {
+            // Says why in the status bar, and opens nothing.
+            self.session.open_upload();
+            cx.notify();
+            return;
+        }
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Upload".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            this.update(cx, |model, cx| {
+                model.open_upload_with(&paths);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Take file `index` out of the list.
+    pub fn remove_upload_file(&mut self, index: usize) {
+        if let Some(panel) = self.session.upload_mut() {
+            panel.remove(index);
+        }
+    }
+
+    /// Upload into `dir` (typed in the panel's folder field).
+    pub fn set_upload_dir(&mut self, dir: &str) {
+        if let Some(panel) = self.session.upload_mut() {
+            if panel.dir != dir {
+                panel.set_dir(dir);
+            }
+        }
+    }
+
+    /// Upload: ask the worker for the list.
+    pub fn start_upload(&mut self) {
+        self.session.start_upload();
+    }
+
+    /// The person's answer to names already taken.
+    pub fn resolve_upload(&mut self, resolution: Resolution) {
+        self.session.resolve_upload(resolution);
+    }
+
+    /// Stop the upload; what was written stays written.
+    pub fn cancel_upload(&mut self) {
+        self.session.cancel_upload();
+    }
+
+    /// After Done or Cancelled: an empty list, the same folder.
+    pub fn upload_more(&mut self) {
+        if let Some(panel) = self.session.upload_mut() {
+            panel.start_over();
+        }
+    }
+
+    /// Close the upload panel (and a folder choice it had open).
+    pub fn close_upload(&mut self) {
+        if self.choosing_upload_dir {
+            self.close_picker();
+        }
+        self.session.close_upload();
+    }
+
+    /// The panel's Choose…: the project picker, listing the panel's folder,
+    /// in its choose-a-folder mode.
+    pub fn choose_upload_dir(&mut self) {
+        let Some(dir) = self
+            .upload()
+            .filter(|p| p.is_choosing())
+            .map(|p| p.dir.clone())
+        else {
+            return;
+        };
+        self.session.open_folder_picker(&dir);
+        self.choosing_upload_dir = true;
+    }
+
+    /// Whether the project picker is open to choose the upload's folder.
+    pub fn choosing_upload_dir(&self) -> bool {
+        self.choosing_upload_dir && self.picker().is_some() && self.upload().is_some()
+    }
+
+    /// Upload into `path` (the picker's Choose this folder), and go back to
+    /// the panel. The picker's Back ([`RemoteModel::close_picker`]) goes back
+    /// without choosing.
+    pub fn upload_dir_chosen(&mut self, path: &str) {
+        self.set_upload_dir(path);
+        self.close_picker();
     }
 
     /// The pane size the terminal element measured. On a worker it is sent
@@ -507,7 +645,13 @@ impl RemoteModel {
 
     /// [`RemoteModel::turn`] without the redraw, for tests and the loop.
     pub fn pump(&mut self) -> bool {
-        self.session.pump()
+        let changed = self.session.pump();
+        // A picker the session closed itself (a reconnect) ends a folder
+        // choice with it, so the next picker is the project picker again.
+        if self.session.picker().is_none() {
+            self.choosing_upload_dir = false;
+        }
+        changed
     }
 
     // -- input --------------------------------------------------------------
@@ -527,6 +671,9 @@ impl RemoteModel {
             }
         }
         self.apply(event);
+        if std::mem::take(&mut self.pick_files) {
+            self.pick_upload_files(cx);
+        }
         for action in self.take_front_end_actions() {
             if let Some(command) = crate::menus::AppCommand::for_front_end(action) {
                 cx.defer(move |cx| command.perform(cx));
@@ -539,8 +686,8 @@ impl RemoteModel {
     }
 
     /// [`RemoteModel::dispatch`] without a GPUI context. The palette rows
-    /// only this window answers (Open in VS Code, Rename Remote) are answered
-    /// here; the app's own are kept for [`RemoteModel::take_front_end_actions`].
+    /// only this window answers (Open in VS Code, Rename Remote, Upload
+    /// Files — whose file chooser `dispatch` then opens) are answered here; the app's own are kept for [`RemoteModel::take_front_end_actions`].
     pub fn apply(&mut self, event: HostEvent) {
         self.session.apply(event);
         for action in self.session.take_front_end_actions() {
@@ -552,6 +699,7 @@ impl RemoteModel {
                     }
                 }
                 FrontEndAction::RenameRemote => self.open_rename(),
+                FrontEndAction::UploadFiles => self.pick_files = true,
                 action => self.front_end.push(action),
             }
         }

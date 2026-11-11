@@ -350,6 +350,29 @@ fn clone_result() -> CloneResult {
     }
 }
 
+fn upload_plan() -> UploadPlan {
+    UploadPlan {
+        seq: 12,
+        dir: "/home/u/proj/assets".into(),
+        files: vec![
+            UploadPlanFile {
+                name: "logo.png".into(),
+                final_name: "logo (1).png".into(),
+                ticket: Some("AAAAAAAAAAAAAAAAAAAAAA".into()),
+                exists: true,
+            },
+            UploadPlanFile {
+                name: "new.txt".into(),
+                final_name: "new.txt".into(),
+                ticket: None,
+                exists: false,
+            },
+        ],
+        conflicts: true,
+        refusal: Some("never all three, but the shape allows it".into()),
+    }
+}
+
 /// One palette row as the host describes it, exercising every optional field so
 /// the round-trip test cannot skip one.
 fn command_view() -> CommandView {
@@ -525,6 +548,7 @@ fn all_server_msgs() -> Vec<ServerMsg> {
         ServerMsg::ProjectScan(project_scan()),
         ServerMsg::CloneProgress(clone_progress()),
         ServerMsg::CloneResult(clone_result()),
+        ServerMsg::UploadPlan(upload_plan()),
         ServerMsg::TakenOver {
             by: "laptop".into(),
         },
@@ -672,10 +696,16 @@ fn protocol_version_is_seven_and_still_serves_six() {
     // frame kinds and `ResizeTerminal`. And v7 is the first *range*: a native
     // FlightDeck Desktop does not co-ship with its host, so a v6 Desktop keeps
     // driving a v7 TUI host. Only a worker refuses it.
-    assert_eq!(PROTOCOL_VERSION, 7);
+    //
+    // **v8 is uploading files to a worker** (`remote-control-usem`): one frame
+    // kind, `UploadPlan`. The range widens rather than moves: a v6 Desktop
+    // still drives a TUI host, a v7 Desktop still drives a worker (it just
+    // cannot upload), and only `UploadPlan` is held back below v8.
+    assert_eq!(PROTOCOL_VERSION, 8);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 7);
+    assert_eq!(MAX_SUPPORTED_VERSION, 8);
     assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
+    assert_eq!(UPLOAD_MIN_VERSION, 8);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -691,10 +721,10 @@ fn protocol_version_is_seven_and_still_serves_six() {
 /// next person to add one has to read this comment to update it.
 #[test]
 fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
-    // `TakenOver` and the picker's frames arrived with v7. If you are adding a
-    // frame kind and this line still says 7, the answer is almost certainly a
-    // bump — see the module doc's forward-compatibility rule 1.
-    let newest_frame_kind_arrived_in = 7;
+    // `UploadPlan` arrived with v8. If you are adding a frame kind and this
+    // line still says 8, the answer is almost certainly a bump — see the
+    // module doc's forward-compatibility rule 1.
+    let newest_frame_kind_arrived_in = 8;
     assert!(
         PROTOCOL_VERSION >= newest_frame_kind_arrived_in,
         "a frame kind was added without bumping PROTOCOL_VERSION: a peer at the \
@@ -703,6 +733,8 @@ fn the_newest_frame_kind_is_covered_by_the_advertised_version() {
 
     // And it really is a frame this build sends, so the pairing above is about
     // live code rather than a number kept in step with nothing.
+    let frame = ServerMsg::UploadPlan(upload_plan());
+    assert_eq!(serde_json::to_value(&frame).unwrap()["type"], "upload_plan");
     let frame = ServerMsg::TakenOver {
         by: "laptop".into(),
     };
@@ -731,8 +763,10 @@ fn matching_version_is_accepted() {
 fn the_host_answers_each_peer_at_the_lower_of_the_two_versions() {
     assert_eq!(check_version(6), Ok(6));
     assert_eq!(check_version(7), Ok(7));
+    assert_eq!(check_version(8), Ok(8));
     assert_eq!(negotiated(6), 6);
     assert_eq!(negotiated(7), 7);
+    assert_eq!(negotiated(8), 8);
     // A peer newer than this build never gets past `check_version`, but the
     // arithmetic still never claims a version this build does not speak.
     assert_eq!(negotiated(9), PROTOCOL_VERSION);
@@ -750,15 +784,15 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round. v7 keeps v6 in its range and still refuses v5.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v7 host");
+    // refused both ways round. v8 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v8 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 7,
+            local: 8,
             peer: 5,
             min_supported: 6,
-            max_supported: 7,
+            max_supported: 8,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
@@ -767,7 +801,7 @@ fn mismatched_version_is_representable_and_detectable() {
     }
     // Newer than our ceiling is equally a mismatch. A native client that
     // dialled too new may redial at `max_supported`; a browser reloads.
-    assert!(check_version(8).is_err());
+    assert!(check_version(9).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -775,7 +809,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 7);
+    assert_eq!(value["version"]["max_supported"], 8);
     assert_eq!(round_trip(&frame), frame);
 }
 
@@ -1992,6 +2026,7 @@ fn every_v7_frame_and_delta_has_its_wire_tag() {
         (ServerMsg::ProjectScan(project_scan()), "project_scan"),
         (ServerMsg::CloneProgress(clone_progress()), "clone_progress"),
         (ServerMsg::CloneResult(clone_result()), "clone_result"),
+        (ServerMsg::UploadPlan(upload_plan()), "upload_plan"),
         (
             ServerMsg::TakenOver {
                 by: "laptop".into(),
@@ -2168,6 +2203,46 @@ fn every_worker_command_parses_into_its_op() {
             Some(json!({ "ignored": true })),
             WorkerOp::RestartWorkerShell,
         ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({
+                "dir": "~/proj",
+                "files": [{ "name": "a.png", "size": 10 }, { "name": "b", "size": 0 }],
+                "on_conflict": "keep_both",
+            })),
+            WorkerOp::BeginUpload {
+                dir: "~/proj".into(),
+                files: vec![
+                    UploadFile {
+                        name: "a.png".into(),
+                        size: 10,
+                    },
+                    UploadFile {
+                        name: "b".into(),
+                        size: 0,
+                    },
+                ],
+                on_conflict: OnConflict::KeepBoth,
+            },
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [] })),
+            WorkerOp::BeginUpload {
+                dir: "~".into(),
+                files: Vec::new(),
+                on_conflict: OnConflict::Ask,
+            },
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [], "on_conflict": "replace" })),
+            WorkerOp::BeginUpload {
+                dir: "~".into(),
+                files: Vec::new(),
+                on_conflict: OnConflict::Replace,
+            },
+        ),
     ];
     for (name, args, expected) in cases {
         assert_eq!(
@@ -2204,6 +2279,28 @@ fn a_worker_command_with_bad_args_is_refused_with_a_reason() {
             Some(json!({ "show_hidden": "yes" })),
         ),
         (worker_command::BROWSE_DIR, Some(json!("/home/u"))),
+        (worker_command::BEGIN_UPLOAD, Some(json!({ "files": [] }))),
+        (worker_command::BEGIN_UPLOAD, Some(json!({ "dir": "~" }))),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": "a.png" })),
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [{ "name": "a" }] })),
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [{ "name": "a", "size": -1 }] })),
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [{ "name": 1, "size": 1 }] })),
+        ),
+        (
+            worker_command::BEGIN_UPLOAD,
+            Some(json!({ "dir": "~", "files": [], "on_conflict": "overwrite" })),
+        ),
     ];
     for (name, args) in bad {
         match WorkerOp::parse(name, args.as_ref()) {

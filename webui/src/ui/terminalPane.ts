@@ -1,6 +1,7 @@
 import { paneTone } from "../state/connection";
 import type { PaneTone } from "../state/connection";
 import type { AppState } from "../state/types";
+import { onScreenTerminalId, stageGeometry } from "../state/worker";
 import { append, clear, el } from "./dom";
 import type { Region } from "./dom";
 import { createTerminalStage } from "./terminalStage";
@@ -35,9 +36,13 @@ import type { TerminalMount } from "./terminalStage";
  */
 export function createTerminalPane(mount: TerminalMount): Region {
   const stage = createTerminalStage({
-    terminalId: (state) => state.selection?.terminalId ?? null,
+    /** The selection's terminal on every host but a worker, exactly as
+     * before; a worker's shell tab shows its shell (`remote-control-vjtb`). */
+    terminalId: onScreenTerminalId,
     mount,
     label: "terminal",
+    /** D4's one grid, except on a worker, where each terminal has its own. */
+    geometry: stageGeometry,
   });
 
   const foot = el("div", { class: "fd-pane__foot" }, [

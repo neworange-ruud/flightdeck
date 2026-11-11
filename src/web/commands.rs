@@ -1014,6 +1014,48 @@ pub const WORKER_UNPAIR_PHONE_REFUSAL: &str =
 pub const WORKER_OPEN_PROJECT_REFUSAL: &str =
     "Use the worker's project picker (browse, scan, clone).";
 
+/// Why a worker does not run `upload_files` for a window that sends it: the
+/// row is the window's own upload panel (W34), which asks with
+/// [`crate::web::protocol::worker_command::BEGIN_UPLOAD`] instead.
+pub const WORKER_UPLOAD_FILES_REFUSAL: &str = "Use the window's upload panel.";
+
+/// The wire name of a worker's **Upload Files…** palette row (v8, W34,
+/// `specs/WEB_INTERFACE.md` R30).
+///
+/// Deliberately not in [`crate::web::protocol::command`] and not in
+/// [`INVENTORY`]: a TUI or Desktop host has nothing to upload into and never
+/// lists it, and the palette-coverage tests rightly hold every
+/// [`crate::web::protocol::command`] name to a row of the TUI's own palette.
+/// A worker lists it from [`WORKER_ROWS`]; its window runs it locally — like
+/// Open Project, it opens a panel — and a frame naming it anyway is refused
+/// with [`WORKER_UPLOAD_FILES_REFUSAL`].
+pub const UPLOAD_FILES: &str = "upload_files";
+
+/// The rows only a **worker** lists, after [`INVENTORY`]'s (v8).
+///
+/// Each is run locally by the worker's window, so each carries the refusal
+/// [`worker_refusal`] gives a frame that names it anyway — the same "the
+/// inventory says what the server answers" rule as the refused [`INVENTORY`]
+/// rows.
+pub static WORKER_ROWS: &[CommandSpec] = &[CommandSpec {
+    name: UPLOAD_FILES,
+    label: "Upload Files…",
+    group: "Projects",
+    host_only: false,
+    annotation: None,
+    route: Route::Rejected(WORKER_UPLOAD_FILES_REFUSAL),
+}];
+
+/// The spec for one wire name on a host of `kind`: [`lookup`], and on a worker
+/// [`WORKER_ROWS`] too. A TUI or Desktop host never finds a worker row, so a
+/// frame naming one is unknown there (`not_supported`).
+pub fn lookup_for(kind: HostKind, name: &str) -> Option<&'static CommandSpec> {
+    lookup(name).or_else(|| match kind {
+        HostKind::Worker => WORKER_ROWS.iter().find(|spec| spec.name == name),
+        HostKind::Tui | HostKind::Desktop => None,
+    })
+}
+
 /// The palette rows a **worker** host refuses, and why (design §2.4).
 ///
 /// `None` for every other name — including every name on a TUI or Desktop
@@ -1031,6 +1073,7 @@ pub fn worker_refusal(name: &str) -> Option<&'static str> {
         names::PAIR_PHONE => Some(WORKER_PHONE_REFUSAL),
         names::UNPAIR_PHONE => Some(WORKER_UNPAIR_PHONE_REFUSAL),
         names::OPEN_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
+        UPLOAD_FILES => Some(WORKER_UPLOAD_FILES_REFUSAL),
         _ => None,
     }
 }
@@ -1040,12 +1083,14 @@ pub fn worker_refusal(name: &str) -> Option<&'static str> {
 /// A TUI or Desktop host sends [`inventory`] unchanged. A worker overlays
 /// [`worker_refusal`] onto the rows it will not run, so a Desktop palette can
 /// hide or explain them before anyone picks one; the server answers those
-/// names `Rejected` all the same.
+/// names `Rejected` all the same. A worker also lists [`WORKER_ROWS`] (v8),
+/// after the rest.
 pub fn inventory_for(kind: HostKind) -> Vec<CommandView> {
     match kind {
         HostKind::Tui | HostKind::Desktop => inventory(),
         HostKind::Worker => INVENTORY
             .iter()
+            .chain(WORKER_ROWS)
             .map(|spec| {
                 let mut view = spec.view();
                 if let Some(reason) = worker_refusal(spec.name) {

@@ -44,6 +44,10 @@ pub struct WorkerStatusReport {
     /// The phone link, while the worker runs with `[worker] phone` on.
     #[serde(default)]
     pub phone: Option<PhoneStatusReport>,
+    /// FlightDeck Web (the browser app), while the worker runs; absent from
+    /// a worker that predates it.
+    #[serde(default)]
+    pub web: Option<WebReport>,
     /// Crash restarts since the supervisor started.
     pub restarts: u32,
     pub last_exit: Option<ExitReport>,
@@ -97,6 +101,26 @@ pub struct WorkerRuntimeReport {
     /// The phone link; `None` while `[worker] phone` is off.
     #[serde(default)]
     pub phone: Option<PhoneStatusReport>,
+    /// FlightDeck Web, the browser app (absent from an older worker).
+    #[serde(default)]
+    pub web: Option<WebReport>,
+}
+
+/// FlightDeck Web on a worker (`[worker] web`, `[worker] https`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebReport {
+    /// Whether the browser app is served at all (`[worker] web`).
+    pub enabled: bool,
+    /// Where a browser opens it (`https://<name>:<port>` or
+    /// `http://<address>`), while it is served and the worker listens.
+    pub url: Option<String>,
+    /// Whether `url` is HTTPS, with a Tailscale certificate.
+    pub https: bool,
+    /// Why it is not HTTPS, when it is served but not over HTTPS.
+    pub https_reason: Option<String>,
+    /// When the served certificate expires (unix seconds), while HTTPS is up
+    /// and the date could be read.
+    pub certificate_expires: Option<u64>,
 }
 
 /// The worker's phone link (`[worker] phone = true`).
@@ -219,6 +243,7 @@ pub fn merge(
         projects: Vec::new(),
         unread_messages: 0,
         phone: None,
+        web: None,
         restarts,
         last_exit,
         gave_up_reason,
@@ -236,6 +261,7 @@ pub fn merge(
             report.projects = rt.projects;
             report.unread_messages = rt.unread_messages;
             report.phone = rt.phone;
+            report.web = rt.web;
         }
         None => {
             // A supervised worker that has not answered yet still has a pid.
@@ -288,6 +314,9 @@ pub fn render_text(r: &WorkerStatusReport) -> String {
             let why = listen.reason.as_deref().unwrap_or("unknown reason");
             line(format!("Not listening: {why}"));
         }
+    }
+    if let Some(web) = &r.web {
+        line(render_web(web));
     }
 
     if r.state == WorkerState::Running {
@@ -361,6 +390,27 @@ pub fn render_text(r: &WorkerStatusReport) -> String {
     out
 }
 
+/// The one `Web:` line of `worker status`.
+fn render_web(web: &WebReport) -> String {
+    if !web.enabled {
+        return "Web: off".to_string();
+    }
+    let Some(url) = &web.url else {
+        return "Web: not reachable yet (the worker is not listening)".to_string();
+    };
+    if web.https {
+        let until = match web.certificate_expires {
+            Some(at) => format!("certificate until {}", crate::web::cert::format_date(at)),
+            None => "certificate validity unknown".to_string(),
+        };
+        return format!("Web: {url} ({until})");
+    }
+    match &web.https_reason {
+        Some(why) => format!("Web: {url} (HTTPS unavailable: {why})"),
+        None => format!("Web: {url}"),
+    }
+}
+
 /// `3d 4h`, `2h 5m`, `7m 3s`, `42s`: the two largest units.
 fn format_duration(secs: u64) -> String {
     let (d, h, m, s) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60, secs % 60);
@@ -421,6 +471,13 @@ pub(crate) mod tests {
             }],
             unread_messages: 0,
             phone: None,
+            web: Some(WebReport {
+                enabled: true,
+                url: Some("https://box.tail1234.ts.net:7420".to_string()),
+                https: true,
+                https_reason: None,
+                certificate_expires: Some(1_800_000_000),
+            }),
         }
     }
 
@@ -576,6 +633,13 @@ pub(crate) mod tests {
             }],
             "unread_messages": 0,
             "phone": null,
+            "web": {
+                "enabled": true,
+                "url": "https://box.tail1234.ts.net:7420",
+                "https": true,
+                "https_reason": null,
+                "certificate_expires": 1_800_000_000u64
+            },
             "restarts": 1,
             "last_exit": {
                 "at": 1_700_000_600u64,
@@ -587,8 +651,8 @@ pub(crate) mod tests {
             "start_on_boot": null
         });
         assert_eq!(serde_json::to_value(&r).unwrap(), expected);
-        // And it reads back, as does the shape from before `phone` and
-        // `start_on_boot` existed.
+        // And it reads back, as does the shape from before `phone`,
+        // `start_on_boot` and `web` existed.
         let back: WorkerStatusReport = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(back, r);
         let mut before_phone = expected;
@@ -597,8 +661,9 @@ pub(crate) mod tests {
             .as_object_mut()
             .unwrap()
             .remove("start_on_boot");
+        before_phone.as_object_mut().unwrap().remove("web");
         let back: WorkerStatusReport = serde_json::from_value(before_phone).unwrap();
-        assert_eq!(back, r);
+        assert_eq!(back, WorkerStatusReport { web: None, ..r });
     }
 
     fn boot() -> BootReport {
@@ -757,6 +822,55 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(!text.contains("Projects"), "{text}");
+    }
+
+    /// The `Web:` line, in each of its states.
+    #[test]
+    fn status_text_has_one_web_line() {
+        let mut rt = sample_runtime();
+        let text = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(
+            text.contains("Web: https://box.tail1234.ts.net:7420 (certificate until 2027-01-15)\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("Web:").count(), 1, "{text}");
+
+        let web = rt.web.as_mut().unwrap();
+        web.certificate_expires = None;
+        let text = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(text.contains("(certificate validity unknown)"), "{text}");
+
+        rt.web = Some(WebReport {
+            enabled: true,
+            url: Some("http://100.64.1.2:7420".to_string()),
+            https: false,
+            https_reason: Some("turned off ([worker] https = false)".to_string()),
+            certificate_expires: None,
+        });
+        let text = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(
+            text.contains(
+                "Web: http://100.64.1.2:7420 (HTTPS unavailable: turned off ([worker] https = false))"
+            ),
+            "{text}"
+        );
+
+        rt.web = Some(WebReport {
+            enabled: false,
+            url: None,
+            https: false,
+            https_reason: None,
+            certificate_expires: None,
+        });
+        let text = render_text(&merge(Some(rt.clone()), None, true, false));
+        assert!(text.contains("Web: off\n"), "{text}");
+
+        rt.web = None;
+        let text = render_text(&merge(Some(rt), None, true, false));
+        assert!(
+            !text.contains("Web:"),
+            "an older worker says nothing: {text}"
+        );
     }
 
     #[test]

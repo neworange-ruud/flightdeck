@@ -559,10 +559,14 @@ const WORKER_REFUSED: &[&str] = &[
 #[test]
 fn a_worker_inventory_marks_exactly_its_refusals() {
     let worker = inventory_for(HostKind::Worker);
+    // Deliberately `INVENTORY` *plus* `WORKER_ROWS` (v8): a worker lists the
+    // whole shared table — no row is dropped, only marked — and then its own
+    // rows (`upload_files`), which are kept out of `INVENTORY` so the TUI
+    // palette's coverage tests above stay about the TUI's palette.
     assert_eq!(
         worker.len(),
-        INVENTORY.len(),
-        "no row is dropped, only marked"
+        INVENTORY.len() + WORKER_ROWS.len(),
+        "no row is dropped, only marked; the worker's own rows follow"
     );
     for name in WORKER_REFUSED {
         let row = worker
@@ -589,6 +593,67 @@ fn a_worker_inventory_marks_exactly_its_refusals() {
 fn tui_and_desktop_hosts_send_the_inventory_unchanged() {
     assert_eq!(inventory_for(HostKind::Tui), inventory());
     assert_eq!(inventory_for(HostKind::Desktop), inventory());
+}
+
+// ---------------------------------------------------------------------------
+// The worker's own rows (v8, W34)
+// ---------------------------------------------------------------------------
+
+/// A worker's palette lists Upload Files…, last, refused if sent — its
+/// window runs it locally, as it does Open Project.
+#[test]
+fn a_worker_lists_upload_files_and_refuses_it_as_a_frame() {
+    let worker = inventory_for(HostKind::Worker);
+    let last = worker.last().expect("a worker lists rows");
+    assert_eq!(last.id, UPLOAD_FILES);
+    assert_eq!(last.run.name, "upload_files");
+    assert_eq!(last.label, "Upload Files…");
+    assert_eq!(last.group, "Projects");
+    assert!(!last.host_only, "the window runs it, not the box");
+    assert!(!last.answers_dialog);
+    assert_eq!(last.target, None);
+    assert_eq!(
+        last.refusal.as_deref(),
+        Some("Use the window's upload panel."),
+        "a frame naming it gets the words the row carries"
+    );
+    assert_eq!(
+        worker_refusal(UPLOAD_FILES),
+        Some(WORKER_UPLOAD_FILES_REFUSAL)
+    );
+    assert_eq!(
+        worker.iter().filter(|row| row.id == UPLOAD_FILES).count(),
+        1,
+        "listed once"
+    );
+}
+
+/// The row never reaches a TUI or Desktop host's palette, nor the shared
+/// table the TUI palette's coverage is checked against.
+#[test]
+fn upload_files_is_a_worker_row_only() {
+    assert!(lookup(UPLOAD_FILES).is_none(), "not in INVENTORY");
+    for kind in [HostKind::Tui, HostKind::Desktop] {
+        assert!(
+            !inventory_for(kind).iter().any(|row| row.id == UPLOAD_FILES),
+            "{kind:?} does not list it"
+        );
+        assert!(lookup_for(kind, UPLOAD_FILES).is_none(), "{kind:?}");
+    }
+    let spec = lookup_for(HostKind::Worker, UPLOAD_FILES).expect("a worker knows it");
+    assert_eq!(spec.refusal(), Some(WORKER_UPLOAD_FILES_REFUSAL));
+    assert!(
+        spec.requires_control(),
+        "an observer is told read_only first"
+    );
+    // `lookup_for` is `lookup` for every shared row, on every host.
+    for spec in INVENTORY {
+        for kind in [HostKind::Tui, HostKind::Desktop, HostKind::Worker] {
+            assert_eq!(lookup_for(kind, spec.name).map(|s| s.name), Some(spec.name));
+        }
+    }
+    // Not a worker command either: those are parsed before any lookup.
+    assert!(!crate::web::protocol::worker_command::ALL.contains(&UPLOAD_FILES));
 }
 
 #[test]

@@ -236,6 +236,12 @@ FlightDeck tab open is silent by design.
 > version earns its keep is a separate and much smaller question. D17 does not
 > decide it and no milestone carries it.
 
+> **A worker is a second secure-context case** (remote-control-ougi, PRD W32). A
+> worker served over HTTPS with a Tailscale certificate for its MagicDNS name is a
+> secure context, so its page uses the `Notification` API while the tab is open
+> and hidden. That is still not Web Push: no service worker, no subscription, and
+> a closed tab is silent, exactly as above.
+
 ### D12 — Wire protocol: a new web-only protocol in its own module
 
 `src/web/protocol.rs`, versioned, JSON over WebSocket:
@@ -3530,10 +3536,19 @@ floor at most one below it, rather than none.
 sizes the PTYs (PRD W5), since a worker has no pane of its own. A TUI or
 Desktop host drops the frame silently, and D4 holds there unchanged.
 
-**The SPA handles none of it.** A worker serves no SPA (only `/ws`,
+**The SPA handled none of it at first.** A worker serves no SPA (only `/ws`,
 `/auth/exchange` and `/auth/session`), so `webui/src/wire/frames.ts` only
 declares the optional v7 fields and `WireTakenOver`, and bumps its
 `PROTOCOL_VERSION` to 7 to stay in step with the host.
+
+*Amended (remote-control-ougi, PRD W31–W33).* A worker now serves the SPA too,
+and the SPA has a worker mode keyed on the snapshot's `host_kind`: it handles
+`taken_over` as the end of the link (no automatic retry, a "Take it back"
+button), sends `resize_terminal` for the terminal on screen (W5 — D4's
+letterbox is off on a worker only), shows the worker shell, opens the project
+picker for Open Project, and shows host messages, health and notifications.
+D3's shared selection is kept: a worker has one window, so the host's selection
+is that window's. TUI and Desktop hosts are unchanged.
 
 ### R29 — Mission control in a remote window, with no version bump
 
@@ -3577,6 +3592,37 @@ deferred keystroke queue) and claims the input lock **as that viewer**, so a
 remote click never lands in the middle of someone else's typing either.
 
 ---
+
+### R30 — protocol v8: uploading files to a worker
+
+A window can upload one or more files into one folder on a worker
+(`specs/WORKER_PRD.md` W34, epic `remote-control-usem`). The bytes do not ride
+the socket: base64 inside JSON costs a third more, and every byte would pass
+through the host loop's inbound channel ahead of keystrokes and terminal
+output. The socket carries only the grant.
+
+**New kind (hence the bump to v8).** `ServerMsg::UploadPlan`, wire tag
+`upload_plan`, answers the worker command `begin_upload` and goes only to the
+window that asked. Like `dir_listing`, it is never sent to a background link,
+and never to a peer negotiated below 8 (such a peer cannot ask). The ranges
+become: a TUI or Desktop host accepts **6..=8**, a worker **7..=8**.
+`begin_upload` is a worker command (R28), not a palette row; the palette's
+**Upload files** row is a separate inventory entry that a worker window runs
+locally, as it does Open Project.
+
+**The bytes go over HTTP.** `PUT /upload/<ticket>` on the same port, with the
+same cookie: the ticket is single-use, bound to the token that asked, and
+valid for two minutes. A browser sends it with `XMLHttpRequest` for upload
+progress (`fetch` has none), from `wire/upload.ts`, since the guard tests keep
+I/O and timing out of `state/` and `ui/`. The route is a worker's only: a TUI
+or Desktop host has no `/upload`.
+
+**Drag and drop.** Dropping files on a worker's window or tab opens the same
+upload panel with them selected. Folders in a drop are left out, with a note.
+
+**The default folder** is the selected session's worktree, else the selected
+project's root, else the worker's home. The SPA therefore now keeps
+`worktree_path` on each session (the host always sent it; rule 4).
 
 ## 7. Reference
 

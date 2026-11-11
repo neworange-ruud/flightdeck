@@ -8,7 +8,9 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **A worker serves FlightDeck Web.** Open a worker in any browser on your tailnet and drive it as you would from FlightDeck Desktop's worker window: the worker shell, your projects and agents with terminals sized to the browser, **Open Project** (scan, browse, clone), host messages and health. `flightdeck worker pair` now also prints an **In a browser** link with the code in it. A browser attaches as a window, so a browser and a Desktop take the worker over from each other; the page that was taken over offers **Take it back**. A paired browser has the same full power as a paired Desktop. It is on by default; `[worker] web = false` turns the page off.
+- **Upload files to a worker.** From FlightDeck Desktop's worker window or a browser, choose **Upload files…** (or drop files on the window), pick one or more files and a folder on the worker, and upload them. The folder starts at the worktree you're looking at and can be changed by browsing the worker's home folder. A file that already exists is never overwritten without asking: you choose **Replace**, **Keep both** (`name (1).ext`) or **Cancel**. Uploads are confined to the worker account's home folder. The web protocol goes to v8; an older Desktop still connects, without the upload button.
+- **HTTPS for a worker, on the same port.** When your tailnet has HTTPS certificates turned on, the worker fetches a certificate for its Tailscale name with `tailscale cert`, renews it daily and answers HTTPS on its port, while the Desktop keeps connecting as before. Plain links redirect to `https://`, and the page can show notifications while its tab is in the background. Without HTTPS on the tailnet the page is served over `http://` on the Tailscale address. `flightdeck worker status` has a new **Web** line saying which, and why. `[worker] https = false` never asks for a certificate.
 
 ### Improvements
 

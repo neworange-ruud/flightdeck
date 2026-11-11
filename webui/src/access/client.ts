@@ -1,6 +1,6 @@
 import { parseAccessScreen } from "../state/access";
-import type { AccessScreen } from "../state/model";
-import { agoLabel } from "../wire/adapt";
+import type { AccessScreen, HostKind } from "../state/model";
+import { agoLabel, hostKindOf } from "../wire/adapt";
 
 /**
  * The two HTTP calls the access screens make (Q4, D5).
@@ -61,6 +61,14 @@ export interface AccessRefusal {
    * host did not say when, and the sentence then renders without the clause.
    */
   readonly revokedAgo: string | null;
+  /**
+   * What kind of FlightDeck refused us — the body's `host_kind`
+   * (`remote-control-vjtb`). It decides where the screens send the reader for
+   * a code: a TUI or Desktop's Web Interface overlay, or `flightdeck worker
+   * pair` on a worker. `null` when the host did not say, and the screens then
+   * read as they always have.
+   */
+  readonly hostKind: HostKind | null;
 }
 
 export type AccessResult =
@@ -173,6 +181,7 @@ async function readResult(response: Response): Promise<AccessResult> {
       numberOrNull(record.revoked_at_ms),
       numberOrNull(record.server_time_ms),
     ),
+    hostKind: hostKindOf(record.host_kind),
   };
 }
 

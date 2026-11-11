@@ -13,8 +13,9 @@ day-to-day operation, phone pairing and the `[worker]` settings.
 ## One window at a time
 
 A worker has one remote window at a time. If you open the worker from a second
-Desktop, or with `flightdeck connect`, the newer one takes over. The first window shows **Taken over by
-`<device>`** with a **Reconnect** button, which takes the worker back. Its
+Desktop, a browser, or with `flightdeck connect`, the newer one takes over. The
+first window shows **Taken over by `<device>`** with a **Reconnect** button (in a
+browser, **Take it back**), which takes the worker back. Its
 pairing stays valid.
 
 If the worker is stopped, the window shows **The worker stopped.** and tells you
@@ -48,9 +49,9 @@ shows them as **N messages while you were away**.
 ## Security
 
 <Callout type="warning">
-  **Pairing a Desktop with a worker gives it the worker account's full power:** a
-  shell and read and write access to the whole home directory. Only pair
-  Desktops you trust as much as you trust a login on that account.
+  **Pairing a Desktop or a browser with a worker gives it the worker account's
+  full power:** a shell and read and write access to the whole home directory.
+  Only pair devices you trust as much as you trust a login on that account.
 </Callout>
 
 - **The tailnet is the boundary.** The worker listens only on Tailscale
@@ -58,24 +59,67 @@ shows them as **N messages while you were away**.
 - **Codes need a shell on the box.** A pairing code can only be minted through a
   control socket that only the worker account can reach. Getting a code already
   means being logged in as that account.
-- **Tokens are per Desktop and revocable.** List them with
+- **Tokens are per device and revocable.** List them with
   `flightdeck worker devices`. Revoke one with `flightdeck worker revoke <device>`,
   by id, by label (case-insensitive) or by a unique id prefix. Its live
   connections close at once, and it must pair again to reconnect.
-- **No credentials cross the wire.** Nothing leaves the WireGuard tunnel, so there
-  is no TLS, and the worker never handles your agent or git logins.
+- **Uploads stay in the home folder.** [Uploading files](/worker#upload-files-to-the-worker)
+  writes only inside the worker account's home folder, never overwrites a file
+  without asking, and only the window that holds the worker can do it.
+- **Nothing leaves the WireGuard tunnel.** The browser page also gets HTTPS when
+  your tailnet allows it (below), and the worker never handles your agent or git
+  logins.
 
 ```bash
 flightdeck worker devices
 flightdeck worker revoke mbp
 ```
 
-`devices` prints a table with each Desktop's id, label, state (attached,
+`devices` prints a table with each paired device's id (a browser shows as, for
+example, *Chrome on macOS (browser)*), label, state (attached,
 background or offline; revoked ones are marked), when it paired, when it was last
 seen and its address. `devices --json` prints a bare array for scripts.
 
 Whether agents run in containers or worktree isolation follows your normal
 [configuration](/reference/configuration), with no worker-specific default.
+
+## HTTPS
+
+The worker serves the browser page and the Desktop's connection on the same
+port. When it can, it also answers HTTPS there, with a certificate from Tailscale
+for the machine's name (`box.tail1234.ts.net`). That makes the page a *secure
+context*, so it can show notifications while its tab is in the background.
+
+To turn it on, in the [Tailscale admin console](https://login.tailscale.com/admin/dns)
+under **DNS**, enable **MagicDNS** and **HTTPS Certificates**. The worker notices
+within a minute, fetches a certificate with `tailscale cert` and renews it daily.
+`flightdeck worker status` shows the result:
+
+```text
+Web:          https://box.tail1234.ts.net:7420 (certificate until 2027-02-09)
+```
+
+or, without a certificate, why not:
+
+```text
+Web:          http://100.101.102.103:7420 (HTTPS unavailable: HTTPS certificates are not enabled for this tailnet …)
+```
+
+<Callout type="info">
+  Turning on HTTPS certificates publishes your machines' Tailscale names in public
+  [Certificate Transparency](https://tailscale.com/kb/1153/enabling-https) logs.
+  The worker never asks for a certificate until you have turned it on.
+</Callout>
+
+Without a certificate, the browser page is served over plain `http://` on the
+worker's Tailscale address. It is still encrypted by Tailscale, but the browser
+treats it as insecure, so notifications are not offered. Once a certificate is
+loaded, an `http://` link redirects to the `https://` name. The Desktop always
+connects without TLS and is not affected.
+
+To serve the page without HTTPS, set `https = false` under `[worker]`. To serve no
+browser page at all, set `web = false`. Run `flightdeck worker restart` after
+either change.
 
 ## Pair the iPhone app
 
@@ -221,6 +265,8 @@ port = 7420
 projects_root = "~/flightdeck"
 default_cols = 200
 default_rows = 50
+web = true
+https = true
 ```
 
 | Key | Default | Meaning |
@@ -230,6 +276,8 @@ default_rows = 50
 | `default_cols` | `200` | Terminal width for an agent started while no window has reported a size (20 to 1000). |
 | `default_rows` | `50` | Terminal height in the same case (4 to 500). |
 | `phone` | `false` | Allow pairing the iPhone app with `flightdeck worker pair --phone`. See [Pair the iPhone app](#pair-the-iphone-app). |
+| `web` | `true` | Serve FlightDeck Web's page, so a browser can pair and drive the worker. `false` serves only the Desktop's connection. |
+| `https` | `true` | Fetch a Tailscale certificate and answer HTTPS on the same port, when your tailnet has HTTPS certificates on. See [HTTPS](#https). |
 
 An attached window resizes terminals to fit its panes, so the defaults only apply
 when nothing is attached. An invalid `[worker]` table stops the worker from

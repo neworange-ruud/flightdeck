@@ -5,6 +5,7 @@ import { viewerChipText, viewerChipTitle } from "../state/seats";
 import { findSession } from "../state/model";
 import type { StatusGlyph } from "../state/model";
 import type { AppState } from "../state/types";
+import { healthLine, isWorker, offersNotifications } from "../state/worker";
 import { append, clear, el, separator, spinnerGlyph } from "./dom";
 import type { Child, Region } from "./dom";
 
@@ -80,6 +81,9 @@ export interface StatusBarOptions {
   readonly onAction?: (action: StripAction) => void;
   /** The unread chip is the pointer half of `a` (2e). */
   readonly onOpenFeed?: () => void;
+  /** A worker's window, in a context that can ask: "Enable notifications"
+   * (W18). Asking is the browser's business, so `main.ts` does it. */
+  readonly onEnableNotifications?: () => void;
 }
 
 export function createStatusBar(options: StatusBarOptions = {}): Region {
@@ -131,6 +135,8 @@ export function createStatusBar(options: StatusBarOptions = {}): Region {
       ]);
     }
     parts.push(hints);
+    /** A worker's own line, before the spacer so 2c's strip never moves. */
+    parts.push(workerGroup(state, options.onEnableNotifications));
 
     parts.push(
       /** Rule 1. This spacer is load-bearing: it is what keeps `.fd-conn` in
@@ -191,6 +197,60 @@ export function createStatusBar(options: StatusBarOptions = {}): Region {
 }
 
 /** The `● connected 18ms` group, in the one shape every 2c row uses. */
+/**
+ * A worker's window says, in the status bar, what the worker would have put on
+ * its own if it had one (`remote-control-vjtb`, `messages.rs`): the latest
+ * notice — a host message, or how something this window asked for turned out —
+ * else the health line (`load 0.42 · 18 GB free · 3 agents`). And, in a
+ * context that can ask, the one control that turns on browser notifications.
+ *
+ * `null` on every other host: nothing is added, so a TUI or Desktop host's bar
+ * is the bar it always was.
+ */
+function workerGroup(
+  state: AppState,
+  onEnable: (() => void) | undefined,
+): HTMLElement | null {
+  if (!isWorker(state)) {
+    return null;
+  }
+  const health = state.worker?.health ?? null;
+  const line = health === null ? "" : healthLine(health);
+  const children: HTMLElement[] = [];
+  if (state.notice !== null) {
+    children.push(
+      separator(),
+      el("span", {
+        class: "fd-statusbar__notice",
+        text: state.notice,
+        title: state.notice,
+      }),
+    );
+  } else if (line !== "") {
+    children.push(
+      separator(),
+      el("span", {
+        class: "fd-statusbar__health",
+        text: line,
+        title: health === null ? "" : `worker FlightDeck ${health.version}`,
+      }),
+    );
+  }
+  if (offersNotifications(state)) {
+    const button = el("button", {
+      class: "fd-statusbar__notify",
+      text: "Enable notifications",
+      title: "let this browser tell you when an agent on the worker needs you",
+      attrs: { type: "button" },
+    });
+    button.addEventListener("click", () => onEnable?.());
+    children.push(separator(), button);
+  }
+  return children.length === 0
+    ? null
+    : el("span", { class: "fd-statusbar__worker" }, children);
+}
+
 function connectionGroup(strip: ConnectionStrip): HTMLElement {
   return el("span", { class: "fd-conn" }, [
     glyph(strip.status.glyph, strip.status.tone),

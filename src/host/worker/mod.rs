@@ -24,6 +24,9 @@
 //! * [`AppHost::publish`] routes the window's worker frames (`ResizeTerminal`,
 //!   the picker's [`WorkerOp`]s, attach kinds) and publishes a
 //!   [`WorkerHostState`] with the rest of the host state.
+//! * Uploads (v8, [`upload`]): a `begin_upload` is checked and planned here,
+//!   granted through the server, and each `PUT` it granted reports back
+//!   ([`WebInbound::UploadFinished`]); a finished batch is one host message.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,20 +35,22 @@ use std::sync::{Arc, Mutex};
 use crate::contracts::{Config, Notification, NotificationSound, PtySize, Result, WorkerConfig};
 use crate::host::AppHost;
 use crate::persistence::workspace::{load_workspace, WorkspaceUi};
+use crate::web::credentials::TokenId;
 use crate::web::credentials::{BrowserToken, BOOTSTRAP_CODE_TTL_MS};
 use crate::web::protocol::{
     Ack, AckOutcome, Delta, DirEntryView, DirListing, HostKind, MessageLevel,
     NotificationSoundView, NotificationView, ProjectId, ProjectScan, ScannedRepo, ServerMsg,
-    TerminalId, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView, WORKER_SHELL_TERMINAL_ID,
+    TerminalId, UploadPlan, UploadPlanFile, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView,
+    WORKER_SHELL_TERMINAL_ID,
 };
 use crate::web::server::{
-    ConnectionInfo, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice, WebInbound,
-    WebOutbound, WebServerHandle, WorkerHostState,
+    ConnectionInfo, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice, UploadFinished,
+    UploadGrantRequest, WebInbound, WebOutbound, WebServerHandle, WorkerHostState,
 };
 use crate::worker::control::{DeviceReport, DeviceState, PairingCode};
 use crate::worker::paths::WorkerPaths;
 use crate::worker::status::{
-    AgentReport, AttachedReport, ListenReport, ProjectReport, WorkerRuntimeReport,
+    AgentReport, AttachedReport, ListenReport, ProjectReport, WebReport, WorkerRuntimeReport,
 };
 use crate::{
     apply_update_notice, locate_web_terminal, open_project, resume_active_project_agents,
@@ -59,6 +64,8 @@ pub mod notify;
 pub mod phone;
 pub mod projects;
 pub mod shell;
+pub mod tls;
+pub mod upload;
 
 // The worker is Linux and macOS only (W2); its tests use unix paths.
 #[cfg(all(test, unix))]
@@ -71,6 +78,7 @@ use health::{AgentCounts, HealthProbe, HealthSampler};
 use messages::{level_of, HostMessageLog};
 use projects::Confinement;
 use shell::WorkerShell;
+use tls::{CertLifecycle, CertSetup};
 
 /// The answer to every command that needs a project, on a worker that has
 /// none yet (design A9).
@@ -115,6 +123,10 @@ pub struct WorkerOptions {
     pub listen: ListenPlan,
     pub health: Box<dyn health::HealthProbe + Send>,
     pub cloner: Arc<dyn clone::CloneRunner>,
+    /// What the HTTPS certificate lifecycle needs ([`tls`]): `Some` when the
+    /// worker listens on Tailscale, `None` otherwise (then the browser app is
+    /// plain HTTP).
+    pub certs: Option<CertSetup>,
 }
 
 /// A worker op's answer: `Ok((ack detail, answer frame))` when it applied,
@@ -133,6 +145,56 @@ impl OpRefusal {
         OpRefusal {
             reason: reason.into(),
             frame: None,
+        }
+    }
+}
+
+/// One granted upload batch (one `begin_upload`), until every file of it
+/// has reported.
+struct UploadBatch {
+    /// The canonical target folder.
+    dir: PathBuf,
+    /// How many files were granted.
+    expected: usize,
+    /// The files written, by final name.
+    written: Vec<String>,
+    /// The files that were not, with why.
+    failed: Vec<(String, String)>,
+}
+
+impl UploadBatch {
+    /// The one host message a finished batch posts.
+    fn message(&self, home: &Path) -> (MessageLevel, String) {
+        let place = upload::tilde(home, &self.dir);
+        let failures = || {
+            let (name, why) = &self.failed[0];
+            let more = match self.failed.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            format!("{name}: {}{more}", why.trim_end_matches('.'))
+        };
+        match (self.written.len(), self.failed.len()) {
+            (1, 0) => (
+                MessageLevel::Info,
+                format!("Uploaded {} to {place}.", self.written[0]),
+            ),
+            (n, 0) => (
+                MessageLevel::Info,
+                format!("Uploaded {n} files to {place}."),
+            ),
+            (0, _) => (
+                MessageLevel::Warning,
+                format!("Nothing was uploaded to {place}. {}.", failures()),
+            ),
+            (n, _) => (
+                MessageLevel::Warning,
+                format!(
+                    "Uploaded {n} of {} files to {place}. {}.",
+                    self.expected,
+                    failures()
+                ),
+            ),
         }
     }
 }
@@ -167,6 +229,10 @@ pub(crate) struct WorkerExt {
     last_health: Option<crate::web::protocol::Health>,
     clones: CloneJobs,
     clone_meta: HashMap<u64, CloneMeta>,
+    /// Upload batches granted and not yet finished, by batch id.
+    uploads: HashMap<u64, UploadBatch>,
+    /// The next upload batch's id.
+    next_upload_batch: u64,
     confinement: Confinement,
     /// The pane size the window last reported: what a project opened later,
     /// and every agent spawned later, starts at.
@@ -183,6 +249,13 @@ pub(crate) struct WorkerExt {
     not_listening_reason: Option<String>,
     /// When to try starting the server again, after it could not start.
     listen_retry_at_ms: Option<u64>,
+    /// The HTTPS certificate: fetched, renewed, and what the server presents.
+    certs: CertLifecycle,
+    /// Whether the server's certificate must be set again (it changed, or a
+    /// new server started).
+    cert_dirty: bool,
+    /// The HTTPS name last handed to the server for its redirect.
+    https_host_applied: Option<String>,
     /// Every frame the worker emitted of its own accord (not an answer to a
     /// frame), server or not: what the tests read.
     #[cfg(test)]
@@ -234,6 +307,36 @@ impl WorkerExt {
     }
 }
 
+/// Make the server present what the certificate lifecycle says, and
+/// redirect plain page loads to the name the certificate is for.
+fn sync_certificate(
+    w: &mut WorkerExt,
+    handle: &WebServerHandle,
+    now_ms: u64,
+    magic_dns: Option<String>,
+) {
+    if w.cert_dirty {
+        w.cert_dirty = false;
+        let pem = w
+            .certs
+            .current()
+            .map(|c| (c.cert_pem.clone(), c.key_pem.clone()));
+        let applied = handle.set_certificate(pem.as_ref().map(|(c, k)| (c.as_str(), k.as_str())));
+        if let (Err(e), Some(_)) = (applied, pem.as_ref()) {
+            w.certs.rejected(e, now_ms);
+            let _ = handle.set_certificate(None);
+        }
+    }
+    let host = w
+        .certs
+        .current()
+        .and_then(|c| c.domain.clone().or(magic_dns));
+    if host != w.https_host_applied {
+        handle.set_https_host(host.clone());
+        w.https_host_applied = host;
+    }
+}
+
 fn level_label(level: MessageLevel) -> &'static str {
     match level {
         MessageLevel::Info => "info",
@@ -259,10 +362,18 @@ fn notification_view(note: &Notification, at_ms: i64) -> NotificationView {
     }
 }
 
-/// The device name a Desktop's label carries: `FlightDeck Desktop/1.2 (box)`
-/// names `box` (design A11); any other label is shown as it is.
+/// The name a paired device is shown by, from the label it paired (or
+/// attached) with: `FlightDeck Desktop/1.2 (box)` names `box` (design A11);
+/// a browser's user-agent names it `Chrome on macOS (browser)`; any other
+/// label is shown as it is.
 pub fn device_name(label: Option<&str>) -> String {
     let label = label.map(str::trim).unwrap_or("");
+    let native = crate::web::server::NATIVE_CLIENT_AGENTS
+        .iter()
+        .any(|name| label.contains(name));
+    if !native && !crate::web::server::coarse_user_agent(label).is_empty() {
+        return crate::web::server::browser_device_name(label);
+    }
     if let Some(inner) = label
         .strip_suffix(')')
         .and_then(|rest| rest.rfind('(').map(|i| rest[i + 1..].trim()))
@@ -404,6 +515,7 @@ impl<'a> AppHost<'a> {
             p.state.set_pty_size(size);
         }
         let projects_root = opts.config.projects_root_path(confinement.home());
+        let certs = CertLifecycle::new(opts.config.web, opts.config.https, opts.certs);
         host.worker = Some(Box::new(WorkerExt {
             home: opts.home,
             projects_root,
@@ -420,6 +532,8 @@ impl<'a> AppHost<'a> {
             last_health: None,
             clones: CloneJobs::new(),
             clone_meta: HashMap::new(),
+            uploads: HashMap::new(),
+            next_upload_batch: 1,
             confinement,
             last_window_size: None,
             started_ms,
@@ -429,6 +543,9 @@ impl<'a> AppHost<'a> {
             last_listen: None,
             not_listening_reason: None,
             listen_retry_at_ms: None,
+            certs,
+            cert_dirty: true,
+            https_host_applied: None,
             #[cfg(test)]
             sent: Vec::new(),
         }));
@@ -445,9 +562,10 @@ impl<'a> AppHost<'a> {
         }
     }
 
-    /// Start the web server (Tailscale listeners, no browser assets) and the
-    /// worker shell. A bind failure is not fatal: the worker keeps running,
-    /// not listening, and retries. Idempotent.
+    /// Start the web server (Tailscale listeners; the browser app when
+    /// `[worker] web` is on) and the worker shell. A bind failure is not
+    /// fatal: the worker keeps running, not listening, and retries.
+    /// Idempotent. The HTTPS certificate follows on later ticks ([`tls`]).
     pub fn start_worker(&mut self) {
         let now0 = self.env.clock.now_millis();
         let update_check = match self.worker.as_mut() {
@@ -495,14 +613,19 @@ impl<'a> AppHost<'a> {
     /// Start the server on the worker's listen plan. A failure is logged and
     /// retried after [`LISTEN_RETRY_MS`].
     fn start_listening(&mut self, now_ms: u64) {
-        let Some(listen) = self.worker.as_ref().map(|w| w.listen.clone()) else {
+        let Some((listen, web)) = self
+            .worker
+            .as_ref()
+            .map(|w| (w.listen.clone(), w.config.web))
+        else {
             return;
         };
         let options = ServerOptions {
             host_kind: HostKind::Worker,
             listen,
-            // Design A5: the protocol routes only, no browser SPA.
-            serve_assets: false,
+            // The browser app beside the protocol routes, unless `[worker]
+            // web` is off (then the protocol routes only, design A5).
+            serve_assets: web,
         };
         let mut initial = web_host_state_now(
             &self.workspace,
@@ -520,6 +643,9 @@ impl<'a> AppHost<'a> {
             Ok(()) => {
                 w.not_listening_reason = None;
                 w.listen_retry_at_ms = None;
+                // A new server presents nothing until told.
+                w.cert_dirty = true;
+                w.https_host_applied = None;
             }
             Err(e) => {
                 w.log(format!("not listening: {e}"));
@@ -590,6 +716,21 @@ impl<'a> AppHost<'a> {
                 w.log(line);
                 w.last_listen = Some(status);
             }
+        }
+
+        // --- HTTPS: the certificate lifecycle (never blocks: fetches run on
+        //     their own thread), and what the server presents. ---
+        let magic_dns = handle.and_then(|h| h.listen_status().magic_dns);
+        if w.certs.poll(now_ms, magic_dns.as_deref()).is_some() {
+            w.cert_dirty = true;
+        }
+        if let Some(handle) = handle {
+            sync_certificate(w, handle, now_ms, magic_dns);
+            // Grants nobody redeemed in time end their batch.
+            handle.expire_uploads();
+        }
+        for line in w.certs.take_log() {
+            w.log(line);
         }
 
         // --- Notifications: what an OS notification would have said, to
@@ -819,8 +960,16 @@ impl<'a> AppHost<'a> {
                 self.resize_from_window(terminal_id, *size);
                 Some(Vec::new())
             }
-            WebInbound::WorkerOp { viewer_id, seq, op } => {
-                Some(self.run_worker_op(viewer_id, *seq, op.clone()))
+            WebInbound::WorkerOp {
+                viewer_id,
+                token,
+                seq,
+                op,
+            } => Some(self.run_worker_op(viewer_id, token, *seq, op.clone())),
+            WebInbound::UploadFinished(finished) => {
+                self.worker.as_ref()?;
+                self.upload_finished(finished.clone());
+                Some(Vec::new())
             }
             _ => None,
         }
@@ -860,8 +1009,14 @@ impl<'a> AppHost<'a> {
     /// Run one of the window's project-picker or shell operations, answering
     /// the [`Ack`] and then whatever the operation produced, to the viewer
     /// that asked.
-    fn run_worker_op(&mut self, viewer_id: &ViewerId, seq: u64, op: WorkerOp) -> Vec<WebOutbound> {
-        let (outcome, detail, answer) = match self.worker_op(seq, op) {
+    fn run_worker_op(
+        &mut self,
+        viewer_id: &ViewerId,
+        token: &TokenId,
+        seq: u64,
+        op: WorkerOp,
+    ) -> Vec<WebOutbound> {
+        let (outcome, detail, answer) = match self.worker_op(token, seq, op) {
             Ok((detail, answer)) => (AckOutcome::Applied, detail, answer),
             Err(refusal) => (
                 AckOutcome::Rejected,
@@ -888,7 +1043,7 @@ impl<'a> AppHost<'a> {
 
     /// One worker op: `Ok((ack detail, answer frame))` when applied,
     /// `Err(refusal)` when refused.
-    fn worker_op(&mut self, seq: u64, op: WorkerOp) -> OpOutcome {
+    fn worker_op(&mut self, token: &TokenId, seq: u64, op: WorkerOp) -> OpOutcome {
         let fs = self.env.fs;
         let Some(w) = self.worker.as_mut() else {
             return Err(OpRefusal::new("This FlightDeck is not a worker."));
@@ -987,6 +1142,142 @@ impl<'a> AppHost<'a> {
                     ))),
                 }
             }
+            WorkerOp::BeginUpload {
+                dir,
+                files,
+                on_conflict,
+            } => {
+                // A refusal still answers in the plan's own frame, as a
+                // refused scan does, so the window's upload panel says why.
+                let refused = |reason: String| OpRefusal {
+                    reason: reason.clone(),
+                    frame: Some(Box::new(ServerMsg::UploadPlan(UploadPlan {
+                        seq,
+                        dir: dir.clone(),
+                        files: files
+                            .iter()
+                            .map(|f| UploadPlanFile {
+                                name: f.name.clone(),
+                                final_name: f.name.clone(),
+                                ticket: None,
+                                exists: false,
+                            })
+                            .collect(),
+                        conflicts: false,
+                        refusal: Some(reason),
+                    }))),
+                };
+                let probe = &w.probe;
+                let planned = upload::plan(fs, &w.confinement, &dir, &files, on_conflict, |p| {
+                    probe.disk_free(p)
+                })
+                .map_err(refused)?;
+                let (canonical, planned, conflicts) = match planned {
+                    upload::Plan::Ready { dir, files } => (dir, files, false),
+                    upload::Plan::Conflicts { dir, files } => (dir, files, true),
+                };
+                let place = upload::tilde(w.confinement.home(), &canonical);
+                let mut frame = UploadPlan {
+                    seq,
+                    dir: canonical.display().to_string(),
+                    files: planned
+                        .iter()
+                        .map(|f| UploadPlanFile {
+                            name: f.name.clone(),
+                            final_name: f.final_name.clone(),
+                            ticket: None,
+                            exists: f.exists,
+                        })
+                        .collect(),
+                    conflicts,
+                    refusal: None,
+                };
+                if conflicts {
+                    let taken = planned.iter().filter(|f| f.exists).count();
+                    let detail = match taken {
+                        1 => format!("A file by that name is already in {place}."),
+                        n => format!("{n} of those names are already taken in {place}."),
+                    };
+                    return Ok((Some(detail), Some(ServerMsg::UploadPlan(frame))));
+                }
+                let Some(handle) = self.web_surface.handle.as_ref() else {
+                    return Err(refused(
+                        "The worker is not listening, so it cannot take files right now."
+                            .to_string(),
+                    ));
+                };
+                let batch = w.next_upload_batch;
+                w.next_upload_batch += 1;
+                let requests: Vec<UploadGrantRequest> = planned
+                    .iter()
+                    .map(|f| UploadGrantRequest {
+                        final_name: f.final_name.clone(),
+                        size: f.size,
+                        replace: f.replace,
+                    })
+                    .collect();
+                let tickets =
+                    handle.grant_uploads(token, batch, w.confinement.home(), &canonical, &requests);
+                for (row, ticket) in frame.files.iter_mut().zip(tickets) {
+                    row.ticket = Some(ticket);
+                }
+                w.uploads.insert(
+                    batch,
+                    UploadBatch {
+                        dir: canonical,
+                        expected: planned.len(),
+                        written: Vec::new(),
+                        failed: Vec::new(),
+                    },
+                );
+                w.log(format!(
+                    "upload of {} file(s) into {place} granted ({})",
+                    planned.len(),
+                    on_conflict.as_str()
+                ));
+                Ok((None, Some(ServerMsg::UploadPlan(frame))))
+            }
+        }
+    }
+
+    /// One granted upload ended: log it, and when its batch is complete,
+    /// post one host message for the whole batch.
+    fn upload_finished(&mut self, finished: UploadFinished) {
+        let at_ms = self.env.clock.now_millis() as i64;
+        let handle = self.web_surface.handle.as_ref();
+        let Some(w) = self.worker.as_mut() else {
+            return;
+        };
+        let home = w.confinement.home().to_path_buf();
+        let shown = upload::tilde(&home, &finished.path);
+        let name = finished
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| shown.clone());
+        let reason = finished
+            .reason
+            .clone()
+            .unwrap_or_else(|| "it failed".to_string());
+        if finished.ok {
+            w.log(format!("uploaded {shown} ({} bytes)", finished.bytes));
+        } else {
+            w.log(format!("upload of {shown} failed: {reason}"));
+        }
+        let Some(batch) = w.uploads.get_mut(&finished.batch) else {
+            return;
+        };
+        if finished.ok {
+            batch.written.push(name);
+        } else {
+            batch.failed.push((name, reason));
+        }
+        if batch.written.len() + batch.failed.len() < batch.expected {
+            return;
+        }
+        if let Some(batch) = w.uploads.remove(&finished.batch) {
+            let (level, text) = batch.message(&home);
+            w.post(handle, level, text, at_ms);
         }
     }
 
@@ -1107,6 +1398,7 @@ impl<'a> AppHost<'a> {
                     .collect(),
             })
             .collect();
+        let web = self.worker.as_ref().map(|w| web_report(w, &listen));
         WorkerRuntimeReport {
             version: crate::VERSION.to_string(),
             pid: std::process::id(),
@@ -1124,6 +1416,7 @@ impl<'a> AppHost<'a> {
             projects,
             unread_messages,
             phone: self.phone_status(),
+            web,
         }
     }
 
@@ -1149,6 +1442,13 @@ impl<'a> AppHost<'a> {
                     .or_else(|| status.bound.first().map(|a| a.to_string()))
             })
             .flatten();
+        // The code rides in the URL's fragment, which a browser never sends
+        // anywhere: the SPA reads it and exchanges it in a POST body.
+        let web_url = self
+            .worker
+            .as_ref()
+            .and_then(|w| web_base_url(w, &status).0)
+            .map(|base| format!("{base}/#{code}"));
         if let Some(w) = self.worker.as_mut() {
             w.log("pairing code minted");
         }
@@ -1158,10 +1458,11 @@ impl<'a> AppHost<'a> {
             address,
             listening,
             not_listening_reason: (!listening).then_some(status.reason).flatten(),
+            web_url,
         }
     }
 
-    /// Every paired Desktop, with its connection state.
+    /// Every paired device (Desktop or browser), with its connection state.
     pub fn devices(&self) -> Vec<DeviceReport> {
         let connections = self
             .web_surface
@@ -1180,7 +1481,7 @@ impl<'a> AppHost<'a> {
             .collect()
     }
 
-    /// Revoke the Desktop `selector` names (an exact id, an exact label, or a
+    /// Revoke the device `selector` names (an exact id, an exact label, or a
     /// unique id prefix) and close its connections; returns the device and
     /// how many connections were closed. `Err` names the candidates when the
     /// selector is ambiguous.
@@ -1315,6 +1616,54 @@ impl<'a> AppHost<'a> {
             .as_mut()
             .map(|w| std::mem::take(&mut w.log_lines))
             .unwrap_or_default()
+    }
+}
+
+/// Where a browser opens FlightDeck Web on this worker (no trailing slash),
+/// and the HTTPS facts behind it: `https://<MagicDNS name>:<port>` while a
+/// certificate is served, else `http://<advertised address>`; `None` while
+/// `[worker] web` is off or nothing is listening.
+fn web_base_url(w: &WorkerExt, status: &ListenStatus) -> (Option<String>, tls::CertReport) {
+    let mut certs = w.certs.report();
+    let Some(first) = status.bound.first().filter(|_| w.config.web) else {
+        return (None, certs);
+    };
+    if certs.https {
+        let name = certs.domain.clone().or_else(|| status.magic_dns.clone());
+        match name {
+            Some(name) => return (Some(format!("https://{name}:{}", first.port())), certs),
+            None => {
+                certs.https = false;
+                certs.reason = Some("this machine's MagicDNS name is not known yet".to_string());
+            }
+        }
+    }
+    let address = status
+        .advertised
+        .clone()
+        .unwrap_or_else(|| first.to_string());
+    (Some(format!("http://{address}")), certs)
+}
+
+/// FlightDeck Web as `worker status` reports it.
+fn web_report(w: &WorkerExt, status: &ListenStatus) -> WebReport {
+    if !w.config.web {
+        return WebReport {
+            enabled: false,
+            url: None,
+            https: false,
+            https_reason: None,
+            certificate_expires: None,
+        };
+    }
+    let (url, certs) = web_base_url(w, status);
+    let https = certs.https && url.as_deref().is_some_and(|u| u.starts_with("https://"));
+    WebReport {
+        enabled: true,
+        url,
+        https,
+        https_reason: (!https).then_some(certs.reason).flatten(),
+        certificate_expires: https.then_some(certs.expires).flatten(),
     }
 }
 

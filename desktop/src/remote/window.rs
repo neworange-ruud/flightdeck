@@ -37,6 +37,11 @@
 //! project picker ([`super::projects`]) in place of the body while it is
 //! open, a version-skew banner under the titlebar when its FlightDeck is
 //! not this app's, and Reconnect when another window took it over.
+//!
+//! A worker that takes uploads (protocol v8) also gets **Upload files…** in
+//! the titlebar, files dropped anywhere on the window (a highlight while they
+//! hover), and the upload panel ([`super::upload`]) over everything while it
+//! is open — hidden while its Choose… has the picker up.
 
 use std::rc::Rc;
 
@@ -50,13 +55,15 @@ use flightdeck_desktop::keys::{app_key_down, KeymapAction};
 use flightdeck_desktop::overlays::{Emit, OverlayContext, OverlayLayer};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, App, AppContext, Context, Entity, FocusHandle, FontWeight, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    div, px, App, AppContext, Context, Entity, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 
 use super::projects::ProjectPickerView;
+use super::upload::UploadPanelView;
 use super::{RemoteModel, Tab};
 use crate::commands::{
     intent_for, keycap, keymap, perform_remote_entry, perform_remote_id, Intent,
@@ -101,6 +108,8 @@ pub struct RemoteWindow {
     titled: String,
     /// Rename Remote's name field, while the model has the dialog open.
     rename: Option<Entity<InputState>>,
+    /// The upload panel's view, while the model has the panel open.
+    upload: Option<Entity<UploadPanelView>>,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -135,6 +144,7 @@ impl RemoteWindow {
             picker: None,
             titled,
             rename: None,
+            upload: None,
             #[cfg(target_os = "macos")]
             drag_pending: false,
         }
@@ -358,8 +368,47 @@ impl RemoteWindow {
         }
     }
 
+    /// The upload panel's view, while it is open.
+    #[cfg(test)]
+    pub(crate) fn upload_view(&self) -> Option<Entity<UploadPanelView>> {
+        self.upload.clone()
+    }
+
+    /// Build the upload panel's view when the model opened the panel (it
+    /// takes the keyboard), drop it when the model closed it.
+    fn sync_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.remote.read(cx).upload().is_some();
+        match (open, &self.upload) {
+            (true, None) => {
+                let remote = self.remote.clone();
+                let view = cx.new(|cx| UploadPanelView::new(remote, window, cx));
+                let focus = view.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+                self.upload = Some(view);
+            }
+            (false, Some(_)) => self.upload = None,
+            _ => {}
+        }
+    }
+
+    /// Files dropped on the window: the upload panel opens with them, or
+    /// takes them while it is open and still choosing. Folders are left out
+    /// with its note.
+    fn drop_files(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let paths = paths.paths().to_vec();
+        self.remote.update(cx, |model, cx| {
+            if model.supports_upload() {
+                model.open_upload_with(&paths);
+                cx.notify();
+            }
+        });
+    }
+
     fn on_keymap_action(&mut self, action: &KeymapAction, _: &mut Window, cx: &mut Context<Self>) {
-        if self.remote.read(cx).overlay().is_some() || self.rename.is_some() {
+        // The upload panel takes its own keys; table chords wait behind it
+        // (unless its Choose… has the picker up).
+        let upload_shown = self.upload.is_some() && !self.remote.read(cx).choosing_upload_dir();
+        if self.remote.read(cx).overlay().is_some() || self.rename.is_some() || upload_shown {
             cx.propagate();
             return;
         }
@@ -505,6 +554,9 @@ impl RemoteWindow {
                     .child(link),
             );
 
+        let upload = model
+            .supports_upload()
+            .then(|| upload_files_button(p, &self.remote));
         let emit_remote = self.remote.clone();
         let command = h_flex()
             .id("remote-command-field")
@@ -549,6 +601,7 @@ impl RemoteWindow {
             ))
             .child(div().flex_none().w(px(1.)).h(px(20.)).bg(p.border.hsla()))
             .child(tabs_row)
+            .children(upload)
             .child(command);
 
         #[cfg(target_os = "macos")]
@@ -877,6 +930,7 @@ impl Render for RemoteWindow {
         self.ensure_shell(cx);
         self.sync_picker(window, cx);
         self.sync_rename(window, cx);
+        self.sync_upload(window, cx);
         self.sync_title(window, cx);
         let mission = self.mission_shown(cx);
         let model = self.remote.read(cx);
@@ -892,6 +946,9 @@ impl Render for RemoteWindow {
         let off_project = model.tab() != Tab::Project;
         let skew = model.skew_warning();
         let picker = self.picker.clone().filter(|_| model.ended().is_none());
+        // Hidden, not closed, while its Choose… has the picker up.
+        let upload = self.upload.clone().filter(|_| !model.choosing_upload_dir());
+        let takes_drops = model.supports_upload();
         let data = SidebarData {
             rows: views::agent_rows(ws),
             focused_child: views::focused_child(ws),
@@ -909,8 +966,17 @@ impl Render for RemoteWindow {
             layer.set_view(overlay, window, cx);
         });
         // The picker's fields take the keyboard where they are clicked, and
-        // Rename Remote's field keeps it while the dialog is up.
-        if !overlay_open && picker.is_none() && self.rename.is_none() {
+        // Rename Remote's field keeps it while the dialog is up. The upload
+        // panel keeps it while it is up — back from Choose… too.
+        if let Some(panel) = upload
+            .as_ref()
+            .filter(|_| !overlay_open && self.rename.is_none())
+        {
+            if !panel.read(cx).has_focus(window, cx) {
+                let focus = panel.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+        } else if !overlay_open && picker.is_none() && self.rename.is_none() {
             let shell_focus = self
                 .shell
                 .as_ref()
@@ -985,9 +1051,51 @@ impl Render for RemoteWindow {
                     .into_any_element(),
             })
             .child(status)
+            .children(upload)
             .children(rename)
             .child(self.layer.clone())
+            .when(takes_drops, |root| root.child(drop_target(&p, cx)))
     }
+}
+
+/// Where files dropped on a worker's window land: the whole window, on top
+/// of everything but taking no clicks (its hitbox does not block), tinted
+/// with an accent frame while files hover over it.
+fn drop_target(p: &Palette, cx: &mut Context<RemoteWindow>) -> impl IntoElement {
+    let mut tint = p.accent.hsla();
+    tint.a = 0.08;
+    let frame = p.accent.hsla();
+    div()
+        .id("remote-drop-target")
+        .debug_selector(|| "remote-drop-target".into())
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+            style.bg(tint).border_2().border_color(frame)
+        })
+        .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.drop_files(paths, cx)))
+}
+
+/// A worker's Upload files…, in the titlebar (W34).
+fn upload_files_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+    let remote = remote.clone();
+    h_flex()
+        .id("remote-upload-files")
+        .debug_selector(|| "remote-upload-files".into())
+        .flex_none()
+        .h(px(30.))
+        .px(px(10.))
+        .rounded(px(7.))
+        .border_1()
+        .border_color(p.border.hsla())
+        .text_size(px(12.5))
+        .text_color(p.ink_2.hsla())
+        .cursor_pointer()
+        .hover(|s| s.bg(p.surface_raised.hsla()))
+        .child("Upload files…")
+        .on_click(move |_, _, cx| remote.update(cx, |model, cx| model.pick_upload_files(cx)))
 }
 
 /// The SSH shell's tab, first in the row, before the project tabs.

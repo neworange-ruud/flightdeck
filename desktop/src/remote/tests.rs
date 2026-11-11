@@ -137,13 +137,29 @@ fn open_on(
     Entity<RemoteWindow>,
     &mut VisualTestContext,
 ) {
+    let (client, script) = RemoteClient::scripted();
+    open_client(app, client, script, snapshot)
+}
+
+/// [`open_on`] with a scripted `client` the test prepared (an upload
+/// endpoint, say).
+fn open_client(
+    app: &mut TestAppContext,
+    client: RemoteClient,
+    script: Script,
+    snapshot: Snapshot,
+) -> (
+    Entity<RemoteModel>,
+    Script,
+    Entity<RemoteWindow>,
+    &mut VisualTestContext,
+) {
     app.update(|cx| {
         gpui_component::init(cx);
         crate::theme::init(cx);
         flightdeck_desktop::keys::register(cx, crate::commands::keymap());
         flightdeck_desktop::overlays::register(cx, crate::commands::keymap());
     });
-    let (client, script) = RemoteClient::scripted();
     script.snapshot(snapshot);
     let model = app.new(|_| {
         RemoteModel::new(
@@ -1474,7 +1490,7 @@ mod worker {
     }
 
     /// The recorded snapshot, from a worker running this app's FlightDeck.
-    fn worker_snapshot() -> Snapshot {
+    pub(super) fn worker_snapshot() -> Snapshot {
         let mut snapshot = snapshot();
         snapshot.host_kind = Some(HostKind::Worker);
         snapshot.host_version = flightdeck::VERSION.to_string();
@@ -1517,7 +1533,9 @@ mod worker {
     }
 
     /// The commands sent, with their seqs.
-    fn sent_commands(script: &mut Script) -> Vec<(u64, String, Option<serde_json::Value>)> {
+    pub(super) fn sent_commands(
+        script: &mut Script,
+    ) -> Vec<(u64, String, Option<serde_json::Value>)> {
         script
             .sent()
             .into_iter()
@@ -2428,3 +2446,6 @@ mod mission {
         assert_eq!(view_of(&model, cx), MainView::Mission);
     }
 }
+
+/// Uploading files to a worker (W34, protocol v8).
+mod upload;

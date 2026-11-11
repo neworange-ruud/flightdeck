@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use crate::web::server::{AUTH_EXCHANGE_PATH, AUTH_SESSION_PATH, COOKIE_NAME};
 
 /// How long either request may take, connect included.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest response this reads. Both bodies are a few hundred bytes.
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -168,10 +168,10 @@ fn refusal(response: &Response) -> ExchangeError {
     }
 }
 
-struct Response {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: String,
+pub(super) struct Response {
+    pub(super) status: u16,
+    pub(super) headers: Vec<(String, String)>,
+    pub(super) body: String,
 }
 
 impl Response {
@@ -238,7 +238,7 @@ async fn request_inner(
     parse_response(&raw)
 }
 
-fn parse_response(raw: &[u8]) -> Result<Response, ExchangeError> {
+pub(super) fn parse_response(raw: &[u8]) -> Result<Response, ExchangeError> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text
         .split_once("\r\n\r\n")

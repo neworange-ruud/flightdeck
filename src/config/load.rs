@@ -151,7 +151,7 @@ const WORKER_SECTION_COMMENT: &str = "\
 # and read from this global file only: a project's [worker] table is ignored.
 #
 # port: TCP port the worker serves on its Tailscale address(es) only, never on
-# other networks. Keep it stable: paired Desktops store it.
+# other networks. Keep it stable: paired devices store it.
 # projects_root: folder scanned (two levels deep) for repositories to offer, and
 # where clones land. \"~\" is your home folder.
 # default_cols / default_rows: terminal size for an agent started while no
@@ -160,6 +160,14 @@ const WORKER_SECTION_COMMENT: &str = "\
 # pair --phone`). Off by default: a paired phone can type into agents and open a
 # shell. Uses [remote]'s relay and direct_port, and always the direct link over
 # Tailscale, whatever [remote] enabled says. Restart the worker after changing it.
+# web: also serve FlightDeck Web (the browser app) on port; pair a browser with
+# `flightdeck worker pair` and open the link it prints. Off: Desktop only.
+# https: serve the browser app over HTTPS with a certificate from `tailscale
+# cert` for this machine's MagicDNS name, on the same port (Desktop keeps plain
+# ws://). Only used when your tailnet admin has enabled HTTPS certificates
+# (issuing one lists the machine name in public Certificate Transparency logs);
+# otherwise the browser app is plain HTTP. Restart the worker after changing
+# web or https.
 ";
 
 /// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]`, [`WEB_SECTION_COMMENT`]
@@ -540,8 +548,15 @@ mod tests {
         assert!(
             toml.contains("projects_root = \"~/flightdeck\"")
                 && toml.contains("default_cols = 200")
-                && toml.contains("default_rows = 50"),
+                && toml.contains("default_rows = 50")
+                && toml.contains("web = true")
+                && toml.contains("https = true"),
             "global: {toml}"
+        );
+        assert!(
+            toml.contains("# web: also serve FlightDeck Web")
+                && toml.contains("# https: serve the browser app over HTTPS"),
+            "the two settings are documented: {toml}"
         );
         let comment_idx = toml.find("# FlightDeck Worker").unwrap();
         let header_idx = toml.find("[worker]").unwrap();

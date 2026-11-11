@@ -264,12 +264,14 @@ describe("the wire version mirror", () => {
   });
 
   /** The ceiling is the host's own version (D9: server and SPA ship
-   * together). Since v7 the floor sits **one** below it and no lower: a
-   * FlightDeck Desktop does not co-ship with its host, so a v6 Desktop keeps
-   * driving a v7 TUI host, which never sends it a v7 frame (those come only
-   * from a worker, which refuses v6). A range that drifted wider would let a
-   * stale tab attach and then fail on the first frame it cannot parse. */
-  it("the host advertises its own version, and at most one below it", () => {
+   * together). The floor is v6 — explicit command targets, the oldest a
+   * FlightDeck Desktop may still speak, since a Desktop does not co-ship with
+   * its host — and it only ever rises: a v6 Desktop keeps driving a TUI host,
+   * which never sends it a newer frame (v7's come only from a worker, which
+   * refuses v6; v8's `upload_plan` only to a v8 peer). A floor that sank
+   * below v6 would let a stale tab attach and then fail on the first frame
+   * it cannot parse. */
+  it("the host advertises its own version, and never below v6", () => {
     const rust = readFileSync(
       new URL("../../../src/web/protocol.rs", import.meta.url),
       "utf8",
@@ -278,7 +280,7 @@ describe("the wire version mirror", () => {
       Number(new RegExp(`pub const ${name}: u16 = (\\d+);`).exec(rust)?.[1]);
     const current = of("PROTOCOL_VERSION");
     expect(of("MAX_SUPPORTED_VERSION")).toBe(current);
-    expect(of("MIN_SUPPORTED_VERSION")).toBeGreaterThanOrEqual(current - 1);
+    expect(of("MIN_SUPPORTED_VERSION")).toBeGreaterThanOrEqual(6);
     expect(of("MIN_SUPPORTED_VERSION")).toBeLessThanOrEqual(current);
   });
 });

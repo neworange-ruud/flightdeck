@@ -42,7 +42,16 @@
 //! * **Where it listens.** [`ListenPlan::Tailscale`] keeps one listener per
 //!   Tailscale address, re-read on a poll and reconciled — never loopback,
 //!   never the unspecified address — and reports itself through
-//!   [`WebServerHandle::listen_status`]. No SPA is served.
+//!   [`WebServerHandle::listen_status`]. The SPA is served when
+//!   `[worker] web` says so ([`ServerOptions::serve_assets`]).
+//! * **How it is reached.** On unix a `Tailscale` or `Fixed` listener sniffs
+//!   each connection ([`crate::web::tls`]): a TLS one is served over HTTPS
+//!   with the certificate [`WebServerHandle::set_certificate`] loaded (or
+//!   closed while there is none), everything else as plain HTTP on the same
+//!   port, so FlightDeck Desktop keeps dialling `ws://`. With a certificate
+//!   and [`WebServerHandle::set_https_host`], a plain-HTTP page load is
+//!   redirected to the HTTPS name ([`https_redirect`]); `/ws` and `/auth/*`
+//!   never are. A `Configured` (TUI/Desktop) server never sniffs.
 //! * **Who may connect.** Clients older than
 //!   [`WORKER_MIN_CLIENT_VERSION`] are refused with the worker's own floor.
 //! * **The seat model.** One **window** drives; a new window takes over the
@@ -108,7 +117,11 @@ use crate::web::protocol::{
     ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot,
     TermCursor, TerminalId, VersionMismatch, ViewerId, Viewport, WindowInfo, WireError, WorkerOp,
     WorkerShellView, WorkerSnapshot, WorkerStatusView, MAX_SUPPORTED_VERSION, PROTOCOL_VERSION,
-    WORKER_MIN_CLIENT_VERSION,
+    UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION,
+};
+use crate::web::upload::UploadGrants;
+pub use crate::web::upload::{
+    UploadFinished, UploadGrantRequest, UPLOAD_GRANT_TTL_MS, UPLOAD_PATH,
 };
 
 // ===========================================================================
@@ -455,11 +468,17 @@ pub enum WebInbound {
     WorkerOp {
         /// Who asked.
         viewer_id: ViewerId,
+        /// The credential that window authenticated with: what an upload grant
+        /// is bound to ([`WebServerHandle::grant_uploads`], v8).
+        token: TokenId,
         /// The [`crate::web::protocol::Command::seq`] to ack.
         seq: u64,
         /// What they asked for.
         op: WorkerOp,
     },
+    /// One `PUT /upload/{ticket}` ended — written, refused part-way, cut off,
+    /// or its grant expired unused (v8). Exactly one per grant.
+    UploadFinished(UploadFinished),
 }
 
 /// Why the socket is closing, as [`WebServerHandle::stop`] is told it (Q5).
@@ -555,9 +574,55 @@ pub struct ServerOptions {
     pub host_kind: HostKind,
     /// Where to listen.
     pub listen: ListenPlan,
-    /// Whether the SPA's assets are served. A worker serves only the protocol
-    /// routes, and every other path is a 404.
+    /// Whether the SPA's assets are served. Without them only the protocol
+    /// routes are, and every other path is a 404 (a worker with
+    /// `[worker] web = false`).
     pub serve_assets: bool,
+}
+
+/// What a route knows about the connection a request arrived on: the TCP
+/// peer (never a header; see [`rate_limit_address`]), the local port it came
+/// in on, and whether it is TLS.
+///
+/// The connect-info type of every listener this server runs: a plain
+/// [`tokio::net::TcpListener`] (always `tls: false`) or, on unix, a
+/// [`crate::web::tls::SniffListener`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// The peer's address, as the socket reports it.
+    pub addr: SocketAddr,
+    /// The port of the listener that accepted it.
+    pub local_port: u16,
+    /// Whether the connection is TLS (HTTPS / `wss://`).
+    pub tls: bool,
+}
+
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for PeerInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        PeerInfo {
+            addr: *stream.remote_addr(),
+            local_port: stream.io().local_addr().map_or(0, |a| a.port()),
+            tls: false,
+        }
+    }
+}
+
+/// Whether a PEM certificate chain and key could be served over HTTPS: the
+/// check [`WebServerHandle::set_certificate`] makes, without a server. `Err`
+/// says why not, and always on a platform without the TLS stack (Windows).
+pub fn check_certificate(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        crate::web::tls::certified_key(cert_pem, key_pem).map(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cert_pem, key_pem);
+        Err("HTTPS is not available on this platform".to_string())
+    }
 }
 
 /// Where a server listens (v7).
@@ -620,6 +685,9 @@ pub struct ListenStatus {
     pub reason: Option<String>,
     /// Where the Tailscale addresses came from, on a Tailscale plan.
     pub origin: Option<AddressOrigin>,
+    /// This machine's MagicDNS name, when Tailscale reports one (a Tailscale
+    /// plan only): the name a worker's HTTPS certificate is issued for.
+    pub magic_dns: Option<String>,
 }
 
 /// One attached connection, as `flightdeck worker status` and the worker's
@@ -811,6 +879,85 @@ impl WebServerHandle {
     /// Where the server is listening, and why not when it is not (v7).
     pub fn listen_status(&self) -> ListenStatus {
         self.listen.borrow().clone()
+    }
+
+    /// Present this certificate to TLS clients from the next handshake on, or
+    /// (`None`) refuse TLS again. Takes effect on every listener at once, with
+    /// no rebind and no dropped connection.
+    ///
+    /// `Err` when the PEMs cannot be used (nothing changes then), or when this
+    /// server does not serve HTTPS at all: a `Configured` (TUI/Desktop) plan,
+    /// or a platform without the TLS stack (Windows).
+    pub fn set_certificate(&self, pem: Option<(&str, &str)>) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let Some(tls) = self.shared.tls.as_ref() else {
+                return Err("this server does not serve HTTPS".to_string());
+            };
+            let key = match pem {
+                Some((cert, key)) => Some(Arc::new(crate::web::tls::certified_key(cert, key)?)),
+                None => None,
+            };
+            tls.resolver().set(key);
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            match pem {
+                Some(_) => Err("HTTPS is not available on this platform".to_string()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// Grant one upload per file into `dir` for the window that authenticated
+    /// with `token` (v8): what a worker does when it accepts a
+    /// [`crate::web::protocol::worker_command::BEGIN_UPLOAD`]. `home` and
+    /// `dir` are canonical, `dir` inside `home`; the folder is checked again
+    /// when each file is committed. Returns one ticket per file, in order.
+    ///
+    /// Each grant is single use, bound to `token`, and gone after
+    /// [`UPLOAD_GRANT_TTL_MS`] unused. Every grant ends in exactly one
+    /// [`WebInbound::UploadFinished`] carrying `batch`: written, failed, or
+    /// expired.
+    pub fn grant_uploads(
+        &self,
+        token: &TokenId,
+        batch: u64,
+        home: &std::path::Path,
+        dir: &std::path::Path,
+        files: &[UploadGrantRequest],
+    ) -> Vec<String> {
+        let now = self.shared.now_ms();
+        let (tickets, expired) = self
+            .shared
+            .uploads
+            .unwrap_or_recover()
+            .grant(token, batch, home, dir, files, now);
+        self.shared.report_expired_uploads(expired);
+        tickets
+    }
+
+    /// Drop the upload grants nobody redeemed in time, telling the host about
+    /// each ([`WebInbound::UploadFinished`]). Cheap; a worker calls it every
+    /// tick so a batch whose last files were never sent still ends.
+    pub fn expire_uploads(&self) {
+        let now = self.shared.now_ms();
+        let expired = self.shared.uploads.unwrap_or_recover().expire(now);
+        self.shared.report_expired_uploads(expired);
+    }
+
+    /// Whether a certificate is loaded (see [`Self::set_certificate`]).
+    pub fn has_certificate(&self) -> bool {
+        self.shared.has_certificate()
+    }
+
+    /// The name this server's certificate is for (`box.tail1234.ts.net`), or
+    /// `None`. While it is set **and** a certificate is loaded, a plain-HTTP
+    /// page load is redirected to `https://<name>:<port>` (the port it came
+    /// in on) — see [`https_redirect`].
+    pub fn set_https_host(&self, host: Option<String>) {
+        *self.shared.https_host.unwrap_or_recover() = host;
     }
 
     /// Every address a listener is bound on (v7). [`Self::bound_addr`] is the
@@ -1022,6 +1169,20 @@ pub fn start_with(
     let (state_tx, state_rx) = watch::channel(Arc::new(initial_state));
     let (listen_tx, listen_rx) = watch::channel(ListenStatus::default());
     let started_ms = clock.now_millis() as i64;
+    // HTTPS beside HTTP on one port is a worker's (the `Tailscale` plan and
+    // its test seam `Fixed`); a `Configured` TUI/Desktop server stays exactly
+    // as it was (PRD W23). Unix only, with the TLS stack.
+    #[cfg(unix)]
+    let tls = match &plan {
+        ListenPlan::Configured { .. } => None,
+        ListenPlan::Tailscale { .. } | ListenPlan::Fixed(_) => match crate::web::tls::Tls::new() {
+            Ok(tls) => Some(Arc::new(tls)),
+            Err(e) => {
+                debuglog::log(&format!("web TLS unavailable err={e}"));
+                None
+            }
+        },
+    };
 
     let shared = Arc::new(Shared {
         credentials,
@@ -1037,6 +1198,10 @@ pub fn start_with(
         drain: Arc::new(Drain::default()),
         host_kind,
         serve_assets,
+        #[cfg(unix)]
+        tls,
+        https_host: Mutex::new(None),
+        uploads: Mutex::new(UploadGrants::default()),
     });
 
     // Rendezvous: the task reports the bind result, then serves. Blocking the
@@ -1209,7 +1374,13 @@ async fn serve_fixed(
     }
     let tasks: Vec<JoinHandle<()>> = listeners
         .into_iter()
-        .map(|listener| tokio::spawn(serve(Arc::clone(&shared), router.clone(), listener)))
+        .map(|listener| {
+            tokio::spawn(serve_sniffing(
+                Arc::clone(&shared),
+                router.clone(),
+                listener,
+            ))
+        })
         .collect();
     for task in tasks {
         let _ = task.await;
@@ -1268,7 +1439,7 @@ async fn supervise_tailscale(
         let errors = reconcile(&mut listeners, &wanted, plan.port, &mut |addr| {
             let listener = bind_std(addr).and_then(tokio::net::TcpListener::from_std)?;
             debuglog::log(&format!("web LISTEN {addr}"));
-            Ok(ListenerTask(tokio::spawn(serve(
+            Ok(ListenerTask(tokio::spawn(serve_sniffing(
                 Arc::clone(&shared),
                 router.clone(),
                 listener,
@@ -1417,6 +1588,10 @@ fn tailscale_listen_status(
         advertised,
         reason,
         origin: Some(origin),
+        magic_dns: magic_dns
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -1436,27 +1611,30 @@ fn bind_std(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     Ok(listener)
 }
 
-/// Run axum on one listener until shutdown, then release it.
+/// What every listener waits on before it lets go of its port: the shutdown
+/// signal, then the viewers' `Shutdown` frames.
+fn graceful_shutdown(shared: &Shared) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut shutdown = shared.shutdown.clone();
+    let drain = Arc::clone(&shared.drain);
+    async move {
+        let notice = await_shutdown(&mut shutdown).await;
+        debuglog::log(&format!("web SHUTDOWN reason={}", notice.reason.as_str()));
+        // Q5: every viewer must have written its `Shutdown` frame before the
+        // listener closes. Each connection drops its drain guard only after
+        // that write, so waiting for the count to reach zero *is* waiting
+        // for the frames to be out. Bounded, so one wedged socket cannot
+        // hold the port.
+        let _ = tokio::time::timeout(DRAIN_GRACE, drain.wait_for_idle()).await;
+    }
+}
+
+/// Run axum on one plain listener until shutdown, then release it.
 async fn serve(shared: Arc<Shared>, app: Router, listener: tokio::net::TcpListener) {
-    let graceful = {
-        let mut shutdown = shared.shutdown.clone();
-        let drain = Arc::clone(&shared.drain);
-        async move {
-            let notice = await_shutdown(&mut shutdown).await;
-            debuglog::log(&format!("web SHUTDOWN reason={}", notice.reason.as_str()));
-            // Q5: every viewer must have written its `Shutdown` frame before the
-            // listener closes. Each connection drops its drain guard only after
-            // that write, so waiting for the count to reach zero *is* waiting
-            // for the frames to be out. Bounded, so one wedged socket cannot
-            // hold the port.
-            let _ = tokio::time::timeout(DRAIN_GRACE, drain.wait_for_idle()).await;
-        }
-    };
     let served = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app.into_make_service_with_connect_info::<PeerInfo>(),
     )
-    .with_graceful_shutdown(graceful)
+    .with_graceful_shutdown(graceful_shutdown(&shared))
     .await;
     if let Err(e) = served {
         debuglog::log(&format!("web SERVE ended err={e}"));
@@ -1465,18 +1643,59 @@ async fn serve(shared: Arc<Shared>, app: Router, listener: tokio::net::TcpListen
     // task ends, the runtime keeps running.
 }
 
+/// A worker's listener (`Tailscale` or `Fixed`): HTTPS and plain HTTP on the
+/// one port when this server has a TLS half ([`crate::web::tls`]), else
+/// exactly [`serve`].
+async fn serve_sniffing(shared: Arc<Shared>, app: Router, listener: tokio::net::TcpListener) {
+    #[cfg(unix)]
+    {
+        if let Some(tls) = shared.tls.clone() {
+            let listener = match crate::web::tls::sniff(listener, tls) {
+                Ok(listener) => listener,
+                Err(e) => {
+                    debuglog::log(&format!("web LISTEN sniffing failed err={e}"));
+                    return;
+                }
+            };
+            let served = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<PeerInfo>(),
+            )
+            .with_graceful_shutdown(graceful_shutdown(&shared))
+            .await;
+            if let Err(e) = served {
+                debuglog::log(&format!("web SERVE ended err={e}"));
+            }
+            return;
+        }
+    }
+    serve(shared, app, listener).await;
+}
+
 fn router(shared: Arc<Shared>) -> Router {
     let serve_assets = shared.serve_assets;
     let routes = Router::new()
         .route(WS_PATH, get(ws_route))
         .route(AUTH_EXCHANGE_PATH, post(exchange_route))
         .route(AUTH_SESSION_PATH, get(session_route));
+    // Only a worker takes files (v8), and only where it runs (W2).
+    #[cfg(unix)]
+    let routes = if shared.is_worker() {
+        routes.route(
+            upload_route::UPLOAD_ROUTE,
+            axum::routing::put(upload_route::upload_route)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+    } else {
+        routes
+    };
     let routes = if serve_assets {
         // Everything else is the SPA: `/`, its hashed assets, and its
         // client-side routes (D9). `assets::lookup` owns the fallback rules.
         routes.fallback(asset_route)
     } else {
-        // A worker serves the protocol routes and nothing else (design A5).
+        // A worker with `[worker] web = false` serves the protocol routes
+        // and nothing else (design A5).
         routes.fallback(not_found_route)
     };
     routes.with_state(shared)
@@ -1521,8 +1740,18 @@ struct Shared {
     /// one-window seat model, background links, the worker commands and the
     /// v7 floor; every other host keeps the multi-writer model unchanged.
     host_kind: HostKind,
-    /// Whether the SPA's assets are served (design A5).
+    /// Whether the SPA's assets are served (design A5, `[worker] web`).
     serve_assets: bool,
+    /// The TLS half of a sniffing listener: `Some` on a `Tailscale` or
+    /// `Fixed` plan, `None` on a `Configured` one.
+    #[cfg(unix)]
+    tls: Option<Arc<crate::web::tls::Tls>>,
+    /// The name the certificate is for, which a plain-HTTP page load is
+    /// redirected to ([`WebServerHandle::set_https_host`]).
+    https_host: Mutex<Option<String>>,
+    /// Upload tickets the worker granted and nobody has redeemed yet (v8,
+    /// [`WebServerHandle::grant_uploads`]). Always empty on a TUI or Desktop.
+    uploads: Mutex<UploadGrants>,
 }
 
 impl Shared {
@@ -1575,6 +1804,54 @@ impl Shared {
 
     fn is_worker(&self) -> bool {
         self.host_kind == HostKind::Worker
+    }
+
+    /// Tell the host about upload grants that expired unused.
+    fn report_expired_uploads(&self, expired: Vec<crate::web::upload::UploadGrant>) {
+        for grant in expired {
+            debuglog::log(&format!(
+                "web UPLOAD expired batch={} name={}",
+                grant.batch, grant.final_name
+            ));
+            self.notify(WebInbound::UploadFinished(
+                grant.failed("The upload did not start in time; send it again.", 0),
+            ));
+        }
+    }
+
+    /// What kind of host this is, as a client is told: the server's own kind
+    /// for a worker, else what the host published (TUI or Desktop) — the
+    /// same rule [`Snapshot::host_kind`] follows.
+    fn effective_host_kind(&self) -> HostKind {
+        if self.is_worker() {
+            HostKind::Worker
+        } else {
+            self.state_rx.borrow().host_kind
+        }
+    }
+
+    /// Whether a TLS certificate is loaded.
+    fn has_certificate(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.tls
+                .as_ref()
+                .is_some_and(|tls| tls.resolver().is_loaded())
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The HTTPS name a plain-HTTP page load is redirected to: only while a
+    /// certificate is loaded, since a redirect to an `https://` nobody can
+    /// answer would strand the browser.
+    fn https_host(&self) -> Option<String> {
+        if !self.has_certificate() {
+            return None;
+        }
+        self.https_host.unwrap_or_recover().clone()
     }
 
     /// Route one [`WebOutbound`] to its recipients. A background link only
@@ -1663,7 +1940,15 @@ impl Shared {
             // rather than on `HostState`: there is no change for a `Delta` to
             // describe, and the browser needs it in the same frame it paints
             // the palette from.
-            commands: crate::web::commands::inventory_for(host_kind),
+            commands: {
+                let mut rows = crate::web::commands::inventory_for(host_kind);
+                // A peer below v8 cannot upload (R30), so it is not offered
+                // the worker's Upload Files… row.
+                if protocol_version < crate::web::protocol::UPLOAD_MIN_VERSION {
+                    rows.retain(|row| row.id != crate::web::commands::UPLOAD_FILES);
+                }
+                rows
+            },
             // Both overlays are the host's own words, sent so the browser
             // renders them rather than authoring a copy (§6.5 R16).
             help: Some(state.help.clone()),
@@ -2015,6 +2300,14 @@ impl SeatRegistry {
         displaced
     }
 
+    /// The credential `id` authenticated with, while it is attached.
+    fn token_of(&self, id: &ViewerId) -> Option<TokenId> {
+        self.viewers
+            .iter()
+            .find(|v| &v.id == id)
+            .map(|v| v.identity.token.clone())
+    }
+
     /// The version this viewer was answered at; [`PROTOCOL_VERSION`] for one
     /// that has gone.
     ///
@@ -2193,6 +2486,9 @@ impl SeatRegistry {
         if viewer.kind == ConnectionKind::Background && !background_may_receive(&msg) {
             return;
         }
+        if viewer.protocol_version < min_version_for(&msg) {
+            return;
+        }
         if viewer.tx.try_send(msg).is_err() {
             debuglog::log(&format!(
                 "web VIEWER dropped id={id} address={} reason=queue_full",
@@ -2261,8 +2557,20 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
             | ServerMsg::ProjectScan(_)
             | ServerMsg::CloneProgress(_)
             | ServerMsg::CloneResult(_)
+            | ServerMsg::UploadPlan(_)
             | ServerMsg::Delta(Delta::HostMessage(_))
     )
+}
+
+/// The oldest negotiated version a frame may be sent to. Everything before v8
+/// goes to every peer a host accepts (a worker's v7 frames reach only the v7
+/// peers a worker admits); an [`ServerMsg::UploadPlan`] reaches no peer below
+/// [`UPLOAD_MIN_VERSION`], which would drop it and wait forever.
+fn min_version_for(msg: &ServerMsg) -> u16 {
+    match msg {
+        ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
+        _ => 0,
+    }
 }
 
 /// Accept or refuse a peer's protocol version on a host of `kind`.
@@ -2323,23 +2631,30 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 ///
 /// * `HttpOnly` — Q4's own requirement: script on the page never reads it, so an
 ///   XSS in the SPA cannot exfiltrate the credential.
-/// * **No `Secure`.** This server speaks plain HTTP on loopback or the LAN (D1:
-///   there is no relay, no certificate and no name to put on one). A `Secure`
-///   cookie would never be sent back over `http://`, so setting it would not
-///   harden anything — it would break authentication outright. Recording the
-///   absence deliberately rather than by omission.
+/// * **`Secure` exactly when the exchange came over TLS** (`secure`). A TUI or
+///   Desktop server speaks plain HTTP on loopback or the LAN (D1: no
+///   certificate and no name to put on one), and a `Secure` cookie would never
+///   be sent back over `http://`: setting it there would not harden anything,
+///   it would break authentication outright. A worker that serves HTTPS with
+///   a Tailscale certificate (SPECS §33) is the other case: a cookie issued
+///   over HTTPS is marked `Secure`, so the browser never sends it back over a
+///   plain connection on the same name. The cookie a plain exchange issues
+///   stays as it always was.
 /// * `SameSite=Lax` — a middle that is doing real work here. `Strict` would drop
 ///   the cookie on the documented entry paths: a link or QR opened from another
 ///   app arrives as a cross-site top-level navigation, and `Strict` would send
 ///   the user back to the code screen every time. `None` requires `Secure`,
-///   which we cannot set. `Lax` sends the cookie on top-level navigations only,
+///   which a plain-HTTP server cannot set. `Lax` sends the cookie on top-level navigations only,
 ///   which means a hostile page's `new WebSocket("ws://127.0.0.1:…/ws")` — not a
 ///   navigation — carries no cookie and is refused. That is the cross-site
 ///   WebSocket-hijacking case, and `Lax` closes it.
 /// * `Path=/` so the SPA's own client-side routes keep it, and a long `Max-Age`
 ///   ([`COOKIE_MAX_AGE_SECS`]) because revocation is server-side.
-fn set_cookie_value(secret: &str) -> String {
-    format!("{COOKIE_NAME}={secret}; Path=/; HttpOnly; SameSite=Lax; Max-Age={COOKIE_MAX_AGE_SECS}")
+fn set_cookie_value(secret: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{COOKIE_NAME}={secret}; Path=/; HttpOnly; SameSite=Lax; Max-Age={COOKIE_MAX_AGE_SECS}{secure}"
+    )
 }
 
 /// The wire spelling of the browser screen a refusal maps to (artboard 2b).
@@ -2469,7 +2784,22 @@ fn refusal_response(
 // ===========================================================================
 
 /// The SPA and its assets (D9).
-async fn asset_route(uri: axum::http::Uri) -> Response {
+async fn asset_route(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<PeerInfo>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> Response {
+    if let Some(location) = https_redirect(&shared, &peer, &method, &uri) {
+        return redirect_response(&location);
+    }
+    // The page is only ever read. Without this, a write aimed at a route this
+    // host does not have — `PUT /upload/…` sent to a TUI host, which has no
+    // upload route — would fall through to here and get the SPA with a 200,
+    // reading as success.
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return method_not_allowed();
+    }
     // Deliberately unauthenticated. The SPA's own shell has to load before it
     // can show the code-entry screen at all, and it contains nothing secret —
     // every fact the app renders arrives over the authenticated WebSocket.
@@ -2480,10 +2810,76 @@ async fn asset_route(uri: axum::http::Uri) -> Response {
     }
 }
 
+/// Where a plain-HTTP page load should go instead: `https://<name>:<port>`
+/// plus the path and query, when this server has a certificate and knows
+/// the name it is for ([`WebServerHandle::set_https_host`]).
+///
+/// Only `GET`/`HEAD` of the SPA and its assets. `/ws`, `/auth/*` and
+/// `/upload/*` are never redirected: FlightDeck Desktop dials them over plain
+/// `ws://`/`http://` on purpose, and a redirect would break it (an upload is a
+/// `PUT`, which is never redirected anyway — the exclusion says so twice). The name is the server's own,
+/// never the request's `Host` header, so this cannot be turned into an open
+/// redirect; the port is the one the request came in on, which is the one
+/// that also speaks TLS.
+fn https_redirect(
+    shared: &Shared,
+    peer: &PeerInfo,
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+) -> Option<String> {
+    if peer.tls || !(method == axum::http::Method::GET || method == axum::http::Method::HEAD) {
+        return None;
+    }
+    let path = uri.path();
+    if path == WS_PATH
+        || path == "/auth"
+        || path.starts_with("/auth/")
+        || path == "/upload"
+        || path.starts_with("/upload/")
+    {
+        return None;
+    }
+    let host = shared.https_host()?;
+    let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    Some(format!(
+        "https://{host}:{}{path_and_query}",
+        peer.local_port
+    ))
+}
+
+/// `308 Permanent Redirect` to `location`, never cached: the certificate can
+/// go away again (renewal failed, HTTPS switched off), and a browser that had
+/// cached the redirect would then be stranded on an `https://` nobody serves.
+fn redirect_response(location: &str) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+    if let Ok(value) = header::HeaderValue::from_str(location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 /// Every non-protocol path on a server that does not serve the SPA (a
-/// worker, design A5).
+/// worker with `[worker] web = false`, design A5).
 async fn not_found_route() -> Response {
     not_found()
+}
+
+/// 405 for anything but a read of the page (`asset_route`).
+fn method_not_allowed() -> Response {
+    let mut response = Response::new(Body::from("method not allowed"));
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    let headers = response.headers_mut();
+    headers.insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn not_found() -> Response {
@@ -2521,10 +2917,10 @@ struct ExchangeRequest {
 /// `POST /auth/exchange` — the one-time bootstrap-code exchange (Q4).
 async fn exchange_route(
     State(shared): State<Arc<Shared>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(conn): ConnectInfo<PeerInfo>,
     body: Result<axum::Json<ExchangeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let address = rate_limit_address(peer);
+    let address = rate_limit_address(conn.addr);
     let Ok(axum::Json(request)) = body else {
         // A malformed body is not a credential attempt, so it must not spend the
         // address's budget — otherwise anyone could lock a browser out with
@@ -2566,7 +2962,9 @@ async fn exchange_route(
                 token.id()
             ));
             let mut response = json_response(StatusCode::OK, serde_json::json!({ "ok": true }));
-            if let Ok(value) = header::HeaderValue::from_str(&set_cookie_value(token.reveal())) {
+            if let Ok(value) =
+                header::HeaderValue::from_str(&set_cookie_value(token.reveal(), conn.tls))
+            {
                 response.headers_mut().insert(header::SET_COOKIE, value);
             }
             response
@@ -2582,13 +2980,24 @@ async fn exchange_route(
 }
 
 /// `GET /auth/session` — is this browser's cookie still good?
+///
+/// Both answers carry `host_kind` (`"tui"`, `"desktop"` or `"worker"`): the
+/// SPA's first request is this one, and it must know before it draws
+/// anything — the code-entry screen included — whether it is talking to a
+/// worker, whose screens and wording differ.
 async fn session_route(
     State(shared): State<Arc<Shared>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(conn): ConnectInfo<PeerInfo>,
     headers: HeaderMap,
 ) -> Response {
+    let peer = conn.addr;
+    let host_kind =
+        serde_json::to_value(shared.effective_host_kind()).unwrap_or(serde_json::Value::Null);
     match authenticate(&shared, peer, &headers) {
-        Ok(_) => json_response(StatusCode::OK, serde_json::json!({ "authenticated": true })),
+        Ok(_) => json_response(
+            StatusCode::OK,
+            serde_json::json!({ "authenticated": true, "host_kind": host_kind }),
+        ),
         Err(failure) => {
             let attempts = shared
                 .credentials
@@ -2596,6 +3005,7 @@ async fn session_route(
                 .attempts_remaining(&rate_limit_address(peer));
             let mut body = refusal_body(failure, attempts, shared.now_ms());
             body["authenticated"] = serde_json::json!(false);
+            body["host_kind"] = host_kind;
             let mut response = json_response(refusal_status(failure), body);
             attach_retry_after(&mut response, failure);
             response
@@ -2641,10 +3051,11 @@ fn authenticate(
 /// there is no window in which an unauthenticated socket exists.
 async fn ws_route(
     State(shared): State<Arc<Shared>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(conn): ConnectInfo<PeerInfo>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let peer = conn.addr;
     let address = rate_limit_address(peer);
     let token = match authenticate(&shared, peer, &headers) {
         Ok(token) => token,
@@ -2721,9 +3132,18 @@ impl ViewerIdentity {
     ///
     /// FlightDeck Desktop introduces itself as
     /// `FlightDeck Desktop/<version> (<hostname>)` (design A11), and the
-    /// hostname is what tells one Desktop from another. Any other client is
-    /// named by its chip label.
+    /// hostname is what tells one Desktop from another. A browser is named by
+    /// what it is, `Chrome on macOS (browser)` ([`browser_device_name`]); a
+    /// client that said nothing about itself by its address.
     fn device_label(&self) -> String {
+        if let Some(agent) = self.user_agent_label.as_deref() {
+            if !NATIVE_CLIENT_AGENTS
+                .iter()
+                .any(|name| agent.starts_with(name))
+            {
+                return browser_device_name(agent);
+            }
+        }
         let host = self
             .user_agent_label
             .as_deref()
@@ -2817,7 +3237,26 @@ pub const NATIVE_TERMINAL_AGENT: &str = "FlightDeck Terminal";
 
 /// Every native client's product name, so each is listed — and revoked, and
 /// named in "taken over by …" — by name rather than as an unknown browser.
-const NATIVE_CLIENT_AGENTS: [&str; 2] = [NATIVE_CLIENT_AGENT, NATIVE_TERMINAL_AGENT];
+pub(crate) const NATIVE_CLIENT_AGENTS: [&str; 2] = [NATIVE_CLIENT_AGENT, NATIVE_TERMINAL_AGENT];
+
+/// How a worker names a browser (a client that is not FlightDeck Desktop or
+/// Terminal) in `worker devices`, `worker status` and "taken over by …":
+/// `Chrome on macOS (browser)`. `agent` is its user-agent, raw (as the
+/// exchange stores it) or already reduced (as a chip label carries it); what
+/// [`coarse_user_agent`] cannot reduce is shown as it came, capped.
+pub(crate) fn browser_device_name(agent: &str) -> String {
+    let coarse = coarse_user_agent(agent);
+    let name = if coarse.is_empty() {
+        truncate_chars(&sanitize_label(agent.trim()), MAX_LABEL_CHARS)
+    } else {
+        coarse
+    };
+    if name.is_empty() {
+        "browser".to_string()
+    } else {
+        format!("{name} (browser)")
+    }
+}
 
 /// Reduce a `User-Agent` to the `Chrome on macOS` shape turn 2 asks for, keeping
 /// only characters that are safe to render verbatim in a terminal chip.
@@ -3547,7 +3986,14 @@ async fn handle_command(
         return;
     }
 
-    let Some(spec) = commands::lookup(&command.name) else {
+    // A worker also knows its own rows (`upload_files`), which it refuses at
+    // step 3; a TUI or Desktop host does not, and calls them unknown.
+    let host_kind = if shared.is_worker() {
+        HostKind::Worker
+    } else {
+        HostKind::Tui
+    };
+    let Some(spec) = commands::lookup_for(host_kind, &command.name) else {
         let _ = send_msg(
             sink,
             &ServerMsg::Error(WireError {
@@ -3715,6 +4161,13 @@ async fn handle_worker_op(
     parsed: Result<WorkerOp, String>,
     sink: &mut Sink,
 ) {
+    let (version, token) = {
+        let registry = shared.registry();
+        (
+            registry.protocol_version_of(viewer_id),
+            registry.token_of(viewer_id),
+        )
+    };
     let refusal = if !shared.is_worker() {
         Some(WireError::new(
             ErrorCode::NotSupported,
@@ -3726,11 +4179,22 @@ async fn handle_worker_op(
             "this connection only watches; open the worker's window to drive it",
         ))
     } else {
-        match parsed {
-            Err(reason) => Some(WireError::new(ErrorCode::NotSupported, reason)),
-            Ok(op) => {
+        match (parsed, token) {
+            (Err(reason), _) => Some(WireError::new(ErrorCode::NotSupported, reason)),
+            // The plan that answers it is a v8 frame: a v7 window would drop
+            // it and wait forever, so it is told now instead.
+            (Ok(WorkerOp::BeginUpload { .. }), _) if version < UPLOAD_MIN_VERSION => {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Uploading files needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
+            // Gone between the frame and here: nobody to answer.
+            (Ok(_), None) => None,
+            (Ok(op), Some(token)) => {
                 shared.notify(WebInbound::WorkerOp {
                     viewer_id: viewer_id.clone(),
+                    token,
                     seq,
                     op,
                 });
@@ -3757,6 +4221,11 @@ fn applied(seq: u64) -> ServerMsg {
         detail: None,
     })
 }
+
+// `PUT /upload/{ticket}` (v8): a child module, so it checks the cookie with
+// the very `authenticate` every other route uses. Unix only, like the worker.
+#[cfg(unix)]
+mod upload_route;
 
 #[cfg(test)]
 mod tests;

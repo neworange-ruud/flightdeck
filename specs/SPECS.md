@@ -1606,10 +1606,10 @@ the Desktop opens a remote window onto them. Requirements are in
 | `flightdeck worker start` | Starts the supervisor in the background and returns once the worker answers on the control socket (or prints why it didn't, with the last log lines). Refuses if a worker is already running for this account. |
 | `flightdeck worker stop` | Stops the supervisor and the worker gracefully: agents are terminated as on a TUI quit and state is persisted, so the next `start` resumes them. "Not running" is not an error. |
 | `flightdeck worker restart` | Stop, then start. This is how `flightdeck update` takes effect; the supervisor is re-executed too, so both run the new binary. |
-| `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
-| `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port). |
+| `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; where a browser opens the page and whether it is HTTPS (and if not, why); paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
+| `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port), and, unless `[worker] web = false`, the browser link with the code in its fragment (`web_url` in `--json`). |
 | `flightdeck worker pair --phone [--json]` | Pairs the FlightDeck iPhone app (needs `[worker] phone = true`): asks the relay for a code, prints the QR and the 4-digit code, and waits until the phone has paired (exit 0), or the code expired or the attempt failed (exit 1). `--json` prints one JSON object per step. See "The phone" below. |
-| `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
+| `flightdeck worker devices [--json]` | Lists paired devices (Desktops, `flightdeck connect` and browsers, a browser named like `Chrome on macOS (browser)`): label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
 | `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. A selector no Desktop matches is tried against the paired phones' pairing ids (exact or unique prefix), and a match is unpaired. |
 | `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
 | `flightdeck worker enable [--dry-run]` | Sets up start on boot (see "Start on boot" below): writes the launchd agent (macOS) or systemd user unit (Linux), registers it, and starts the worker through it when none runs. Idempotent: running it again rewrites the unit (refreshing the binary path and `PATH`). `--dry-run` prints the file and the commands without changing anything. |
@@ -1743,6 +1743,7 @@ carries it as `start_on_boot`.
 | `~/.flightdeck/worker/workspace.json` | The worker's open projects, separate from the TUI's `~/.flightdeck/workspace.json`. Each project's `state.json` stays in its repository, as for the TUI. |
 | `~/.flightdeck/worker/devices.json` | Paired Desktops' tokens, in the web interface's credential format but separate from `~/.flightdeck/web.json`: a browser token for a TUI's web interface never grants a worker shell. |
 | `~/.flightdeck/worker/remote.json`, `remote.lock`, `remote-direct/` | With `[worker] phone` on: the worker's own FlightDeck Remote identity and phone pairings, its lock, and the direct link's outboxes. Separate from the TUI's `~/.flightdeck/remote.json`, so the phone sees the worker as a machine of its own. |
+| `~/.flightdeck/worker/tls/cert.pem`, `key.pem` | The Tailscale certificate for HTTPS (W32), when the tailnet allows it. The key is mode 0600. |
 | `~/.flightdeck/logs/worker.log` | The log, rotated at 10 MiB, 5 files kept (`worker.log`, `.1` … `.4`). The supervisor's own lines go to the same file. |
 | `~/Library/LaunchAgents/agency.neworange.flightdeck.worker.plist` (macOS), `~/.config/systemd/user/flightdeck-worker.service` (Linux) | Start on boot, written by `worker enable` (mode 0644) and removed by `worker disable`. |
 
@@ -1759,6 +1760,8 @@ projects_root = "~/flightdeck"
 default_cols = 200
 default_rows = 50
 phone = false
+web = true
+https = true
 ```
 
 - **`port`** (integer, default `7420`) — the TCP port served on each Tailscale
@@ -1775,20 +1778,65 @@ phone = false
   with this worker (see "The phone"). Off by default because a paired phone can
   type into agents and open a shell. Read at start: restart the worker after
   changing it.
+- **`web`** (boolean, default `true`) — serve FlightDeck Web's page on the
+  worker's port, so a browser can pair and drive the worker as a Desktop does.
+  `false` serves the protocol only; paired browsers then get a 404. Read at
+  start.
+- **`https`** (boolean, default `true`) — fetch a certificate with `tailscale
+  cert` for this machine's MagicDNS name and answer TLS on the same port. Only
+  acted on when the tailnet has HTTPS turned on; `false` never asks Tailscale for
+  a certificate and serves plain HTTP only. Read at start.
 
 An invalid `[worker]` table makes `worker run` exit 78. It is not in the
 configuration manager (numbers and a path, not toggles): edit the file.
 
 ### Network and pairing
 
-The worker serves the web protocol's `/ws`, `/auth/exchange` and
-`/auth/session` (no browser assets) **only on the addresses Tailscale
-reports**, never on loopback, `0.0.0.0` or another network. With no Tailscale
+The worker serves the web protocol's `/ws`, `/auth/exchange`,
+`/auth/session` and `/upload/<ticket>`, and FlightDeck Web's page unless `[worker] web = false`,
+**only on the addresses Tailscale reports**, never on loopback, `0.0.0.0` or
+another network. With no Tailscale
 address it keeps running, reports "not listening: no Tailscale address", polls
 every 5 s and binds when one appears. Pairing uses the web interface's
 single-use bootstrap codes, minted by `worker pair` over the control socket.
 One remote window is attached at a time (a second takes over; the first's token
-stays valid); any number of status-only background links may be held.
+stays valid); any number of status-only background links may be held. A
+browser attaches as a window, so a browser and a Desktop take the worker over
+from each other.
+
+**HTTPS on the same port.** Each connection is told apart by its first byte: a
+TLS ClientHello is served with the worker's certificate, anything else as plain
+HTTP. The certificate comes from `tailscale cert --cert-file - --key-file -
+<magicdns-name>`, asked for only when `[worker] https` is on and `tailscale
+status --json` lists the name in `CertDomains` (the tailnet admin turned HTTPS
+on; doing so publishes machine names in Certificate Transparency logs). It is
+stored in `~/.flightdeck/worker/tls/` (key mode 0600), loaded at start and
+re-fetched every 24 h; a renewal swaps it in without rebinding. Without a
+certificate a TLS connection is closed and the page is served over plain HTTP.
+With one, a plain request for the page redirects (308) to
+`https://<magicdns-name>:<port>`; `/ws` and `/auth/*` never redirect, because
+the Desktop speaks plain `ws://`. A cookie issued over TLS is `Secure`.
+
+`worker pair` prints the browser link with the code in its fragment
+(`https://<name>:<port>/#NNNN`, or `http://<address>/#NNNN` without a
+certificate) beside the Desktop's address.
+
+**Uploading files** (protocol v8, `specs/WORKER_PRD.md` W34). The window
+holding the seat sends the `begin_upload` command with
+`{dir, files: [{name, size}], on_conflict: "ask" | "replace" | "keep_both"}`.
+The worker resolves `dir` inside `$HOME` (it must be an existing directory),
+checks each name is a single path component and that the total fits in the
+free space, and answers that window alone with an `upload_plan` frame: per
+file its `final_name`, whether the name `exists`, and a single-use `ticket`
+bound to the window's token and valid for two minutes. With `ask` and a name
+already taken it grants nothing and sets `conflicts`, and the window asks
+Replace, Keep both (`name (1).ext`) or Cancel before asking again. Each file
+is then sent as the body of `PUT /upload/<ticket>` (same cookie, exact
+`Content-Length`, plain or TLS, never redirected), streamed into a temporary
+`.<name>.fdupload-…` beside the target and moved into place only when
+complete; the folder is checked again at that moment. When a batch is done
+the worker posts one host message naming the folder. Background links cannot
+upload, and folders are not uploaded.
 
 ### The phone
 
@@ -1840,6 +1888,13 @@ never missing.
     "advertised": "box.tail1234.ts.net:7420",
     "reason": null,
     "origin": "magic_dns"
+  },
+  "web": {
+    "enabled": true,
+    "url": "https://box.tail1234.ts.net:7420",
+    "https": true,
+    "https_reason": null,
+    "certificate_expires": 1794787200
   },
   "devices": [{
     "id": "tok1", "label": "mbp", "address": "100.64.1.9",
@@ -1897,8 +1952,8 @@ never missing.
 
 ### Security model
 
-- **Pairing a Desktop with a worker gives it the worker account's full power**:
-  a shell and the whole home directory.
+- **Pairing a Desktop or a browser with a worker gives it the worker account's
+  full power**: a shell and the whole home directory.
 - **Pairing a phone** (`[worker] phone`, off by default) gives it what a phone
   paired with a TUI has: typing into agents, starting and closing them, and a
   shell in an agent's worktree. Its code is the TUI's single-use 4-digit
@@ -1909,11 +1964,11 @@ never missing.
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket only the account can
   reach, so getting one already requires a shell on the box.
-- Tokens are long-lived, one per Desktop, listed by `worker devices` and
+- Tokens are long-lived, one per paired device, listed by `worker devices` and
   revoked by `worker revoke`, which closes live connections at once.
-- No credentials cross the wire, and no TLS is needed because nothing leaves
-  WireGuard. The worker never stores, forwards or injects agent or git
+- No credentials cross the wire unencrypted: everything travels inside
+  WireGuard, and HTTPS is added only for the browser's sake. The worker never stores, forwards or injects agent or git
   credentials: agents and git run with the account's own environment.
-- Opening, browsing and cloning are confined to `$HOME`: paths are
+- Opening, browsing, cloning and uploading are confined to `$HOME`: paths are
   canonicalised and anything resolving outside it, through a symlink too, is
   refused.

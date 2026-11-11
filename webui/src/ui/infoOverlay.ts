@@ -127,6 +127,26 @@ export function createInfoOverlay(options: InfoOverlayOptions = {}): Region {
         layer.setAttribute("aria-label", "Git status");
         append(bodyEl, gitStatusBody(overlay.panel));
         return;
+      /**
+       * A worker's words (`remote-control-vjtb`): an error it raised, or the
+       * messages it kept while no window was attached. Verbatim, one line per
+       * paragraph — the first line of a "while you were away" text is its
+       * count, which is what the title already says, so it is the subtitle.
+       */
+      case "message": {
+        const lines = overlay.text.split(String.fromCharCode(10));
+        const away = lines[0]?.endsWith("while you were away") === true;
+        titleEl.textContent = overlay.title;
+        subtitleEl.textContent = away ? (lines[0] ?? "") : "";
+        layer.setAttribute("aria-label", overlay.title);
+        append(
+          bodyEl,
+          (away ? lines.slice(1) : lines).map((line) =>
+            el("p", { class: "fd-info__message", text: line }),
+          ),
+        );
+        return;
+      }
     }
   }
 

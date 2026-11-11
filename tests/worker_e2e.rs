@@ -628,6 +628,13 @@ fn a_cli_minted_code_pairs_and_the_window_attaches_to_a_worker() {
 
     // A code is single use.
     let code: PairingCode = worker.cli_json(&["worker", "pair", "--json"]);
+    // The same code pairs a browser: the link carries it in the fragment.
+    // Plain HTTP here, with no Tailscale to issue a certificate.
+    assert_eq!(
+        code.web_url,
+        Some(format!("http://{}/#{}", worker.addr, code.code)),
+        "{code:?}"
+    );
     on_runtime(exchange_code(&worker.addr, &code.code, &desktop("studio")))
         .expect("the first exchange succeeds");
     assert!(
@@ -635,6 +642,66 @@ fn a_cli_minted_code_pairs_and_the_window_attaches_to_a_worker() {
         "a used code is refused"
     );
     client.stop();
+}
+
+/// `GET <path>` over plain HTTP: the status code and the `Content-Type`.
+fn http_get(addr: &str, path: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).expect("the worker accepts");
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let content_type = text
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, content_type)
+}
+
+/// The worker serves FlightDeck Web (the browser app) on its one port by
+/// default, says where in `worker status`, and not at all with
+/// `[worker] web = false`.
+#[test]
+fn the_worker_serves_the_browser_app_unless_turned_off() {
+    let worker = Worker::start();
+    let (status, content_type) = http_get(&worker.addr, "/");
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    let report = worker.status();
+    let web = report.web.expect("a running worker reports its web app");
+    assert!(web.enabled);
+    assert_eq!(web.url, Some(format!("http://{}", worker.addr)));
+    assert!(!web.https, "no Tailscale here, so no certificate");
+    let text = String::from_utf8_lossy(&worker.cli(&["worker", "status"]).stdout).to_string();
+    assert!(
+        text.contains(&format!("Web: http://{} (HTTPS unavailable:", worker.addr)),
+        "{text}"
+    );
+    drop(worker);
+
+    let mut off = Worker::prepare_with(|config| config.worker.web = false);
+    off.run();
+    let (status, _) = http_get(&off.addr, "/");
+    assert_eq!(status, 404, "the protocol routes only");
+    let code: PairingCode = off.cli_json(&["worker", "pair", "--json"]);
+    assert_eq!(code.web_url, None);
+    let text = String::from_utf8_lossy(&off.cli(&["worker", "status"]).stdout).to_string();
+    assert!(text.contains("Web: off\n"), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,4 +1658,237 @@ fn the_terminal_ui_takes_a_worker_over_and_drives_its_shell() {
             .active_terminal()
             .is_some_and(|t| t.screen().contents().contains("fd-tui-42"))
     });
+}
+
+// ---------------------------------------------------------------------------
+// Uploads (v8, `remote-control-usem`)
+// ---------------------------------------------------------------------------
+
+/// Pump `client` until the worker's answer to `begin_upload` `seq` arrives.
+fn upload_plan(
+    worker: &Worker,
+    client: &mut RemoteClient,
+    seq: Option<u64>,
+    what: &str,
+) -> flightdeck::web::protocol::UploadPlan {
+    let seq = seq.unwrap_or_else(|| panic!("{what}: begin_upload did not go out"));
+    let mut plan = None;
+    worker.wait(&format!("the upload plan for {what}"), || {
+        client.pump();
+        plan = client.take_upload_plan().filter(|p| p.seq == seq);
+        plan.is_some()
+    });
+    plan.unwrap()
+}
+
+/// A real worker plans, grants and writes uploads into a folder under its
+/// `$HOME`: a taken name is asked about first, `keep_both` numbers the copy,
+/// the bytes land exactly, a ticket works once, a folder outside `$HOME` is
+/// refused, and the finished batch is one host message to the window.
+#[test]
+fn files_upload_into_home_and_a_taken_name_is_asked_about() {
+    use flightdeck::web::client::upload_http::{put_file, UploadError};
+    use flightdeck::web::protocol::{OnConflict, UploadFile};
+
+    let worker = Worker::start();
+    let home = std::fs::canonicalize(worker.home()).unwrap();
+    let drop_dir = home.join("drop");
+    std::fs::create_dir_all(&drop_dir).unwrap();
+    std::fs::write(drop_dir.join("taken.txt"), "old").unwrap();
+    let here = tempfile::tempdir().unwrap();
+    let big: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(here.path().join("big.bin"), &big).unwrap();
+    std::fs::write(here.path().join("taken.txt"), "new!").unwrap();
+
+    let (_token, mut client) = worker.window("laptop");
+    assert!(client.supports_upload(), "a v8 window on a worker");
+    let files = vec![
+        UploadFile {
+            name: "big.bin".into(),
+            size: big.len() as u64,
+        },
+        UploadFile {
+            name: "taken.txt".into(),
+            size: 4,
+        },
+    ];
+
+    // Ask: the taken name comes back, and nothing is granted.
+    let seq = client.begin_upload("~/drop", &files, OnConflict::Ask);
+    let ack = worker.applied(&mut client, seq, "begin_upload (ask)");
+    assert!(ack.detail.is_some_and(|d| d.contains("~/drop")));
+    let plan = upload_plan(&worker, &mut client, seq, "ask");
+    assert!(plan.conflicts, "{plan:?}");
+    assert_eq!(plan.dir, drop_dir.display().to_string());
+    let taken: Vec<(&str, bool)> = plan
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.exists))
+        .collect();
+    assert_eq!(taken, vec![("big.bin", false), ("taken.txt", true)]);
+    assert!(plan.files.iter().all(|f| f.ticket.is_none()));
+
+    // Keep both: granted, the copy numbered.
+    let seq = client.begin_upload("~/drop", &files, OnConflict::KeepBoth);
+    worker.applied(&mut client, seq, "begin_upload (keep_both)");
+    let plan = upload_plan(&worker, &mut client, seq, "keep_both");
+    assert!(!plan.conflicts && plan.refusal.is_none(), "{plan:?}");
+    let finals: Vec<&str> = plan.files.iter().map(|f| f.final_name.as_str()).collect();
+    assert_eq!(finals, vec!["big.bin", "taken (1).txt"]);
+
+    // The bytes, over the core client's uploader, as whom the link is.
+    let access = client.http_access().expect("a dialled client").clone();
+    for (row, file) in plan.files.iter().zip(&files) {
+        let ticket = row.ticket.as_deref().expect("granted");
+        let mut reported = Vec::new();
+        let reply = on_runtime(put_file(
+            &access,
+            ticket,
+            &here.path().join(&file.name),
+            file.size,
+            |sent| reported.push(sent),
+        ))
+        .unwrap_or_else(|e| panic!("{} uploads: {e:?}{}", file.name, worker.log_tail()));
+        assert_eq!(reply.bytes, file.size);
+        assert_eq!(
+            reply.path,
+            drop_dir.join(&row.final_name).display().to_string()
+        );
+        assert_eq!(reported.last().copied(), Some(file.size), "{reported:?}");
+    }
+    assert_eq!(std::fs::read(drop_dir.join("big.bin")).unwrap(), big);
+    assert_eq!(
+        std::fs::read_to_string(drop_dir.join("taken (1).txt")).unwrap(),
+        "new!"
+    );
+    assert_eq!(
+        std::fs::read_to_string(drop_dir.join("taken.txt")).unwrap(),
+        "old",
+        "keep both never overwrites"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&drop_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["big.bin", "taken (1).txt", "taken.txt"],
+        "no temp left"
+    );
+
+    // A ticket is single use.
+    let again = on_runtime(put_file(
+        &access,
+        plan.files[1].ticket.as_deref().unwrap(),
+        &here.path().join("taken.txt"),
+        4,
+        |_| {},
+    ));
+    assert!(
+        matches!(&again, Err(UploadError::Refused { status: 403, reason, .. }) if reason == "invalid_ticket"),
+        "{again:?}"
+    );
+
+    // The batch is one host message.
+    let mut said = Vec::new();
+    worker.wait("the upload's host message", || {
+        client.pump();
+        said.extend(client.take_new_messages().into_iter().map(|m| m.text));
+        said.iter().any(|t| t == "Uploaded 2 files to ~/drop.")
+    });
+
+    // Outside $HOME: refused in the plan's own words.
+    let outside = tempfile::Builder::new()
+        .prefix("fdo")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let seq = client.begin_upload(
+        &outside.path().display().to_string(),
+        &files,
+        OnConflict::Ask,
+    );
+    let reason = worker.rejected(&mut client, seq, "begin_upload outside home");
+    assert!(reason.contains("outside your home folder"), "{reason}");
+    let plan = upload_plan(&worker, &mut client, seq, "outside home");
+    assert_eq!(plan.refusal.as_deref(), Some(reason.as_str()));
+    client.stop();
+}
+
+/// What FlightDeck Desktop does: the session's upload panel, from picked
+/// paths to written files, with the transfers on the client's runtime.
+#[test]
+fn the_session_uploads_picked_files_to_the_folder_on_screen() {
+    use flightdeck::terminal::session::TerminalProfile;
+    use flightdeck::web::client::session::RemoteSession;
+    use flightdeck::web::client::upload::{Resolution, UploadPhase};
+
+    let worker = Worker::start();
+    let home = std::fs::canonicalize(worker.home()).unwrap();
+    let here = tempfile::tempdir().unwrap();
+    let paths: Vec<PathBuf> = ["one.txt", "two.txt"]
+        .iter()
+        .map(|name| {
+            let path = here.path().join(name);
+            std::fs::write(&path, format!("this is {name}")).unwrap();
+            path
+        })
+        .collect();
+    std::fs::write(home.join("two.txt"), "already here").unwrap();
+
+    let (_token, client) = worker.window("laptop");
+    let mut session = RemoteSession::new(
+        client,
+        "box".to_string(),
+        worker.addr.clone(),
+        TerminalProfile::TUI,
+    );
+    session.set_notifier(std::rc::Rc::new(flightdeck::testing::FakeNotifier::new()));
+    worker.wait("the session to attach", || {
+        session.pump();
+        session.workspace().ready
+    });
+    session.open_upload_with(&paths);
+    let panel = session.upload().expect("the panel opens on a worker");
+    assert_eq!(
+        std::fs::canonicalize(&panel.dir).unwrap(),
+        home,
+        "no project open: the worker's home"
+    );
+    assert_eq!(panel.files.len(), 2);
+
+    session.start_upload();
+    worker.wait("the conflict question", || {
+        session.pump();
+        matches!(
+            session.upload().map(|p| &p.phase),
+            Some(UploadPhase::Asking { .. })
+        )
+    });
+    session.resolve_upload(Resolution::Replace);
+    worker.wait("the upload to finish", || {
+        session.pump();
+        matches!(
+            session.upload().map(|p| &p.phase),
+            Some(UploadPhase::Done { .. })
+        )
+    });
+    let Some(UploadPhase::Done {
+        written, failed, ..
+    }) = session.upload().map(|p| p.phase.clone())
+    else {
+        unreachable!()
+    };
+    assert_eq!(written, vec!["one.txt", "two.txt"], "{failed:?}");
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(
+        std::fs::read_to_string(home.join("two.txt")).unwrap(),
+        "this is two.txt",
+        "replaced"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("one.txt")).unwrap(),
+        "this is one.txt"
+    );
+    session.close_upload();
 }

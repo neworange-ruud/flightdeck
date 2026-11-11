@@ -63,14 +63,22 @@
  * shared selection; a native client always names one.
  *
  * **v7 is the FlightDeck Worker** (`remote-control-qlyd.9`): new delta and
- * frame kinds a headless worker sends a FlightDeck Desktop. This tab never
- * receives one — a worker serves no SPA and v7 frames come only from a worker
- * — so the SPA handles none of them; it only declares the additive fields
- * below. v7 is also the host's first range: a TUI host still serves v6, for a
- * Desktop that has not updated yet, and answers each peer at the version it
- * asked for.
+ * frame kinds a headless worker sends its attached window. A worker serves this
+ * SPA too (`remote-control-vjtb`), so the tab handles every one of them — but
+ * only a worker ever sends them, and everything they drive switches on
+ * `Snapshot.host_kind === "worker"`, so a TUI or Desktop host renders exactly
+ * as it did at v6. v7 is also the host's first range: a TUI host still serves
+ * v6, for a Desktop that has not updated yet, and answers each peer at the
+ * version it asked for.
+ *
+ * **v8 is uploading files to a worker** (`remote-control-usem`): the window
+ * asks with the `begin_upload` worker command and the worker answers with a
+ * new frame, `upload_plan` — the target folder, each file's final name and a
+ * single-use ticket for `PUT /upload/{ticket}`, or the names already taken, or
+ * a refusal. A worker never sends `upload_plan` to a peer below v8, and
+ * refuses `begin_upload` from one.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -136,6 +144,10 @@ export interface WireSessionView {
   readonly lifecycle_reporting: boolean;
   readonly recovered?: boolean;
   readonly attached_existing_branch?: boolean;
+  /** The absolute folder the session runs in on the host: its worktree, or
+   * the project root for a session on the base branch. Empty (or absent) from
+   * a host that predates the field. */
+  readonly worktree_path?: string;
 }
 
 export interface WireProjectView {
@@ -500,13 +512,207 @@ export interface WireSnapshot {
    */
   readonly sidebar_position?: "left" | "right" | null;
   /**
-   * v7: what kind of FlightDeck this is. Absent from a v6 host. This tab only
-   * ever attaches to a TUI or Desktop host (a worker serves no SPA).
+   * v7: what kind of FlightDeck this is. Absent from a v6 host, which is a TUI
+   * or a Desktop. Everything worker-specific in this tab switches on
+   * `"worker"`, and nothing else.
    */
-  readonly host_kind?: "tui" | "desktop" | "worker" | null;
-  /** v7: a worker's own state. Only a worker sends it, so this tab never sees it. */
-  readonly worker?: unknown;
+  readonly host_kind?: WireHostKind | null;
+  /** v7: a worker's own state (`protocol::WorkerSnapshot`). Only a worker
+   * sends it. */
+  readonly worker?: WireWorkerSnapshot | null;
 }
+
+/** `protocol::HostKind`. */
+export type WireHostKind = "tui" | "desktop" | "worker";
+
+/** `protocol::WorkerSnapshot` — everything a worker's window paints from. */
+export interface WireWorkerSnapshot {
+  /** `$HOME` on the worker: the picker's root and its boundary (W16). */
+  readonly home: string;
+  readonly shell?: WireWorkerShellView | null;
+  readonly health?: WireHealth | null;
+  readonly status: WireWorkerStatusView;
+  readonly connections: WireConnectionsView;
+  /** Kept while nothing was attached, oldest first. Carried once: the worker
+   * marks them read as this window attaches. */
+  readonly host_messages?: readonly WireHostMessage[];
+}
+
+/** `protocol::WorkerShellView`. Also the body of `Delta::WorkerShell`. */
+export interface WireWorkerShellView {
+  readonly terminal_id: string;
+  readonly title: string;
+  readonly geometry: WireGeometry;
+  readonly byte_len: number;
+  readonly replay_from: number;
+  readonly alive: boolean;
+  readonly exit_code?: number | null;
+}
+
+/** `protocol::Health` (PRD W29). Every reading the platform cannot give is
+ * absent rather than a guess. Also the body of `Delta::Health`. */
+export interface WireHealth {
+  readonly sampled_at_ms: number;
+  readonly uptime_secs: number;
+  readonly version: string;
+  /** The one-minute load average × 100. */
+  readonly load_avg_1m_centi?: number | null;
+  readonly cpu_count: number;
+  readonly mem_total_bytes?: number | null;
+  readonly mem_available_bytes?: number | null;
+  readonly disk_free_home_bytes?: number | null;
+  readonly disk_free_projects_root_bytes?: number | null;
+  readonly agents_total: number;
+  readonly agents_running: number;
+}
+
+/** `protocol::WorkerStatusView`. Also the body of `Delta::WorkerStatus`. */
+export interface WireWorkerStatusView {
+  readonly listening?: readonly string[];
+  readonly advertised?: string | null;
+  readonly not_listening_reason?: string | null;
+  readonly unread_messages?: number;
+  readonly projects_root: string;
+}
+
+/** `protocol::ConnectionsView`, as seen by this recipient. Also the body of
+ * `Delta::Connections`. */
+export interface WireConnectionsView {
+  readonly window?: WireWindowInfo | null;
+  readonly background_links?: number;
+}
+
+/** `protocol::WindowInfo`. */
+export interface WireWindowInfo {
+  readonly label: string;
+  readonly address?: string | null;
+  readonly since_ms: number;
+  readonly same_device?: boolean;
+}
+
+/** `protocol::HostMessage`. Also the body of `Delta::HostMessage`. */
+export interface WireHostMessage {
+  /** Monotonic per worker run, so a replay can be de-duplicated. */
+  readonly id: number;
+  readonly at_ms: number;
+  readonly level: "info" | "warning" | "error";
+  readonly text: string;
+}
+
+/** `protocol::NotificationView`. The body of `Delta::Notification`. */
+export interface WireNotificationView {
+  readonly at_ms: number;
+  readonly title: string;
+  readonly body: string;
+  readonly sound: "none" | "completion" | "input_required";
+}
+
+/** `ServerMsg::DirListing` — one directory under `$HOME`, beside the `ack`
+ * for the `browse_dir` it answers (PRD W9, W16). */
+export interface WireDirListing {
+  readonly type: "dir_listing";
+  readonly seq: number;
+  readonly path: string;
+  /** `null` at `$HOME`: the picker goes no higher. */
+  readonly parent?: string | null;
+  readonly home: string;
+  readonly entries: readonly WireDirEntry[];
+  readonly truncated?: boolean;
+}
+
+export interface WireDirEntry {
+  readonly name: string;
+  readonly path: string;
+  readonly is_git_repo?: boolean;
+  readonly is_open_project?: boolean;
+}
+
+/** `ServerMsg::ProjectScan` — the repositories under the projects root. */
+export interface WireProjectScan {
+  readonly type: "project_scan";
+  readonly seq: number;
+  readonly root: string;
+  readonly root_exists: boolean;
+  readonly repos: readonly WireScannedRepo[];
+  readonly refusal?: string | null;
+}
+
+export interface WireScannedRepo {
+  readonly name: string;
+  readonly path: string;
+  readonly is_open_project?: boolean;
+}
+
+/** `ServerMsg::CloneProgress`. `clone_id` is the seq of the `clone_project`. */
+export interface WireCloneProgress {
+  readonly type: "clone_progress";
+  readonly clone_id: number;
+  readonly url: string;
+  readonly phase: string;
+  readonly percent?: number | null;
+}
+
+/** `ServerMsg::CloneResult`. On success the worker has opened the clone. */
+export interface WireCloneResult {
+  readonly type: "clone_result";
+  readonly clone_id: number;
+  readonly url: string;
+  readonly ok: boolean;
+  readonly path?: string | null;
+  readonly project_id?: string | null;
+  readonly error?: string | null;
+}
+
+/** What a worker does with a file whose name is already taken (v8). */
+export type WireOnConflict = "ask" | "replace" | "keep_both";
+
+/** One file in a `begin_upload`'s `files`: its name and exact size. */
+export interface WireUploadFile {
+  readonly name: string;
+  readonly size: number;
+}
+
+/**
+ * `ServerMsg::UploadPlan` (v8) — the worker's answer to this window's
+ * `begin_upload`, beside the `ack` for the same `seq`. Exactly one of: every
+ * file has a `ticket` (granted — `PUT` its bytes to `/upload/{ticket}` with
+ * the cookie, `Content-Length` = its size, within two minutes), `conflicts`
+ * is true (`on_conflict: "ask"` and some names are taken, `exists` says
+ * which; nothing granted), or `refusal` says why nothing was granted.
+ */
+export interface WireUploadPlan {
+  readonly type: "upload_plan";
+  readonly seq: number;
+  /** The target folder, canonical and absolute on the worker. */
+  readonly dir: string;
+  readonly files: readonly WireUploadPlanFile[];
+  readonly conflicts?: boolean;
+  readonly refusal?: string | null;
+}
+
+export interface WireUploadPlanFile {
+  /** The name asked for. */
+  readonly name: string;
+  /** The name it gets: the same, or `name (n).ext` under `keep_both`. */
+  readonly final_name: string;
+  readonly ticket?: string | null;
+  /** Whether something by the asked name is already there. */
+  readonly exists?: boolean;
+}
+
+/**
+ * The reply to `PUT /upload/{ticket}` (v8). `reason` is a stable code
+ * (`invalid_ticket`, `size_mismatch`, `length_required`, `exists`, …) and
+ * `message` a sentence; an authentication refusal carries the same body as
+ * `/auth/session`'s, without `message`.
+ */
+export type WireUploadReply =
+  | { readonly ok: true; readonly path: string; readonly bytes: number }
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly message?: string;
+    };
 
 /** A newer release than the host is running (SPECS §30). */
 export interface WireUpdateNotice {
@@ -560,9 +766,10 @@ export interface WireShutdown {
 }
 
 /**
- * v7: another window took a worker over, and the socket closes after this.
- * Declared for completeness — only a worker sends it, and a worker serves no
- * SPA.
+ * v7: another window took a worker over (PRD W17), and the socket closes after
+ * this. Terminal: the tab does **not** redial on its own, because attaching
+ * again as a window would take the worker straight back. Only the user's
+ * "Take it back" does that.
  */
 export interface WireTakenOver {
   readonly type: "taken_over";
@@ -593,6 +800,11 @@ export type ServerFrame =
   | WireTakenOver
   | WireGitStatus
   | WireConfiguration
+  | WireDirListing
+  | WireProjectScan
+  | WireCloneProgress
+  | WireCloneResult
+  | WireUploadPlan
   | WireDeltaEnvelope
   | { readonly type: string };
 
@@ -626,7 +838,19 @@ export interface WireInput {
   readonly data: string;
 }
 
-export type ClientFrame = WireAttach | WireInput;
+/**
+ * v7, worker hosts only (PRD W5): size one terminal's PTY. The one relaxation
+ * of D4 — a worker has no pane of its own, so its window's pane is the only
+ * size there is. Never sent to a TUI or Desktop host, which drops it anyway.
+ */
+export interface WireResizeTerminal {
+  readonly type: "resize_terminal";
+  readonly terminal_id: string;
+  readonly cols: number;
+  readonly rows: number;
+}
+
+export type ClientFrame = WireAttach | WireInput | WireResizeTerminal;
 
 // ---------------------------------------------------------------------------
 // base64, both directions

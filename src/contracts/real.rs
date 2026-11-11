@@ -310,7 +310,7 @@ impl Clock for RealClock {
 ///
 /// Uses Howard Hinnant's `civil_from_days` algorithm to avoid a date-library
 /// dependency.
-fn format_iso8601_utc(secs: u64) -> String {
+pub(crate) fn format_iso8601_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);

@@ -33,6 +33,11 @@ import { createStore } from "./store";
 import { createTakeover } from "./takeover";
 import { createTerminalPane } from "./terminalPane";
 import { createTerminalTabs } from "./terminalTabs";
+import { createProjectPicker } from "./projectPicker";
+import { createTakenOver } from "./takenOver";
+import { createWorkerCard } from "./workerCard";
+import { OPEN_PROJECT_COMMAND, UPLOAD_FILES_COMMAND, workerCard } from "../state/worker";
+import { createUploadPanel, installDropTarget } from "./uploadPanel";
 import { el } from "./dom";
 import type { Region } from "./dom";
 import type { Store } from "./store";
@@ -129,7 +134,20 @@ export interface AppOptions {
    * `Delta::DialogClosed` from the host takes it off either surface.
    */
   readonly onAnswerDialog?: (key: string | null) => void;
+  /**
+   * A worker's window, in a context that can ask (W18): the status bar's
+   * "Enable notifications". Asking the browser is `main.ts`'s business.
+   */
+  readonly onEnableNotifications?: () => void;
 }
+
+/** A worker's "Take it back" (W17), as the strip and the panel both offer it. */
+const RECLAIM: StripAction = {
+  key: "Enter",
+  label: "Take it back",
+  kind: "reclaim",
+  tone: "stopped",
+};
 
 export interface App {
   readonly el: HTMLElement;
@@ -146,7 +164,13 @@ export function createApp(options: AppOptions): App {
   );
 
   const logo = createLogoBand();
-  const projects = createProjectTabs(store);
+  /** Upload files to a worker (v8, R30): the panel, its hidden file input
+   * and the drop overlay. Built first, because the tab bar's button and the
+   * palette row both open its file chooser. */
+  const upload = createUploadPanel(store);
+  const projects = createProjectTabs(store, {
+    onUploadFiles: () => upload.chooseFiles(),
+  });
   const sidebar = createSidebar(store);
   const tabs = createTerminalTabs(store);
   const pane = createTerminalPane(options.mount);
@@ -214,12 +238,27 @@ export function createApp(options: AppOptions): App {
   const statusBar = createStatusBar({
     onAction: (action) => options.onStripAction?.(action),
     onOpenFeed: () => toggleFeed(),
+    ...(options.onEnableNotifications === undefined
+      ? {}
+      : { onEnableNotifications: options.onEnableNotifications }),
+  });
+
+  /**
+   * A FlightDeck Worker's window (`remote-control-vjtb`): the card that stands
+   * in for a terminal there is none of, the picker that is Open Project there,
+   * and the panel a taken-over window shows. All three are hidden on every
+   * other host, which never sets the state they draw.
+   */
+  const workerCardRegion = createWorkerCard(store);
+  const picker = createProjectPicker(store);
+  const takenOver = createTakenOver({
+    onReclaim: () => options.onStripAction?.(RECLAIM),
   });
 
   const main = el(
     "div",
     { class: "fd-main", attrs: { "aria-label": "Terminal" } },
-    [tabs.el, pane.el, feed.el],
+    [tabs.el, pane.el, workerCardRegion.el, feed.el],
   );
   const body = el("div", { class: "fd-body" }, [sidebar.el, main]);
   /**
@@ -258,8 +297,16 @@ export function createApp(options: AppOptions): App {
       config.el,
       info.el,
       dialog.el,
+      picker.el,
+      /** After the picker: its Choose… opens the picker over this panel, which
+       * waits hidden meanwhile. */
+      upload.el,
+      takenOver.el,
+      upload.dropzone,
+      upload.input,
     ],
   );
+  installDropTarget(frame, store, upload.dropzone);
 
   /** 1c is built the first time it is needed: three xterm instances nobody can
    * reach yet (split toggling is M2, D8) would be three wasted PTY subscriptions. */
@@ -280,6 +327,10 @@ export function createApp(options: AppOptions): App {
     config,
     info,
     dialog,
+    workerCardRegion,
+    upload,
+    picker,
+    takenOver,
   ];
 
   function render(state: AppState): void {
@@ -317,8 +368,30 @@ export function createApp(options: AppOptions): App {
      * query.
      */
     frame.setAttribute("data-sidebar-side", state.sidebarPosition);
+    /**
+     * A worker's window (`remote-control-vjtb`). Set only on a worker, so a
+     * TUI or Desktop host's frame carries exactly the attributes it always
+     * did. `worker.css` keys off them: no letterbox (W5), the shell's tab
+     * full width, and the card in place of the pane.
+     */
+    if (state.hostKind === "worker") {
+      frame.setAttribute("data-host", "worker");
+      frame.setAttribute("data-worker-shell", String(state.workerShellTab));
+      frame.setAttribute("data-worker-card", workerCard(state) ?? "none");
+      frame.setAttribute("data-picker", String(state.picker !== null));
+      frame.setAttribute("data-upload", state.upload?.phase.kind ?? "none");
+    } else {
+      frame.removeAttribute("data-host");
+      frame.removeAttribute("data-worker-shell");
+      frame.removeAttribute("data-worker-card");
+      frame.removeAttribute("data-picker");
+      frame.removeAttribute("data-upload");
+    }
 
-    if (state.layout === "split") {
+    /** The worker shell's tab is one terminal, full width: split view is the
+     * selected *session's* terminals, and the shell is not in one. */
+    const showSplit = state.layout === "split" && !state.workerShellTab;
+    if (showSplit) {
       if (split === null) {
         split = createSplitView(store, options.mount);
         main.append(split.el);
@@ -337,7 +410,7 @@ export function createApp(options: AppOptions): App {
     for (const region of regions) {
       region.update(state);
     }
-    if (split !== null && state.layout === "split") {
+    if (split !== null && showSplit) {
       split.update(state);
     }
   }
@@ -421,6 +494,17 @@ export function createApp(options: AppOptions): App {
       return;
     }
     /**
+     * A taken-over worker window (W17): `Enter` takes it back, as the panel's
+     * own button says. Nothing else is claimed — the panel asks one question.
+     */
+    if (state.connection === "taken_over") {
+      if (isPlain(event) && event.key === "Enter") {
+        event.preventDefault();
+        options.onStripAction?.(RECLAIM);
+      }
+      return;
+    }
+    /**
      * A dialog outranks the palette and the configuration manager: it is a
      * question somebody asked that has to be answered before the keyboard means
      * anything, which is the same argument the takeover prompt above makes. It
@@ -434,6 +518,32 @@ export function createApp(options: AppOptions): App {
       return;
     }
     if (state.config !== null && configKey(event, state)) {
+      return;
+    }
+    /**
+     * The worker's project picker (`remote-control-vjtb`). Its three text
+     * fields are real inputs, so every key belongs to them — `Enter` is
+     * handled on the field itself — and none may reach a shortcut here: a
+     * typed `a` must not open the feed. `Esc` closes it.
+     */
+    if (state.picker !== null) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        store.dispatch({ type: "picker/close" });
+      }
+      return;
+    }
+    /**
+     * The upload panel (v8, R30), under the picker its Choose… opens. Like
+     * the picker it owns every key — its buttons and folder field take them
+     * natively, and none may reach a shortcut here. `Esc` closes it, except
+     * while files are going out: that is what Cancel is for.
+     */
+    if (state.upload !== null) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        store.dispatch({ type: "upload/close" });
+      }
       return;
     }
     /**
@@ -621,7 +731,13 @@ export function createApp(options: AppOptions): App {
      * would show a palette with nothing real to run — the chord still gets
      * swallowed either way, which is the whole point of claiming it.
      */
-    if (state.access === null && state.takeover === null) {
+    if (
+      state.access === null &&
+      state.takeover === null &&
+      state.picker === null &&
+      state.upload === null &&
+      state.connection !== "taken_over"
+    ) {
       store.dispatch({
         type: state.palette === null ? "palette/open" : "palette/close",
       });
@@ -790,6 +906,29 @@ export function createApp(options: AppOptions): App {
     }
     if (command.id === "about_flightdeck") {
       store.dispatch({ type: "about/open" });
+      return;
+    }
+    /**
+     * Open Project on a worker is this window's project picker
+     * (`remote-control-vjtb`): a worker has no folder dialog, and the host
+     * refuses the row for exactly that reason. Any other host is sent it.
+     */
+    if (
+      store.getState().hostKind === "worker" &&
+      command.run.name === OPEN_PROJECT_COMMAND
+    ) {
+      store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+      return;
+    }
+    /**
+     * Upload Files… (v8, R30) is this window's file chooser, the same one
+     * the tab bar's button opens. The worker lists the row only to say it
+     * exists, and refuses it as a frame. Opened here, inside the key press
+     * or click that ran the row, because a chooser opens only from one.
+     */
+    if (command.run.name === UPLOAD_FILES_COMMAND) {
+      store.dispatch({ type: "palette/close" });
+      upload.chooseFiles();
       return;
     }
     options.onRunCommand?.(command);
@@ -1254,7 +1393,10 @@ export function createApp(options: AppOptions): App {
       path.includes(takeover.el) ||
       path.includes(palette.el) ||
       path.includes(config.el) ||
-      path.includes(dialog.el)
+      path.includes(dialog.el) ||
+      path.includes(picker.el) ||
+      path.includes(upload.el) ||
+      path.includes(takenOver.el)
     ) {
       return;
     }

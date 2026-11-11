@@ -6,6 +6,8 @@ import type {
   GitStatusPanel,
   HelpDoc,
   HostCommand,
+  HostKind,
+  HostMessage,
   Incumbent,
   Project,
   ReplayProgress,
@@ -19,8 +21,32 @@ import type {
   TakeoverState,
   UpdateInfo,
   VersionMismatch,
+  WorkerConnections,
+  WorkerHealth,
+  WorkerInfo,
+  WorkerShell,
+  WorkerStatus,
 } from "./model";
 import { shouldRetry } from "./model";
+import type {
+  CloneProgress,
+  CloneResult,
+  OpenedProject,
+  PickerListing,
+  PickerScanAnswer,
+  PickerIntent,
+  PickerSent,
+  PickerState,
+} from "./picker";
+import type { NotificationPermissionState } from "./worker";
+import type {
+  OnConflict,
+  Picked,
+  Resolution,
+  TransferResult,
+  UploadPlan,
+  UploadState,
+} from "./upload";
 import type { ConfigDoc, ConfigEdits, ConfigScope } from "./config";
 import type { ViewportWidth } from "./viewport";
 import type {
@@ -90,7 +116,16 @@ export type ConnectionStatus =
    * global binding: see `specs/WEB_INTERFACE.md` §6.5 R9.
    */
   | "revoked"
-  | "stopped";
+  | "stopped"
+  /**
+   * A worker's window only (PRD W17): another window attached to the worker
+   * and took it over, and the host closed this socket. **Terminal**, like
+   * `stopped` — the tab does not redial on its own, because attaching again
+   * as a window would take the worker straight back from whoever just took
+   * it. Only "Take it back" (`connection/reclaim`) leaves it. Who took it is
+   * `AppState.takenOverBy`.
+   */
+  | "taken_over";
 
 /**
  * The PTY grid size. D4: the desktop always owns this — the browser never
@@ -378,6 +413,51 @@ export interface AppState {
   readonly help: HelpDoc | null;
   /** The About screen's version and credits, from the host's own build. */
   readonly about: AboutDoc | null;
+
+  /* --- A FlightDeck Worker's window (remote-control-vjtb) ---------------- */
+
+  /**
+   * What kind of FlightDeck this tab is attached to (`Snapshot::host_kind`),
+   * `null` until a snapshot says (and from a host that predates the field).
+   * Every worker-only behaviour below switches on `"worker"`; on a TUI or
+   * Desktop host none of the fields after this one is ever set.
+   */
+  readonly hostKind: HostKind | null;
+  /** The worker's own state, `null` from any other host. */
+  readonly worker: WorkerInfo | null;
+  /** Each terminal's own grid, by id — a worker sizes every one to this
+   * window (W5). Empty on other hosts, which keep D4's one grid. */
+  readonly terminalGeometry: Readonly<Record<string, TerminalGeometry>>;
+  /**
+   * Whether the worker shell's tab is the one on screen. **Local**: the shell
+   * is not one of the host's sessions, so it is no part of the shared
+   * selection (D3) — choosing it moves nothing on the host, and choosing a
+   * project tab again leaves it.
+   */
+  readonly workerShellTab: boolean;
+  /** Open Project on a worker: the project picker, or `null` when closed. */
+  readonly picker: PickerState | null;
+  /** A project the picker had the worker open, until it shows up in a
+   * snapshot and is selected (`main.ts`). */
+  readonly pendingOpen: OpenedProject | null;
+  /**
+   * The status bar's notice: the latest host message, or how something this
+   * window asked for turned out. The worker has no status bar of its own, so
+   * this is where its words go (`messages.rs`).
+   */
+  readonly notice: string | null;
+  /** The device that took the worker over, while `connection` is
+   * `taken_over`. */
+  readonly takenOverBy: string | null;
+  /** What this browser allows for notifications, as `main.ts` read it. */
+  readonly notifications: NotificationPermissionState;
+  /**
+   * The protocol version the host answered this tab at, `null` until a
+   * snapshot says. Only the upload panel reads it (v8, R30).
+   */
+  readonly protocolVersion: number | null;
+  /** Upload files to a worker (W34, R30): the panel, or `null` when closed. */
+  readonly upload: UploadState | null;
 }
 
 /**
@@ -394,7 +474,13 @@ export interface AppState {
 export type ReadOnlyOverlay =
   | { readonly kind: "help" }
   | { readonly kind: "about" }
-  | { readonly kind: "git_status"; readonly panel: GitStatusPanel };
+  | { readonly kind: "git_status"; readonly panel: GitStatusPanel }
+  /**
+   * A worker's words that should not be missed: an error it raised, or the
+   * messages it kept while no window was attached ("2 messages while you
+   * were away"). One panel, read-only like the others, closed by `Esc`.
+   */
+  | { readonly kind: "message"; readonly title: string; readonly text: string };
 
 /** An `open_configuration` command this browser sent and has not heard back
  * about. */
@@ -552,6 +638,18 @@ export function createInitialState(): AppState {
      * is not attached to (`remote-control-ll5.8`). */
     help: null,
     about: null,
+    hostKind: null,
+    worker: null,
+    terminalGeometry: {},
+    workerShellTab: false,
+    picker: null,
+    pendingOpen: null,
+    notice: null,
+    takenOverBy: null,
+    /** The honest default until `main.ts` has asked the browser. */
+    notifications: "unsupported",
+    protocolVersion: null,
+    upload: null,
   };
 }
 
@@ -652,6 +750,9 @@ export type AppAction =
        * constants of its own. `null` means it did not say. */
       readonly lockoutLengthSeconds: number | null;
       readonly codeTtlSeconds: number | null;
+      /** The refusal body's `host_kind`, when the host sent one: which words
+       * tell the reader where to get a code. */
+      readonly hostKind?: HostKind | null;
     }
   /** A digit was typed into 2b's four boxes. Extra digits are ignored, not
    * wrapped: a fifth keystroke means the user mistyped, not that they meant to
@@ -670,6 +771,7 @@ export type AppAction =
       readonly lockoutSeconds: number | null;
       readonly lockoutLengthSeconds: number | null;
       readonly codeTtlSeconds: number | null;
+      readonly hostKind?: HostKind | null;
     }
   /** The exchange succeeded — the cookie is set and the overlay comes down. */
   | { readonly type: "access/granted" }
@@ -683,7 +785,11 @@ export type AppAction =
    * that keeps no tombstone time, or one from before that field, sends neither.
    * `null` renders the sentence without a time rather than with an invented one.
    */
-  | { readonly type: "access/revoked"; readonly revokedAgo: string | null }
+  | {
+      readonly type: "access/revoked";
+      readonly revokedAgo: string | null;
+      readonly hostKind?: HostKind | null;
+    }
   /** 2b's `Enter a new code` — back to a blank keypad from any other screen. */
   | { readonly type: "access/retry" }
   /**
@@ -961,7 +1067,111 @@ export type AppAction =
    */
   | { readonly type: "gitStatus/received"; readonly panel: GitStatusPanel }
   /** `Esc`, the panel's own close button, or a click outside it. */
-  | { readonly type: "readOnly/close" };
+  | { readonly type: "readOnly/close" }
+
+  /* --- A FlightDeck Worker's window (remote-control-vjtb) ---------------- */
+
+  /** `Delta::Geometry` from a worker: one terminal's grid changed (W5). */
+  | {
+      readonly type: "terminalGeometry/set";
+      readonly terminalId: string;
+      readonly geometry: TerminalGeometry;
+    }
+  /** `Delta::WorkerShell`: the shell's title, grid or liveness changed. */
+  | {
+      readonly type: "worker/shell";
+      readonly shell: WorkerShell;
+      readonly geometry: TerminalGeometry;
+    }
+  | { readonly type: "worker/health"; readonly health: WorkerHealth }
+  | { readonly type: "worker/status"; readonly status: WorkerStatus }
+  | { readonly type: "worker/connections"; readonly connections: WorkerConnections }
+  /** `Delta::HostMessage`: a notice, and an error is also an overlay. */
+  | { readonly type: "worker/message"; readonly message: HostMessage }
+  /** The messages the worker kept while no window was attached, carried
+   * once by the attach snapshot: one "while you were away" overlay. */
+  | { readonly type: "worker/away"; readonly messages: readonly HostMessage[] }
+  /** The worker shell's tab chosen (`true`) or left (`false`). Local. */
+  | { readonly type: "workerShell/show"; readonly show: boolean }
+  /**
+   * Something the project picker asks for (`PickerIntent`). `open` opens the
+   * picker (or keeps the open one); every intent is also the cue for
+   * `main.ts`'s `onDispatch` to send the command it means — the same seam a
+   * `selection/*` click goes through — and nothing else changes here until
+   * the seq comes back as `picker/sent`.
+   */
+  | { readonly type: "picker/request"; readonly intent: PickerIntent }
+  /** The worker shell's Restart shell. Sent by `main.ts`; nothing local. */
+  | { readonly type: "workerShell/restart" }
+  | { readonly type: "picker/close" }
+  /** A picker request went out as `seq`. */
+  | { readonly type: "picker/sent"; readonly sent: PickerSent; readonly seq: number }
+  | { readonly type: "picker/listing"; readonly listing: PickerListing }
+  | { readonly type: "picker/scan"; readonly scan: PickerScanAnswer }
+  | { readonly type: "picker/cloneProgress"; readonly progress: CloneProgress }
+  | { readonly type: "picker/cloneResult"; readonly result: CloneResult }
+  | {
+      readonly type: "picker/field";
+      readonly field: "path" | "url" | "name";
+      readonly value: string;
+    }
+  | { readonly type: "picker/toggleHidden" }
+  /** Something the picker could not send, said on its error line. */
+  | { readonly type: "picker/error"; readonly error: string }
+  /** The project the picker opened is selected; stop looking for it. */
+  | { readonly type: "pendingOpen/done" }
+  /** `ServerMsg::TakenOver` (W17): another window took the worker. */
+  | { readonly type: "connection/takenOver"; readonly by: string }
+  /** "Take it back": the transport is attaching as a window again. */
+  | { readonly type: "connection/reclaim" }
+  | { readonly type: "notice/set"; readonly notice: string | null }
+  /* --- Uploading files to a worker (v8, W34, R30) ------------------------- */
+  /**
+   * Files picked or dropped: opens the upload panel at the default folder
+   * (`defaultUploadDir`) with them, or adds them to the open one while it is
+   * still choosing.
+   */
+  | { readonly type: "upload/open"; readonly picked: readonly Picked[] }
+  | { readonly type: "upload/remove"; readonly index: number }
+  /** The folder field, as typed. */
+  | { readonly type: "upload/dir"; readonly dir: string }
+  /** Upload pressed. `main.ts` sends the `begin_upload` it means (or says
+   * why there is none) and reports back with `upload/requested`. */
+  | { readonly type: "upload/submit" }
+  /** A `begin_upload` went out as `seq`; `null` when it could not be sent. */
+  | {
+      readonly type: "upload/requested";
+      readonly seq: number | null;
+      readonly onConflict: OnConflict;
+    }
+  /** Something the panel could not send, said on its note line. */
+  | { readonly type: "upload/note"; readonly note: string }
+  /** The answer to taken names. `cancel` is local; `main.ts` sends the
+   * other two again. */
+  | { readonly type: "upload/resolve"; readonly resolution: Resolution }
+  /** `ServerMsg::UploadPlan`. */
+  | { readonly type: "upload/plan"; readonly plan: UploadPlan }
+  /** `main.ts` started item `index`'s transfer. */
+  | { readonly type: "upload/started"; readonly index: number }
+  | { readonly type: "upload/progress"; readonly index: number; readonly sent: number }
+  | {
+      readonly type: "upload/finished";
+      readonly index: number;
+      readonly result: TransferResult;
+    }
+  /** Stop. `main.ts` aborts a transfer under way. */
+  | { readonly type: "upload/cancel" }
+  /** Upload more: an empty list, same folder. */
+  | { readonly type: "upload/startOver" }
+  /** Close the panel. Refused while uploading — Cancel first. */
+  | { readonly type: "upload/close" }
+  /** The project picker, opened by the upload panel's Choose…, chose `path`
+   * as the upload's folder. */
+  | { readonly type: "picker/chosen"; readonly path: string }
+  | {
+      readonly type: "notifications/permission";
+      readonly permission: NotificationPermissionState;
+    };
 
 /**
  * Seq of `pendingInput[0]`, or the seq the *next* keystroke will get when the
@@ -999,7 +1209,7 @@ export function dropAckedInput(
  * is dead, so retrying the socket cannot help — the user needs a code.
  */
 export function isTerminalConnection(state: AppState): boolean {
-  if (state.connection === "revoked") {
+  if (state.connection === "revoked" || state.connection === "taken_over") {
     return true;
   }
   return state.shutdown !== null && !shouldRetry(state.shutdown.reason);

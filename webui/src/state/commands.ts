@@ -1,5 +1,6 @@
 import type { HostCommand, Project, Session } from "./model";
 import type { AppState } from "./types";
+import { workerPaletteRow } from "./worker";
 
 /**
  * The command palette's inventory (artboard 1d) and the pure filtering /
@@ -246,7 +247,14 @@ export function paletteInventory(state: AppState): readonly PaletteCommand[] {
     if (row.answersDialog) {
       continue;
     }
-    commands.push(...expandTemplate(row, state));
+    /** A worker's window hides the rows about a host screen it does not have
+     * and runs `open_project` itself, as the picker (`remote-control-vjtb`).
+     * Every row on any other host comes back untouched. */
+    const offered = workerPaletteRow(state, row);
+    if (offered === null) {
+      continue;
+    }
+    commands.push(...expandTemplate(offered, state));
   }
   return commands;
 }

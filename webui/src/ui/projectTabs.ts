@@ -7,6 +7,7 @@ import {
 } from "../state/status";
 import type { Project } from "../state/model";
 import type { AppState } from "../state/types";
+import { uploadAvailable } from "../state/worker";
 import { clear, el, hostOnlyBadge, separator, spinnerGlyph } from "./dom";
 import type { Child, Region } from "./dom";
 import { toneClass } from "./tone";
@@ -30,8 +31,26 @@ import type { Store } from "./store";
  * destructive operation, which D8 puts outside M1 — so it renders, disabled,
  * and says which milestone owns it. It is not badged `host only`, because it
  * is not a desktop-only action; it is an unbuilt one.
+ *
+ * **A worker** (`remote-control-vjtb`) adds two things, and only on a worker:
+ * the worker shell's tab, ahead of the project tabs (W15) — local, because the
+ * shell is not one of the host's sessions — and `+ project` becomes a working
+ * Open Project, because on a worker the picker runs in this window rather than
+ * on a host screen nobody is looking at.
  */
-export function createProjectTabs(store: Store): Region {
+export interface ProjectTabsOptions {
+  /**
+   * A worker's "Upload files" (v8, R30): open the browser's file chooser.
+   * A call rather than an action, because a file chooser only opens inside
+   * the click that asked for it (`ui/uploadPanel.ts`).
+   */
+  readonly onUploadFiles?: () => void;
+}
+
+export function createProjectTabs(
+  store: Store,
+  options: ProjectTabsOptions = {},
+): Region {
   const row = el("div", {
     class: "fd-projects",
     attrs: { role: "tablist", "aria-label": "Projects" },
@@ -39,8 +58,19 @@ export function createProjectTabs(store: Store): Region {
 
   function render(state: AppState): void {
     clear(row);
-    const selectedId = state.selection?.projectId ?? null;
+    const worker = state.hostKind === "worker";
+    /** On the shell's tab no project tab is the one on screen. */
+    const selectedId = worker && state.workerShellTab
+      ? null
+      : (state.selection?.projectId ?? null);
     const children: Child[] = [sessionChip(state, store)];
+
+    if (worker) {
+      children.push(workerShellTab(state, store));
+      if (state.projects.length > 0) {
+        children.push(separator());
+      }
+    }
 
     state.projects.forEach((project, index) => {
       if (index > 0) {
@@ -50,7 +80,12 @@ export function createProjectTabs(store: Store): Region {
     });
 
     children.push(el("div", { class: "fd-spacer" }));
-    children.push(newProjectAction());
+    /** Upload files sits beside Open Project, and only where this window
+     * can upload: a worker at v8 or later. */
+    if (uploadAvailable(state) && options.onUploadFiles !== undefined) {
+      children.push(uploadFilesAction(options.onUploadFiles));
+    }
+    children.push(worker ? openProjectAction(store) : newProjectAction());
     for (const child of children) {
       if (child !== null && child !== undefined && child !== false) {
         row.append(child);
@@ -184,6 +219,79 @@ function projectTab(
     },
     [select, close],
   );
+}
+
+/**
+ * The worker shell's tab (W15): a login shell on the worker, in `$HOME`. It is
+ * not one of the host's sessions, so choosing it moves nothing on the host —
+ * it is this window's own, like the native window's.
+ */
+function workerShellTab(state: AppState, store: Store): HTMLElement {
+  const selected = state.workerShellTab;
+  const shell = state.worker?.shell ?? null;
+  const select = el(
+    "button",
+    {
+      class: "fd-project__select fd-project__select--shell",
+      title: "the worker's own shell — choosing it moves nothing on the worker",
+      attrs: {
+        type: "button",
+        role: "tab",
+        "aria-selected": String(selected),
+      },
+    },
+    [
+      el("span", {
+        class: `fd-glyph ${shell !== null && shell.alive ? "fd-tone-ok" : "fd-tone-quiet"}`,
+        text: shell !== null && shell.alive ? "●" : "○",
+        attrs: { "aria-hidden": "true" },
+      }),
+      el("span", { text: "Worker shell" }),
+    ],
+  );
+  select.addEventListener("click", () => {
+    store.dispatch({ type: "workerShell/show", show: true });
+  });
+  return el(
+    "div",
+    {
+      class: "fd-project fd-project--shell",
+      attrs: { role: "presentation", "data-selected": String(selected) },
+    },
+    [select],
+  );
+}
+
+/** A worker's `+ project`: the project picker, in this window. */
+function openProjectAction(store: Store): HTMLElement {
+  const button = el(
+    "button",
+    {
+      class: "fd-action fd-action--project",
+      title: "open a repository on the worker, or clone one",
+      attrs: { type: "button", "data-action": "open-project" },
+    },
+    [el("span", { text: "+ Open Project" })],
+  );
+  button.addEventListener("click", () => {
+    store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+  });
+  return button;
+}
+
+/** A worker's Upload files (v8, W34): the file chooser, then the panel. */
+function uploadFilesAction(onUploadFiles: () => void): HTMLElement {
+  const button = el(
+    "button",
+    {
+      class: "fd-action fd-action--upload",
+      title: "upload files from this computer into a folder on the worker",
+      attrs: { type: "button", "data-action": "upload-files" },
+    },
+    [el("span", { text: "Upload files" })],
+  );
+  button.addEventListener("click", onUploadFiles);
+  return button;
 }
 
 function newProjectAction(): HTMLElement {
