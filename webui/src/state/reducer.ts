@@ -9,8 +9,20 @@ import {
 import type { ConfigEdit, ConfigScope } from "./config";
 import { selectedChoice, visibleChoices } from "./dialog";
 import { findProject, findSession, shouldRetry } from "./model";
-import type { AccessState, Project, SeatInfo, Selection } from "./model";
+import type { AccessState, HostKind, Project, SeatInfo, Selection } from "./model";
 import { incumbentFromSeats } from "./seats";
+import {
+  cloneNotice,
+  newPicker,
+  pickerAck,
+  pickerCloneProgress,
+  pickerCloneResult,
+  pickerListing,
+  pickerScan,
+  pickerSent,
+} from "./picker";
+import type { PickerState } from "./picker";
+import { awayText, messageLine } from "./worker";
 import { widthClass } from "./viewport";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
@@ -205,6 +217,19 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         /** A dated seat list completes an arriving takeover panel — see
          * `refreshArrivingIncumbent`. */
         takeover: refreshArrivingIncumbent(state.takeover, snapshot.seats),
+        /**
+         * `remote-control-vjtb`: a worker's own state, replaced wholesale like
+         * every other host fact. On a TUI or Desktop host these are `null`,
+         * `null` and empty, and nothing that reads them does anything.
+         */
+        hostKind: snapshot.hostKind ?? null,
+        worker: snapshot.worker ?? null,
+        terminalGeometry: snapshot.terminalGeometry ?? {},
+        /** The shell's tab only exists on a worker. */
+        workerShellTab:
+          snapshot.hostKind === "worker" ? state.workerShellTab : false,
+        /** The picker only exists on a worker. */
+        picker: snapshot.hostKind === "worker" ? state.picker : null,
       };
     }
 
@@ -213,7 +238,12 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       if (project === null) {
         return state;
       }
-      return { ...state, selection: firstSelectionIn(project) };
+      return {
+        ...state,
+        selection: firstSelectionIn(project),
+        /** A project tab chosen is the worker shell's tab left. */
+        workerShellTab: false,
+      };
     }
 
     case "selection/session": {
@@ -236,6 +266,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
            * point at nothing. */
           terminalId: session.terminals[0]?.id ?? "",
         },
+        workerShellTab: false,
       };
     }
 
@@ -246,6 +277,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         selection: { ...state.selection, terminalId: action.terminalId },
+        workerShellTab: false,
       };
     }
 
@@ -323,7 +355,12 @@ function reduceAction(state: AppState, action: AppAction): AppState {
          * question that has just been overtaken.
          */
         access: revoked
-          ? { ...blankAccess(), screen: "revoked", revokedAgo: null }
+          ? {
+              ...blankAccess(),
+              screen: "revoked",
+              revokedAgo: null,
+              ...accessHostKind(state, undefined),
+            }
           : state.access,
       };
     }
@@ -354,6 +391,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           lockoutLengthSeconds: action.lockoutLengthSeconds,
           codeTtlSeconds: action.codeTtlSeconds,
           revokedAgo: null,
+          ...accessHostKind(state, action.hostKind),
         },
       };
 
@@ -407,6 +445,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           lockoutSeconds: action.lockoutSeconds,
           lockoutLengthSeconds: action.lockoutLengthSeconds,
           codeTtlSeconds: action.codeTtlSeconds,
+          ...accessHostKind(state, action.hostKind),
         },
       };
     }
@@ -429,6 +468,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           screen: "revoked",
           code: "",
           revokedAgo: action.revokedAgo,
+          ...accessHostKind(state, action.hostKind),
         },
         /** 2b: "Everything you can see below this dialog is a photograph from
          * the moment access ended." The pane's stale treatment is derived from
@@ -579,6 +619,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           sessionId: session.id,
           terminalId: session.terminals[0]?.id ?? "",
         },
+        workerShellTab: false,
       };
     }
 
@@ -679,6 +720,22 @@ function reduceAction(state: AppState, action: AppAction): AppState {
     }
 
     case "command/result": {
+      /**
+       * A worker's project picker owns its own seqs (`remote-control-vjtb`):
+       * its acks settle its requests, and an applied open closes it. The
+       * owners' seqs never overlap, since one counter mints them all.
+       */
+      if (state.picker !== null) {
+        const answered = pickerAck(
+          state.picker,
+          action.seq,
+          action.outcome,
+          action.detail ?? null,
+        );
+        if (answered.owned) {
+          return settlePicker(state, answered.picker);
+        }
+      }
       /** One counter, one action, two possible owners (§5.1) — try the
        * palette first, then the config manager, and touch neither if `seq`
        * matches nothing in either: a seq that matches nothing pending is
@@ -751,6 +808,18 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         };
       }
 
+      /**
+       * A worker's window says what became of a command nobody else is
+       * waiting on (a shell restart, a palette row whose palette has closed):
+       * a refusal as a message, anything else with words as the notice — the
+       * native window's rule (`session.rs`'s `take_answers`). Any other host
+       * keeps the silence it has always had.
+       */
+      if (state.hostKind === "worker" && action.detail !== undefined) {
+        return action.outcome === "rejected" || action.outcome === "read_only"
+          ? showMessage(state, "The worker refused that", action.detail)
+          : { ...state, notice: action.detail };
+      }
       return state;
     }
 
@@ -1149,6 +1218,179 @@ function reduceAction(state: AppState, action: AppAction): AppState {
     case "readOnly/close":
       return state.readOnly === null ? state : { ...state, readOnly: null };
 
+    /* --- A FlightDeck Worker's window (remote-control-vjtb) -------------- */
+
+    case "terminalGeometry/set":
+      return {
+        ...state,
+        terminalGeometry: {
+          ...state.terminalGeometry,
+          [action.terminalId]: action.geometry,
+        },
+      };
+
+    case "worker/shell": {
+      if (state.worker === null) {
+        return state;
+      }
+      return {
+        ...state,
+        worker: { ...state.worker, shell: action.shell },
+        terminalGeometry: {
+          ...state.terminalGeometry,
+          [action.shell.terminalId]: action.geometry,
+        },
+      };
+    }
+
+    case "worker/health":
+      return state.worker === null
+        ? state
+        : { ...state, worker: { ...state.worker, health: action.health } };
+
+    case "worker/status":
+      return state.worker === null
+        ? state
+        : { ...state, worker: { ...state.worker, status: action.status } };
+
+    case "worker/connections":
+      return state.worker === null
+        ? state
+        : {
+            ...state,
+            worker: { ...state.worker, connections: action.connections },
+          };
+
+    case "worker/message": {
+      /** `session.rs`'s `take_worker_news`: every message is the notice, and
+       * an error is also put in front of the reader. */
+      const noticed = { ...state, notice: messageLine(action.message) };
+      return action.message.level === "error"
+        ? showMessage(noticed, "Error on the worker", action.message.text)
+        : noticed;
+    }
+
+    case "worker/away":
+      return action.messages.length === 0
+        ? state
+        : showMessage(state, "While you were away", awayText(action.messages));
+
+    case "workerShell/show":
+      if (state.hostKind !== "worker" || state.workerShellTab === action.show) {
+        return state;
+      }
+      return { ...state, workerShellTab: action.show };
+
+    case "picker/request":
+      if (state.hostKind !== "worker" || action.intent.kind !== "open") {
+        return state;
+      }
+      return {
+        ...state,
+        /** One overlay at a time: the palette is usually what opened this. */
+        palette: null,
+        picker: state.picker ?? newPicker(state.worker?.home ?? ""),
+      };
+
+    case "workerShell/restart":
+      return state;
+
+    case "picker/close":
+      return state.picker === null ? state : { ...state, picker: null };
+
+    case "picker/sent":
+      return state.picker === null
+        ? state
+        : {
+            ...state,
+            picker: pickerSent(state.picker, action.sent, action.seq),
+          };
+
+    case "picker/listing":
+      return state.picker === null
+        ? state
+        : { ...state, picker: pickerListing(state.picker, action.listing) };
+
+    case "picker/scan":
+      return state.picker === null
+        ? state
+        : { ...state, picker: pickerScan(state.picker, action.scan) };
+
+    case "picker/cloneProgress":
+      return state.picker === null
+        ? state
+        : {
+            ...state,
+            picker: pickerCloneProgress(state.picker, action.progress),
+          };
+
+    case "picker/cloneResult":
+      /** A clone the closed picker started still ends somewhere the reader
+       * can see: the notice. */
+      if (state.picker === null) {
+        return { ...state, notice: cloneNotice(action.result) };
+      }
+      return settlePicker(state, pickerCloneResult(state.picker, action.result));
+
+    case "picker/field": {
+      const picker = state.picker;
+      if (picker === null) {
+        return state;
+      }
+      const key =
+        action.field === "path"
+          ? "pathField"
+          : action.field === "url"
+            ? "urlField"
+            : "nameField";
+      return picker[key] === action.value
+        ? state
+        : { ...state, picker: { ...picker, [key]: action.value } };
+    }
+
+    case "picker/toggleHidden":
+      return state.picker === null
+        ? state
+        : {
+            ...state,
+            picker: { ...state.picker, showHidden: !state.picker.showHidden },
+          };
+
+    case "picker/error":
+      return state.picker === null
+        ? state
+        : { ...state, picker: { ...state.picker, error: action.error } };
+
+    case "pendingOpen/done":
+      return state.pendingOpen === null ? state : { ...state, pendingOpen: null };
+
+    case "connection/takenOver":
+      return {
+        ...state,
+        connection: "taken_over",
+        takenOverBy: action.by,
+        /** Nothing this window had open is answerable from here any more. */
+        picker: null,
+        palette: null,
+        retry: null,
+      };
+
+    case "connection/reclaim":
+      if (state.connection !== "taken_over") {
+        return state;
+      }
+      return { ...state, connection: "connecting", takenOverBy: null };
+
+    case "notice/set":
+      return state.notice === action.notice
+        ? state
+        : { ...state, notice: action.notice };
+
+    case "notifications/permission":
+      return state.notifications === action.permission
+        ? state
+        : { ...state, notifications: action.permission };
+
     default: {
       // Exhaustiveness check: a new AppAction variant left unhandled above is
       // a compile error here, not a silently-ignored action at runtime.
@@ -1270,6 +1512,50 @@ function refreshArrivingIncumbent(
   }
   const incumbent = incumbentFromSeats(seats);
   return incumbent === null ? takeover : { kind: "arriving", incumbent };
+}
+
+/**
+ * The picker after an answer: still open, or — when the worker opened a
+ * project for it — closed, with the project to go to and a notice saying so.
+ * The native client's `close_opened_picker`, as a reduction.
+ */
+function settlePicker(state: AppState, picker: PickerState): AppState {
+  if (picker.opened === null) {
+    return { ...state, picker };
+  }
+  return {
+    ...state,
+    picker: null,
+    pendingOpen: picker.opened,
+    notice: picker.status ?? `Opened ${picker.opened.path}.`,
+  };
+}
+
+/**
+ * Put a worker's words in front of the reader — unless something they are
+ * working in (the palette, the configuration manager, the picker) is up; then
+ * its first line is the notice instead. The native window's `show_message`.
+ */
+function showMessage(state: AppState, title: string, text: string): AppState {
+  if (state.palette !== null || state.config !== null || state.picker !== null) {
+    return { ...state, notice: text.split(NEWLINE)[0] ?? text };
+  }
+  return { ...state, palette: null, readOnly: { kind: "message", title, text } };
+}
+
+const NEWLINE = String.fromCharCode(10);
+
+/**
+ * The host kind an access screen words itself for: what the refusal said, else
+ * what this screen already knew, else what the last snapshot said. Spread, so
+ * a host that never says leaves the field absent rather than `undefined`.
+ */
+function accessHostKind(
+  state: AppState,
+  said: HostKind | null | undefined,
+): { readonly hostKind?: HostKind } {
+  const kind = said ?? state.access?.hostKind ?? state.hostKind ?? null;
+  return kind === null ? {} : { hostKind: kind };
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { AccessScreen, AccessState } from "./model";
+import type { AccessScreen, AccessState, HostKind } from "./model";
 import { ACCESS_CODE_LENGTH } from "./model";
 
 /**
@@ -35,6 +35,15 @@ import { ACCESS_CODE_LENGTH } from "./model";
  * `attempts_remaining` set the precedent and is followed exactly: host-sent,
  * never guessed, and when it is absent the sentence loses the clause instead of
  * gaining an invention.
+ *
+ * ## Where a code comes from depends on the host (`remote-control-vjtb`)
+ *
+ * A TUI or Desktop mints a code in its Web Interface overlay (`Ctrl-g`). A
+ * FlightDeck Worker has no screen to show one on: its code is printed by
+ * `flightdeck worker pair` in a shell on the worker, and a browser's access is
+ * withdrawn there with `flightdeck worker revoke`. The refusal body says which
+ * host refused us (`host_kind`), and only then do the screens say so — a host
+ * that does not say reads exactly as it always has.
  */
 
 /** Everything one of 2b's four screens renders, chosen by `accessCopy`. */
@@ -62,13 +71,21 @@ export interface AccessCopy {
   readonly acceptsCode: boolean;
 }
 
+/** The worker's command that prints a code (`flightdeck worker pair`). */
+export const WORKER_PAIR_COMMAND = "flightdeck worker pair";
+/** The worker's command that withdraws a browser's access. */
+export const WORKER_REVOKE_COMMAND = "flightdeck worker revoke";
+
 export function accessCopy(access: AccessState): AccessCopy {
+  const worker = access.hostKind === "worker";
   switch (access.screen) {
     case "code_entry":
       return {
         title: "Enter your code",
         eyebrow: null,
-        body: codeEntrySentence(access.codeTtlSeconds),
+        body: worker
+          ? workerCodeEntrySentence(access.codeTtlSeconds)
+          : codeEntrySentence(access.codeTtlSeconds),
         /**
          * 2b prints this on the *first* screen, which reads oddly until you
          * notice what it is doing: a user who reached the code screen from a
@@ -93,10 +110,15 @@ export function accessCopy(access: AccessState): AccessCopy {
         detail: null,
         /** 2b's two numbered steps, verbatim — both of them are on the *other*
          * machine, which is the fact the user needs first. */
-        steps: [
-          "go to the machine running FlightDeck",
-          "Ctrl-g → Web Interface → Space for a fresh code",
-        ],
+        steps: worker
+          ? [
+              "open a shell on the worker",
+              `run ${WORKER_PAIR_COMMAND} for a fresh code`,
+            ]
+          : [
+              "go to the machine running FlightDeck",
+              "Ctrl-g → Web Interface → Space for a fresh code",
+            ],
         primary: { key: "Enter", label: "Try again" },
         secondary: null,
         tone: "alert",
@@ -106,11 +128,14 @@ export function accessCopy(access: AccessState): AccessCopy {
     case "revoked":
       return {
         title: "Access revoked",
-        eyebrow: "from the desktop",
-        body:
-          "Someone at the FlightDeck machine withdrew this browser's access" +
-          (access.revokedAgo === null ? "" : ` ${access.revokedAgo}`) +
-          ". Nothing is broken and nothing is lost — you are simply no longer allowed in.",
+        eyebrow: worker ? "on the worker" : "from the desktop",
+        body: worker
+          ? `Someone on the worker withdrew this browser's access with ${WORKER_REVOKE_COMMAND}` +
+            (access.revokedAgo === null ? "" : ` ${access.revokedAgo}`) +
+            `. Nothing is broken and nothing is lost — run ${WORKER_PAIR_COMMAND} there for a new code.`
+          : "Someone at the FlightDeck machine withdrew this browser's access" +
+            (access.revokedAgo === null ? "" : ` ${access.revokedAgo}`) +
+            ". Nothing is broken and nothing is lost — you are simply no longer allowed in.",
         detail:
           "The agents kept running. Everything you can see below this dialog is a " +
           "photograph from the moment access ended.",
@@ -139,9 +164,11 @@ export function accessCopy(access: AccessState): AccessCopy {
         title: "Too many attempts",
         eyebrow: "this address",
         body: lockoutSentence(access.lockoutSeconds),
-        detail:
-          "The limit is per address, not per code, so a fresh code from the desktop " +
-          "will not shorten the wait.",
+        detail: worker
+          ? "The limit is per address, not per code, so a fresh code from " +
+            `${WORKER_PAIR_COMMAND} will not shorten the wait.`
+          : "The limit is per address, not per code, so a fresh code from the desktop " +
+            "will not shorten the wait.",
         steps: [],
         primary: null,
         secondary: null,
@@ -167,6 +194,25 @@ function codeEntrySentence(codeTtlSeconds: number | null): string {
   return codeTtlSeconds === null
     ? `${lead}.`
     : `${lead}, good for ${codeTtlSeconds} seconds.`;
+}
+
+/**
+ * The worker's half of the same sentence: a worker has no overlay, so its code
+ * is printed by `flightdeck worker pair` in a shell there.
+ */
+function workerCodeEntrySentence(codeTtlSeconds: number | null): string {
+  const lead =
+    `On the worker, run ${WORKER_PAIR_COMMAND} in a shell. ` +
+    "It prints a four-digit code";
+  return codeTtlSeconds === null
+    ? `${lead}.`
+    : `${lead}, good for ${codeTtlSeconds} seconds.`;
+}
+
+/** Whether an access screen is about a worker — for callers that word
+ * something beside it. */
+export function isWorkerAccess(hostKind: HostKind | null | undefined): boolean {
+  return hostKind === "worker";
 }
 
 /** 2b: "It expired, or it was mistyped. Codes last **120 seconds** and only

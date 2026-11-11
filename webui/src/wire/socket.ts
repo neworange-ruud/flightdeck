@@ -18,20 +18,45 @@
  * 3. **Attach is the handshake.** The host closes the socket on any frame sent
  *    before `attach`, so nothing is written to the wire until the socket is open
  *    and `attach` has gone out; keystrokes typed before that are queued.
+ *
+ * ## A worker host (`remote-control-vjtb`)
+ *
+ * A FlightDeck Worker (`specs/WORKER_PRD.md`) serves this SPA too, and speaks
+ * v7 frames no other host sends. Everything below that handles one switches on
+ * the snapshot's `host_kind`, so a TUI or Desktop host sees no difference:
+ *
+ * - **Takeover is terminal (W17).** A worker serves one window; when another
+ *   attaches, this one gets `taken_over` and the socket closes. Redialling on
+ *   our own would attach as a window again and take the worker straight back,
+ *   so the tab stops — only `reconnect()` (the user's "Take it back") dials.
+ * - **Each terminal has its own grid (W5)**, and `resizeTerminal` sends the
+ *   one on screen its size — once per size per terminal, per connection.
+ * - **Its words**: health, status, the shell, host messages and the picker's
+ *   answers are applied as they arrive instead of resynced.
  */
 
 import { isStale } from "../state/connection";
 import { shouldRetry } from "../state/model";
 import type { ShutdownReason } from "../state/model";
+import { onScreenTerminalId } from "../state/worker";
 import type { Store } from "../ui/store";
 import {
   agoLabel,
+  cloneProgressOf,
+  cloneResultOf,
   configDocOf,
+  connectionsOf,
   dialogOf,
+  dirListingOf,
   gitStatusOf,
+  healthOf,
+  hostMessageOf,
+  projectScanOf,
   seatOf,
   snapshotFromWire,
   statusFromLabel,
+  workerShellOf,
+  workerStatusOf,
 } from "./adapt";
 import {
   decodeBase64,
@@ -40,7 +65,18 @@ import {
   WS_PATH,
   type ServerFrame,
   type WireAck,
+  type WireCloneProgress,
+  type WireCloneResult,
+  type WireConnectionsView,
   type WireDeltaEnvelope,
+  type WireDirListing,
+  type WireHealth,
+  type WireHostMessage,
+  type WireNotificationView,
+  type WireProjectScan,
+  type WireTakenOver,
+  type WireWorkerShellView,
+  type WireWorkerStatusView,
   type WireDialogView,
   type WireError,
   type WireGeometry,
@@ -172,6 +208,17 @@ export interface SessionSocket {
    * so nothing here has to guess what it got.
    */
   requestSeat(seat: "write" | "take_over" | "observe"): void;
+  /**
+   * W5, a worker host only: size `terminalId`'s PTY to the window. Sent when
+   * it differs from the last size sent for that terminal on this connection,
+   * and never to any other host (D4) — returns whether a frame went out.
+   */
+  resizeTerminal(terminalId: string, cols: number, rows: number): boolean;
+  /**
+   * Dial again now: a worker's "Take it back" (W17), which attaches as its
+   * window and so takes it from whoever took it. Also clears a give-up.
+   */
+  reconnect(): void;
   close(): void;
 }
 
@@ -184,6 +231,11 @@ export interface SessionSocketOptions {
   /** Injected in tests. */
   readonly socketFactory?: (url: string) => WebSocket;
   readonly now?: () => number;
+  /**
+   * A worker raised a notification (W18). Where it is shown — a browser
+   * notification, or nowhere — is `main.ts`'s call, not the transport's.
+   */
+  readonly onNotification?: (notification: WireNotificationView) => void;
 }
 
 function defaultUrl(): string {
@@ -202,6 +254,12 @@ function shutdownReason(reason: string): ShutdownReason {
   return (SHUTDOWN_REASONS as readonly string[]).includes(reason)
     ? (reason as ShutdownReason)
     : "unknown";
+}
+
+/** A host message's identity: a worker numbers them per run, so the time
+ * tells a replay from a new message after a worker restart. */
+function messageKey(message: { readonly id: number; readonly at_ms: number }): string {
+  return `${message.id}:${message.at_ms}`;
 }
 
 /** Open the session and keep it open. Returns immediately; the first frames
@@ -285,6 +343,17 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
   let attempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * W5: the size last sent for each terminal on **this** connection, so a
+   * pane that has not changed sends nothing. Cleared on every attach, because
+   * whoever held the worker in between may have resized it.
+   */
+  const sentSizes = new Map<string, string>();
+  /**
+   * The host messages already shown, by id and time — a worker numbers them
+   * per run, so the pair tells a replay from a new message after a restart.
+   */
+  const shownMessages = new Set<string>();
 
   function remember(terminalId: string, bytes: Uint8Array): void {
     const previous = scrollback.get(terminalId);
@@ -471,7 +540,9 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
    * would hang waiting for one.
    */
   function catchUpFromSnapshot(frame: WireSnapshot): CatchUp | null {
-    const terminalId = store.getState().selection?.terminalId ?? null;
+    /** The terminal on screen — on any host but a worker, the selection's,
+     * exactly as before; on a worker possibly its shell. */
+    const terminalId = onScreenTerminalId(store.getState());
     if (terminalId === null) {
       return null;
     }
@@ -479,10 +550,14 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     if (cursor === undefined) {
       return null;
     }
-    const view = frame.projects
-      .flatMap((project) => project.sessions)
-      .flatMap((session) => session.terminals)
-      .find((terminal) => terminal.terminal_id === terminalId);
+    const shell = frame.worker?.shell ?? null;
+    const view =
+      shell !== null && shell.terminal_id === terminalId
+        ? shell
+        : frame.projects
+            .flatMap((project) => project.sessions)
+            .flatMap((session) => session.terminals)
+            .find((terminal) => terminal.terminal_id === terminalId);
     if (view === undefined) {
       return null;
     }
@@ -559,6 +634,7 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     held = held.filter((item) => item.seq > frame.last_input_seq);
     seq = Math.max(seq, frame.last_input_seq);
     store.dispatch({ type: "snapshot/received", snapshot: snapshotFromWire(frame) });
+    showKeptMessages(frame);
     store.dispatch({ type: "connection/changed", status: "connected" });
     store.dispatch({ type: "retry/set", retry: null });
     /** 1a is drawn in Terminal mode, and a browser that just attached is here
@@ -586,6 +662,24 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       store.dispatch({ type: "replay/set", replay: null });
     }
     flushHeld();
+  }
+
+  /**
+   * The messages a worker kept while no window was attached ride on the attach
+   * snapshot, once — the worker marks them read as this window attaches. They
+   * are shown together as one "while you were away" panel, and remembered so
+   * a later snapshot that still carries one cannot show it twice.
+   */
+  function showKeptMessages(frame: WireSnapshot): void {
+    const kept = frame.worker?.host_messages ?? [];
+    const fresh = kept.filter((message) => !shownMessages.has(messageKey(message)));
+    if (fresh.length === 0) {
+      return;
+    }
+    for (const message of fresh) {
+      shownMessages.add(messageKey(message));
+    }
+    store.dispatch({ type: "worker/away", messages: fresh.map(hostMessageOf) });
   }
 
   function onTermBytes(frame: WireTermBytes): void {
@@ -668,11 +762,82 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       }
       case "geometry": {
         const geometry = frame.geometry as WireGeometry | undefined;
-        if (geometry !== undefined) {
-          store.dispatch({ type: "geometry/set", geometry });
+        if (geometry === undefined) {
+          return;
         }
+        /**
+         * W5: on a worker every terminal has its own grid, sized to this
+         * window, so the delta's `terminal_id` is the point of it. Every
+         * other host keeps D4's one grid, exactly as before.
+         */
+        const terminalId = frame.terminal_id;
+        if (isWorkerHost() && typeof terminalId === "string") {
+          store.dispatch({
+            type: "terminalGeometry/set",
+            terminalId,
+            geometry: { cols: geometry.cols, rows: geometry.rows },
+          });
+          return;
+        }
+        store.dispatch({ type: "geometry/set", geometry });
         return;
       }
+      case "terminal_upsert": {
+        /** A worker's terminal changed — its grid among other things, after
+         * a resize this window asked for. The grid is applied now; the rest
+         * of the row still arrives with the resync every other host gets. */
+        const geometry = frame.geometry as WireGeometry | undefined;
+        const terminalId = frame.terminal_id;
+        if (isWorkerHost() && geometry !== undefined && typeof terminalId === "string") {
+          store.dispatch({
+            type: "terminalGeometry/set",
+            terminalId,
+            geometry: { cols: geometry.cols, rows: geometry.rows },
+          });
+        }
+        requestSnapshotSoon();
+        return;
+      }
+      /* --- v7, worker hosts only (`remote-control-vjtb`) ---------------- */
+      case "health":
+        store.dispatch({
+          type: "worker/health",
+          health: healthOf(frame as unknown as WireHealth),
+        });
+        return;
+      case "worker_shell": {
+        const view = frame as unknown as WireWorkerShellView;
+        store.dispatch({
+          type: "worker/shell",
+          shell: workerShellOf(view),
+          geometry: { cols: view.geometry.cols, rows: view.geometry.rows },
+        });
+        return;
+      }
+      case "worker_status":
+        store.dispatch({
+          type: "worker/status",
+          status: workerStatusOf(frame as unknown as WireWorkerStatusView),
+        });
+        return;
+      case "connections":
+        store.dispatch({
+          type: "worker/connections",
+          connections: connectionsOf(frame as unknown as WireConnectionsView),
+        });
+        return;
+      case "host_message": {
+        const message = frame as unknown as WireHostMessage;
+        if (shownMessages.has(messageKey(message))) {
+          return;
+        }
+        shownMessages.add(messageKey(message));
+        store.dispatch({ type: "worker/message", message: hostMessageOf(message) });
+        return;
+      }
+      case "notification":
+        options.onNotification?.(frame as unknown as WireNotificationView);
+        return;
       case "selection": {
         /**
          * `Delta::Selection` (D3/D8, `remote-control-ll5.7`): the instance's
@@ -808,6 +973,27 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         type: "command/result",
         seq: frame.seq,
         outcome: "read_only",
+        detail: frame.message,
+      });
+      return;
+    }
+    /**
+     * A worker's window: an error naming a command this tab sent (a picker
+     * request with a malformed path, say) settles it as a refusal, so the
+     * picker's error line says it in the worker's words. Any other host keeps
+     * the console line below — nothing about a TUI or Desktop host changes.
+     */
+    if (
+      isWorkerHost() &&
+      frame.seq !== undefined &&
+      pendingCommands.has(frame.seq) &&
+      frame.code !== "version_mismatch"
+    ) {
+      pendingCommands.delete(frame.seq);
+      store.dispatch({
+        type: "command/result",
+        seq: frame.seq,
+        outcome: "rejected",
         detail: frame.message,
       });
       return;
@@ -999,16 +1185,65 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
       case "shutdown":
         onShutdown(frame as WireShutdown);
         return;
+      /* --- v7, worker hosts only (`remote-control-vjtb`) ------------------ */
+      case "taken_over":
+        onTakenOver(frame as WireTakenOver);
+        return;
+      case "dir_listing":
+        store.dispatch({
+          type: "picker/listing",
+          listing: dirListingOf(frame as WireDirListing),
+        });
+        return;
+      case "project_scan":
+        store.dispatch({
+          type: "picker/scan",
+          scan: projectScanOf(frame as WireProjectScan),
+        });
+        return;
+      case "clone_progress":
+        store.dispatch({
+          type: "picker/cloneProgress",
+          progress: cloneProgressOf(frame as WireCloneProgress),
+        });
+        return;
+      case "clone_result":
+        store.dispatch({
+          type: "picker/cloneResult",
+          result: cloneResultOf(frame as WireCloneResult),
+        });
+        return;
       default:
         /** A frame this build has never heard of. Ignored on purpose. */
         return;
     }
   }
 
+  /**
+   * W17: another window took the worker. The socket closes right after this
+   * frame, and it must stay closed — a redial would attach as a window and
+   * take the worker straight back — so the retry loop is switched off here,
+   * before `onclose` can consult it. `reconnect()` switches it back on.
+   */
+  function onTakenOver(frame: WireTakenOver): void {
+    closedForGood = true;
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    store.dispatch({ type: "connection/takenOver", by: frame.by });
+  }
+
+  function isWorkerHost(): boolean {
+    return store.getState().hostKind === "worker";
+  }
+
   function sendAttach(seat: "write" | "take_over" | "observe"): void {
     if (socket === null || socket.readyState !== WebSocket.OPEN) {
       return;
     }
+    /** A new attach is a new connection's sizes (W5). */
+    sentSizes.clear();
     /** `attached` gates every *other* frame, so it has to be true for the
      * attach itself to go out. */
     attached = true;
@@ -1157,6 +1392,45 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     sendCommand,
     requestSeat(seat) {
       sendAttach(seat);
+    },
+    resizeTerminal(terminalId, cols, rows) {
+      /** D4 everywhere but a worker: no other host may be sent a size. */
+      if (!isWorkerHost() || terminalId === "") {
+        return false;
+      }
+      const size = `${cols}x${rows}`;
+      if (sentSizes.get(terminalId) === size) {
+        return false;
+      }
+      const went = send({
+        type: "resize_terminal",
+        terminal_id: terminalId,
+        cols,
+        rows,
+      });
+      if (went) {
+        sentSizes.set(terminalId, size);
+      }
+      return went;
+    },
+    reconnect() {
+      closedForGood = false;
+      attempt = 0;
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      store.dispatch({ type: "connection/reclaim" });
+      if (socket !== null) {
+        /** Still open (a reconnect asked for over a live link): this one's
+         * close must not schedule a retry of its own. */
+        const old = socket;
+        old.onclose = null;
+        old.close();
+        socket = null;
+        attached = false;
+      }
+      connect();
     },
     close() {
       closedForGood = true;
