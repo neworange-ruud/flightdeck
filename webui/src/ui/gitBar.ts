@@ -2,6 +2,7 @@ import { findSession } from "../state/model";
 import type { GitBarInfo } from "../state/model";
 import type { ViewportWidth } from "../state/viewport";
 import type { AppState, TerminalGeometry } from "../state/types";
+import { onScreenTerminalId, stageGeometry } from "../state/worker";
 import { clear, el, separator } from "./dom";
 import type { Child, Region } from "./dom";
 
@@ -56,7 +57,11 @@ export function createGitBar(): Region {
         bar.append(part);
       }
     }
-    bar.append(geometryChip(state.geometry, state.width));
+    bar.append(
+      state.hostKind === "worker"
+        ? workerGeometryChip(state)
+        : geometryChip(state.geometry, state.width),
+    );
   }
 
   return { el: bar, update: render };
@@ -148,6 +153,23 @@ function changeCounts(git: GitBarInfo): HTMLElement {
  * towards a `FitAddon`, so this file does not do it and the *scrollbar* is
  * what says the grid is actually over the edge right now.
  */
+/**
+ * A worker's window (W5, `remote-control-vjtb`): D4 does not hold there — the
+ * worker has no pane, so the terminal on screen is sized to *this* window and
+ * the chip says so, with that terminal's own grid. Nothing is letterboxed.
+ */
+function workerGeometryChip(state: AppState): HTMLElement {
+  const id = onScreenTerminalId(state);
+  const geometry = id === null ? null : stageGeometry(state, id);
+  const grid = geometry === null ? "—×—" : `${geometry.cols}×${geometry.rows}`;
+  return el("span", {
+    class: "fd-geometry",
+    text: `${grid} · sized to this window`,
+    title:
+      "a worker has no screen of its own, so the terminal on screen takes this window's size (W5)",
+  });
+}
+
 function geometryChip(
   geometry: TerminalGeometry | null,
   width: ViewportWidth,

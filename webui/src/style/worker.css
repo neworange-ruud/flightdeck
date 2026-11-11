@@ -1,0 +1,309 @@
+/*
+ * A FlightDeck Worker's window (`remote-control-vjtb`, specs/WORKER_PRD.md).
+ *
+ * Every rule here hangs off an attribute `ui/app.ts` sets **only on a worker**
+ * (`data-host="worker"` and its companions), or off an element that only a
+ * worker's state ever shows. A TUI or Desktop host's frame never carries them,
+ * so nothing in this file can reach its layout.
+ *
+ * Loaded after main.css and states.css (it overrides one rule of each) and
+ * before narrow.css (which still has the last word below 900px).
+ */
+
+/*
+ * W5 — no letterbox. On a worker the terminal's grid is *this window's* size
+ * (main.ts measures the pane and asks the worker for it), so there is no
+ * leftover margin to centre the grid in: it sits where the pane starts, and
+ * the few pixels short of a whole cell are left at the far edges. The padding
+ * stays — main.ts measures it and takes it off the pane before dividing.
+ */
+.fd-frame[data-host="worker"] .fd-letterbox {
+  margin: 0;
+}
+
+/*
+ * W5, and the asleep footer. Elsewhere it appears only while the terminal is
+ * asleep, which changes the pane's height on every click in and out — on a
+ * worker that would resize the PTY (and redraw a full-screen program) each
+ * time focus moved. Here it always keeps its room and is only *shown* asleep,
+ * so the pane, and the PTY, hold still.
+ */
+.fd-frame[data-host="worker"] .fd-pane[data-tone] .fd-pane__foot {
+  display: block;
+  visibility: hidden;
+}
+.fd-frame[data-host="worker"] .fd-pane[data-tone="asleep"] .fd-pane__foot {
+  visibility: visible;
+}
+
+/*
+ * The worker shell's tab is one terminal, full width (W15): the sidebar lists
+ * the selected project's sessions and the terminal tabs that session's
+ * terminals, and the shell is in neither.
+ */
+.fd-frame[data-host="worker"][data-worker-shell="true"] .fd-sidebar,
+.fd-frame[data-host="worker"][data-worker-shell="true"] .fd-tabs {
+  display: none;
+}
+
+/* The worker shell's own tab, ahead of the project tabs. */
+.fd-project--shell .fd-project__select--shell {
+  font-weight: 700;
+}
+
+/*
+ * A card in place of a terminal there is none of: no projects yet, or no
+ * shell. The pane gives way; an exited shell keeps its pane (its last words)
+ * and the card is a bar under it.
+ */
+.fd-frame[data-worker-card="empty"] .fd-pane,
+.fd-frame[data-worker-card="shell_missing"] .fd-pane,
+.fd-frame[data-worker-card="empty"] .fd-tabs,
+.fd-frame[data-worker-card="empty"] .fd-sidebar {
+  display: none;
+}
+.fd-workercard {
+  display: flex;
+  background: var(--fd-ground);
+}
+.fd-workercard[data-kind="empty"],
+.fd-workercard[data-kind="shell_missing"] {
+  flex: 1;
+  min-height: 0;
+}
+.fd-workercard__panel {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 22px 28px;
+  box-shadow: inset 0 0 0 1px var(--fd-rule);
+  background: var(--fd-chrome);
+}
+.fd-workercard__title {
+  margin: 0;
+  color: var(--fd-text);
+  font-size: var(--fd-t-title);
+}
+.fd-workercard__detail,
+.fd-workercard__line {
+  margin: 0;
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-body);
+}
+.fd-workercard__bar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--fd-rule);
+  background: var(--fd-chrome);
+}
+.fd-workercard__bar .fd-workercard__line {
+  flex: 1;
+  min-width: 0;
+}
+.fd-workercard__action,
+.fd-picker__button,
+.fd-statusbar__notify {
+  font: inherit;
+  font-size: var(--fd-t-meta);
+  padding: 3px 10px;
+  border: 0;
+  cursor: pointer;
+  color: var(--fd-ground);
+  background: var(--fd-accent);
+}
+.fd-workercard__action:focus-visible,
+.fd-picker__button:focus-visible,
+.fd-statusbar__notify:focus-visible {
+  outline: 1px solid var(--fd-focus);
+  outline-offset: 2px;
+}
+.fd-picker__button[disabled] {
+  cursor: not-allowed;
+  color: var(--fd-text-quiet);
+  background: var(--fd-rule);
+}
+
+/* --- The status bar's worker line --------------------------------------- */
+
+.fd-statusbar__worker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.fd-statusbar__notice,
+.fd-statusbar__health {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fd-text-quiet);
+}
+.fd-statusbar__notice {
+  color: var(--fd-text-soft);
+}
+.fd-statusbar__notify {
+  padding: 1px 8px;
+  color: var(--fd-accent);
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+}
+
+/* --- A worker's words, in the read-only panel --------------------------- */
+
+.fd-info__message {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* --- The project picker (W9) -------------------------------------------- */
+
+.fd-picker {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  background: color-mix(in srgb, var(--fd-canvas) 72%, transparent);
+}
+.fd-picker__panel {
+  width: min(820px, calc(100% - 40px));
+  max-height: calc(100% - 60px);
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in srgb, var(--fd-ground) 70%, var(--fd-canvas));
+  box-shadow: inset 0 0 0 1px var(--fd-accent);
+  overflow-y: auto;
+}
+.fd-picker__head {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--fd-rule);
+  background: color-mix(in srgb, var(--fd-accent) 7%, transparent);
+}
+.fd-picker__title {
+  color: var(--fd-accent);
+  font-weight: 700;
+}
+.fd-picker__busy {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-picker__close {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--fd-text-decor);
+  cursor: pointer;
+}
+.fd-picker__error,
+.fd-picker__status {
+  margin: 0;
+  padding: 6px 14px;
+  font-size: var(--fd-t-body);
+}
+.fd-picker__error {
+  color: var(--fd-alert);
+}
+.fd-picker__status {
+  color: var(--fd-ok);
+}
+.fd-picker__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--fd-rule-inner);
+}
+.fd-picker__section-title {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+  letter-spacing: 0.06em;
+}
+.fd-picker__row,
+.fd-picker__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.fd-picker__input {
+  flex: 1;
+  min-width: 160px;
+  font: inherit;
+  font-size: var(--fd-t-body);
+  padding: 4px 8px;
+  border: 0;
+  color: var(--fd-text);
+  background: var(--fd-canvas);
+  box-shadow: inset 0 0 0 1px var(--fd-rule);
+}
+.fd-picker__input:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--fd-focus);
+}
+.fd-picker__list {
+  display: flex;
+  flex-direction: column;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.fd-picker__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 4px;
+  font-size: var(--fd-t-body);
+}
+.fd-picker__item:hover {
+  background: var(--fd-tui-select);
+}
+.fd-picker__name {
+  color: var(--fd-text-soft);
+}
+.fd-picker__name--link {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--fd-accent);
+}
+.fd-picker__detail,
+.fd-picker__muted,
+.fd-picker__tag {
+  color: var(--fd-text-quiet);
+  font-size: var(--fd-t-meta);
+}
+.fd-picker__muted {
+  margin: 0;
+  padding: 3px 4px;
+}
+.fd-picker__clone-line {
+  margin: 0;
+  font-size: var(--fd-t-body);
+  color: var(--fd-text-soft);
+}
+.fd-picker__clone-line[data-tone="ok"] {
+  color: var(--fd-ok);
+}
+.fd-picker__clone-line[data-tone="alert"] {
+  color: var(--fd-alert);
+}
+.fd-picker__foot {
+  display: flex;
+  gap: 14px;
+  padding: 6px 14px;
+  font-size: var(--fd-t-meta);
+  color: var(--fd-text-quiet);
+}
