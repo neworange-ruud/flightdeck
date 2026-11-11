@@ -312,6 +312,10 @@ pub const SPLIT_VIEW_UNAVAILABLE: &str =
 pub const CONFIG_UNAVAILABLE: &str =
     "The host does not offer its configuration manager to a remote window.";
 
+/// Why Upload Files is not offered: only a worker at protocol v8 or later
+/// takes files (W34).
+pub const UPLOAD_UNAVAILABLE: &str = "Only a FlightDeck worker on a current version takes uploads.";
+
 /// What `action` does from a remote window.
 pub fn route_palette(action: &PaletteAction) -> RemoteAction {
     if let PaletteAction::Dispatch(command) = action {
@@ -354,6 +358,9 @@ pub fn route_palette_for(ws: &RemoteWorkspace, action: &PaletteAction) -> Remote
         }
         PaletteAction::OpenConfig if !forwards(ws, names::OPEN_CONFIGURATION) => {
             RemoteAction::Unavailable(CONFIG_UNAVAILABLE)
+        }
+        PaletteAction::FrontEnd(FrontEndAction::UploadFiles) if !ws.takes_uploads() => {
+            RemoteAction::Unavailable(UPLOAD_UNAVAILABLE)
         }
         _ => route_palette(action),
     }
@@ -435,8 +442,9 @@ pub fn target(ws: &RemoteWorkspace, scope: Scope) -> Option<Target> {
 
 /// The palette rows a remote window offers: this build's own rows, kept to the
 /// ones the host's inventory forwards and a remote window can use, plus the
-/// desktop's own front-end rows and the remote window's own (Rename Remote): a
-/// remote window only exists in the desktop.
+/// desktop's own front-end rows and the remote window's own (Rename Remote,
+/// and Upload Files on a worker that takes uploads): a remote window only
+/// exists in the desktop.
 pub fn palette_entries(ws: &RemoteWorkspace) -> Vec<&'static PaletteEntry> {
     crate::tui::palette::remote_window_rows()
         .filter(|entry| match route_palette_for(ws, &entry.action) {

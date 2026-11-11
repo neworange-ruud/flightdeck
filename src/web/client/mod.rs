@@ -57,7 +57,7 @@ use crate::contracts::{PtySize, TabId};
 use crate::web::protocol::{
     command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, GitStatusView,
     HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan, ResizeTerminal, SeatRequest,
-    TerminalId, UploadFile, UploadPlan, WireError, UPLOAD_MIN_VERSION,
+    TerminalId, UploadFile, UploadPlan, WireError,
 };
 
 pub use config::{EditorEffect, RemoteConfigEditor};
@@ -579,10 +579,10 @@ impl RemoteClient {
     }
 
     /// Whether this worker takes uploads: a worker, attached at protocol v8
-    /// or later ([`UPLOAD_MIN_VERSION`]). A v7 worker has no upload door, and
+    /// or later ([`crate::web::protocol::UPLOAD_MIN_VERSION`]). A v7 worker has no upload door, and
     /// a TUI or Desktop host never offers one.
     pub fn supports_upload(&self) -> bool {
-        self.is_worker() && self.workspace.protocol_version >= UPLOAD_MIN_VERSION
+        self.workspace.takes_uploads()
     }
 
     /// Ask the worker to take `files` into `dir` (v8). The answer arrives as

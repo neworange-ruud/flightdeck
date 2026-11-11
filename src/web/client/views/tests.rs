@@ -563,3 +563,39 @@ fn open_project_opens_the_picker_on_a_worker_and_the_folder_dialog_elsewhere() {
         }
     ));
 }
+
+#[test]
+fn upload_files_is_offered_only_on_a_worker_that_takes_uploads() {
+    let upload = PaletteAction::FrontEnd(FrontEndAction::UploadFiles);
+    let offered = |ws: &RemoteWorkspace| palette_entries(ws).iter().any(|e| e.action == upload);
+
+    // A v8 worker: a local row the window performs (its file chooser).
+    let mut ws = with_kind(Some(wire::HostKind::Worker));
+    ws.protocol_version = wire::UPLOAD_MIN_VERSION;
+    assert!(ws.takes_uploads());
+    assert_eq!(
+        route_palette_for(&ws, &upload),
+        RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::UploadFiles))
+    );
+    assert!(offered(&ws));
+
+    // A v7 worker has no upload door.
+    ws.protocol_version = wire::UPLOAD_MIN_VERSION - 1;
+    assert_eq!(
+        route_palette_for(&ws, &upload),
+        RemoteAction::Unavailable(UPLOAD_UNAVAILABLE)
+    );
+    assert!(!offered(&ws));
+
+    // Nor has any other host, at any version.
+    for kind in [
+        None,
+        Some(wire::HostKind::Tui),
+        Some(wire::HostKind::Desktop),
+    ] {
+        let mut ws = with_kind(kind);
+        ws.protocol_version = wire::PROTOCOL_VERSION;
+        assert!(!ws.takes_uploads());
+        assert!(!offered(&ws), "{kind:?}");
+    }
+}

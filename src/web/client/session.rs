@@ -465,6 +465,25 @@ impl RemoteSession {
         self.local = Local::None;
     }
 
+    /// Open the project picker to choose a folder rather than a project (the
+    /// upload panel's Choose…): a fresh picker listing `start` — no scan, no
+    /// clone. Blank, it lists `$HOME`. A folder the worker refuses is the
+    /// picker's error line, and the front-end can list `$HOME` instead.
+    pub fn open_folder_picker(&mut self, start: &str) {
+        let home = self
+            .workspace()
+            .worker
+            .as_ref()
+            .map(|w| w.home.clone())
+            .unwrap_or_default();
+        let mut picker = ProjectPicker::new(home);
+        let start = start.trim();
+        let start = (!start.is_empty() && start != "~").then_some(start);
+        picker.browse_sent(self.client.browse_dir(start, picker.show_hidden));
+        self.picker = Some(picker);
+        self.local = Local::None;
+    }
+
     // -- uploads (v8) ----------------------------------------------------------
 
     /// The upload panel, while it is open.
