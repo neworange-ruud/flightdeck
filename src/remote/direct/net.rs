@@ -54,10 +54,16 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long the `tailscale status --json` probe may run.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long `tailscale cert` may run. Issuing (or renewing) a certificate is
+/// an ACME round trip through Let's Encrypt, so it is given far longer than
+/// the status probe; it only ever runs off the worker's main loop.
+pub const CERT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Whether `ip` is a Tailscale address: `100.64.0.0/10` (IPv4 CGNAT) or
 /// `fd7a:115c:a1e0::/48` (Tailscale's IPv6 ULA prefix).
@@ -119,6 +125,13 @@ pub struct TailscaleStatus {
     /// `Self.TailscaleIPs`: the addresses Tailscale assigned this node. Empty
     /// when it reports none (logged out, stopped, no `Self`).
     pub ips: Vec<IpAddr>,
+    /// The top-level `CertDomains`: the names `tailscale cert` may issue a
+    /// certificate for. Empty (the JSON's `null`) when the tailnet's admin has
+    /// not enabled HTTPS certificates; then no certificate may be asked for
+    /// at all, because issuing one publishes the machine's name in the public
+    /// Certificate Transparency logs, and the admin turning HTTPS on is the
+    /// consent to that.
+    pub cert_domains: Vec<String>,
 }
 
 /// Parse `tailscale status --json` output. `None` only for output that is not
@@ -141,7 +154,22 @@ pub fn status_from_json(json: &str) -> Option<TailscaleStatus> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(TailscaleStatus { magic_dns, ips })
+    let cert_domains = value
+        .get("CertDomains")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|d| d.as_str())
+                .map(|d| d.trim().trim_end_matches('.').to_string())
+                .filter(|d| !d.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TailscaleStatus {
+        magic_dns,
+        ips,
+        cert_domains,
+    })
 }
 
 /// Pull `Self.DNSName` out of `tailscale status --json` output, without the
@@ -258,6 +286,16 @@ pub trait TailscaleProbe: Send + Sync {
     fn magic_dns_name(&self) -> Option<String> {
         self.status().and_then(|s| s.magic_dns)
     }
+
+    /// A TLS certificate for `domain` (one of [`TailscaleStatus::cert_domains`])
+    /// from `tailscale cert`: `(certificate chain PEM, private key PEM)`, or
+    /// why there is none, for a person. Blocking for up to [`CERT_TIMEOUT`]:
+    /// never call it on a loop that must keep ticking.
+    ///
+    /// The caller must have checked that the tailnet has HTTPS enabled and
+    /// that `domain` is one of its certificate domains: this asks for a
+    /// certificate unconditionally.
+    fn cert(&self, domain: &str) -> Result<(String, String), String>;
 }
 
 /// [`TailscaleProbe`] that runs `tailscale status --json` (argv, no shell),
@@ -284,6 +322,78 @@ impl TailscaleProbe for CliTailscaleProbe {
                     .and_then(|out| status_from_json(&out))
             })
     }
+
+    /// `tailscale cert --cert-file - --key-file - <domain>`: both PEMs on
+    /// stdout, which this process then writes itself. Writing them through
+    /// the CLI's own file paths would not work for the macOS App Store
+    /// build, whose sandbox only writes inside its own container.
+    fn cert(&self, domain: &str) -> Result<(String, String), String> {
+        let args = ["cert", "--cert-file", "-", "--key-file", "-", domain];
+        let mut last = "the tailscale CLI was not found".to_string();
+        for program in TAILSCALE_CANDIDATES
+            .iter()
+            .filter(|c| !c.starts_with('/') || std::path::Path::new(c).exists())
+        {
+            match run_bounded_detailed(program, &args, CERT_TIMEOUT) {
+                Ok(out) => return split_cert_and_key(&out),
+                // Not this candidate: try the next one.
+                Err(RunError::Spawn(e)) => last = format!("could not run {program}: {e}"),
+                // It ran and said no: that is the answer.
+                Err(RunError::Failed(why)) => return Err(why),
+            }
+        }
+        Err(last)
+    }
+}
+
+/// Split the PEM stream `tailscale cert --cert-file - --key-file -` prints
+/// into the certificate chain (every `CERTIFICATE` block, in order) and the
+/// private key (the one `… PRIVATE KEY` block), each re-assembled as PEM.
+/// Anything outside a block is ignored, and the order of the two parts in the
+/// stream does not matter.
+pub fn split_cert_and_key(pem: &str) -> Result<(String, String), String> {
+    let mut certs = String::new();
+    let mut key = String::new();
+    let mut keys = 0usize;
+    let mut block: Option<(String, String)> = None;
+    for line in pem.lines() {
+        let line = line.trim();
+        match &mut block {
+            None => {
+                if let Some(label) = line
+                    .strip_prefix("-----BEGIN ")
+                    .and_then(|rest| rest.strip_suffix("-----"))
+                {
+                    block = Some((label.to_string(), format!("{line}\n")));
+                }
+            }
+            Some((label, text)) => {
+                text.push_str(line);
+                text.push('\n');
+                if line
+                    .strip_prefix("-----END ")
+                    .and_then(|r| r.strip_suffix("-----"))
+                    == Some(label.as_str())
+                {
+                    if label == "CERTIFICATE" {
+                        certs.push_str(text);
+                    } else if label.ends_with("PRIVATE KEY") {
+                        keys += 1;
+                        key.push_str(text);
+                    }
+                    block = None;
+                }
+            }
+        }
+    }
+    if certs.is_empty() {
+        return Err("tailscale cert printed no certificate".to_string());
+    }
+    match keys {
+        0 => Err("tailscale cert printed no private key".to_string()),
+        1 => Ok((certs, key)),
+        _ => Err("tailscale cert printed more than one private key".to_string()),
+    }
 }
 
 /// A probe with a fixed answer, for tests.
@@ -294,25 +404,52 @@ impl TailscaleProbe for FixedTailscaleProbe {
     fn status(&self) -> Option<TailscaleStatus> {
         self.0.clone()
     }
+
+    /// A fixed probe never has a certificate: the tests that need one load
+    /// the committed fixture into the server directly, or script a probe of
+    /// their own.
+    fn cert(&self, domain: &str) -> Result<(String, String), String> {
+        Err(format!("no certificate for {domain} (a fixed probe)"))
+    }
+}
+
+/// Why [`run_bounded_detailed`] has no output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunError {
+    /// The program could not be started at all (not installed, forbidden).
+    Spawn(String),
+    /// It ran but failed or timed out: what it said, for a person.
+    Failed(String),
 }
 
 /// Run `program args…` and return its stdout if it exits successfully within
-/// `limit`; kill it and return `None` otherwise. Output is read on a helper
-/// thread so a chatty child can never fill the pipe and stall the wait.
+/// `limit`; kill it and return `None` otherwise. Output is read on helper
+/// threads so a chatty child can never fill a pipe and stall the wait.
 fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<String> {
+    run_bounded_detailed(program, args, limit).ok()
+}
+
+/// [`run_bounded`], saying why when there is no output: the last line the
+/// program wrote to stderr when it failed, or that it timed out.
+fn run_bounded_detailed(program: &str, args: &[&str], limit: Duration) -> Result<String, RunError> {
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut buf);
+            }
+            buf
+        })
+    }
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::Read::read_to_string(&mut stdout, &mut buf);
-        buf
-    });
+        .map_err(|e| RunError::Spawn(e.to_string()))?;
+    let reader = drain(child.stdout.take());
+    let errors = drain(child.stderr.take());
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
@@ -325,8 +462,22 @@ fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<String> 
             }
         }
     };
-    let out = reader.join().ok()?;
-    status.filter(|s| s.success()).map(|_| out)
+    let out = reader.join().unwrap_or_default();
+    let said = errors.join().unwrap_or_default();
+    let verb = args.first().copied().unwrap_or("");
+    match status {
+        Some(status) if status.success() => Ok(out),
+        Some(status) => Err(RunError::Failed(
+            match said.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+                Some(line) => format!("{program} {verb}: {line}"),
+                None => format!("{program} {verb} {status}"),
+            },
+        )),
+        None => Err(RunError::Failed(format!(
+            "{program} {verb} did not finish within {} s",
+            limit.as_secs()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +588,7 @@ mod tests {
             Some(TailscaleStatus {
                 magic_dns: Some("mbp.tail1234.ts.net".into()),
                 ips: vec![ip("100.100.1.2"), ip("fd7a:115c:a1e0::9")],
+                cert_domains: Vec::new(),
             })
         );
         // The CLI answered "needs login": a status with no addresses, which is
@@ -504,8 +656,93 @@ mod tests {
         let probe = FixedTailscaleProbe(Some(TailscaleStatus {
             magic_dns: Some("m.ts.net".into()),
             ips: vec![ip("100.64.0.1")],
+            cert_domains: vec!["m.ts.net".into()],
         }));
         assert_eq!(probe.magic_dns_name().as_deref(), Some("m.ts.net"));
+        assert!(probe.cert("m.ts.net").is_err(), "a fixed probe has no cert");
         assert_eq!(FixedTailscaleProbe(None).magic_dns_name(), None);
+    }
+
+    /// `CertDomains` is how a worker knows the tailnet admin enabled HTTPS:
+    /// `null` (or absent, or empty) means no certificate may be asked for.
+    #[test]
+    fn status_reads_the_certificate_domains() {
+        let json = r#"{"Self":{"DNSName":"box.tail1234.ts.net.","TailscaleIPs":["100.64.0.1"]},
+                       "CertDomains":["box.tail1234.ts.net", " other.tail1234.ts.net. ", ""]}"#;
+        assert_eq!(
+            status_from_json(json).unwrap().cert_domains,
+            vec!["box.tail1234.ts.net", "other.tail1234.ts.net"]
+        );
+        for off in [
+            r#"{"Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":null}"#,
+            r#"{"Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":[]}"#,
+            r#"{"Self":{"DNSName":"box.tail1234.ts.net."}}"#,
+        ] {
+            assert!(
+                status_from_json(off).unwrap().cert_domains.is_empty(),
+                "{off}"
+            );
+        }
+    }
+
+    const CERT_A: &str = "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----\n";
+    const CERT_B: &str = "-----BEGIN CERTIFICATE-----\nQkJC\n-----END CERTIFICATE-----\n";
+    const KEY: &str = "-----BEGIN EC PRIVATE KEY-----\nS0tL\n-----END EC PRIVATE KEY-----\n";
+
+    /// `tailscale cert --cert-file - --key-file -` prints the chain and the
+    /// key on one stream: the split keeps the chain's order and finds the
+    /// key wherever it is.
+    #[test]
+    fn the_cert_stream_splits_into_chain_and_key() {
+        let stream = format!("{CERT_A}{CERT_B}{KEY}");
+        assert_eq!(
+            split_cert_and_key(&stream).unwrap(),
+            (format!("{CERT_A}{CERT_B}"), KEY.to_string())
+        );
+        let key_first = format!("noise\r\n{KEY}\r\n{CERT_A}\n");
+        assert_eq!(
+            split_cert_and_key(&key_first).unwrap(),
+            (CERT_A.to_string(), KEY.to_string()),
+            "CRLF, leading noise and key-first order are all fine"
+        );
+        assert!(split_cert_and_key(CERT_A)
+            .unwrap_err()
+            .contains("no private key"));
+        assert!(split_cert_and_key(KEY)
+            .unwrap_err()
+            .contains("no certificate"));
+        assert!(split_cert_and_key(&format!("{CERT_A}{KEY}{KEY}"))
+            .unwrap_err()
+            .contains("more than one"));
+        assert!(split_cert_and_key("").is_err());
+        // An unterminated block is not a block.
+        assert!(split_cert_and_key("-----BEGIN CERTIFICATE-----\nQUFB\n").is_err());
+    }
+
+    /// A program that runs and fails says why, from its stderr.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_program_reports_its_stderr() {
+        let failed = run_bounded_detailed(
+            "/bin/sh",
+            &["-c", "echo first >&2; echo 'the real reason' >&2; exit 3"],
+            Duration::from_secs(5),
+        );
+        match failed {
+            Err(RunError::Failed(why)) => assert!(why.ends_with("the real reason"), "{why}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(matches!(
+            run_bounded_detailed(
+                "flightdeck-definitely-not-a-real-program",
+                &[],
+                Duration::from_secs(1)
+            ),
+            Err(RunError::Spawn(_))
+        ));
+        assert_eq!(
+            run_bounded_detailed("/bin/sh", &["-c", "echo ok"], Duration::from_secs(5)),
+            Ok("ok\n".to_string())
+        );
     }
 }
