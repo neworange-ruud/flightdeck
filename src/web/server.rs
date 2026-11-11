@@ -117,7 +117,11 @@ use crate::web::protocol::{
     ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot,
     TermCursor, TerminalId, VersionMismatch, ViewerId, Viewport, WindowInfo, WireError, WorkerOp,
     WorkerShellView, WorkerSnapshot, WorkerStatusView, MAX_SUPPORTED_VERSION, PROTOCOL_VERSION,
-    WORKER_MIN_CLIENT_VERSION,
+    UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION,
+};
+use crate::web::upload::UploadGrants;
+pub use crate::web::upload::{
+    UploadFinished, UploadGrantRequest, UPLOAD_GRANT_TTL_MS, UPLOAD_PATH,
 };
 
 // ===========================================================================
@@ -464,11 +468,17 @@ pub enum WebInbound {
     WorkerOp {
         /// Who asked.
         viewer_id: ViewerId,
+        /// The credential that window authenticated with: what an upload grant
+        /// is bound to ([`WebServerHandle::grant_uploads`], v8).
+        token: TokenId,
         /// The [`crate::web::protocol::Command::seq`] to ack.
         seq: u64,
         /// What they asked for.
         op: WorkerOp,
     },
+    /// One `PUT /upload/{ticket}` ended — written, refused part-way, cut off,
+    /// or its grant expired unused (v8). Exactly one per grant.
+    UploadFinished(UploadFinished),
 }
 
 /// Why the socket is closing, as [`WebServerHandle::stop`] is told it (Q5).
@@ -900,6 +910,43 @@ impl WebServerHandle {
         }
     }
 
+    /// Grant one upload per file into `dir` for the window that authenticated
+    /// with `token` (v8): what a worker does when it accepts a
+    /// [`crate::web::protocol::worker_command::BEGIN_UPLOAD`]. `home` and
+    /// `dir` are canonical, `dir` inside `home`; the folder is checked again
+    /// when each file is committed. Returns one ticket per file, in order.
+    ///
+    /// Each grant is single use, bound to `token`, and gone after
+    /// [`UPLOAD_GRANT_TTL_MS`] unused. Every grant ends in exactly one
+    /// [`WebInbound::UploadFinished`] carrying `batch`: written, failed, or
+    /// expired.
+    pub fn grant_uploads(
+        &self,
+        token: &TokenId,
+        batch: u64,
+        home: &std::path::Path,
+        dir: &std::path::Path,
+        files: &[UploadGrantRequest],
+    ) -> Vec<String> {
+        let now = self.shared.now_ms();
+        let (tickets, expired) = self
+            .shared
+            .uploads
+            .unwrap_or_recover()
+            .grant(token, batch, home, dir, files, now);
+        self.shared.report_expired_uploads(expired);
+        tickets
+    }
+
+    /// Drop the upload grants nobody redeemed in time, telling the host about
+    /// each ([`WebInbound::UploadFinished`]). Cheap; a worker calls it every
+    /// tick so a batch whose last files were never sent still ends.
+    pub fn expire_uploads(&self) {
+        let now = self.shared.now_ms();
+        let expired = self.shared.uploads.unwrap_or_recover().expire(now);
+        self.shared.report_expired_uploads(expired);
+    }
+
     /// Whether a certificate is loaded (see [`Self::set_certificate`]).
     pub fn has_certificate(&self) -> bool {
         self.shared.has_certificate()
@@ -1154,6 +1201,7 @@ pub fn start_with(
         #[cfg(unix)]
         tls,
         https_host: Mutex::new(None),
+        uploads: Mutex::new(UploadGrants::default()),
     });
 
     // Rendezvous: the task reports the bind result, then serves. Blocking the
@@ -1630,6 +1678,17 @@ fn router(shared: Arc<Shared>) -> Router {
         .route(WS_PATH, get(ws_route))
         .route(AUTH_EXCHANGE_PATH, post(exchange_route))
         .route(AUTH_SESSION_PATH, get(session_route));
+    // Only a worker takes files (v8), and only where it runs (W2).
+    #[cfg(unix)]
+    let routes = if shared.is_worker() {
+        routes.route(
+            upload_route::UPLOAD_ROUTE,
+            axum::routing::put(upload_route::upload_route)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+    } else {
+        routes
+    };
     let routes = if serve_assets {
         // Everything else is the SPA: `/`, its hashed assets, and its
         // client-side routes (D9). `assets::lookup` owns the fallback rules.
@@ -1690,6 +1749,9 @@ struct Shared {
     /// The name the certificate is for, which a plain-HTTP page load is
     /// redirected to ([`WebServerHandle::set_https_host`]).
     https_host: Mutex<Option<String>>,
+    /// Upload tickets the worker granted and nobody has redeemed yet (v8,
+    /// [`WebServerHandle::grant_uploads`]). Always empty on a TUI or Desktop.
+    uploads: Mutex<UploadGrants>,
 }
 
 impl Shared {
@@ -1742,6 +1804,19 @@ impl Shared {
 
     fn is_worker(&self) -> bool {
         self.host_kind == HostKind::Worker
+    }
+
+    /// Tell the host about upload grants that expired unused.
+    fn report_expired_uploads(&self, expired: Vec<crate::web::upload::UploadGrant>) {
+        for grant in expired {
+            debuglog::log(&format!(
+                "web UPLOAD expired batch={} name={}",
+                grant.batch, grant.final_name
+            ));
+            self.notify(WebInbound::UploadFinished(
+                grant.failed("The upload did not start in time; send it again.", 0),
+            ));
+        }
     }
 
     /// What kind of host this is, as a client is told: the server's own kind
@@ -2217,6 +2292,14 @@ impl SeatRegistry {
         displaced
     }
 
+    /// The credential `id` authenticated with, while it is attached.
+    fn token_of(&self, id: &ViewerId) -> Option<TokenId> {
+        self.viewers
+            .iter()
+            .find(|v| &v.id == id)
+            .map(|v| v.identity.token.clone())
+    }
+
     /// The version this viewer was answered at; [`PROTOCOL_VERSION`] for one
     /// that has gone.
     ///
@@ -2395,6 +2478,9 @@ impl SeatRegistry {
         if viewer.kind == ConnectionKind::Background && !background_may_receive(&msg) {
             return;
         }
+        if viewer.protocol_version < min_version_for(&msg) {
+            return;
+        }
         if viewer.tx.try_send(msg).is_err() {
             debuglog::log(&format!(
                 "web VIEWER dropped id={id} address={} reason=queue_full",
@@ -2463,8 +2549,20 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
             | ServerMsg::ProjectScan(_)
             | ServerMsg::CloneProgress(_)
             | ServerMsg::CloneResult(_)
+            | ServerMsg::UploadPlan(_)
             | ServerMsg::Delta(Delta::HostMessage(_))
     )
+}
+
+/// The oldest negotiated version a frame may be sent to. Everything before v8
+/// goes to every peer a host accepts (a worker's v7 frames reach only the v7
+/// peers a worker admits); an [`ServerMsg::UploadPlan`] reaches no peer below
+/// [`UPLOAD_MIN_VERSION`], which would drop it and wait forever.
+fn min_version_for(msg: &ServerMsg) -> u16 {
+    match msg {
+        ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
+        _ => 0,
+    }
 }
 
 /// Accept or refuse a peer's protocol version on a host of `kind`.
@@ -2701,9 +2799,10 @@ async fn asset_route(
 /// plus the path and query, when this server has a certificate and knows
 /// the name it is for ([`WebServerHandle::set_https_host`]).
 ///
-/// Only `GET`/`HEAD` of the SPA and its assets. `/ws` and `/auth/*` are
-/// never redirected: FlightDeck Desktop dials them over plain `ws://`/`http://`
-/// on purpose, and a redirect would break it. The name is the server's own,
+/// Only `GET`/`HEAD` of the SPA and its assets. `/ws`, `/auth/*` and
+/// `/upload/*` are never redirected: FlightDeck Desktop dials them over plain
+/// `ws://`/`http://` on purpose, and a redirect would break it (an upload is a
+/// `PUT`, which is never redirected anyway — the exclusion says so twice). The name is the server's own,
 /// never the request's `Host` header, so this cannot be turned into an open
 /// redirect; the port is the one the request came in on, which is the one
 /// that also speaks TLS.
@@ -2717,7 +2816,12 @@ fn https_redirect(
         return None;
     }
     let path = uri.path();
-    if path == WS_PATH || path == "/auth" || path.starts_with("/auth/") {
+    if path == WS_PATH
+        || path == "/auth"
+        || path.starts_with("/auth/")
+        || path == "/upload"
+        || path.starts_with("/upload/")
+    {
         return None;
     }
     let host = shared.https_host()?;
@@ -4022,6 +4126,13 @@ async fn handle_worker_op(
     parsed: Result<WorkerOp, String>,
     sink: &mut Sink,
 ) {
+    let (version, token) = {
+        let registry = shared.registry();
+        (
+            registry.protocol_version_of(viewer_id),
+            registry.token_of(viewer_id),
+        )
+    };
     let refusal = if !shared.is_worker() {
         Some(WireError::new(
             ErrorCode::NotSupported,
@@ -4033,11 +4144,22 @@ async fn handle_worker_op(
             "this connection only watches; open the worker's window to drive it",
         ))
     } else {
-        match parsed {
-            Err(reason) => Some(WireError::new(ErrorCode::NotSupported, reason)),
-            Ok(op) => {
+        match (parsed, token) {
+            (Err(reason), _) => Some(WireError::new(ErrorCode::NotSupported, reason)),
+            // The plan that answers it is a v8 frame: a v7 window would drop
+            // it and wait forever, so it is told now instead.
+            (Ok(WorkerOp::BeginUpload { .. }), _) if version < UPLOAD_MIN_VERSION => {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Uploading files needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
+            // Gone between the frame and here: nobody to answer.
+            (Ok(_), None) => None,
+            (Ok(op), Some(token)) => {
                 shared.notify(WebInbound::WorkerOp {
                     viewer_id: viewer_id.clone(),
+                    token,
                     seq,
                     op,
                 });
@@ -4064,6 +4186,11 @@ fn applied(seq: u64) -> ServerMsg {
         detail: None,
     })
 }
+
+// `PUT /upload/{ticket}` (v8): a child module, so it checks the cookie with
+// the very `authenticate` every other route uses. Unix only, like the worker.
+#[cfg(unix)]
+mod upload_route;
 
 #[cfg(test)]
 mod tests;

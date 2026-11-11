@@ -24,6 +24,9 @@
 //! * [`AppHost::publish`] routes the window's worker frames (`ResizeTerminal`,
 //!   the picker's [`WorkerOp`]s, attach kinds) and publishes a
 //!   [`WorkerHostState`] with the rest of the host state.
+//! * Uploads (v8, [`upload`]): a `begin_upload` is checked and planned here,
+//!   granted through the server, and each `PUT` it granted reports back
+//!   ([`WebInbound::UploadFinished`]); a finished batch is one host message.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,15 +35,17 @@ use std::sync::{Arc, Mutex};
 use crate::contracts::{Config, Notification, NotificationSound, PtySize, Result, WorkerConfig};
 use crate::host::AppHost;
 use crate::persistence::workspace::{load_workspace, WorkspaceUi};
+use crate::web::credentials::TokenId;
 use crate::web::credentials::{BrowserToken, BOOTSTRAP_CODE_TTL_MS};
 use crate::web::protocol::{
     Ack, AckOutcome, Delta, DirEntryView, DirListing, HostKind, MessageLevel,
     NotificationSoundView, NotificationView, ProjectId, ProjectScan, ScannedRepo, ServerMsg,
-    TerminalId, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView, WORKER_SHELL_TERMINAL_ID,
+    TerminalId, UploadPlan, UploadPlanFile, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView,
+    WORKER_SHELL_TERMINAL_ID,
 };
 use crate::web::server::{
-    ConnectionInfo, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice, WebInbound,
-    WebOutbound, WebServerHandle, WorkerHostState,
+    ConnectionInfo, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice, UploadFinished,
+    UploadGrantRequest, WebInbound, WebOutbound, WebServerHandle, WorkerHostState,
 };
 use crate::worker::control::{DeviceReport, DeviceState, PairingCode};
 use crate::worker::paths::WorkerPaths;
@@ -60,6 +65,7 @@ pub mod phone;
 pub mod projects;
 pub mod shell;
 pub mod tls;
+pub mod upload;
 
 // The worker is Linux and macOS only (W2); its tests use unix paths.
 #[cfg(all(test, unix))]
@@ -143,6 +149,56 @@ impl OpRefusal {
     }
 }
 
+/// One granted upload batch (one `begin_upload`), until every file of it
+/// has reported.
+struct UploadBatch {
+    /// The canonical target folder.
+    dir: PathBuf,
+    /// How many files were granted.
+    expected: usize,
+    /// The files written, by final name.
+    written: Vec<String>,
+    /// The files that were not, with why.
+    failed: Vec<(String, String)>,
+}
+
+impl UploadBatch {
+    /// The one host message a finished batch posts.
+    fn message(&self, home: &Path) -> (MessageLevel, String) {
+        let place = upload::tilde(home, &self.dir);
+        let failures = || {
+            let (name, why) = &self.failed[0];
+            let more = match self.failed.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            format!("{name}: {}{more}", why.trim_end_matches('.'))
+        };
+        match (self.written.len(), self.failed.len()) {
+            (1, 0) => (
+                MessageLevel::Info,
+                format!("Uploaded {} to {place}.", self.written[0]),
+            ),
+            (n, 0) => (
+                MessageLevel::Info,
+                format!("Uploaded {n} files to {place}."),
+            ),
+            (0, _) => (
+                MessageLevel::Warning,
+                format!("Nothing was uploaded to {place}. {}.", failures()),
+            ),
+            (n, _) => (
+                MessageLevel::Warning,
+                format!(
+                    "Uploaded {n} of {} files to {place}. {}.",
+                    self.expected,
+                    failures()
+                ),
+            ),
+        }
+    }
+}
+
 /// One clone in flight, as the window learns of it.
 struct CloneMeta {
     url: String,
@@ -173,6 +229,10 @@ pub(crate) struct WorkerExt {
     last_health: Option<crate::web::protocol::Health>,
     clones: CloneJobs,
     clone_meta: HashMap<u64, CloneMeta>,
+    /// Upload batches granted and not yet finished, by batch id.
+    uploads: HashMap<u64, UploadBatch>,
+    /// The next upload batch's id.
+    next_upload_batch: u64,
     confinement: Confinement,
     /// The pane size the window last reported: what a project opened later,
     /// and every agent spawned later, starts at.
@@ -472,6 +532,8 @@ impl<'a> AppHost<'a> {
             last_health: None,
             clones: CloneJobs::new(),
             clone_meta: HashMap::new(),
+            uploads: HashMap::new(),
+            next_upload_batch: 1,
             confinement,
             last_window_size: None,
             started_ms,
@@ -664,6 +726,8 @@ impl<'a> AppHost<'a> {
         }
         if let Some(handle) = handle {
             sync_certificate(w, handle, now_ms, magic_dns);
+            // Grants nobody redeemed in time end their batch.
+            handle.expire_uploads();
         }
         for line in w.certs.take_log() {
             w.log(line);
@@ -896,8 +960,16 @@ impl<'a> AppHost<'a> {
                 self.resize_from_window(terminal_id, *size);
                 Some(Vec::new())
             }
-            WebInbound::WorkerOp { viewer_id, seq, op } => {
-                Some(self.run_worker_op(viewer_id, *seq, op.clone()))
+            WebInbound::WorkerOp {
+                viewer_id,
+                token,
+                seq,
+                op,
+            } => Some(self.run_worker_op(viewer_id, token, *seq, op.clone())),
+            WebInbound::UploadFinished(finished) => {
+                self.worker.as_ref()?;
+                self.upload_finished(finished.clone());
+                Some(Vec::new())
             }
             _ => None,
         }
@@ -937,8 +1009,14 @@ impl<'a> AppHost<'a> {
     /// Run one of the window's project-picker or shell operations, answering
     /// the [`Ack`] and then whatever the operation produced, to the viewer
     /// that asked.
-    fn run_worker_op(&mut self, viewer_id: &ViewerId, seq: u64, op: WorkerOp) -> Vec<WebOutbound> {
-        let (outcome, detail, answer) = match self.worker_op(seq, op) {
+    fn run_worker_op(
+        &mut self,
+        viewer_id: &ViewerId,
+        token: &TokenId,
+        seq: u64,
+        op: WorkerOp,
+    ) -> Vec<WebOutbound> {
+        let (outcome, detail, answer) = match self.worker_op(token, seq, op) {
             Ok((detail, answer)) => (AckOutcome::Applied, detail, answer),
             Err(refusal) => (
                 AckOutcome::Rejected,
@@ -965,7 +1043,7 @@ impl<'a> AppHost<'a> {
 
     /// One worker op: `Ok((ack detail, answer frame))` when applied,
     /// `Err(refusal)` when refused.
-    fn worker_op(&mut self, seq: u64, op: WorkerOp) -> OpOutcome {
+    fn worker_op(&mut self, token: &TokenId, seq: u64, op: WorkerOp) -> OpOutcome {
         let fs = self.env.fs;
         let Some(w) = self.worker.as_mut() else {
             return Err(OpRefusal::new("This FlightDeck is not a worker."));
@@ -1064,6 +1142,142 @@ impl<'a> AppHost<'a> {
                     ))),
                 }
             }
+            WorkerOp::BeginUpload {
+                dir,
+                files,
+                on_conflict,
+            } => {
+                // A refusal still answers in the plan's own frame, as a
+                // refused scan does, so the window's upload panel says why.
+                let refused = |reason: String| OpRefusal {
+                    reason: reason.clone(),
+                    frame: Some(Box::new(ServerMsg::UploadPlan(UploadPlan {
+                        seq,
+                        dir: dir.clone(),
+                        files: files
+                            .iter()
+                            .map(|f| UploadPlanFile {
+                                name: f.name.clone(),
+                                final_name: f.name.clone(),
+                                ticket: None,
+                                exists: false,
+                            })
+                            .collect(),
+                        conflicts: false,
+                        refusal: Some(reason),
+                    }))),
+                };
+                let probe = &w.probe;
+                let planned = upload::plan(fs, &w.confinement, &dir, &files, on_conflict, |p| {
+                    probe.disk_free(p)
+                })
+                .map_err(&refused)?;
+                let (canonical, planned, conflicts) = match planned {
+                    upload::Plan::Ready { dir, files } => (dir, files, false),
+                    upload::Plan::Conflicts { dir, files } => (dir, files, true),
+                };
+                let place = upload::tilde(w.confinement.home(), &canonical);
+                let mut frame = UploadPlan {
+                    seq,
+                    dir: canonical.display().to_string(),
+                    files: planned
+                        .iter()
+                        .map(|f| UploadPlanFile {
+                            name: f.name.clone(),
+                            final_name: f.final_name.clone(),
+                            ticket: None,
+                            exists: f.exists,
+                        })
+                        .collect(),
+                    conflicts,
+                    refusal: None,
+                };
+                if conflicts {
+                    let taken = planned.iter().filter(|f| f.exists).count();
+                    let detail = match taken {
+                        1 => format!("A file by that name is already in {place}."),
+                        n => format!("{n} of those names are already taken in {place}."),
+                    };
+                    return Ok((Some(detail), Some(ServerMsg::UploadPlan(frame))));
+                }
+                let Some(handle) = self.web_surface.handle.as_ref() else {
+                    return Err(refused(
+                        "The worker is not listening, so it cannot take files right now."
+                            .to_string(),
+                    ));
+                };
+                let batch = w.next_upload_batch;
+                w.next_upload_batch += 1;
+                let requests: Vec<UploadGrantRequest> = planned
+                    .iter()
+                    .map(|f| UploadGrantRequest {
+                        final_name: f.final_name.clone(),
+                        size: f.size,
+                        replace: f.replace,
+                    })
+                    .collect();
+                let tickets =
+                    handle.grant_uploads(token, batch, w.confinement.home(), &canonical, &requests);
+                for (row, ticket) in frame.files.iter_mut().zip(tickets) {
+                    row.ticket = Some(ticket);
+                }
+                w.uploads.insert(
+                    batch,
+                    UploadBatch {
+                        dir: canonical,
+                        expected: planned.len(),
+                        written: Vec::new(),
+                        failed: Vec::new(),
+                    },
+                );
+                w.log(format!(
+                    "upload of {} file(s) into {place} granted ({})",
+                    planned.len(),
+                    on_conflict.as_str()
+                ));
+                Ok((None, Some(ServerMsg::UploadPlan(frame))))
+            }
+        }
+    }
+
+    /// One granted upload ended: log it, and when its batch is complete,
+    /// post one host message for the whole batch.
+    fn upload_finished(&mut self, finished: UploadFinished) {
+        let at_ms = self.env.clock.now_millis() as i64;
+        let handle = self.web_surface.handle.as_ref();
+        let Some(w) = self.worker.as_mut() else {
+            return;
+        };
+        let home = w.confinement.home().to_path_buf();
+        let shown = upload::tilde(&home, &finished.path);
+        let name = finished
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| shown.clone());
+        let reason = finished
+            .reason
+            .clone()
+            .unwrap_or_else(|| "it failed".to_string());
+        if finished.ok {
+            w.log(format!("uploaded {shown} ({} bytes)", finished.bytes));
+        } else {
+            w.log(format!("upload of {shown} failed: {reason}"));
+        }
+        let Some(batch) = w.uploads.get_mut(&finished.batch) else {
+            return;
+        };
+        if finished.ok {
+            batch.written.push(name);
+        } else {
+            batch.failed.push((name, reason));
+        }
+        if batch.written.len() + batch.failed.len() < batch.expected {
+            return;
+        }
+        if let Some(batch) = w.uploads.remove(&finished.batch) {
+            let (level, text) = batch.message(&home);
+            w.post(handle, level, text, at_ms);
         }
     }
 

@@ -680,7 +680,8 @@ impl TerminalStreams {
             WebInbound::SeatsChanged { .. }
             | WebInbound::Command { .. }
             | WebInbound::ResizeTerminal { .. }
-            | WebInbound::WorkerOp { .. } => Vec::new(),
+            | WebInbound::WorkerOp { .. }
+            | WebInbound::UploadFinished(_) => Vec::new(),
         }
     }
 }

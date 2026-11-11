@@ -70,8 +70,15 @@
  * as it did at v6. v7 is also the host's first range: a TUI host still serves
  * v6, for a Desktop that has not updated yet, and answers each peer at the
  * version it asked for.
+ *
+ * **v8 is uploading files to a worker** (`remote-control-usem`): the window
+ * asks with the `begin_upload` worker command and the worker answers with a
+ * new frame, `upload_plan` — the target folder, each file's final name and a
+ * single-use ticket for `PUT /upload/{ticket}`, or the names already taken, or
+ * a refusal. A worker never sends `upload_plan` to a peer below v8, and
+ * refuses `begin_upload` from one.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -652,6 +659,56 @@ export interface WireCloneResult {
   readonly error?: string | null;
 }
 
+/** What a worker does with a file whose name is already taken (v8). */
+export type WireOnConflict = "ask" | "replace" | "keep_both";
+
+/** One file in a `begin_upload`'s `files`: its name and exact size. */
+export interface WireUploadFile {
+  readonly name: string;
+  readonly size: number;
+}
+
+/**
+ * `ServerMsg::UploadPlan` (v8) — the worker's answer to this window's
+ * `begin_upload`, beside the `ack` for the same `seq`. Exactly one of: every
+ * file has a `ticket` (granted — `PUT` its bytes to `/upload/{ticket}` with
+ * the cookie, `Content-Length` = its size, within two minutes), `conflicts`
+ * is true (`on_conflict: "ask"` and some names are taken, `exists` says
+ * which; nothing granted), or `refusal` says why nothing was granted.
+ */
+export interface WireUploadPlan {
+  readonly type: "upload_plan";
+  readonly seq: number;
+  /** The target folder, canonical and absolute on the worker. */
+  readonly dir: string;
+  readonly files: readonly WireUploadPlanFile[];
+  readonly conflicts?: boolean;
+  readonly refusal?: string | null;
+}
+
+export interface WireUploadPlanFile {
+  /** The name asked for. */
+  readonly name: string;
+  /** The name it gets: the same, or `name (n).ext` under `keep_both`. */
+  readonly final_name: string;
+  readonly ticket?: string | null;
+  /** Whether something by the asked name is already there. */
+  readonly exists?: boolean;
+}
+
+/**
+ * The reply to `PUT /upload/{ticket}` (v8). `reason` is a stable code
+ * (`invalid_ticket`, `size_mismatch`, `length_required`, `exists`, …) and
+ * `message` a sentence; an authentication refusal carries the same body as
+ * `/auth/session`'s, without `message`.
+ */
+export type WireUploadReply =
+  | { readonly ok: true; readonly path: string; readonly bytes: number }
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly message?: string;
+    };
 
 /** A newer release than the host is running (SPECS §30). */
 export interface WireUpdateNotice {
@@ -743,6 +800,7 @@ export type ServerFrame =
   | WireProjectScan
   | WireCloneProgress
   | WireCloneResult
+  | WireUploadPlan
   | WireDeltaEnvelope
   | { readonly type: string };
 

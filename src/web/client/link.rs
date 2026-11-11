@@ -779,6 +779,8 @@ async fn session(
                         events.send(LinkEvent::CloneProgress(progress))
                     }
                     ServerMsg::CloneResult(result) => events.send(LinkEvent::CloneResult(result)),
+                    // A v8 answer this client does not ask for yet.
+                    ServerMsg::UploadPlan(_) => {}
                     ServerMsg::TakenOver { by } => {
                         return SessionEnd::Ended(LinkEnd::TakenOver { by });
                     }
