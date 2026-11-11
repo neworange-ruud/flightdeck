@@ -2785,6 +2785,13 @@ async fn asset_route(
     if let Some(location) = https_redirect(&shared, &peer, &method, &uri) {
         return redirect_response(&location);
     }
+    // The page is only ever read. Without this, a write aimed at a route this
+    // host does not have — `PUT /upload/…` sent to a TUI host, which has no
+    // upload route — would fall through to here and get the SPA with a 200,
+    // reading as success.
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return method_not_allowed();
+    }
     // Deliberately unauthenticated. The SPA's own shell has to load before it
     // can show the code-entry screen at all, and it contains nothing secret —
     // every fact the app renders arrives over the authenticated WebSocket.
@@ -2852,6 +2859,19 @@ fn redirect_response(location: &str) -> Response {
 /// worker with `[worker] web = false`, design A5).
 async fn not_found_route() -> Response {
     not_found()
+}
+
+/// 405 for anything but a read of the page (`asset_route`).
+fn method_not_allowed() -> Response {
+    let mut response = Response::new(Body::from("method not allowed"));
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    let headers = response.headers_mut();
+    headers.insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn not_found() -> Response {

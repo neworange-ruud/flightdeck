@@ -377,6 +377,26 @@ fn the_default_bind_is_loopback_and_the_port_is_reported_back() {
     assert_eq!(harness.handle.exposure(), BindExposure::Loopback);
 }
 
+/// A TUI host has no upload route: a `PUT /upload/…` must not fall through to
+/// the page and answer 200 with the SPA, and neither may any other write to a
+/// page path.
+#[test]
+fn the_page_answers_only_reads() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    on_runtime(async {
+        for (method, path) in [("PUT", "/upload/abc"), ("POST", "/"), ("DELETE", "/app.js")] {
+            let response = request(&addr, method, path, &[], None).await;
+            assert_eq!(response.status, 405, "{method} {path}");
+            assert!(
+                !response.body.contains("<html"),
+                "{method} {path} served the page"
+            );
+        }
+        assert_eq!(get(&addr, "/", &[]).await.status, 200);
+    });
+}
+
 /// The acceptance criterion in the issue: start, stop, and start **again** — on
 /// the very same port, which only works if the listener was really released and
 /// the runtime thread was not leaked.
