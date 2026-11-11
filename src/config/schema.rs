@@ -196,7 +196,7 @@ fn validate_worker(worker: &WorkerConfig) -> Result<()> {
     use crate::terminal::session::{MIN_GRID_COLS, MIN_GRID_ROWS};
     if worker.port == 0 {
         return Err(FlightDeckError::Config(
-            "worker.port must not be 0 (paired Desktops store a stable port)".to_string(),
+            "worker.port must not be 0 (paired devices store a stable port)".to_string(),
         ));
     }
     if worker.projects_root.trim().is_empty() {
@@ -699,6 +699,36 @@ mod tests {
         assert_eq!(cfg.worker.default_cols, 200);
         assert_eq!(cfg.worker.default_rows, 50);
         assert!(!cfg.worker.phone, "the phone stays off unless asked for");
+        assert!(cfg.worker.web, "the browser app is on unless turned off");
+        assert!(cfg.worker.https, "HTTPS is on unless turned off");
+    }
+
+    #[test]
+    fn worker_web_and_https_default_on_and_turn_off_alone() {
+        let cfg = default_config("proj", "main");
+        assert!(cfg.worker.web && cfg.worker.https);
+        let off: Config = "[worker]\nweb = false\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(!off.worker.web);
+        assert!(off.worker.https, "a sibling keeps its default");
+        assert_eq!(off.worker.port, 7420);
+        let plain: Config = "[worker]\nhttps = false\n"
+            .parse::<toml::Table>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(plain.worker.web && !plain.worker.https);
+        // Any combination is valid: `https` without `web` simply does nothing.
+        let mut both_off = default_config("proj", "main");
+        both_off.worker.web = false;
+        assert!(validate(&both_off).is_ok());
+        // And it round-trips.
+        let text = toml::to_string(&off.worker).unwrap();
+        let back: WorkerConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, off.worker);
     }
 
     #[test]
