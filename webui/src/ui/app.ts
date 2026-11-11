@@ -36,7 +36,8 @@ import { createTerminalTabs } from "./terminalTabs";
 import { createProjectPicker } from "./projectPicker";
 import { createTakenOver } from "./takenOver";
 import { createWorkerCard } from "./workerCard";
-import { OPEN_PROJECT_COMMAND, workerCard } from "../state/worker";
+import { OPEN_PROJECT_COMMAND, UPLOAD_FILES_COMMAND, workerCard } from "../state/worker";
+import { createUploadPanel, installDropTarget } from "./uploadPanel";
 import { el } from "./dom";
 import type { Region } from "./dom";
 import type { Store } from "./store";
@@ -163,7 +164,13 @@ export function createApp(options: AppOptions): App {
   );
 
   const logo = createLogoBand();
-  const projects = createProjectTabs(store);
+  /** Upload files to a worker (v8, R30): the panel, its hidden file input
+   * and the drop overlay. Built first, because the tab bar's button and the
+   * palette row both open its file chooser. */
+  const upload = createUploadPanel(store);
+  const projects = createProjectTabs(store, {
+    onUploadFiles: () => upload.chooseFiles(),
+  });
   const sidebar = createSidebar(store);
   const tabs = createTerminalTabs(store);
   const pane = createTerminalPane(options.mount);
@@ -291,9 +298,15 @@ export function createApp(options: AppOptions): App {
       info.el,
       dialog.el,
       picker.el,
+      /** After the picker: its Choose… opens the picker over this panel, which
+       * waits hidden meanwhile. */
+      upload.el,
       takenOver.el,
+      upload.dropzone,
+      upload.input,
     ],
   );
+  installDropTarget(frame, store, upload.dropzone);
 
   /** 1c is built the first time it is needed: three xterm instances nobody can
    * reach yet (split toggling is M2, D8) would be three wasted PTY subscriptions. */
@@ -315,6 +328,7 @@ export function createApp(options: AppOptions): App {
     info,
     dialog,
     workerCardRegion,
+    upload,
     picker,
     takenOver,
   ];
@@ -365,11 +379,13 @@ export function createApp(options: AppOptions): App {
       frame.setAttribute("data-worker-shell", String(state.workerShellTab));
       frame.setAttribute("data-worker-card", workerCard(state) ?? "none");
       frame.setAttribute("data-picker", String(state.picker !== null));
+      frame.setAttribute("data-upload", state.upload?.phase.kind ?? "none");
     } else {
       frame.removeAttribute("data-host");
       frame.removeAttribute("data-worker-shell");
       frame.removeAttribute("data-worker-card");
       frame.removeAttribute("data-picker");
+      frame.removeAttribute("data-upload");
     }
 
     /** The worker shell's tab is one terminal, full width: split view is the
@@ -514,6 +530,19 @@ export function createApp(options: AppOptions): App {
       if (event.key === "Escape") {
         event.preventDefault();
         store.dispatch({ type: "picker/close" });
+      }
+      return;
+    }
+    /**
+     * The upload panel (v8, R30), under the picker its Choose… opens. Like
+     * the picker it owns every key — its buttons and folder field take them
+     * natively, and none may reach a shortcut here. `Esc` closes it, except
+     * while files are going out: that is what Cancel is for.
+     */
+    if (state.upload !== null) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        store.dispatch({ type: "upload/close" });
       }
       return;
     }
@@ -706,6 +735,7 @@ export function createApp(options: AppOptions): App {
       state.access === null &&
       state.takeover === null &&
       state.picker === null &&
+      state.upload === null &&
       state.connection !== "taken_over"
     ) {
       store.dispatch({
@@ -888,6 +918,17 @@ export function createApp(options: AppOptions): App {
       command.run.name === OPEN_PROJECT_COMMAND
     ) {
       store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+      return;
+    }
+    /**
+     * Upload Files… (v8, R30) is this window's file chooser, the same one
+     * the tab bar's button opens. The worker lists the row only to say it
+     * exists, and refuses it as a frame. Opened here, inside the key press
+     * or click that ran the row, because a chooser opens only from one.
+     */
+    if (command.run.name === UPLOAD_FILES_COMMAND) {
+      store.dispatch({ type: "palette/close" });
+      upload.chooseFiles();
       return;
     }
     options.onRunCommand?.(command);
@@ -1354,6 +1395,7 @@ export function createApp(options: AppOptions): App {
       path.includes(config.el) ||
       path.includes(dialog.el) ||
       path.includes(picker.el) ||
+      path.includes(upload.el) ||
       path.includes(takenOver.el)
     ) {
       return;
