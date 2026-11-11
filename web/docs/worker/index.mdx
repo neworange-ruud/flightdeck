@@ -187,7 +187,9 @@ onto the window.
 
 If a file with the same name is already in that folder, nothing is overwritten
 until you say so: the window lists the names and asks **Replace**, **Keep both**
-(the new file is saved as `name (1).ext`) or **Cancel**.
+(the new file is saved as `name (1).ext`) or **Cancel**. A replaced file gets
+the usual permissions for a new file, so a script you replace needs
+`chmod +x` again.
 
 Uploads go into the worker account's home folder only, like browsing does.
 Folders can't be uploaded yet, only the files in them.
