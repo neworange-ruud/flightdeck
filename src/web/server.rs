@@ -1940,7 +1940,15 @@ impl Shared {
             // rather than on `HostState`: there is no change for a `Delta` to
             // describe, and the browser needs it in the same frame it paints
             // the palette from.
-            commands: crate::web::commands::inventory_for(host_kind),
+            commands: {
+                let mut rows = crate::web::commands::inventory_for(host_kind);
+                // A peer below v8 cannot upload (R30), so it is not offered
+                // the worker's Upload Files… row.
+                if protocol_version < crate::web::protocol::UPLOAD_MIN_VERSION {
+                    rows.retain(|row| row.id != crate::web::commands::UPLOAD_FILES);
+                }
+                rows
+            },
             // Both overlays are the host's own words, sent so the browser
             // renders them rather than authoring a copy (§6.5 R16).
             help: Some(state.help.clone()),
@@ -3978,7 +3986,14 @@ async fn handle_command(
         return;
     }
 
-    let Some(spec) = commands::lookup(&command.name) else {
+    // A worker also knows its own rows (`upload_files`), which it refuses at
+    // step 3; a TUI or Desktop host does not, and calls them unknown.
+    let host_kind = if shared.is_worker() {
+        HostKind::Worker
+    } else {
+        HostKind::Tui
+    };
+    let Some(spec) = commands::lookup_for(host_kind, &command.name) else {
         let _ = send_msg(
             sink,
             &ServerMsg::Error(WireError {

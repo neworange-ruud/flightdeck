@@ -1648,6 +1648,49 @@ fn an_unknown_command_is_not_supported_rather_than_fatal() {
     });
 }
 
+/// v8: Upload Files… is a worker's row. A TUI host neither lists it nor
+/// knows the name.
+#[test]
+fn a_tui_host_does_not_list_or_know_upload_files() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let cookie = on_runtime(harness.authenticate());
+
+    on_runtime(async {
+        let mut ws = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+        attach(&mut ws, SeatRequest::Write).await;
+        let snapshot = await_snapshot(&mut ws).await;
+        assert!(
+            !snapshot.commands.iter().any(|row| row.id == "upload_files"),
+            "a TUI host has nothing to upload into"
+        );
+
+        send(
+            &mut ws,
+            &ClientMsg::Command(flightdeck::web::protocol::Command {
+                seq: 3,
+                name: "upload_files".to_string(),
+                args: None,
+            }),
+        )
+        .await;
+        let error = frame_matching(&mut ws, |frame| match frame {
+            ServerMsg::Error(error) => Some(error),
+            _ => None,
+        })
+        .await;
+        assert_eq!(error.code, ErrorCode::NotSupported);
+        assert_eq!(error.seq, Some(3));
+    });
+    assert!(
+        !harness
+            .inbound()
+            .iter()
+            .any(|event| matches!(event, WebInbound::Command { .. })),
+        "nothing reached the host"
+    );
+}
+
 #[test]
 fn releasing_the_seat_frees_it_for_the_next_browser() {
     let harness = Harness::start();
@@ -5765,13 +5808,36 @@ mod worker {
             .await;
             assert_eq!(refused.code, ErrorCode::NotSupported);
             assert!(refused.message.contains("open_project_path"), "{refused:?}");
+
+            // v8: Upload Files… is listed, and is the window's to run — a
+            // frame naming it is refused in the words the row carries.
+            let upload = snapshot
+                .commands
+                .iter()
+                .find(|row| row.id == "upload_files")
+                .expect("a v8 worker lists Upload Files…");
+            assert_eq!(upload.label, "Upload Files…");
+            assert!(!upload.host_only);
+            command(&mut ws, 5, "upload_files", None).await;
+            let ack = frame_matching(&mut ws, |frame| match frame {
+                ServerMsg::Ack(ack) if ack.seq == 5 => Some(ack),
+                _ => None,
+            })
+            .await;
+            assert_eq!(ack.outcome, AckOutcome::Rejected);
+            assert_eq!(
+                ack.detail.as_deref(),
+                Some("Use the window's upload panel.")
+            );
+            assert_eq!(ack.detail, upload.refusal);
         });
         assert!(
             !harness.inbound().iter().any(|e| matches!(
                 e,
-                WebInbound::Command { command, .. } if command.name == names::QUIT
+                WebInbound::Command { command, .. }
+                    if command.name == names::QUIT || command.name == "upload_files"
             )),
-            "quit never reached the host"
+            "neither quit nor upload_files reached the host"
         );
     }
 
@@ -6403,6 +6469,10 @@ mod worker {
                 .await;
                 let snapshot = await_snapshot(&mut old).await;
                 assert_eq!(snapshot.protocol_version, 7);
+                assert!(
+                    !snapshot.commands.iter().any(|row| row.id == "upload_files"),
+                    "a v7 peer cannot upload, so it is not offered the row"
+                );
                 command(
                     &mut old,
                     2,
