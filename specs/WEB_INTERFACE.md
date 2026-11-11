@@ -3593,6 +3593,37 @@ remote click never lands in the middle of someone else's typing either.
 
 ---
 
+### R30 — protocol v8: uploading files to a worker
+
+A window can upload one or more files into one folder on a worker
+(`specs/WORKER_PRD.md` W34, epic `remote-control-usem`). The bytes do not ride
+the socket: base64 inside JSON costs a third more, and every byte would pass
+through the host loop's inbound channel ahead of keystrokes and terminal
+output. The socket carries only the grant.
+
+**New kind (hence the bump to v8).** `ServerMsg::UploadPlan`, wire tag
+`upload_plan`, answers the worker command `begin_upload` and goes only to the
+window that asked. Like `dir_listing`, it is never sent to a background link,
+and never to a peer negotiated below 8 (such a peer cannot ask). The ranges
+become: a TUI or Desktop host accepts **6..=8**, a worker **7..=8**.
+`begin_upload` is a worker command (R28), not a palette row; the palette's
+**Upload files** row is a separate inventory entry that a worker window runs
+locally, as it does Open Project.
+
+**The bytes go over HTTP.** `PUT /upload/<ticket>` on the same port, with the
+same cookie: the ticket is single-use, bound to the token that asked, and
+valid for two minutes. A browser sends it with `XMLHttpRequest` for upload
+progress (`fetch` has none), from `wire/upload.ts`, since the guard tests keep
+I/O and timing out of `state/` and `ui/`. The route is a worker's only: a TUI
+or Desktop host has no `/upload`.
+
+**Drag and drop.** Dropping files on a worker's window or tab opens the same
+upload panel with them selected. Folders in a drop are left out, with a note.
+
+**The default folder** is the selected session's worktree, else the selected
+project's root, else the worker's home. The SPA therefore now keeps
+`worktree_path` on each session (the host always sent it; rule 4).
+
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.

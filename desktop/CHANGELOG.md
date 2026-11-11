@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Upload files to a worker.** A worker's window has **Upload files…** (also in the command palette, and you can drop files onto the window). Pick one or more files and a folder on the worker; the folder starts at the worktree you're looking at, and **Choose…** browses the worker's home folder. Each file shows its progress. A file that already exists is never overwritten without asking: **Replace**, **Keep both** (`name (1).ext`) or **Cancel**. Needs a worker running a FlightDeck with this change; against an older worker the button is not shown.
 
 ### Improvements
 

@@ -107,6 +107,7 @@ give you a shell, and tell you something went wrong.
 | W31 | Browser | *Added after v1 (remote-control-ougi).* A worker **serves FlightDeck Web** as well as the protocol, on by default (`[worker] web`). A browser pairs with the same `worker pair` code and attaches as a **window**, so a browser and a Desktop take the worker over from each other (W17). Supersedes the earlier "protocol routes only, no browser SPA" rule (design note A5). |
 | W32 | HTTPS | *Added after v1.* The same port answers **TLS and plain** connections, told apart by the first byte. TLS uses a certificate from `tailscale cert` for the machine's MagicDNS name, fetched only when the tailnet has HTTPS turned on (`CertDomains`) and `[worker] https` is on, renewed daily. Plain HTTP stays for the Desktop and as the browser's fallback; a plain page request redirects to HTTPS once a certificate is loaded. |
 | W33 | Browser scope | *Added after v1.* The browser does what the Desktop's worker window does: terminals sized to the browser (W5), the worker shell (W15), Open Project (W9), the takeover screen, host messages, health and notifications. The configuration manager in the browser is a follow-up (remote-control-knuy). |
+| W34 | Upload | *Added after v1 (remote-control-usem).* The Desktop and the browser **upload one or more files into one folder** on the worker, chosen from a file chooser or by dropping files on the window. The folder must be inside the worker account's home, like browse and clone (W16). The window asks first (`begin_upload` over the socket); the worker checks the folder, the names and the free space and answers with one single-use ticket per file (`upload_plan`, protocol v8). The bytes then go over HTTP (`PUT /upload/<ticket>`) on the same port, into a temporary file that is renamed into place only when complete. A name that already exists is never overwritten silently: the worker reports it and the window asks **Replace**, **Keep both** (`name (1).ext`) or **Cancel**. Only the window holding the seat can upload; background links cannot. Folders are not uploaded (follow-up). |
 
 ## 4. Requirements
 
@@ -265,12 +266,17 @@ releases must both ship v7.
 - Project operations: `BrowseDir`, `OpenProject`, `ScanProjects`, `CloneProject`
   with progress and result frames.
 - A `Health` delta, and host messages with replay on attach.
+- Upload (W34, protocol v8): a `BeginUpload` op answered by an `UploadPlan` frame,
+  and the `PUT /upload/<ticket>` route.
 
 ## 6. Security model
 
 - **Pairing a Desktop or a browser with a worker gives it the worker account's full
   power**: a shell (W15) and the whole home directory (W16). The docs must say so
   plainly.
+- Upload (W34) adds no power beyond that: it writes only inside the home
+  directory, needs a ticket the worker granted to that device's token a moment
+  earlier, and checks the folder again before the file is moved into place.
 - The outer boundary is the tailnet. The worker listens nowhere else (W8), so
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket that only the account

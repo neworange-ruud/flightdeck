@@ -170,6 +170,28 @@ A few things are different on a worker:
   tile. Browsing never changes what another window sees. Split view isn't
   available in a worker's window.
 
+### Upload files to the worker
+
+To put files on the worker (a dataset, a screenshot for an agent, a config file
+that isn't in Git), choose **Upload files…** in the worker's window, in the
+Desktop or a browser. You can also find it in the command palette, or drop files
+onto the window.
+
+1. Pick one or more files. Drop more on the panel or use **Add files…** to add
+   to the list.
+2. Check the **folder** they go to. It starts at the worktree of the agent
+   you're looking at, or the project's folder. **Choose…** browses the
+   worker's home folder for another one.
+3. Choose **Upload**. Each file shows its progress, and **Cancel** stops the
+   rest.
+
+If a file with the same name is already in that folder, nothing is overwritten
+until you say so: the window lists the names and asks **Replace**, **Keep both**
+(the new file is saved as `name (1).ext`) or **Cancel**.
+
+Uploads go into the worker account's home folder only, like browsing does.
+Folders can't be uploaded yet, only the files in them.
+
 ## Use a terminal instead of the Desktop
 
 `flightdeck connect` is the terminal UI attached to a worker. It works from any

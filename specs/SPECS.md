@@ -1792,8 +1792,8 @@ configuration manager (numbers and a path, not toggles): edit the file.
 
 ### Network and pairing
 
-The worker serves the web protocol's `/ws`, `/auth/exchange` and
-`/auth/session`, and FlightDeck Web's page unless `[worker] web = false`,
+The worker serves the web protocol's `/ws`, `/auth/exchange`,
+`/auth/session` and `/upload/<ticket>`, and FlightDeck Web's page unless `[worker] web = false`,
 **only on the addresses Tailscale reports**, never on loopback, `0.0.0.0` or
 another network. With no Tailscale
 address it keeps running, reports "not listening: no Tailscale address", polls
@@ -1820,6 +1820,23 @@ the Desktop speaks plain `ws://`. A cookie issued over TLS is `Secure`.
 `worker pair` prints the browser link with the code in its fragment
 (`https://<name>:<port>/#NNNN`, or `http://<address>/#NNNN` without a
 certificate) beside the Desktop's address.
+
+**Uploading files** (protocol v8, `specs/WORKER_PRD.md` W34). The window
+holding the seat sends the `begin_upload` command with
+`{dir, files: [{name, size}], on_conflict: "ask" | "replace" | "keep_both"}`.
+The worker resolves `dir` inside `$HOME` (it must be an existing directory),
+checks each name is a single path component and that the total fits in the
+free space, and answers that window alone with an `upload_plan` frame: per
+file its `final_name`, whether the name `exists`, and a single-use `ticket`
+bound to the window's token and valid for two minutes. With `ask` and a name
+already taken it grants nothing and sets `conflicts`, and the window asks
+Replace, Keep both (`name (1).ext`) or Cancel before asking again. Each file
+is then sent as the body of `PUT /upload/<ticket>` (same cookie, exact
+`Content-Length`, plain or TLS, never redirected), streamed into a temporary
+`.<name>.fdupload-…` beside the target and moved into place only when
+complete; the folder is checked again at that moment. When a batch is done
+the worker posts one host message naming the folder. Background links cannot
+upload, and folders are not uploaded.
 
 ### The phone
 
@@ -1935,8 +1952,8 @@ never missing.
 
 ### Security model
 
-- **Pairing a Desktop with a worker gives it the worker account's full power**:
-  a shell and the whole home directory.
+- **Pairing a Desktop or a browser with a worker gives it the worker account's
+  full power**: a shell and the whole home directory.
 - **Pairing a phone** (`[worker] phone`, off by default) gives it what a phone
   paired with a TUI has: typing into agents, starting and closing them, and a
   shell in an agent's worktree. Its code is the TUI's single-use 4-digit
@@ -1947,11 +1964,11 @@ never missing.
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket only the account can
   reach, so getting one already requires a shell on the box.
-- Tokens are long-lived, one per Desktop, listed by `worker devices` and
+- Tokens are long-lived, one per paired device, listed by `worker devices` and
   revoked by `worker revoke`, which closes live connections at once.
-- No credentials cross the wire, and no TLS is needed because nothing leaves
-  WireGuard. The worker never stores, forwards or injects agent or git
+- No credentials cross the wire unencrypted: everything travels inside
+  WireGuard, and HTTPS is added only for the browser's sake. The worker never stores, forwards or injects agent or git
   credentials: agents and git run with the account's own environment.
-- Opening, browsing and cloning are confined to `$HOME`: paths are
+- Opening, browsing, cloning and uploading are confined to `$HOME`: paths are
   canonicalised and anything resolving outside it, through a symlink too, is
   refused.
