@@ -1606,10 +1606,10 @@ the Desktop opens a remote window onto them. Requirements are in
 | `flightdeck worker start` | Starts the supervisor in the background and returns once the worker answers on the control socket (or prints why it didn't, with the last log lines). Refuses if a worker is already running for this account. |
 | `flightdeck worker stop` | Stops the supervisor and the worker gracefully: agents are terminated as on a TUI quit and state is persisted, so the next `start` resumes them. "Not running" is not an error. |
 | `flightdeck worker restart` | Stop, then start. This is how `flightdeck update` takes effect; the supervisor is re-executed too, so both run the new binary. |
-| `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
-| `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port). |
+| `flightdeck worker status [--json]` | Running or stopped; pid; uptime; version; listen addresses, or why it isn't listening; where a browser opens the page and whether it is HTTPS (and if not, why); paired devices; the attached device; background links; projects; agents and their status. When stopped: the supervisor's last exit and give-up reason. |
+| `flightdeck worker pair [--json]` | Mints a single-use pairing code in the running worker and prints it with the address to type in the Desktop (the MagicDNS name when Tailscale has one, else the `100.x` address, with the port), and, unless `[worker] web = false`, the browser link with the code in its fragment (`web_url` in `--json`). |
 | `flightdeck worker pair --phone [--json]` | Pairs the FlightDeck iPhone app (needs `[worker] phone = true`): asks the relay for a code, prints the QR and the 4-digit code, and waits until the phone has paired (exit 0), or the code expired or the attempt failed (exit 1). `--json` prints one JSON object per step. See "The phone" below. |
-| `flightdeck worker devices [--json]` | Lists paired Desktops: label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
+| `flightdeck worker devices [--json]` | Lists paired devices (Desktops, `flightdeck connect` and browsers, a browser named like `Chrome on macOS (browser)`): label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
 | `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. A selector no Desktop matches is tried against the paired phones' pairing ids (exact or unique prefix), and a match is unpaired. |
 | `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
 | `flightdeck worker enable [--dry-run]` | Sets up start on boot (see "Start on boot" below): writes the launchd agent (macOS) or systemd user unit (Linux), registers it, and starts the worker through it when none runs. Idempotent: running it again rewrites the unit (refreshing the binary path and `PATH`). `--dry-run` prints the file and the commands without changing anything. |
@@ -1871,6 +1871,13 @@ never missing.
     "advertised": "box.tail1234.ts.net:7420",
     "reason": null,
     "origin": "magic_dns"
+  },
+  "web": {
+    "enabled": true,
+    "url": "https://box.tail1234.ts.net:7420",
+    "https": true,
+    "https_reason": null,
+    "certificate_expires": 1794787200
   },
   "devices": [{
     "id": "tok1", "label": "mbp", "address": "100.64.1.9",
