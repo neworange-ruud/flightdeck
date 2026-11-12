@@ -77,8 +77,16 @@
  * single-use ticket for `PUT /upload/{ticket}`, or the names already taken, or
  * a refusal. A worker never sends `upload_plan` to a peer below v8, and
  * refuses `begin_upload` from one.
+ *
+ * **v9 is downloading files from a worker** (`remote-control-pz6d`, the
+ * Transfer files panel): `browse_dir` takes `include_files` and a
+ * `dir_listing` then carries the folder's `files`; the window asks with the
+ * `begin_download` worker command and the worker answers with a new frame,
+ * `download_plan` — each file's size and a single-use ticket for
+ * `GET /download/{ticket}`, or a refusal. A worker never sends
+ * `download_plan` to a peer below v9, and refuses `begin_download` from one.
  */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -617,7 +625,18 @@ export interface WireDirListing {
   readonly parent?: string | null;
   readonly home: string;
   readonly entries: readonly WireDirEntry[];
+  /** v9: the folder's regular files, when `browse_dir` said
+   * `include_files: true`. Absent or empty otherwise. */
+  readonly files?: readonly WireFileEntry[];
   readonly truncated?: boolean;
+}
+
+/** `protocol::FileEntryView` (v9): one regular file in a `dir_listing`. */
+export interface WireFileEntry {
+  readonly name: string;
+  /** Absolute, as listed (not resolved). */
+  readonly path: string;
+  readonly size?: number;
 }
 
 export interface WireDirEntry {
@@ -698,6 +717,29 @@ export interface WireUploadPlanFile {
   readonly ticket?: string | null;
   /** Whether something by the asked name is already there. */
   readonly exists?: boolean;
+}
+
+/**
+ * `ServerMsg::DownloadPlan` (v9) — the worker's answer to this window's
+ * `begin_download`, beside the `ack` for the same `seq`. All or nothing:
+ * every file has a `ticket` (granted — `GET /download/{ticket}` with the
+ * cookie, within two minutes, once), or `refusal` says why nothing was.
+ */
+export interface WireDownloadPlan {
+  readonly type: "download_plan";
+  readonly seq: number;
+  /** The source folder, canonical and absolute on the worker. */
+  readonly dir: string;
+  readonly files: readonly WireDownloadPlanFile[];
+  readonly refusal?: string | null;
+}
+
+export interface WireDownloadPlanFile {
+  /** The name asked for, and the name the download suggests. */
+  readonly name: string;
+  /** Bytes at grant time; the `GET`'s `Content-Length` wins if it changed. */
+  readonly size?: number;
+  readonly ticket?: string | null;
 }
 
 /**
@@ -805,6 +847,7 @@ export type ServerFrame =
   | WireCloneProgress
   | WireCloneResult
   | WireUploadPlan
+  | WireDownloadPlan
   | WireDeltaEnvelope
   | { readonly type: string };
 

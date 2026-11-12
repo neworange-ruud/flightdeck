@@ -82,6 +82,21 @@ describe("workerPaletteRow", () => {
     expect(offered?.hostOnly).toBe(false);
   });
 
+  it("lifts the transfer rows only where this window can run them", () => {
+    const refusal = "Use the window's Transfer Files panel.";
+    for (const name of ["upload_files", "download_files"]) {
+      expect(workerPaletteRow(worker(), row(name, refusal))?.refusal).toBeNull();
+    }
+    /** v8: Upload, and no Download. */
+    const v8 = worker({ protocolVersion: 8 });
+    expect(workerPaletteRow(v8, row("upload_files", refusal))?.refusal).toBeNull();
+    expect(workerPaletteRow(v8, row("download_files", refusal))).toBeNull();
+    /** v7: neither. */
+    const v7 = worker({ protocolVersion: 7 });
+    expect(workerPaletteRow(v7, row("upload_files", refusal))).toBeNull();
+    expect(workerPaletteRow(v7, row("download_files", refusal))).toBeNull();
+  });
+
   it("leaves every row on any other host untouched", () => {
     const quit = row("quit", "refused");
     expect(workerPaletteRow(tui(), quit)).toBe(quit);

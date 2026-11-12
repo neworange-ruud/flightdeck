@@ -80,6 +80,9 @@ describe("createInitialState", () => {
       /** No snapshot has said a version, and nothing is being uploaded. */
       protocolVersion: null,
       upload: null,
+      download: null,
+      /** Transfer files opens on Upload until another tab is used. */
+      transferTab: "upload",
     });
   });
 });

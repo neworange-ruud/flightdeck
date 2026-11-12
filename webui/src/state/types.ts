@@ -47,6 +47,7 @@ import type {
   UploadPlan,
   UploadState,
 } from "./upload";
+import type { DownloadIntent, DownloadPlan, DownloadState } from "./download";
 import type { ConfigDoc, ConfigEdits, ConfigScope } from "./config";
 import type { ViewportWidth } from "./viewport";
 import type {
@@ -456,9 +457,20 @@ export interface AppState {
    * snapshot says. Only the upload panel reads it (v8, R30).
    */
   readonly protocolVersion: number | null;
-  /** Upload files to a worker (W34, R30): the panel, or `null` when closed. */
+  /**
+   * The Transfer files panel's Upload tab (W34, R30) — and the panel itself:
+   * it is open exactly when this is not `null`, whichever tab is showing.
+   */
   readonly upload: UploadState | null;
+  /** The panel's Download tab (v9), from the first time it is shown until the
+   * panel closes. */
+  readonly download: DownloadState | null;
+  /** The tab the panel shows — and the one Transfer files reopens on. */
+  readonly transferTab: TransferTab;
 }
+
+/** The Transfer files panel's two tabs. */
+export type TransferTab = "upload" | "download";
 
 /**
  * The three read-only panels, as a union so each carries exactly what it
@@ -650,6 +662,8 @@ export function createInitialState(): AppState {
     notifications: "unsupported",
     protocolVersion: null,
     upload: null,
+    download: null,
+    transferTab: "upload",
   };
 }
 
@@ -1168,6 +1182,40 @@ export type AppAction =
   /** The project picker, opened by the upload panel's Choose…, chose `path`
    * as the upload's folder. */
   | { readonly type: "picker/chosen"; readonly path: string }
+  /* --- The Transfer files panel (v9) ------------------------------------- */
+  /**
+   * Open the panel on `tab` — `null`: the tab last used — or switch to it
+   * when the panel is open. The Download tab exists only at v9; switching is
+   * refused while files are uploading. `main.ts` lists the Download tab's
+   * folder the first time it shows.
+   */
+  | { readonly type: "transfer/open"; readonly tab: TransferTab | null }
+  /** Close the panel, either tab. Refused while uploading — Cancel first. */
+  | { readonly type: "transfer/close" }
+  /* --- Downloading files from a worker (v9) ------------------------------ */
+  /** Up, Home, a folder, Show hidden. `main.ts` sends the `browse_dir`. */
+  | { readonly type: "download/intent"; readonly intent: DownloadIntent }
+  /** A `browse_dir` went out as `seq`; `null` when it could not be sent. */
+  | { readonly type: "download/browsing"; readonly seq: number | null }
+  | { readonly type: "download/toggle"; readonly name: string }
+  /** Tick every file, or none when every one already is. */
+  | { readonly type: "download/selectAll" }
+  | { readonly type: "download/cursor"; readonly index: number }
+  | { readonly type: "download/move"; readonly delta: number }
+  /** `Space`: tick or untick the file under the cursor. */
+  | { readonly type: "download/toggleCursor" }
+  /** Download pressed. `main.ts` sends the `begin_download` it means (or
+   * says why there is none) and reports back with `download/requested`. */
+  | { readonly type: "download/submit" }
+  | { readonly type: "download/requested"; readonly seq: number | null }
+  | { readonly type: "download/note"; readonly note: string }
+  /** `ServerMsg::DownloadPlan`. */
+  | { readonly type: "download/plan"; readonly plan: DownloadPlan }
+  /** `main.ts` handed the granted files to the browser. */
+  | { readonly type: "download/handedOff" }
+  | { readonly type: "download/cancel" }
+  /** Download more: the same folder, nothing ticked. */
+  | { readonly type: "download/startOver" }
   | {
       readonly type: "notifications/permission";
       readonly permission: NotificationPermissionState;

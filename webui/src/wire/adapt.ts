@@ -83,8 +83,10 @@ import type {
   WireSnapshot,
   WireTerminalView,
   WireUploadPlan,
+  WireDownloadPlan,
 } from "./frames";
 import type { UploadPlan } from "../state/upload";
+import type { DownloadPlan } from "../state/download";
 
 /**
  * FlightDeck's interpreted labels (`status_keyword_to_interpreted`, mirrored in
@@ -591,6 +593,13 @@ export function dirListingOf(wire: WireDirListing): PickerListing {
       isGitRepo: entry.is_git_repo ?? false,
       isOpenProject: entry.is_open_project ?? false,
     })),
+    /** Absent from a host below v9, and whenever `include_files` was not
+     * asked for: no files. */
+    files: (wire.files ?? []).map((file) => ({
+      name: file.name,
+      path: file.path,
+      size: file.size ?? 0,
+    })),
     truncated: wire.truncated ?? false,
   };
 }
@@ -644,6 +653,21 @@ export function uploadPlanOf(wire: WireUploadPlan): UploadPlan {
       exists: file.exists ?? false,
     })),
     conflicts: wire.conflicts ?? false,
+    refusal: wire.refusal ?? null,
+  };
+}
+
+/** `ServerMsg::DownloadPlan` (v9) as the Download tab takes it. Every
+ * optional field reads as its absence: no ticket, size 0, no refusal. */
+export function downloadPlanOf(wire: WireDownloadPlan): DownloadPlan {
+  return {
+    seq: wire.seq,
+    dir: wire.dir,
+    files: wire.files.map((file) => ({
+      name: file.name,
+      size: file.size ?? 0,
+      ticket: file.ticket ?? null,
+    })),
     refusal: wire.refusal ?? null,
   };
 }

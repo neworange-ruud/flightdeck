@@ -180,6 +180,7 @@ describe("the panel", () => {
         parent: WORKER_HOME,
         home: WORKER_HOME,
         entries: [],
+        files: [],
         truncated: false,
       },
     });
@@ -194,6 +195,7 @@ describe("the panel", () => {
         parent: WORKER_HOME,
         home: WORKER_HOME,
         entries: [],
+        files: [],
         truncated: false,
       },
     });

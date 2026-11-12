@@ -30,6 +30,8 @@ export const WORKER_COMMAND = {
   RESTART_WORKER_SHELL: "restart_worker_shell",
   /** v8: ask to upload files into one folder (`state/upload.ts`). */
   BEGIN_UPLOAD: "begin_upload",
+  /** v9: ask to download files from one folder (`state/download.ts`). */
+  BEGIN_DOWNLOAD: "begin_download",
 } as const;
 
 /** The palette row a worker refuses and this window answers itself, with the
@@ -47,6 +49,17 @@ export const UPLOAD_FILES_COMMAND = "upload_files";
 export const UPLOAD_MIN_VERSION = 8;
 
 /**
+ * v9: the other palette row only a worker lists (`commands::DOWNLOAD_FILES`),
+ * refused as a frame like `upload_files`; this window runs it by opening the
+ * Transfer files panel on its Download tab (`ui/downloadView.ts`).
+ */
+export const DOWNLOAD_FILES_COMMAND = "download_files";
+
+/** The protocol version that can download (`protocol::DOWNLOAD_MIN_VERSION`):
+ * `begin_download`, `download_plan`, and files in a `dir_listing`. */
+export const DOWNLOAD_MIN_VERSION = 9;
+
+/**
  * Whether this window can upload at all: a worker, spoken to at v8 or later.
  * Every entry point — the tab-bar button, the palette row, a drop — checks
  * it. The SPA ships inside the binary it talks to, so this is a guard rather
@@ -57,6 +70,19 @@ export function uploadAvailable(state: AppState): boolean {
     state.hostKind === "worker" &&
     state.protocolVersion !== null &&
     state.protocolVersion >= UPLOAD_MIN_VERSION
+  );
+}
+
+/**
+ * Whether this window can download: a worker, spoken to at v9 or later. The
+ * Transfer files panel shows its Download tab only then, and the palette's
+ * Download Files… row only then.
+ */
+export function downloadAvailable(state: AppState): boolean {
+  return (
+    state.hostKind === "worker" &&
+    state.protocolVersion !== null &&
+    state.protocolVersion >= DOWNLOAD_MIN_VERSION
   );
 }
 
@@ -103,6 +129,10 @@ export function workerPaletteRow(
    * window can upload, never as a refused row. */
   if (row.run.name === UPLOAD_FILES_COMMAND) {
     return uploadAvailable(state) ? { ...row, refusal: null, hostOnly: false } : null;
+  }
+  /** Download Files… is the panel's Download tab — the same rule, at v9. */
+  if (row.run.name === DOWNLOAD_FILES_COMMAND) {
+    return downloadAvailable(state) ? { ...row, refusal: null, hostOnly: false } : null;
   }
   return row;
 }

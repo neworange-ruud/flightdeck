@@ -48,6 +48,7 @@ import {
   connectionsOf,
   dialogOf,
   dirListingOf,
+  downloadPlanOf,
   gitStatusOf,
   healthOf,
   hostMessageOf,
@@ -71,6 +72,7 @@ import {
   type WireConnectionsView,
   type WireDeltaEnvelope,
   type WireDirListing,
+  type WireDownloadPlan,
   type WireHealth,
   type WireHostMessage,
   type WireNotificationView,
@@ -1222,6 +1224,15 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         store.dispatch({
           type: "upload/plan",
           plan: uploadPlanOf(frame as WireUploadPlan),
+        });
+        return;
+      /* --- v9 ------------------------------------------------------------- */
+      case "download_plan":
+        /** The answer to the Download tab's `begin_download`; the `ack` for
+         * the same seq follows as `command/result`. */
+        store.dispatch({
+          type: "download/plan",
+          plan: downloadPlanOf(frame as WireDownloadPlan),
         });
         return;
       default:
