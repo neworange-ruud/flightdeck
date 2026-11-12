@@ -1815,6 +1815,179 @@ fn files_upload_into_home_and_a_taken_name_is_asked_about() {
     client.stop();
 }
 
+// ---------------------------------------------------------------------------
+// Downloads (v9, `remote-control-pz6d`)
+// ---------------------------------------------------------------------------
+
+/// Pump `client` until the worker's answer to `begin_download` `seq` arrives.
+fn download_plan(
+    worker: &Worker,
+    client: &mut RemoteClient,
+    seq: Option<u64>,
+    what: &str,
+) -> flightdeck::web::protocol::DownloadPlan {
+    let seq = seq.unwrap_or_else(|| panic!("{what}: begin_download did not go out"));
+    let mut plan = None;
+    worker.wait(&format!("the download plan for {what}"), || {
+        client.pump();
+        plan = client.take_download_plan().filter(|p| p.seq == seq);
+        plan.is_some()
+    });
+    plan.unwrap()
+}
+
+/// `GET /download/{ticket}` over plain HTTP with the access cookie, as a
+/// client would send it: the status, the headers, and the body as bytes.
+fn http_download(
+    addr: &str,
+    ticket: &str,
+    token: &AccessToken,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).expect("the worker accepts");
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        stream,
+        "GET /download/{ticket} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Cookie: flightdeck_web={}\r\n\r\n",
+        token.reveal()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    (status, headers, raw[split + 4..].to_vec())
+}
+
+/// A real worker lists a folder's files, grants a download of some, and
+/// serves exactly their bytes once each; a folder outside `$HOME` and a link
+/// leaving it are refused in the plan's own words.
+#[test]
+fn files_download_from_home_and_nothing_outside_it() {
+    let worker = Worker::start();
+    let home = std::fs::canonicalize(worker.home()).unwrap();
+    let out = home.join("out");
+    std::fs::create_dir_all(out.join("sub")).unwrap();
+    let big: Vec<u8> = (0..500_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(out.join("report.bin"), &big).unwrap();
+    std::fs::write(out.join("notes.txt"), "remember").unwrap();
+    std::fs::write(out.join(".hidden"), "x").unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("fdo")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::write(outside.path().join("secret"), "nope").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), out.join("leak")).unwrap();
+
+    let (token, mut client) = worker.window("laptop");
+    assert!(client.supports_download(), "a v9 window on a worker");
+
+    // Browse with files: folders and regular files, no dotfile, no link out.
+    let seq = client.command(
+        flightdeck::web::protocol::worker_command::BROWSE_DIR,
+        Some(serde_json::json!({ "path": "~/out", "include_files": true })),
+    );
+    worker.applied(&mut client, seq, "browse_dir with files");
+    let mut listing = None;
+    worker.wait("the listing with files", || {
+        client.pump();
+        listing = client.take_dir_listing();
+        listing.is_some()
+    });
+    let listing = listing.unwrap();
+    let dirs: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(dirs, vec!["sub"]);
+    let files: Vec<(&str, u64)> = listing
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.size))
+        .collect();
+    assert_eq!(
+        files,
+        vec![("notes.txt", 8), ("report.bin", big.len() as u64)]
+    );
+
+    // Grant two files.
+    let names = vec!["report.bin".to_string(), "notes.txt".to_string()];
+    let seq = client.begin_download("~/out", &names);
+    worker.applied(&mut client, seq, "begin_download");
+    let plan = download_plan(&worker, &mut client, seq, "two files");
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    assert_eq!(plan.dir, out.display().to_string());
+    let rows: Vec<(&str, u64)> = plan
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.size))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("report.bin", big.len() as u64), ("notes.txt", 8)]
+    );
+
+    // The bytes, exactly, as attachments.
+    let access = client.http_access().expect("a dialled client").clone();
+    let report = plan.files[0].ticket.as_deref().expect("granted");
+    let (status, headers, body) = http_download(&access.address, report, &token);
+    assert_eq!(status, 200, "{}", worker.log_tail());
+    assert_eq!(body, big);
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(header("content-length"), Some("500000"));
+    assert_eq!(
+        header("content-disposition"),
+        Some("attachment; filename=\"report.bin\"; filename*=UTF-8''report.bin")
+    );
+    let notes = plan.files[1].ticket.as_deref().expect("granted");
+    let (status, _, body) = http_download(&access.address, notes, &token);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"remember");
+
+    // A ticket is single use.
+    let (status, _, body) = http_download(&access.address, report, &token);
+    assert_eq!(status, 403);
+    let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refusal["reason"], "invalid_ticket");
+
+    // Outside $HOME, and a link leaving it: refused in the plan's own words.
+    let seq = client.begin_download(
+        &outside.path().display().to_string(),
+        &["secret".to_string()],
+    );
+    let reason = worker.rejected(&mut client, seq, "begin_download outside home");
+    assert!(reason.contains("outside your home folder"), "{reason}");
+    let plan = download_plan(&worker, &mut client, seq, "outside home");
+    assert_eq!(plan.refusal.as_deref(), Some(reason.as_str()));
+    assert!(plan.files.iter().all(|f| f.ticket.is_none()));
+
+    let seq = client.begin_download("~/out", &["notes.txt".to_string(), "leak".to_string()]);
+    let reason = worker.rejected(&mut client, seq, "begin_download through a link");
+    assert_eq!(reason, "leak points outside your home folder.");
+    let plan = download_plan(&worker, &mut client, seq, "through a link");
+    assert!(
+        plan.files.iter().all(|f| f.ticket.is_none()),
+        "all or nothing"
+    );
+    client.stop();
+}
+
 /// What FlightDeck Desktop does: the session's upload panel, from picked
 /// paths to written files, with the transfers on the client's runtime.
 #[test]

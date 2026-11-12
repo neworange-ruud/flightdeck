@@ -1225,15 +1225,17 @@ fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_tui_host_serves_v6_to_v8_and_a_worker_v7_and_v8() {
+fn a_tui_host_serves_v6_to_v9_and_a_worker_v7_to_v9() {
     assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Tui, 8), Ok(8));
+    assert_eq!(accept_version(HostKind::Tui, 9), Ok(9));
     assert_eq!(accept_version(HostKind::Desktop, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Worker, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Worker, 8), Ok(8));
+    assert_eq!(accept_version(HostKind::Worker, 9), Ok(9));
 
-    for peer in [5, 6, 9] {
+    for peer in [5, 6, 10] {
         let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
         assert_eq!(refused.peer, peer);
         assert_eq!(refused.min_supported, 7, "the worker's own floor");
@@ -1793,4 +1795,30 @@ fn a_tui_snapshot_carries_no_worker_state() {
     assert_eq!(snapshot.worker, None);
     assert_eq!(snapshot.host_kind, Some(HostKind::Tui));
     assert_eq!(snapshot.commands, crate::web::commands::inventory());
+}
+
+// ---------------------------------------------------------------------------
+// Protocol paths (v8/v9): never redirected, never the page
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_protocol_path_is_its_prefix_or_below_it() {
+    for (path, prefix) in [
+        ("/download", DOWNLOAD_PATH),
+        ("/download/", DOWNLOAD_PATH),
+        ("/download/abc", DOWNLOAD_PATH),
+        ("/upload/abc", UPLOAD_PATH),
+        ("/auth/session", "/auth"),
+    ] {
+        assert!(is_protocol_path(path, prefix), "{path}");
+    }
+    for (path, prefix) in [
+        ("/downloads", DOWNLOAD_PATH),
+        ("/downloadx/abc", DOWNLOAD_PATH),
+        ("/", DOWNLOAD_PATH),
+        ("/app/download/abc", DOWNLOAD_PATH),
+        ("/uploads", UPLOAD_PATH),
+    ] {
+        assert!(!is_protocol_path(path, prefix), "{path}");
+    }
 }

@@ -599,32 +599,44 @@ fn tui_and_desktop_hosts_send_the_inventory_unchanged() {
 // The worker's own rows (v8, W34)
 // ---------------------------------------------------------------------------
 
-/// A worker's palette lists Upload Files…, last, refused if sent — its
-/// window runs it locally, as it does Open Project.
+/// A worker's palette lists Upload Files… and Download Files… (v9), last,
+/// each refused if sent — its window runs them locally, opening the Transfer
+/// Files panel on the matching tab, as it does Open Project.
 #[test]
 fn a_worker_lists_upload_files_and_refuses_it_as_a_frame() {
     let worker = inventory_for(HostKind::Worker);
-    let last = worker.last().expect("a worker lists rows");
-    assert_eq!(last.id, UPLOAD_FILES);
-    assert_eq!(last.run.name, "upload_files");
-    assert_eq!(last.label, "Upload Files…");
-    assert_eq!(last.group, "Projects");
-    assert!(!last.host_only, "the window runs it, not the box");
-    assert!(!last.answers_dialog);
-    assert_eq!(last.target, None);
-    assert_eq!(
-        last.refusal.as_deref(),
-        Some("Use the window's upload panel."),
-        "a frame naming it gets the words the row carries"
-    );
+    let [.., upload, download] = worker.as_slice() else {
+        panic!("a worker lists rows");
+    };
+    for (row, id, label) in [
+        (upload, UPLOAD_FILES, "Upload Files…"),
+        (download, DOWNLOAD_FILES, "Download Files…"),
+    ] {
+        assert_eq!(row.id, id);
+        assert_eq!(row.run.name, id);
+        assert_eq!(row.label, label);
+        assert_eq!(row.group, "Projects");
+        assert!(!row.host_only, "the window runs it, not the box");
+        assert!(!row.answers_dialog);
+        assert_eq!(row.target, None);
+        assert_eq!(
+            row.refusal.as_deref(),
+            Some("Use the window's Transfer Files panel."),
+            "a frame naming it gets the words the row carries"
+        );
+        assert_eq!(
+            worker.iter().filter(|other| other.id == id).count(),
+            1,
+            "listed once"
+        );
+    }
     assert_eq!(
         worker_refusal(UPLOAD_FILES),
         Some(WORKER_UPLOAD_FILES_REFUSAL)
     );
     assert_eq!(
-        worker.iter().filter(|row| row.id == UPLOAD_FILES).count(),
-        1,
-        "listed once"
+        worker_refusal(DOWNLOAD_FILES),
+        Some(WORKER_DOWNLOAD_FILES_REFUSAL)
     );
 }
 
