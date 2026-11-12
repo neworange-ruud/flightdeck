@@ -117,6 +117,13 @@ pub trait FileSystem {
     /// Whether a path exists and is a directory. Used by the project-folder
     /// browser to list only navigable subdirectories.
     fn is_dir(&self, p: &Path) -> bool;
+    /// Whether a path exists and is a regular file, following symbolic links
+    /// (not a folder, socket, FIFO or device). The worker lists and serves
+    /// only regular files for download. The default answers "exists and is
+    /// not a folder", for implementations that cannot tell the rest apart.
+    fn is_file(&self, p: &Path) -> bool {
+        self.exists(p) && !self.is_dir(p)
+    }
     /// Recursively create a directory.
     fn create_dir_all(&self, p: &Path) -> Result<()>;
     /// Read a file to a string.

@@ -3,12 +3,16 @@
 //!
 //! Everything is confined to `$HOME`: a requested path is canonicalised and
 //! refused when it resolves outside it, including through a symlink.
+//!
+//! A listing can carry the folder's regular files too (v9, the Transfer files
+//! panel's Download tab): [`browse`] with `include_files`.
 
 use std::path::{Path, PathBuf};
 
 use crate::contracts::{FileSystem, Result};
 
-/// The most entries one listing returns; more sets `truncated`.
+/// The most entries one listing returns — folders and files together,
+/// folders first; more sets `truncated`.
 pub const MAX_ENTRIES: usize = 2000;
 
 /// The confinement root: the account's home directory, canonical.
@@ -124,13 +128,25 @@ pub struct Entry {
     pub is_git_repo: bool,
 }
 
-/// The folders inside one folder.
+/// One regular file of a listing (v9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    /// The path as listed (a link is not resolved).
+    pub path: PathBuf,
+    /// Its size in bytes when listed.
+    pub size: u64,
+}
+
+/// The folders (and, when asked, the files) inside one folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     pub path: PathBuf,
     /// `None` at home: browsing never goes above it.
     pub parent: Option<PathBuf>,
     pub entries: Vec<Entry>,
+    /// The regular files, only when `include_files`; empty otherwise.
+    pub files: Vec<FileEntry>,
     pub truncated: bool,
 }
 
@@ -138,19 +154,24 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
-/// The sub-folders of canonical `dir` that stay inside home, hidden ones
-/// only when `show_hidden`: `(name, path as listed, canonical path)`, sorted
-/// case-insensitively by name.
-fn child_dirs(
+/// One child of a folder: `(name, path as listed, canonical path)`.
+type Child = (String, PathBuf, PathBuf);
+
+/// The children of canonical `dir` that stay inside home, hidden ones only
+/// when `show_hidden`: its sub-folders, and — when `include_files` — its
+/// regular files, each list sorted case-insensitively by name.
+fn children(
     fs: &dyn FileSystem,
     conf: &Confinement,
     dir: &Path,
     show_hidden: bool,
-) -> std::result::Result<Vec<(String, PathBuf, PathBuf)>, ProjectOpError> {
+    include_files: bool,
+) -> std::result::Result<(Vec<Child>, Vec<Child>), ProjectOpError> {
     let names = fs
         .list_dir(dir)
         .map_err(|e| ProjectOpError::Io(e.to_string()))?;
-    let mut out = Vec::new();
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
     for path in names {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
@@ -158,31 +179,47 @@ fn child_dirs(
         if !show_hidden && is_hidden(&name) {
             continue;
         }
-        // A link that leaves home, dangles or points at a file is not a
-        // navigable folder.
+        // A link that leaves home or dangles is neither a navigable folder
+        // nor a file to download.
         let Some(canonical) = conf.inside(fs, &path) else {
             continue;
         };
-        if !fs.is_dir(&canonical) {
-            continue;
+        if fs.is_dir(&canonical) {
+            dirs.push((name, path, canonical));
+        } else if include_files && fs.is_file(&canonical) {
+            files.push((name, path, canonical));
         }
-        out.push((name, path, canonical));
     }
-    out.sort_by(|a, b| {
+    let by_name = |a: &Child, b: &Child| {
         a.0.to_lowercase()
             .cmp(&b.0.to_lowercase())
             .then_with(|| a.0.cmp(&b.0))
-    });
-    Ok(out)
+    };
+    dirs.sort_by(by_name);
+    files.sort_by(by_name);
+    Ok((dirs, files))
 }
 
-/// List the folders in `requested` (dirs only, hidden ones only when
-/// `show_hidden`, sorted case-insensitively).
+/// The sub-folders of canonical `dir` that stay inside home ([`children`]).
+fn child_dirs(
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    dir: &Path,
+    show_hidden: bool,
+) -> std::result::Result<Vec<Child>, ProjectOpError> {
+    children(fs, conf, dir, show_hidden, false).map(|(dirs, _)| dirs)
+}
+
+/// List the folders in `requested` (hidden ones only when `show_hidden`,
+/// sorted case-insensitively) and, with `include_files`, its regular files
+/// the same way: a link is listed when it resolves to a regular file inside
+/// home. At most [`MAX_ENTRIES`] in all, folders first.
 pub fn browse(
     fs: &dyn FileSystem,
     conf: &Confinement,
     requested: Option<&str>,
     show_hidden: bool,
+    include_files: bool,
 ) -> std::result::Result<Listing, ProjectOpError> {
     let path = conf.resolve(fs, requested)?;
     if !fs.is_dir(&path) {
@@ -190,16 +227,32 @@ pub fn browse(
             requested.unwrap_or("~").to_string(),
         ));
     }
-    let mut entries: Vec<Entry> = child_dirs(fs, conf, &path, show_hidden)?
+    let (dirs, file_children) = children(fs, conf, &path, show_hidden, include_files)?;
+    let mut truncated = dirs.len() > MAX_ENTRIES;
+    let entries: Vec<Entry> = dirs
         .into_iter()
+        .take(MAX_ENTRIES)
         .map(|(name, listed, canonical)| Entry {
             name,
             path: listed,
             is_git_repo: is_git_repo(fs, &canonical),
         })
         .collect();
-    let truncated = entries.len() > MAX_ENTRIES;
-    entries.truncate(MAX_ENTRIES);
+    let room = MAX_ENTRIES - entries.len();
+    truncated |= file_children.len() > room;
+    let files: Vec<FileEntry> = file_children
+        .into_iter()
+        .take(room)
+        // A file that went away between the listing and its size is left out.
+        .filter_map(|(name, listed, canonical)| {
+            let size = fs.file_len(&canonical).ok()?;
+            Some(FileEntry {
+                name,
+                path: listed,
+                size,
+            })
+        })
+        .collect();
     let parent = if path == conf.home {
         None
     } else {
@@ -209,6 +262,7 @@ pub fn browse(
         path,
         parent,
         entries,
+        files,
         truncated,
     })
 }

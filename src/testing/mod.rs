@@ -165,6 +165,15 @@ impl FileSystem for FakeFs {
         st.dirs.contains(p)
     }
 
+    fn is_file(&self, p: &Path) -> bool {
+        // Follows links, as the real one does.
+        let Ok(target) = self.canonicalize(p) else {
+            return false;
+        };
+        let st = self.inner.lock().unwrap();
+        st.files.contains_key(&target) || st.blobs.contains_key(&target)
+    }
+
     fn create_dir_all(&self, p: &Path) -> Result<()> {
         let mut st = self.inner.lock().unwrap();
         mark_parents(&mut st.dirs, p);

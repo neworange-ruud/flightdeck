@@ -89,16 +89,22 @@ pub enum Plan {
 /// no `/`, no `\` (a Windows client's separator), no NUL or other control
 /// character, not empty, not `.` or `..`, and at most [`MAX_NAME_BYTES`].
 pub fn validate_name(name: &str) -> Result<(), String> {
+    validate_name_to(name, "upload")
+}
+
+/// [`validate_name`], worded for `verb` (`upload`, `download`) where the
+/// sentence names what the person is doing.
+pub(super) fn validate_name_to(name: &str, verb: &str) -> Result<(), String> {
     let shown = || format!("\"{}\"", name.escape_debug());
     if name.is_empty() {
-        return Err("A file to upload has no name.".to_string());
+        return Err(format!("A file to {verb} has no name."));
     }
     if name == "." || name == ".." {
         return Err(format!("{} cannot be a file name.", shown()));
     }
     if name.contains('/') || name.contains('\\') {
         return Err(format!(
-            "{} is a path, not a file name: upload files, not folders.",
+            "{} is a path, not a file name: {verb} files, not folders.",
             shown()
         ));
     }

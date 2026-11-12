@@ -27,6 +27,9 @@
 //! * Uploads (v8, [`upload`]): a `begin_upload` is checked and planned here,
 //!   granted through the server, and each `PUT` it granted reports back
 //!   ([`WebInbound::UploadFinished`]); a finished batch is one host message.
+//! * Downloads (v9, [`download`]): a `begin_download` is checked and planned
+//!   here and granted through the server; each `GET` is the server's alone,
+//!   and a download posts no host message (it changes nothing here).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,14 +41,14 @@ use crate::persistence::workspace::{load_workspace, WorkspaceUi};
 use crate::web::credentials::TokenId;
 use crate::web::credentials::{BrowserToken, BOOTSTRAP_CODE_TTL_MS};
 use crate::web::protocol::{
-    Ack, AckOutcome, Delta, DirEntryView, DirListing, HostKind, MessageLevel,
-    NotificationSoundView, NotificationView, ProjectId, ProjectScan, ScannedRepo, ServerMsg,
-    TerminalId, UploadPlan, UploadPlanFile, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView,
-    WORKER_SHELL_TERMINAL_ID,
+    Ack, AckOutcome, Delta, DirEntryView, DirListing, DownloadPlan, DownloadPlanFile,
+    FileEntryView, HostKind, MessageLevel, NotificationSoundView, NotificationView, ProjectId,
+    ProjectScan, ScannedRepo, ServerMsg, TerminalId, UploadPlan, UploadPlanFile, ViewerId,
+    WorkerOp, WorkerShellView, WorkerStatusView, WORKER_SHELL_TERMINAL_ID,
 };
 use crate::web::server::{
-    ConnectionInfo, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice, UploadFinished,
-    UploadGrantRequest, WebInbound, WebOutbound, WebServerHandle, WorkerHostState,
+    ConnectionInfo, DownloadGrantRequest, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice,
+    UploadFinished, UploadGrantRequest, WebInbound, WebOutbound, WebServerHandle, WorkerHostState,
 };
 use crate::worker::control::{DeviceReport, DeviceState, PairingCode};
 use crate::worker::paths::WorkerPaths;
@@ -58,6 +61,7 @@ use crate::{
 };
 
 pub mod clone;
+pub mod download;
 pub mod health;
 pub mod messages;
 pub mod notify;
@@ -1052,10 +1056,16 @@ impl<'a> AppHost<'a> {
             WorkerOp::BrowseDir {
                 path,
                 show_hidden,
-                include_files: _,
+                include_files,
             } => {
-                let listing = projects::browse(fs, &w.confinement, path.as_deref(), show_hidden)
-                    .map_err(|e| OpRefusal::new(e.to_string()))?;
+                let listing = projects::browse(
+                    fs,
+                    &w.confinement,
+                    path.as_deref(),
+                    show_hidden,
+                    include_files,
+                )
+                .map_err(|e| OpRefusal::new(e.to_string()))?;
                 let workspace = &self.workspace;
                 let frame = DirListing {
                     seq,
@@ -1072,8 +1082,15 @@ impl<'a> AppHost<'a> {
                             is_git_repo: e.is_git_repo,
                         })
                         .collect(),
-                    // TODO(download): listed when `include_files` (v9).
-                    files: Vec::new(),
+                    files: listing
+                        .files
+                        .into_iter()
+                        .map(|f| FileEntryView {
+                            name: f.name,
+                            path: f.path.display().to_string(),
+                            size: f.size,
+                        })
+                        .collect(),
                     truncated: listing.truncated,
                 };
                 Ok((None, Some(ServerMsg::DirListing(frame))))
@@ -1243,9 +1260,63 @@ impl<'a> AppHost<'a> {
                 ));
                 Ok((None, Some(ServerMsg::UploadPlan(frame))))
             }
-            // TODO(download): grant tickets for `GET /download/{ticket}`.
-            WorkerOp::BeginDownload { .. } => {
-                Err(OpRefusal::new("This worker cannot give downloads yet."))
+            WorkerOp::BeginDownload { dir, names } => {
+                // A refusal answers in the plan's own frame, as an upload's
+                // does, so the window's download tab says why.
+                let refused = |reason: String| OpRefusal {
+                    reason: reason.clone(),
+                    frame: Some(Box::new(ServerMsg::DownloadPlan(DownloadPlan {
+                        seq,
+                        dir: dir.clone(),
+                        files: names
+                            .iter()
+                            .map(|name| DownloadPlanFile {
+                                name: name.clone(),
+                                size: 0,
+                                ticket: None,
+                            })
+                            .collect(),
+                        refusal: Some(reason),
+                    }))),
+                };
+                let planned = download::plan(fs, &w.confinement, &dir, &names).map_err(&refused)?;
+                let Some(handle) = self.web_surface.handle.as_ref() else {
+                    return Err(refused(
+                        "The worker is not listening, so it cannot give files right now."
+                            .to_string(),
+                    ));
+                };
+                let requests: Vec<DownloadGrantRequest> = planned
+                    .files
+                    .iter()
+                    .map(|f| DownloadGrantRequest {
+                        path: f.path.clone(),
+                        name: f.name.clone(),
+                        size: f.size,
+                    })
+                    .collect();
+                let tickets = handle.grant_downloads(token, w.confinement.home(), &requests);
+                let place = upload::tilde(w.confinement.home(), &planned.dir);
+                let frame = DownloadPlan {
+                    seq,
+                    dir: planned.dir.display().to_string(),
+                    files: planned
+                        .files
+                        .iter()
+                        .zip(tickets)
+                        .map(|(f, ticket)| DownloadPlanFile {
+                            name: f.name.clone(),
+                            size: f.size,
+                            ticket: Some(ticket),
+                        })
+                        .collect(),
+                    refusal: None,
+                };
+                w.log(format!(
+                    "download of {} file(s) from {place} granted",
+                    planned.files.len()
+                ));
+                Ok((None, Some(ServerMsg::DownloadPlan(frame))))
             }
         }
     }
