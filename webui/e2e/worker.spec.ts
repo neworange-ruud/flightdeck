@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
@@ -30,6 +30,9 @@ import {
  *    selected project with their exact bytes, over the real `PUT /upload`;
  *    the same names again are a conflict, and Keep both writes `name (1).ext`
  *    beside them. A dropped file opens the same panel.
+ *    **Download files** (v9): a file in the project, ticked on the Transfer
+ *    files panel's Download tab, arrives as a real browser download over
+ *    `GET /download`, byte for byte.
  * 4. **W17, takeover is terminal.** A second window takes the worker; the
  *    first shows who took it and does **not** take it back on its own — then
  *    "Take it back" does, and the other window is the one that stops.
@@ -234,7 +237,7 @@ test("Upload files puts their bytes in the selected project (W34)", async ({ bro
   const page = await openWindow(browser);
   const tab = page.getByRole("tab", { name: FIXTURE_REPO });
   await expect(tab).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator('[data-action="upload-files"]')).toBeVisible();
+  await expect(page.locator('[data-action="transfer-files"]')).toBeVisible();
 
   await uploadInto(page);
   const panel = page.locator(".fd-upload");
@@ -304,6 +307,51 @@ test("dropping a file on the window opens the upload panel (R30)", async ({ brow
   });
   expect(onDisk("dropped.txt").toString("utf8")).toBe("dropped bytes\n");
   await page.keyboard.press("Escape");
+  await expect(panel).toBeHidden();
+  await page.context().close();
+});
+
+/**
+ * v9: Download files, against the real `GET /download/<ticket>`. The file is
+ * put in the fixture repository — the selected project, and so the Download
+ * tab's starting folder — and must arrive as a browser download whose bytes
+ * are the file's.
+ */
+const DOWNLOADED = Buffer.from(Array.from({ length: 200_000 }, (_, i) => (i * 17 + 3) % 253));
+
+test("Download files hands a worker's file to the browser (v9)", async ({ browser }) => {
+  writeFileSync(join(running().repoDir, "download-me.bin"), DOWNLOADED);
+  const page = await openWindow(browser);
+  await expect(page.getByRole("tab", { name: FIXTURE_REPO })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
+  await page.locator('[data-action="transfer-files"]').click();
+  const panel = page.locator(".fd-upload");
+  await expect(panel).toBeVisible();
+  await panel.locator('.fd-transfer__tab[data-tab="download"]').click();
+  await expect(panel).toHaveAttribute("data-tab", "download");
+  await expect(panel.locator(".fd-download__path")).toHaveText(new RegExp(`/${FIXTURE_REPO}$`));
+
+  const row = panel.locator('[data-list="download"] li[data-kind="file"][data-name="download-me.bin"]');
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(row).toHaveAttribute("aria-selected", "true");
+
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: 30_000 }),
+    panel.locator('.fd-download [data-action="download"]').click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("download-me.bin");
+  expect(await download.failure()).toBeNull();
+  const saved = await download.path();
+  expect(readFileSync(saved).equals(DOWNLOADED)).toBe(true);
+
+  await expect(panel.locator(".fd-download [data-summary]")).toHaveText(
+    "Sent 1 file to your browser's downloads.",
+  );
+  await panel.locator('.fd-download [data-action="close-done"]').click();
   await expect(panel).toBeHidden();
   await page.context().close();
 });
