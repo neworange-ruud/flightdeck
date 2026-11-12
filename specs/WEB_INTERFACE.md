@@ -3624,6 +3624,58 @@ upload panel with them selected. Folders in a drop are left out, with a note.
 project's root, else the worker's home. The SPA therefore now keeps
 `worktree_path` on each session (the host always sent it; rule 4).
 
+### R31 — protocol v9: downloading files from a worker
+
+A window can download files from one folder on a worker
+(`specs/WORKER_PRD.md` W34, epic `remote-control-pz6d`), the other half of
+R30. The upload panel becomes **Transfer files**, with an **Upload** and a
+**Download** tab: the titlebar button "Transfer files" opens it, the palette
+rows **Upload Files…** and **Download Files…** each open their tab, and
+dropping files on the window opens Upload. Files only; folders are a
+follow-up. As with uploads, the socket carries only the grant.
+
+**Listing files is additive.** `browse_dir` takes `include_files`, and
+`DirListing.files` (`FileEntryView { name, path, size }`) lists the folder's
+regular files beside its folders: dotfiles only with `show_hidden`, a link
+only when it resolves to a regular file inside `$HOME`, sorted like the
+folders, at most 2000 entries in all with folders first. Rule 4 covers it
+(`files` defaults to empty), but a worker lists files only for a peer at v9:
+a v8 window's `include_files` is dropped by the server.
+
+**New kind (hence the bump to v9).** `ServerMsg::DownloadPlan`, wire tag
+`download_plan`, answers the worker command `begin_download {dir, names}` and
+goes only to the window that asked — never to a background link, never to a
+peer negotiated below 9 (`DOWNLOAD_MIN_VERSION`; such a peer's
+`begin_download` is refused with `not_supported`, and it is not offered the
+**Download Files…** row). The ranges become: a TUI or Desktop host accepts
+**6..=9**, a worker **7..=9**. Per file the plan carries the name asked for,
+its `size` at grant time and a `ticket`; a refusal (`refusal`, no tickets) is
+all or nothing — the first name that is missing, a folder, or a link leaving
+`$HOME` refuses the request in a sentence naming it.
+
+**The bytes come over HTTP.** `GET /download/<ticket>` on the same port, with
+the same cookie, plain or TLS and never redirected. The ticket is single-use,
+bound to the token that asked, and valid for two minutes. The route checks,
+before any byte is sent: the method (`GET` only, else `405`), the cookie (the
+same refusals as `/ws`), the ticket (`403 invalid_ticket` for unknown, used,
+expired or another device's), and the file again — its granted path must
+still resolve to itself, a regular file inside `$HOME` (`409 file_changed`).
+A read that fails before the first byte is `500 read_failed`; after the
+headers it aborts the body. Refusals are JSON `{ok: false, reason, message}`
+with `Cache-Control: no-store`. A `200` is `application/octet-stream`,
+`Content-Disposition: attachment; filename="<ASCII fallback>";
+filename*=UTF-8''<percent-encoded name>` (RFC 6266/5987), `Cache-Control:
+no-store`, `X-Content-Type-Options: nosniff`, and a `Content-Length` of the
+size when the file was opened; exactly that many bytes follow. The route is a
+worker's only: a TUI or Desktop host answers `/download` with `404`, never
+the page.
+
+**Where the files go.** The browser hands each file to its own downloads, one
+per file, a little apart (`wire/download.ts`: a temporary `<a download>`
+clicked once, so the bytes never pass through the page). The Desktop saves
+into a chosen local folder — by default the OS Downloads folder — and asks
+Replace, Keep both or Cancel for a name already there.
+
 ## 7. Reference
 
 - `specs/WEBAPP_DESIGN_BRIEFING.md` — the design brief this implements.
