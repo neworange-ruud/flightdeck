@@ -1575,7 +1575,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
   marked stale. The relay runs on Azure Container Apps behind a stable custom
   domain (`wss://relay.flightdeckai.app/ws`). Push notifications on device require
   an Apple APNs auth key + signing team.
-- Add a Next.js documentation site under `web/`, including a Flightdeck landing
+- Add a Next.js documentation site under `web/`, including a FlightDeck landing
   page and MDX documentation at `/docs`.
 - Write the full documentation content for the site: an Overview and Core
   Concepts, a Get Started section (install, first run, interface tour), an
