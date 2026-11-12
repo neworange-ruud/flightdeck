@@ -599,3 +599,39 @@ fn upload_files_is_offered_only_on_a_worker_that_takes_uploads() {
         assert!(!offered(&ws), "{kind:?}");
     }
 }
+
+#[test]
+fn download_files_is_offered_only_on_a_worker_that_gives_downloads() {
+    let download = PaletteAction::FrontEnd(FrontEndAction::DownloadFiles);
+    let offered = |ws: &RemoteWorkspace| palette_entries(ws).iter().any(|e| e.action == download);
+
+    // A v9 worker: a local row the window performs (its Download tab).
+    let mut ws = with_kind(Some(wire::HostKind::Worker));
+    ws.protocol_version = wire::DOWNLOAD_MIN_VERSION;
+    assert!(ws.takes_downloads());
+    assert_eq!(
+        route_palette_for(&ws, &download),
+        RemoteAction::Local(LocalAction::FrontEnd(FrontEndAction::DownloadFiles))
+    );
+    assert!(offered(&ws));
+
+    // A v8 worker takes uploads but gives no downloads.
+    ws.protocol_version = wire::DOWNLOAD_MIN_VERSION - 1;
+    assert!(ws.takes_uploads());
+    assert_eq!(
+        route_palette_for(&ws, &download),
+        RemoteAction::Unavailable(DOWNLOAD_UNAVAILABLE)
+    );
+    assert!(!offered(&ws));
+
+    // Nor does any other host, at any version.
+    for kind in [
+        None,
+        Some(wire::HostKind::Tui),
+        Some(wire::HostKind::Desktop),
+    ] {
+        let mut ws = with_kind(kind);
+        ws.protocol_version = wire::PROTOCOL_VERSION;
+        assert!(!offered(&ws), "{kind:?}");
+    }
+}

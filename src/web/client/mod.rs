@@ -24,6 +24,9 @@
 //! | [`worker`] | [`ProjectPicker`]: a worker's browse / scan / clone picker (v7) |
 //! | [`upload`] | [`UploadPanel`]: uploading files to a worker, as a reducer (v8) |
 //! | [`upload_http`] | `PUT /upload/{ticket}`: streaming one file's bytes (v8) |
+//! | [`download`] | [`DownloadPanel`]: downloading files from a worker, as a reducer (v9) |
+//! | [`download_http`] | `GET /download/{ticket}`: streaming one file to disk (v9) |
+//! | [`http`] | the hand-rolled HTTP/1.1 both transfers share |
 //! | [`config`] | [`RemoteConfigEditor`]: the host's configuration manager, staged here |
 //!
 //! [`RemoteClient`] ties them together for a synchronous front-end: start it,
@@ -35,9 +38,12 @@
 //! [`RemoteClient::is_worker`] first and sends nothing otherwise.
 
 pub mod config;
+pub mod download;
+pub mod download_http;
 pub mod exchange;
 #[cfg(test)]
 pub(crate) mod fake_host;
+pub mod http;
 pub mod input;
 pub mod link;
 pub mod messages;
@@ -61,6 +67,7 @@ use crate::web::protocol::{
 };
 
 pub use config::{EditorEffect, RemoteConfigEditor};
+pub use download::DownloadPanel;
 pub use exchange::{exchange_code, probe_session, AccessToken, ExchangeError, Probe};
 pub use input::AckFor;
 pub use link::{LinkConfig, LinkEnd, LinkEvent, LinkHandle, LinkOut, LinkState, Outbound};
@@ -536,6 +543,21 @@ impl RemoteClient {
     /// not a worker or the link is down.
     pub fn browse_dir(&self, path: Option<&str>, show_hidden: bool) -> Option<u64> {
         let mut args = serde_json::json!({ "show_hidden": show_hidden });
+        if let Some(path) = path {
+            args["path"] = serde_json::json!(path);
+        }
+        self.worker_command(worker_command::BROWSE_DIR, Some(args))
+    }
+
+    /// List a directory on the worker with its files too (v9, the Transfer
+    /// Files panel's Download tab): as [`RemoteClient::browse_dir`], with
+    /// `include_files`, so the answer's [`DirListing::files`] is filled.
+    /// `None` — nothing sent — unless [`RemoteClient::supports_download`].
+    pub fn browse_files(&self, path: Option<&str>, show_hidden: bool) -> Option<u64> {
+        if !self.supports_download() {
+            return None;
+        }
+        let mut args = serde_json::json!({ "show_hidden": show_hidden, "include_files": true });
         if let Some(path) = path {
             args["path"] = serde_json::json!(path);
         }

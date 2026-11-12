@@ -62,6 +62,12 @@
 //!   file goes out over `PUT /upload/{ticket}` on the client's runtime, one
 //!   at a time ([`Transfer`]), its progress and end folded back in on
 //!   [`RemoteSession::pump`].
+//! - **Downloads (v9).** Files from a folder on the worker into a folder on
+//!   this machine ([`DownloadPanel`]): browsed with `include_files`, asked
+//!   over the link, each granted file fetched over `GET /download/{ticket}`
+//!   one at a time ([`DownloadTransfer`]). Uploads and downloads are the two
+//!   tabs of one Transfer Files panel ([`TransferTab`]); the tab does not
+//!   change while either is moving bytes.
 //!
 //! The host's configuration manager ([`RemoteConfigEditor`]) is offered on
 //! every host kind that forwards it (design A1): staged here, saved in one
@@ -93,6 +99,8 @@ use crate::tui::clipboard::{check_pasted_image, PastedImage};
 use crate::tui::palette::FrontEndAction;
 use crate::view::TerminalRef;
 use crate::view::{mission_move, MissionView, PromptReply, SessionKey};
+use crate::web::client::download::{self as downloads, DownloadPanel};
+use crate::web::client::download_http::{DownloadEvent, DownloadTransfer};
 use crate::web::client::messages;
 use crate::web::client::mission::{self, ActivityWatch};
 use crate::web::client::upload::{self as uploads, Resolution};
@@ -137,6 +145,25 @@ pub const UPLOAD_WORKER_TOO_OLD: &str =
 
 /// Why a granted file could not be sent from a client with no HTTP access.
 pub const UPLOAD_NO_ACCESS: &str = "This connection cannot send files.";
+
+/// Why the Download tab does not open on a worker too old to give files.
+pub const DOWNLOAD_WORKER_TOO_OLD: &str =
+    "This worker cannot give downloads yet: update FlightDeck on it, then reconnect.";
+
+/// Why a granted file could not be fetched by a client with no HTTP access.
+pub const DOWNLOAD_NO_ACCESS: &str = "This connection cannot fetch files.";
+
+/// Why the Transfer Files panel stays on its tab.
+pub const TRANSFER_BUSY: &str = "Wait for the transfer to finish, or cancel it, first.";
+
+/// The Transfer Files panel's two tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferTab {
+    /// Files from this machine to the worker ([`UploadPanel`], v8).
+    Upload,
+    /// Files from the worker to this machine ([`DownloadPanel`], v9).
+    Download,
+}
 
 /// Why a host command is refused on the worker shell's tab.
 pub const WORKER_SHELL_COMMAND_REFUSAL: &str = "Switch to a project tab to run host commands: \
@@ -258,6 +285,14 @@ pub struct RemoteSession {
     /// The file going out now, and its own events: a channel per transfer,
     /// so a cancelled one cannot speak into the next.
     transfer: Option<(Transfer, std::sync::mpsc::Receiver<TransferEvent>)>,
+    /// The download tab, once opened (v9).
+    download: Option<DownloadPanel>,
+    /// The file coming in now, and its own events.
+    download_transfer: Option<(DownloadTransfer, std::sync::mpsc::Receiver<DownloadEvent>)>,
+    /// The Transfer Files panel's tab on screen; `None` while it is closed.
+    transfer_tab: Option<TransferTab>,
+    /// The tab the panel was last on, which it opens on again.
+    last_transfer_tab: TransferTab,
 }
 
 /// How many answered prompt ids are remembered.
@@ -306,6 +341,10 @@ impl RemoteSession {
             answer_seqs: HashMap::new(),
             upload: None,
             transfer: None,
+            download: None,
+            download_transfer: None,
+            transfer_tab: None,
+            last_transfer_tab: TransferTab::Upload,
         }
     }
 
@@ -496,13 +535,12 @@ impl RemoteSession {
         self.upload.as_mut()
     }
 
-    /// Open the upload panel, aimed at the folder the person is looking at
-    /// ([`uploads::default_dir`]). Open already, it stays as it is. On a host
-    /// that cannot take files the notice says why and nothing opens.
+    /// Open the Transfer Files panel on its Upload tab, aimed at the folder
+    /// the person is looking at ([`uploads::default_dir`]). Open already, the
+    /// tab's list stays as it is. On a host that cannot take files the
+    /// notice says why and nothing opens; while a download is moving bytes
+    /// the panel stays on it.
     pub fn open_upload(&mut self) {
-        if self.upload.is_some() {
-            return;
-        }
         if !self.client.is_worker() {
             self.notice = Some(UPLOAD_NOT_A_WORKER.to_string());
             return;
@@ -511,21 +549,91 @@ impl RemoteSession {
             self.notice = Some(UPLOAD_WORKER_TOO_OLD.to_string());
             return;
         }
-        self.upload = Some(UploadPanel::new(uploads::default_dir(self.workspace())));
+        if self.transfer_tab == Some(TransferTab::Download) && self.transfer_busy() {
+            self.notice = Some(TRANSFER_BUSY.to_string());
+            return;
+        }
+        if self.upload.is_none() {
+            self.upload = Some(UploadPanel::new(uploads::default_dir(self.workspace())));
+        }
+        self.show_transfer_tab(TransferTab::Upload);
+    }
+
+    fn show_transfer_tab(&mut self, tab: TransferTab) {
+        self.transfer_tab = Some(tab);
+        self.last_transfer_tab = tab;
+    }
+
+    /// The Transfer Files panel's tab on screen; `None` while it is closed.
+    pub fn transfer_tab(&self) -> Option<TransferTab> {
+        self.transfer_tab
+    }
+
+    /// The tab the panel opens on: the one it was last on.
+    pub fn last_transfer_tab(&self) -> TransferTab {
+        self.last_transfer_tab
+    }
+
+    /// Open the Transfer Files panel on `tab` (`None`: the tab it was last
+    /// on, Upload at first; Download only where the worker gives files).
+    pub fn open_transfer(&mut self, tab: Option<TransferTab>) {
+        let tab = tab.unwrap_or(self.last_transfer_tab);
+        match tab {
+            TransferTab::Download if self.client.supports_download() => self.open_download(),
+            _ => self.open_upload(),
+        }
+    }
+
+    /// Switch the open panel to `tab`. Refused (`false`) while a transfer
+    /// is moving bytes or being asked for, and for Download on a worker that
+    /// gives none.
+    pub fn set_transfer_tab(&mut self, tab: TransferTab) -> bool {
+        if self.transfer_tab.is_none() || self.transfer_tab == Some(tab) {
+            return false;
+        }
+        if self.transfer_busy() {
+            return false;
+        }
+        match tab {
+            TransferTab::Upload => self.open_upload(),
+            TransferTab::Download => self.open_download(),
+        }
+        self.transfer_tab == Some(tab)
+    }
+
+    /// Whether an upload or a download is being asked for or moving bytes.
+    pub fn transfer_busy(&self) -> bool {
+        let upload = self.upload.as_ref().is_some_and(|p| {
+            p.is_uploading() || matches!(p.phase, uploads::UploadPhase::Requested { .. })
+        });
+        upload || self.download.as_ref().is_some_and(DownloadPanel::is_busy)
+    }
+
+    /// Close the Transfer Files panel, both tabs: a file going out or coming
+    /// in is stopped (what was written stays written; a partial download is
+    /// removed).
+    pub fn close_transfer(&mut self) {
+        self.transfer = None;
+        self.upload = None;
+        self.download_transfer = None;
+        self.download = None;
+        self.transfer_tab = None;
     }
 
     /// Open the upload panel with `paths` already picked (files dropped on
     /// the window).
     pub fn open_upload_with(&mut self, paths: &[std::path::PathBuf]) {
         self.open_upload();
-        self.upload_add_paths(paths);
+        if self.transfer_tab == Some(TransferTab::Upload) {
+            self.upload_add_paths(paths);
+        }
     }
 
-    /// Close the upload panel, stopping a file that is going out. What was
-    /// written stays written.
+    /// Close the upload panel — the whole Transfer Files panel
+    /// ([`RemoteSession::close_transfer`]), stopping a file that is going
+    /// out. What was written stays written.
     pub fn close_upload(&mut self) {
-        self.transfer = None;
-        self.upload = None;
+        self.close_transfer();
     }
 
     /// Pick `paths` on this machine: each is looked at here (a file, a
@@ -623,6 +731,234 @@ impl RemoteSession {
                     None => {
                         panel.finished(job.index, Err(UPLOAD_NO_ACCESS.to_string()));
                     }
+                }
+            }
+        }
+        changed
+    }
+
+    // -- downloads (v9) --------------------------------------------------------
+
+    /// The Download tab, once opened.
+    pub fn download(&self) -> Option<&DownloadPanel> {
+        self.download.as_ref()
+    }
+
+    /// The Download tab, for the front-end's own field edits.
+    pub fn download_mut(&mut self) -> Option<&mut DownloadPanel> {
+        self.download.as_mut()
+    }
+
+    /// Open the Transfer Files panel on its Download tab. The first time it
+    /// lists the folder the person is looking at ([`uploads::default_dir`])
+    /// and saves into this machine's Downloads folder
+    /// ([`downloads::default_destination`]); after that it is as it was
+    /// left. On a host that cannot give files the notice says why and
+    /// nothing opens; while an upload is moving bytes the panel stays on it.
+    pub fn open_download(&mut self) {
+        if !self.client.is_worker() {
+            self.notice = Some(UPLOAD_NOT_A_WORKER.to_string());
+            return;
+        }
+        if !self.client.supports_download() {
+            self.notice = Some(DOWNLOAD_WORKER_TOO_OLD.to_string());
+            return;
+        }
+        if self.transfer_tab == Some(TransferTab::Upload) && self.transfer_busy() {
+            self.notice = Some(TRANSFER_BUSY.to_string());
+            return;
+        }
+        if self.download.is_none() {
+            let home = self
+                .workspace()
+                .worker
+                .as_ref()
+                .map(|w| w.home.clone())
+                .unwrap_or_default();
+            let start = uploads::default_dir(self.workspace());
+            let dest = downloads::default_destination().display().to_string();
+            self.download = Some(DownloadPanel::new(start.clone(), home, dest));
+            self.download_browse(Some(&start));
+        }
+        self.show_transfer_tab(TransferTab::Download);
+    }
+
+    /// List `path` on the Download tab (`None`: the worker's `$HOME`).
+    pub fn download_browse(&mut self, path: Option<&str>) {
+        let Some(panel) = self.download.as_mut() else {
+            return;
+        };
+        if !panel.is_browsing() {
+            return;
+        }
+        let path = path.map(str::trim).filter(|p| !p.is_empty() && *p != "~");
+        panel.browse_sent(self.client.browse_files(path, panel.show_hidden));
+    }
+
+    /// Up one folder from the one the Download tab lists.
+    pub fn download_up(&mut self) {
+        let parent = self.download.as_ref().and_then(|p| p.parent.clone());
+        if let Some(parent) = parent {
+            self.download_browse(Some(&parent));
+        }
+    }
+
+    /// The worker's `$HOME` on the Download tab.
+    pub fn download_home(&mut self) {
+        self.download_browse(None);
+    }
+
+    /// List hidden files and folders too, or not, and list the same folder
+    /// again (the ticks still listed stay ticked).
+    pub fn download_toggle_hidden(&mut self) {
+        let Some(panel) = self.download.as_mut() else {
+            return;
+        };
+        if !panel.is_browsing() {
+            return;
+        }
+        panel.show_hidden = !panel.show_hidden;
+        let cwd = panel.cwd.clone();
+        self.download_browse(Some(&cwd));
+    }
+
+    /// Tick or untick file `name` in the folder on screen.
+    pub fn download_toggle(&mut self, name: &str) {
+        if let Some(panel) = self.download.as_mut() {
+            panel.toggle(name);
+        }
+    }
+
+    /// Tick every file in the folder, or (all ticked) none.
+    pub fn download_select_all(&mut self) {
+        if let Some(panel) = self.download.as_mut() {
+            panel.select_all();
+        }
+    }
+
+    /// Save into `dest` (as typed, or chosen with the platform's chooser).
+    pub fn set_download_dest(&mut self, dest: &str) {
+        if let Some(panel) = self.download.as_mut() {
+            if panel.dest != dest {
+                panel.set_dest(dest);
+            }
+        }
+    }
+
+    /// Download: names already in the destination are asked about first;
+    /// otherwise the worker is asked for the ticked files.
+    pub fn start_download(&mut self) {
+        let Some(panel) = self.download.as_mut() else {
+            return;
+        };
+        let dest = downloads::resolve_destination(&panel.dest).filter(|d| d.is_dir());
+        let folder = dest.clone();
+        let exists = |name: &str| {
+            folder
+                .as_deref()
+                .is_some_and(|d| downloads::taken_here(d, name))
+        };
+        let Some(request) = panel.request(dest, exists) else {
+            return;
+        };
+        self.send_download_request(request);
+    }
+
+    /// The person's answer to names already in the destination: ask the
+    /// worker, replacing them or keeping both, or go back to browsing.
+    pub fn resolve_download(&mut self, resolution: Resolution) {
+        let Some(panel) = self.download.as_mut() else {
+            return;
+        };
+        let folder = match &panel.phase {
+            downloads::DownloadPhase::Asking { dest, .. } => dest.clone(),
+            _ => return,
+        };
+        let exists = |name: &str| downloads::taken_here(&folder, name);
+        let Some(request) = panel.resolve(resolution, exists) else {
+            return;
+        };
+        self.send_download_request(request);
+    }
+
+    fn send_download_request(&mut self, request: downloads::DownloadRequest) {
+        let seq = self.client.begin_download(&request.dir, &request.names);
+        if let Some(panel) = self.download.as_mut() {
+            panel.requested(seq);
+        }
+    }
+
+    /// Stop: the file coming in is dropped (its temporary file removed), the
+    /// rest are not fetched. What was saved stays saved.
+    pub fn cancel_download(&mut self) {
+        if let Some(panel) = self.download.as_mut() {
+            panel.cancel();
+        }
+        self.download_transfer = None;
+    }
+
+    /// After Done or Cancelled: browsing again, nothing ticked, the folder
+    /// listed afresh.
+    pub fn download_more(&mut self) {
+        let Some(panel) = self.download.as_mut() else {
+            return;
+        };
+        panel.start_over();
+        let cwd = panel.cwd.clone();
+        self.download_browse(Some(&cwd));
+    }
+
+    /// Fold in the worker's plan, each transfer's progress and end, and
+    /// start the next file. Returns whether the tab changed.
+    fn pump_download(&mut self) -> bool {
+        let plan = self.client.take_download_plan();
+        let Some(panel) = self.download.as_mut() else {
+            self.download_transfer = None;
+            return false;
+        };
+        let mut changed = false;
+        if let Some(plan) = plan {
+            changed |= panel.on_plan(plan);
+        }
+        if !self.client.state().is_live() {
+            changed |= panel.link_lost();
+        }
+        let mut ended = false;
+        if let Some((_, events)) = &self.download_transfer {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    DownloadEvent::Progress {
+                        index,
+                        received,
+                        total,
+                    } => {
+                        changed |= panel.progress(index, received, total);
+                    }
+                    DownloadEvent::Finished { index, result } => {
+                        let result = result.map(|done| done.path).map_err(|e| e.sentence());
+                        changed |= panel.finished(index, result);
+                        ended = true;
+                    }
+                }
+            }
+        }
+        if ended || !panel.is_downloading() {
+            self.download_transfer = None;
+        }
+        // A file that cannot start fails at once, and the next one is tried.
+        while self.download_transfer.is_none() {
+            let Some(job) = panel.next_job() else {
+                break;
+            };
+            changed = true;
+            match self.client.http_access() {
+                Some(access) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.download_transfer =
+                        Some((DownloadTransfer::start(access.clone(), job, tx), rx));
+                }
+                None => {
+                    panel.finished(job.index, Err(DOWNLOAD_NO_ACCESS.to_string()));
                 }
             }
         }
@@ -804,6 +1140,7 @@ impl RemoteSession {
         changed |= self.track_dialog();
         changed |= self.take_answers();
         changed |= self.pump_upload();
+        changed |= self.pump_download();
         changed |= self.take_worker_news();
         changed |= self.follow_host_kind();
         changed |= self.select_opened();
@@ -969,6 +1306,9 @@ impl RemoteSession {
             if self.upload.as_mut().is_some_and(|p| p.on_ack(&ack)) {
                 continue;
             }
+            if self.download.as_mut().is_some_and(|p| p.on_ack(&ack)) {
+                continue;
+            }
             if self.picker.as_mut().is_some_and(|p| p.on_ack(&ack)) {
                 continue;
             }
@@ -995,6 +1335,9 @@ impl RemoteSession {
         for error in self.client.take_errors() {
             changed = true;
             if self.upload.as_mut().is_some_and(|p| p.on_error(&error)) {
+                continue;
+            }
+            if self.download.as_mut().is_some_and(|p| p.on_error(&error)) {
                 continue;
             }
             if self.picker.as_mut().is_some_and(|p| p.on_error(&error)) {
@@ -1025,7 +1368,17 @@ impl RemoteSession {
     /// a clone's progress and end (its acks are fed with the others).
     fn take_picker_answers(&mut self) -> bool {
         let mut changed = false;
-        let listing = self.client.take_dir_listing();
+        let mut listing = self.client.take_dir_listing();
+        // The Download tab's own listing (it browses with files); any other
+        // is the picker's.
+        if let Some(panel) = self.download.as_mut() {
+            if listing
+                .as_ref()
+                .is_some_and(|l| panel.awaits_listing(l.seq))
+            {
+                changed |= listing.take().is_some_and(|l| panel.on_listing(l));
+            }
+        }
         let scan = self.client.take_project_scan();
         let clones = self.client.take_clone_events();
         if let Some(picker) = self.picker.as_mut() {

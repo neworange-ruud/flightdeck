@@ -117,6 +117,11 @@ pub enum FrontEndAction {
     /// upload panel. A remote window's row alone ([`remote_window_rows`]),
     /// offered only on a worker that takes uploads (protocol v8).
     UploadFiles,
+    /// Download files from a folder on a worker into a folder on this
+    /// machine: the Transfer Files panel on its Download tab. A remote
+    /// window's row alone ([`remote_window_rows`]), offered only on a worker
+    /// that gives downloads (protocol v9).
+    DownloadFiles,
 }
 
 impl PaletteAction {
@@ -379,6 +384,11 @@ const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[
         group: "Projects",
         label: "Upload Files…",
         action: PaletteAction::FrontEnd(FrontEndAction::UploadFiles),
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "Download Files…",
+        action: PaletteAction::FrontEnd(FrontEndAction::DownloadFiles),
     },
     PaletteEntry {
         group: "Remote",
@@ -808,22 +818,29 @@ mod tests {
         );
     }
 
-    /// Upload Files… is a remote window's row (W34), at the end of Projects
-    /// next to Open Project; the local palette and the TUI never offer it.
+    /// Upload Files… and Download Files… are a remote window's rows (W34,
+    /// Transfer Files), at the end of Projects next to Open Project; the
+    /// local palette and the TUI never offer them.
     #[test]
     fn upload_files_is_a_remote_window_row_only() {
-        let is_upload =
-            |e: &&PaletteEntry| e.action == PaletteAction::FrontEnd(FrontEndAction::UploadFiles);
-        assert!(!rows(true).any(|e| is_upload(&e)));
-        assert!(!rows(false).any(|e| is_upload(&e)));
+        let is_transfer = |e: &&PaletteEntry| {
+            matches!(
+                e.action,
+                PaletteAction::FrontEnd(
+                    FrontEndAction::UploadFiles | FrontEndAction::DownloadFiles
+                )
+            )
+        };
+        assert!(!rows(true).any(|e| is_transfer(&e)));
+        assert!(!rows(false).any(|e| is_transfer(&e)));
         let projects: Vec<&str> = remote_window_rows()
             .filter(|e| e.group == "Projects")
             .map(|e| e.label)
             .collect();
         assert_eq!(projects.first().copied(), Some("Open Project"));
         assert_eq!(
-            projects.last().copied(),
-            Some("Upload Files…"),
+            projects[projects.len() - 2..],
+            ["Upload Files…", "Download Files…"],
             "{projects:?}"
         );
         // Its group stays one contiguous section.

@@ -1,11 +1,9 @@
 //! `PUT /upload/{ticket}`: sending one file's bytes to a worker (v8,
 //! `remote-control-usem`).
 //!
-//! The same hand-rolled HTTP/1.1 as [`super::exchange`] — the same address
-//! handling, plain `http://` (the Desktop dials a worker's protocol routes in
-//! the clear, inside the tailnet, exactly as it dials `ws://`), the same
-//! `Cookie: flightdeck_web=…` the link sends and the same `User-Agent` — with
-//! one difference: the body is a local file, streamed in
+//! The shared hand-rolled HTTP/1.1 of [`super::http`] — plain `http://`, the
+//! link's own `Cookie: flightdeck_web=…` and `User-Agent` — with the body a
+//! local file, streamed in
 //! [`CHUNK_BYTES`] chunks read on a blocking thread, never held whole.
 //! `Content-Length` is the size the worker granted; a file that changed size
 //! since it was picked stops the upload rather than send a different length.
@@ -21,12 +19,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
-use crate::web::server::{COOKIE_NAME, UPLOAD_PATH};
+use crate::web::server::UPLOAD_PATH;
 
-use super::exchange::{parse_response, AccessToken, REQUEST_TIMEOUT};
+use super::exchange::parse_response;
+use super::http::{access_sentence, connect, refusal_parts, request_head};
 use super::upload::UploadJob;
+
+pub use super::http::HttpAccess;
 
 /// How much of the file one write carries.
 pub const CHUNK_BYTES: usize = 64 * 1024;
@@ -46,17 +46,6 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// The largest reply read. It is a line of JSON.
 const MAX_REPLY: u64 = 64 * 1024;
-
-/// Where and as whom to upload: the link's own address, token and agent.
-#[derive(Clone, Debug)]
-pub struct HttpAccess {
-    /// `host:port` of the worker's web interface.
-    pub address: String,
-    /// The access token (the `flightdeck_web` cookie).
-    pub token: AccessToken,
-    /// Sent as `User-Agent`, as the link sends it.
-    pub user_agent: String,
-}
 
 /// What the worker said when it took the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,11 +80,9 @@ impl UploadError {
                 message: Some(message),
                 ..
             } => message.clone(),
-            UploadError::Refused { reason, status, .. } => match reason.as_str() {
-                "token_revoked" => "The worker withdrew this app's access.".to_string(),
-                "unknown_token" => "The worker does not know this app any more.".to_string(),
-                "rate_limited" => "Too many attempts; wait a moment.".to_string(),
-                _ => format!("The worker refused the file (HTTP {status}, {reason})."),
+            UploadError::Refused { reason, status, .. } => match access_sentence(reason) {
+                Some(sentence) => sentence.to_string(),
+                None => format!("The worker refused the file (HTTP {status}, {reason})."),
             },
             UploadError::Local(why) => why.clone(),
             UploadError::Network(why) => format!("The upload did not reach the worker: {why}."),
@@ -113,17 +100,17 @@ pub async fn put_file(
     size: u64,
     mut progress: impl FnMut(u64) + Send,
 ) -> Result<UploadReply, UploadError> {
-    let mut stream = tokio::time::timeout(REQUEST_TIMEOUT, TcpStream::connect(&access.address))
+    let mut stream = connect(&access.address)
         .await
-        .map_err(|_| UploadError::Network("timed out connecting".to_string()))?
-        .map_err(|e| UploadError::Network(e.to_string()))?;
-    let head = format!(
-        "PUT {UPLOAD_PATH}/{ticket} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\
-         Cookie: {COOKIE_NAME}={token}\r\nUser-Agent: {agent}\r\n\
-         Content-Type: application/octet-stream\r\nContent-Length: {size}\r\n\r\n",
-        address = access.address,
-        token = access.token.reveal(),
-        agent = access.user_agent.replace(['\r', '\n'], " "),
+        .map_err(UploadError::Network)?;
+    let head = request_head(
+        "PUT",
+        &format!("{UPLOAD_PATH}/{ticket}"),
+        access,
+        &[
+            ("Content-Type", "application/octet-stream".to_string()),
+            ("Content-Length", size.to_string()),
+        ],
     );
     let net = |e: std::io::Error| UploadError::Network(e.to_string());
     stream.write_all(head.as_bytes()).await.map_err(net)?;
@@ -251,13 +238,11 @@ fn reply(raw: &[u8]) -> Result<UploadReply, UploadError> {
             bytes: body["bytes"].as_u64().unwrap_or(0),
         });
     }
+    let (reason, message) = refusal_parts(&response.body);
     Err(UploadError::Refused {
         status: response.status,
-        reason: body["reason"]
-            .as_str()
-            .unwrap_or("unexpected_answer")
-            .to_string(),
-        message: body["message"].as_str().map(str::to_string),
+        reason,
+        message,
     })
 }
 
