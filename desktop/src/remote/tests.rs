@@ -1736,6 +1736,7 @@ mod worker {
                     is_open_project: false,
                 },
             ],
+            files: Vec::new(),
             truncated: false,
         }));
         turn(&model, cx);

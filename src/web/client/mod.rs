@@ -55,9 +55,9 @@ use std::sync::mpsc::{channel, Receiver};
 
 use crate::contracts::{PtySize, TabId};
 use crate::web::protocol::{
-    command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, GitStatusView,
-    HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan, ResizeTerminal, SeatRequest,
-    TerminalId, UploadFile, UploadPlan, WireError,
+    command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, DownloadPlan,
+    GitStatusView, HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan,
+    ResizeTerminal, SeatRequest, TerminalId, UploadFile, UploadPlan, WireError,
 };
 
 pub use config::{EditorEffect, RemoteConfigEditor};
@@ -254,6 +254,8 @@ pub struct RemoteClient {
     clone_events: Vec<CloneEvent>,
     /// A worker's latest upload plan, until taken (v8).
     upload_plan: Option<UploadPlan>,
+    /// A worker's latest download plan, until taken (v9).
+    download_plan: Option<DownloadPlan>,
     /// Where and as whom an upload's `PUT` goes: the link's own address,
     /// token and agent. `None` for a scripted client.
     http_access: Option<upload_http::HttpAccess>,
@@ -288,6 +290,7 @@ impl RemoteClient {
             project_scan: None,
             clone_events: Vec::new(),
             upload_plan: None,
+            download_plan: None,
             http_access: Some(http_access),
             resync: None,
         }
@@ -316,6 +319,7 @@ impl RemoteClient {
             project_scan: None,
             clone_events: Vec::new(),
             upload_plan: None,
+            download_plan: None,
             http_access: None,
             resync: None,
         };
@@ -414,6 +418,10 @@ impl RemoteClient {
             }
             LinkEvent::UploadPlan(plan) => {
                 self.upload_plan = Some(plan);
+                true
+            }
+            LinkEvent::DownloadPlan(plan) => {
+                self.download_plan = Some(plan);
                 true
             }
         }
@@ -610,6 +618,29 @@ impl RemoteClient {
     /// The upload plan the last `begin_upload` produced, once.
     pub fn take_upload_plan(&mut self) -> Option<UploadPlan> {
         self.upload_plan.take()
+    }
+
+    /// Whether this worker gives downloads and lists files: a worker attached
+    /// at protocol v9 or later ([`crate::web::protocol::DOWNLOAD_MIN_VERSION`]).
+    pub fn supports_download(&self) -> bool {
+        self.workspace.takes_downloads()
+    }
+
+    /// Ask the worker for `names` in `dir` (v9). The answer arrives as
+    /// [`RemoteClient::take_download_plan`]: one ticket per file for
+    /// `GET /download/{ticket}`, or a refusal. `None` — nothing sent — unless
+    /// [`RemoteClient::supports_download`] and the link is up.
+    pub fn begin_download(&self, dir: &str, names: &[String]) -> Option<u64> {
+        if !self.supports_download() {
+            return None;
+        }
+        let args = serde_json::json!({ "dir": dir, "names": names });
+        self.worker_command(worker_command::BEGIN_DOWNLOAD, Some(args))
+    }
+
+    /// The download plan the last `begin_download` produced, once.
+    pub fn take_download_plan(&mut self) -> Option<DownloadPlan> {
+        self.download_plan.take()
     }
 
     /// Where an upload's bytes go, as whom: this link's address, token and
@@ -837,6 +868,7 @@ mod tests {
             parent: Some("/home/u".to_string()),
             home: "/home/u".to_string(),
             entries: Vec::new(),
+            files: Vec::new(),
             truncated: false,
         }));
         assert!(client.pump());

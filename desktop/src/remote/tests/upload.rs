@@ -337,6 +337,7 @@ fn choose_browses_the_workers_folders_and_sets_the_target(app: &mut TestAppConte
             is_git_repo: true,
             is_open_project: false,
         }],
+        files: Vec::new(),
         truncated: false,
     }));
     turn(&model, cx);

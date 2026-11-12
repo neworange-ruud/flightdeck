@@ -48,9 +48,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::web::protocol::{
     Ack, Attach, ClientInfo, ClientMsg, CloneProgress, CloneResult, ConfigView, ConnectionKind,
-    Delta, DirListing, ErrorCode, GitStatusView, HostKind, ImagePaste, ProjectScan, ResizeTerminal,
-    SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor, TerminalId,
-    UploadPlan, ViewerId, WireError, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION,
+    Delta, DirListing, DownloadPlan, ErrorCode, GitStatusView, HostKind, ImagePaste, ProjectScan,
+    ResizeTerminal, SeatRequest, ServerMsg, ShutdownReason, Snapshot, TermBytes, TermCursor,
+    TerminalId, UploadPlan, ViewerId, WireError, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION,
     WORKER_MIN_CLIENT_VERSION,
 };
 use crate::web::server::COOKIE_NAME;
@@ -166,6 +166,8 @@ pub enum LinkEvent {
     CloneResult(CloneResult),
     /// A worker's answer to `begin_upload` (v8).
     UploadPlan(UploadPlan),
+    /// A worker's answer to `begin_download` (v9).
+    DownloadPlan(DownloadPlan),
 }
 
 /// What the client asks the link task to send.
@@ -783,6 +785,9 @@ async fn session(
                     }
                     ServerMsg::CloneResult(result) => events.send(LinkEvent::CloneResult(result)),
                     ServerMsg::UploadPlan(plan) => events.send(LinkEvent::UploadPlan(plan)),
+                    ServerMsg::DownloadPlan(plan) => {
+                        events.send(LinkEvent::DownloadPlan(plan))
+                    }
                     ServerMsg::TakenOver { by } => {
                         return SessionEnd::Ended(LinkEnd::TakenOver { by });
                     }

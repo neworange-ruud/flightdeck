@@ -116,8 +116,8 @@ use crate::web::protocol::{
     ConnectionsView, Delta, DialogView, ErrorCode, Geometry, Health, HostKind, HostMessage,
     ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot,
     TermCursor, TerminalId, VersionMismatch, ViewerId, Viewport, WindowInfo, WireError, WorkerOp,
-    WorkerShellView, WorkerSnapshot, WorkerStatusView, MAX_SUPPORTED_VERSION, PROTOCOL_VERSION,
-    UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION,
+    WorkerShellView, WorkerSnapshot, WorkerStatusView, DOWNLOAD_MIN_VERSION, MAX_SUPPORTED_VERSION,
+    PROTOCOL_VERSION, UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION,
 };
 use crate::web::upload::UploadGrants;
 pub use crate::web::upload::{
@@ -1947,6 +1947,10 @@ impl Shared {
                 if protocol_version < crate::web::protocol::UPLOAD_MIN_VERSION {
                     rows.retain(|row| row.id != crate::web::commands::UPLOAD_FILES);
                 }
+                // Nor is a peer below v9 offered Download Files….
+                if protocol_version < DOWNLOAD_MIN_VERSION {
+                    rows.retain(|row| row.id != crate::web::commands::DOWNLOAD_FILES);
+                }
                 rows
             },
             // Both overlays are the host's own words, sent so the browser
@@ -2558,6 +2562,7 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
             | ServerMsg::CloneProgress(_)
             | ServerMsg::CloneResult(_)
             | ServerMsg::UploadPlan(_)
+            | ServerMsg::DownloadPlan(_)
             | ServerMsg::Delta(Delta::HostMessage(_))
     )
 }
@@ -2569,6 +2574,7 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
 fn min_version_for(msg: &ServerMsg) -> u16 {
     match msg {
         ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
+        ServerMsg::DownloadPlan(_) => DOWNLOAD_MIN_VERSION,
         _ => 0,
     }
 }

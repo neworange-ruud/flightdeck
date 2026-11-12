@@ -5796,6 +5796,7 @@ mod worker {
                 WorkerOp::BrowseDir {
                     path: Some("/home/ruud/src".to_string()),
                     show_hidden: true,
+                    include_files: false,
                 }
             );
 

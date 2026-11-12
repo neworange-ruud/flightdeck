@@ -19,6 +19,7 @@ fn listing(seq: u64, path: &str, parent: Option<&str>, names: &[&str]) -> DirLis
                 is_open_project: false,
             })
             .collect(),
+        files: Vec::new(),
         truncated: false,
     }
 }

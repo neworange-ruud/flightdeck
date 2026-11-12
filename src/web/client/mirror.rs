@@ -447,6 +447,13 @@ impl RemoteWorkspace {
         self.is_worker() && self.protocol_version >= crate::web::protocol::UPLOAD_MIN_VERSION
     }
 
+    /// Whether the host gives downloads (Transfer Files): a worker attached
+    /// at protocol v9 or later ([`crate::web::protocol::DOWNLOAD_MIN_VERSION`]),
+    /// which also lists files when browsing.
+    pub fn takes_downloads(&self) -> bool {
+        self.is_worker() && self.protocol_version >= crate::web::protocol::DOWNLOAD_MIN_VERSION
+    }
+
     /// The worker's shell, when the host is a worker that has one.
     pub fn worker_shell(&self) -> Option<&WorkerShellView> {
         self.worker.as_ref()?.shell.as_ref()

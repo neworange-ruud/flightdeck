@@ -1049,7 +1049,11 @@ impl<'a> AppHost<'a> {
             return Err(OpRefusal::new("This FlightDeck is not a worker."));
         };
         match op {
-            WorkerOp::BrowseDir { path, show_hidden } => {
+            WorkerOp::BrowseDir {
+                path,
+                show_hidden,
+                include_files: _,
+            } => {
                 let listing = projects::browse(fs, &w.confinement, path.as_deref(), show_hidden)
                     .map_err(|e| OpRefusal::new(e.to_string()))?;
                 let workspace = &self.workspace;
@@ -1068,6 +1072,8 @@ impl<'a> AppHost<'a> {
                             is_git_repo: e.is_git_repo,
                         })
                         .collect(),
+                    // TODO(download): listed when `include_files` (v9).
+                    files: Vec::new(),
                     truncated: listing.truncated,
                 };
                 Ok((None, Some(ServerMsg::DirListing(frame))))
@@ -1236,6 +1242,10 @@ impl<'a> AppHost<'a> {
                     on_conflict.as_str()
                 ));
                 Ok((None, Some(ServerMsg::UploadPlan(frame))))
+            }
+            // TODO(download): grant tickets for `GET /download/{ticket}`.
+            WorkerOp::BeginDownload { .. } => {
+                Err(OpRefusal::new("This worker cannot give downloads yet."))
             }
         }
     }

@@ -1017,7 +1017,12 @@ pub const WORKER_OPEN_PROJECT_REFUSAL: &str =
 /// Why a worker does not run `upload_files` for a window that sends it: the
 /// row is the window's own upload panel (W34), which asks with
 /// [`crate::web::protocol::worker_command::BEGIN_UPLOAD`] instead.
-pub const WORKER_UPLOAD_FILES_REFUSAL: &str = "Use the window's upload panel.";
+pub const WORKER_UPLOAD_FILES_REFUSAL: &str = "Use the window's Transfer Files panel.";
+
+/// Why a worker does not run `download_files` for a window that sends it: the
+/// row opens the window's Transfer Files panel on its Download tab, which
+/// asks with [`crate::web::protocol::worker_command::BEGIN_DOWNLOAD`] instead.
+pub const WORKER_DOWNLOAD_FILES_REFUSAL: &str = "Use the window's Transfer Files panel.";
 
 /// The wire name of a worker's **Upload Files…** palette row (v8, W34,
 /// `specs/WEB_INTERFACE.md` R30).
@@ -1031,20 +1036,36 @@ pub const WORKER_UPLOAD_FILES_REFUSAL: &str = "Use the window's upload panel.";
 /// with [`WORKER_UPLOAD_FILES_REFUSAL`].
 pub const UPLOAD_FILES: &str = "upload_files";
 
+/// The wire name of a worker's **Download Files…** palette row (v9, the
+/// Transfer Files panel's Download tab). Kept out of [`INVENTORY`] for the
+/// same reasons as [`UPLOAD_FILES`]; a frame naming it is refused with
+/// [`WORKER_DOWNLOAD_FILES_REFUSAL`].
+pub const DOWNLOAD_FILES: &str = "download_files";
+
 /// The rows only a **worker** lists, after [`INVENTORY`]'s (v8).
 ///
 /// Each is run locally by the worker's window, so each carries the refusal
 /// [`worker_refusal`] gives a frame that names it anyway — the same "the
 /// inventory says what the server answers" rule as the refused [`INVENTORY`]
 /// rows.
-pub static WORKER_ROWS: &[CommandSpec] = &[CommandSpec {
-    name: UPLOAD_FILES,
-    label: "Upload Files…",
-    group: "Projects",
-    host_only: false,
-    annotation: None,
-    route: Route::Rejected(WORKER_UPLOAD_FILES_REFUSAL),
-}];
+pub static WORKER_ROWS: &[CommandSpec] = &[
+    CommandSpec {
+        name: UPLOAD_FILES,
+        label: "Upload Files…",
+        group: "Projects",
+        host_only: false,
+        annotation: None,
+        route: Route::Rejected(WORKER_UPLOAD_FILES_REFUSAL),
+    },
+    CommandSpec {
+        name: DOWNLOAD_FILES,
+        label: "Download Files…",
+        group: "Projects",
+        host_only: false,
+        annotation: None,
+        route: Route::Rejected(WORKER_DOWNLOAD_FILES_REFUSAL),
+    },
+];
 
 /// The spec for one wire name on a host of `kind`: [`lookup`], and on a worker
 /// [`WORKER_ROWS`] too. A TUI or Desktop host never finds a worker row, so a
@@ -1074,6 +1095,7 @@ pub fn worker_refusal(name: &str) -> Option<&'static str> {
         names::UNPAIR_PHONE => Some(WORKER_UNPAIR_PHONE_REFUSAL),
         names::OPEN_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
         UPLOAD_FILES => Some(WORKER_UPLOAD_FILES_REFUSAL),
+        DOWNLOAD_FILES => Some(WORKER_DOWNLOAD_FILES_REFUSAL),
         _ => None,
     }
 }

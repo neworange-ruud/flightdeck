@@ -312,6 +312,7 @@ fn dir_listing() -> DirListing {
             is_git_repo: true,
             is_open_project: true,
         }],
+        files: Vec::new(),
         truncated: true,
     }
 }
@@ -2164,6 +2165,7 @@ fn every_worker_command_parses_into_its_op() {
             WorkerOp::BrowseDir {
                 path: Some("/home/u/code".into()),
                 show_hidden: true,
+                include_files: false,
             },
         ),
         (
@@ -2172,6 +2174,7 @@ fn every_worker_command_parses_into_its_op() {
             WorkerOp::BrowseDir {
                 path: None,
                 show_hidden: false,
+                include_files: false,
             },
         ),
         (worker_command::SCAN_PROJECTS, None, WorkerOp::ScanProjects),

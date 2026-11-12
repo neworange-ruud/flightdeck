@@ -1408,6 +1408,7 @@ fn a_background_link_is_never_sent_what_only_a_window_renders() {
             parent: None,
             home: "/home/ruud".to_string(),
             entries: Vec::new(),
+            files: Vec::new(),
             truncated: false,
         }),
     );
