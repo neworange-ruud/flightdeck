@@ -63,9 +63,11 @@ shows them as **N messages while you were away**.
   `flightdeck worker devices`. Revoke one with `flightdeck worker revoke <device>`,
   by id, by label (case-insensitive) or by a unique id prefix. Its live
   connections close at once, and it must pair again to reconnect.
-- **Uploads stay in the home folder.** [Uploading files](/worker#upload-files-to-the-worker)
-  writes only inside the worker account's home folder, never overwrites a file
-  without asking, and only the window that holds the worker can do it.
+- **Transfers stay in the home folder.** [Transferring files](/worker#transfer-files-to-and-from-the-worker)
+  reads and writes only inside the worker account's home folder, never
+  overwrites a file without asking, and only the window that holds the worker
+  can do it. Each file needs a single-use ticket the worker granted to that
+  window a moment earlier.
 - **Nothing leaves the WireGuard tunnel.** The browser page also gets HTTPS when
   your tailnet allows it (below), and the worker never handles your agent or git
   logins.

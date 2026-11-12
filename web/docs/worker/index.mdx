@@ -170,12 +170,17 @@ A few things are different on a worker:
   tile. Browsing never changes what another window sees. Split view isn't
   available in a worker's window.
 
-### Upload files to the worker
+### Transfer files to and from the worker
+
+**Transfer files…** in the worker's window, in the Desktop or a browser, opens
+a panel with two tabs: **Upload** puts files on the worker, **Download** brings
+them back. The command palette has **Upload Files…** and **Download Files…**,
+each opening its tab.
+
+#### Upload
 
 To put files on the worker (a dataset, a screenshot for an agent, a config file
-that isn't in Git), choose **Upload files…** in the worker's window, in the
-Desktop or a browser. You can also find it in the command palette, or drop files
-onto the window.
+that isn't in Git), open the **Upload** tab, or drop files onto the window.
 
 1. Pick one or more files. Drop more on the panel or use **Add files…** to add
    to the list.
@@ -193,6 +198,29 @@ the usual permissions for a new file, so a script you replace needs
 
 Uploads go into the worker account's home folder only, like browsing does.
 Folders can't be uploaded yet, only the files in them.
+
+#### Download
+
+To get files off the worker (a build artifact, a log, a report an agent wrote),
+open the **Download** tab.
+
+1. Browse to the folder. It starts at the worktree of the agent you're looking
+   at, or the project's folder. Open a folder to go into it; **Up** and
+   **Home** go back.
+2. Tick the files you want. You can pick several from the same folder.
+3. Choose **Download**.
+
+In the **Desktop**, the files are saved to the folder shown under **Save to**,
+your Downloads folder unless you choose another one. Each file shows its
+progress, and **Cancel** stops the rest. If a file with the same name is already
+there, you choose **Replace**, **Keep both** (`name (1).ext`) or **Cancel**.
+
+In a **browser**, each file goes to the browser's own downloads, one download
+per file. The first time, the browser may ask whether this page may download
+several files; allow it.
+
+Downloads come from the worker account's home folder only. Folders can't be
+downloaded yet, only the files in them.
 
 ## Use a terminal instead of the Desktop
 
