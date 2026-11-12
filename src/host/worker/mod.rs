@@ -1279,7 +1279,7 @@ impl<'a> AppHost<'a> {
                         refusal: Some(reason),
                     }))),
                 };
-                let planned = download::plan(fs, &w.confinement, &dir, &names).map_err(&refused)?;
+                let planned = download::plan(fs, &w.confinement, &dir, &names).map_err(refused)?;
                 let Some(handle) = self.web_surface.handle.as_ref() else {
                     return Err(refused(
                         "The worker is not listening, so it cannot give files right now."

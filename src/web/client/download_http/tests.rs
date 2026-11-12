@@ -2,7 +2,7 @@
 //! bytes land whole and atomically, a refusal's sentence is kept, and a short
 //! body, a refusal or a cancel never leaves a file — temporary or not.
 
-use std::io::{Read, Write as _};
+use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
