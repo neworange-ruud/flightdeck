@@ -9,17 +9,21 @@ import {
   workerName,
 } from "../state/upload";
 import type { Picked, UploadItem, UploadState } from "../state/upload";
-import type { AppState } from "../state/types";
+import type { AppState, TransferTab } from "../state/types";
+import { downloadAvailable } from "../state/worker";
 import { append, clear, el, hint } from "./dom";
 import type { Child, Region } from "./dom";
 import type { Store } from "./store";
+import { button, section } from "./transferParts";
+import { createDownloadView } from "./downloadView";
 
 /**
- * Upload files to a worker (`specs/WORKER_PRD.md` W34, `specs/WEB_INTERFACE.md`
- * R30, `remote-control-usem`).
+ * The Transfer files panel: upload files to a worker (`specs/WORKER_PRD.md`
+ * W34, `specs/WEB_INTERFACE.md` R30, `remote-control-usem`), and — at v9 —
+ * download files from it (`remote-control-pz6d`, `ui/downloadView.ts`).
  *
  * ```text
- * Upload files to the worker                                 Esc close
+ * Transfer files    [Upload] [Download]                      Esc close
  * note line (a refusal, a skipped folder — the worker's words verbatim)
  * FILES     name ............................. 1.2 MB   Remove
  *           Add files…                         2 files, 3.4 MB
@@ -31,6 +35,10 @@ import type { Store } from "./store";
  * both / Cancel; *uploading* is a `<progress>` per file and one for the whole,
  * with Cancel; *done* is a summary with every failure's reason, Close and
  * Upload more.
+ *
+ * The Download tab is shown only to a worker spoken to at v9; switching
+ * tabs waits while files are uploading (Cancel first). Which tab shows is
+ * `state.transferTab`, and the panel is open while `state.upload` is set.
  *
  * Everything it shows is `state.upload`, and every click is an action —
  * `main.ts` sends what they mean. Three things here are not state, because
@@ -135,19 +143,77 @@ export function createUploadPanel(store: Store): UploadPanelRegion {
   folder.setAttribute("data-section", "folder");
   const foot = el("div", { class: "fd-upload__foot" });
 
+  const tabButton = (tab: TransferTab, label: string): HTMLButtonElement => {
+    const node = el("button", {
+      class: "fd-transfer__tab",
+      text: label,
+      attrs: {
+        type: "button",
+        role: "tab",
+        id: `fd-transfer-tab-${tab}`,
+        "aria-controls": `fd-transfer-${tab}`,
+        "data-tab": tab,
+      },
+    });
+    node.addEventListener("click", () => store.dispatch({ type: "transfer/open", tab }));
+    return node;
+  };
+  const uploadTab = tabButton("upload", "Upload");
+  const downloadTab = tabButton("download", "Download");
+  const tabs = el(
+    "div",
+    { class: "fd-transfer__tabs", attrs: { role: "tablist", "aria-label": "Transfer" } },
+    [uploadTab, downloadTab],
+  );
+  /** ←→ walk the tabs, as a tablist's keyboard does. */
+  tabs.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+    const state = store.getState();
+    if (!downloadAvailable(state)) {
+      return;
+    }
+    event.preventDefault();
+    const tab: TransferTab = state.transferTab === "upload" ? "download" : "upload";
+    store.dispatch({ type: "transfer/open", tab });
+    (tab === "upload" ? uploadTab : downloadTab).focus();
+  });
+
+  const uploadView = el(
+    "div",
+    {
+      class: "fd-transfer__view",
+      attrs: { id: "fd-transfer-upload", role: "tabpanel", "aria-labelledby": "fd-transfer-tab-upload" },
+    },
+    [noteEl, body, folder, foot],
+  );
+  const download = createDownloadView(store);
+  const downloadView = el(
+    "div",
+    {
+      class: "fd-transfer__view",
+      attrs: {
+        id: "fd-transfer-download",
+        role: "tabpanel",
+        "aria-labelledby": "fd-transfer-tab-download",
+      },
+    },
+    [download.el],
+  );
+
   const panel = el("div", { class: "fd-picker__panel fd-upload__panel" }, [
     el("div", { class: "fd-picker__head" }, [
       el("span", {
         class: "fd-picker__title",
-        text: "Upload files to the worker",
+        text: "Transfer files",
         attrs: { id: "fd-upload-title" },
       }),
+      tabs,
       closeEl,
     ]),
-    noteEl,
-    body,
-    folder,
-    foot,
+    uploadView,
+    downloadView,
   ]);
 
   const layer = el(
@@ -171,6 +237,7 @@ export function createUploadPanel(store: Store): UploadPanelRegion {
   dropzone.hidden = true;
 
   let wasOpen = false;
+  let shownTab: TransferTab | null = null;
 
   function render(state: AppState): void {
     const upload = state.upload;
@@ -182,12 +249,48 @@ export function createUploadPanel(store: Store): UploadPanelRegion {
     layer.hidden = upload === null || state.picker !== null;
     if (upload === null) {
       wasOpen = false;
+      shownTab = null;
       return;
+    }
+    /** The tab on screen: Download only where this window can download. */
+    const canDownload = downloadAvailable(state) && state.download !== null;
+    const tab: TransferTab = state.transferTab === "download" && canDownload ? "download" : "upload";
+    const uploading = isUploading(upload);
+    layer.setAttribute("data-tab", tab);
+    tabs.hidden = !downloadAvailable(state);
+    for (const [node, name] of [
+      [uploadTab, "upload"],
+      [downloadTab, "download"],
+    ] as const) {
+      const on = name === tab;
+      node.setAttribute("aria-selected", String(on));
+      node.tabIndex = on ? 0 : -1;
+      node.disabled = uploading && !on;
+    }
+    uploadView.hidden = tab !== "upload";
+    downloadView.hidden = tab !== "download";
+    if (tab === "download") {
+      download.update(state);
+    }
+    const switched = shownTab !== null && shownTab !== tab;
+    shownTab = tab;
+    if (switched && !layer.hidden) {
+      queueMicrotask(() => {
+        if (layer.isConnected && !layer.hidden) {
+          if (tab === "download") {
+            download.focus();
+          } else {
+            layer
+              .querySelector<HTMLElement>('#fd-transfer-upload [data-primary="true"]:not([disabled])')
+              ?.focus();
+          }
+        }
+      });
     }
     layer.setAttribute("data-phase", upload.phase.kind);
     noteEl.textContent = upload.note ?? "";
     noteEl.hidden = upload.note === null;
-    closeEl.hidden = isUploading(upload);
+    closeEl.hidden = uploading;
 
     clear(body);
     clear(foot);
@@ -212,12 +315,17 @@ export function createUploadPanel(store: Store): UploadPanelRegion {
       /** Focus lands on the panel's main button when it opens, so `Enter`
        * uploads and `Tab` walks the list — but only then. */
       queueMicrotask(() => {
-        if (layer.isConnected && !layer.hidden) {
-          (
-            layer.querySelector<HTMLElement>('[data-primary="true"]:not([disabled])') ??
-            layer.querySelector<HTMLElement>("button:not([disabled])")
-          )?.focus();
+        if (!layer.isConnected || layer.hidden) {
+          return;
         }
+        if (tab === "download") {
+          download.focus();
+          return;
+        }
+        (
+          uploadView.querySelector<HTMLElement>('[data-primary="true"]:not([disabled])') ??
+          uploadView.querySelector<HTMLElement>("button:not([disabled])")
+        )?.focus();
       });
     }
   }
@@ -635,36 +743,4 @@ function filesLine(count: number, bytes: number): string {
     return "";
   }
   return `${count === 1 ? "1 file" : `${count} files`}, ${humanSize(bytes)}`;
-}
-
-function section(title: string, children: Child[]): HTMLElement {
-  return el("section", { class: "fd-picker__section" }, [
-    el("div", { class: "fd-picker__section-head" }, [
-      el("span", { class: "fd-picker__section-title", text: title }),
-    ]),
-    ...children,
-  ]);
-}
-
-function button(
-  label: string,
-  action: string,
-  onClick: () => void,
-  disabled = false,
-  primary = false,
-): HTMLButtonElement {
-  const attrs: Record<string, string> = { type: "button", "data-action": action };
-  if (disabled) {
-    attrs.disabled = "";
-  }
-  if (primary) {
-    attrs["data-primary"] = "true";
-  }
-  const node = el("button", {
-    class: primary ? "fd-picker__button" : "fd-picker__button fd-upload__secondary",
-    text: label,
-    attrs,
-  });
-  node.addEventListener("click", onClick);
-  return node;
 }

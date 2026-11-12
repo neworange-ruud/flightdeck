@@ -38,19 +38,7 @@ import type { Store } from "./store";
  * Open Project, because on a worker the picker runs in this window rather than
  * on a host screen nobody is looking at.
  */
-export interface ProjectTabsOptions {
-  /**
-   * A worker's "Upload files" (v8, R30): open the browser's file chooser.
-   * A call rather than an action, because a file chooser only opens inside
-   * the click that asked for it (`ui/uploadPanel.ts`).
-   */
-  readonly onUploadFiles?: () => void;
-}
-
-export function createProjectTabs(
-  store: Store,
-  options: ProjectTabsOptions = {},
-): Region {
+export function createProjectTabs(store: Store): Region {
   const row = el("div", {
     class: "fd-projects",
     attrs: { role: "tablist", "aria-label": "Projects" },
@@ -80,10 +68,11 @@ export function createProjectTabs(
     });
 
     children.push(el("div", { class: "fd-spacer" }));
-    /** Upload files sits beside Open Project, and only where this window
-     * can upload: a worker at v8 or later. */
-    if (uploadAvailable(state) && options.onUploadFiles !== undefined) {
-      children.push(uploadFilesAction(options.onUploadFiles));
+    /** Transfer files sits beside Open Project, and only where this window
+     * can transfer: a worker at v8 or later (Download needs v9; the panel
+     * shows that tab only then). */
+    if (uploadAvailable(state)) {
+      children.push(transferFilesAction(store));
     }
     children.push(worker ? openProjectAction(store) : newProjectAction());
     for (const child of children) {
@@ -279,18 +268,20 @@ function openProjectAction(store: Store): HTMLElement {
   return button;
 }
 
-/** A worker's Upload files (v8, W34): the file chooser, then the panel. */
-function uploadFilesAction(onUploadFiles: () => void): HTMLElement {
+/** A worker's Transfer files (v8, v9): the panel, on the tab last used. */
+function transferFilesAction(store: Store): HTMLElement {
   const button = el(
     "button",
     {
-      class: "fd-action fd-action--upload",
-      title: "upload files from this computer into a folder on the worker",
-      attrs: { type: "button", "data-action": "upload-files" },
+      class: "fd-action fd-action--transfer",
+      title: "upload files to the worker, or download files from it",
+      attrs: { type: "button", "data-action": "transfer-files" },
     },
-    [el("span", { text: "Upload files" })],
+    [el("span", { text: "Transfer files" })],
   );
-  button.addEventListener("click", onUploadFiles);
+  button.addEventListener("click", () => {
+    store.dispatch({ type: "transfer/open", tab: null });
+  });
   return button;
 }
 

@@ -36,7 +36,12 @@ import { createTerminalTabs } from "./terminalTabs";
 import { createProjectPicker } from "./projectPicker";
 import { createTakenOver } from "./takenOver";
 import { createWorkerCard } from "./workerCard";
-import { OPEN_PROJECT_COMMAND, UPLOAD_FILES_COMMAND, workerCard } from "../state/worker";
+import {
+  DOWNLOAD_FILES_COMMAND,
+  OPEN_PROJECT_COMMAND,
+  UPLOAD_FILES_COMMAND,
+  workerCard,
+} from "../state/worker";
 import { createUploadPanel, installDropTarget } from "./uploadPanel";
 import { el } from "./dom";
 import type { Region } from "./dom";
@@ -164,13 +169,10 @@ export function createApp(options: AppOptions): App {
   );
 
   const logo = createLogoBand();
-  /** Upload files to a worker (v8, R30): the panel, its hidden file input
-   * and the drop overlay. Built first, because the tab bar's button and the
-   * palette row both open its file chooser. */
+  /** The Transfer files panel (v8 upload, v9 download): the panel, its
+   * hidden file input and the drop overlay. */
   const upload = createUploadPanel(store);
-  const projects = createProjectTabs(store, {
-    onUploadFiles: () => upload.chooseFiles(),
-  });
+  const projects = createProjectTabs(store);
   const sidebar = createSidebar(store);
   const tabs = createTerminalTabs(store);
   const pane = createTerminalPane(options.mount);
@@ -380,12 +382,17 @@ export function createApp(options: AppOptions): App {
       frame.setAttribute("data-worker-card", workerCard(state) ?? "none");
       frame.setAttribute("data-picker", String(state.picker !== null));
       frame.setAttribute("data-upload", state.upload?.phase.kind ?? "none");
+      frame.setAttribute(
+        "data-download",
+        state.upload === null ? "none" : (state.download?.phase.kind ?? "none"),
+      );
     } else {
       frame.removeAttribute("data-host");
       frame.removeAttribute("data-worker-shell");
       frame.removeAttribute("data-worker-card");
       frame.removeAttribute("data-picker");
       frame.removeAttribute("data-upload");
+      frame.removeAttribute("data-download");
     }
 
     /** The worker shell's tab is one terminal, full width: split view is the
@@ -534,10 +541,11 @@ export function createApp(options: AppOptions): App {
       return;
     }
     /**
-     * The upload panel (v8, R30), under the picker its Choose… opens. Like
-     * the picker it owns every key — its buttons and folder field take them
-     * natively, and none may reach a shortcut here. `Esc` closes it, except
-     * while files are going out: that is what Cancel is for.
+     * The Transfer files panel (v8, v9), under the picker its Choose…
+     * opens. Like the picker it owns every key — its buttons, its folder
+     * field and the Download tab's list take them natively, and none may
+     * reach a shortcut here. `Esc` closes it, except while files are going
+     * out: that is what Cancel is for.
      */
     if (state.upload !== null) {
       if (event.key === "Escape") {
@@ -921,14 +929,17 @@ export function createApp(options: AppOptions): App {
       return;
     }
     /**
-     * Upload Files… (v8, R30) is this window's file chooser, the same one
-     * the tab bar's button opens. The worker lists the row only to say it
-     * exists, and refuses it as a frame. Opened here, inside the key press
-     * or click that ran the row, because a chooser opens only from one.
+     * Upload Files… (v8, R30) and Download Files… (v9) are this window's
+     * Transfer files panel, on that tab — the same panel the tab bar's
+     * button opens. The worker lists the rows only to say they exist, and
+     * refuses them as frames.
      */
     if (command.run.name === UPLOAD_FILES_COMMAND) {
-      store.dispatch({ type: "palette/close" });
-      upload.chooseFiles();
+      store.dispatch({ type: "transfer/open", tab: "upload" });
+      return;
+    }
+    if (command.run.name === DOWNLOAD_FILES_COMMAND) {
+      store.dispatch({ type: "transfer/open", tab: "download" });
       return;
     }
     options.onRunCommand?.(command);
