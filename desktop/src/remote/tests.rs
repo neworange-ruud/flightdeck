@@ -2450,3 +2450,6 @@ mod mission {
 
 /// Uploading files to a worker (W34, protocol v8).
 mod upload;
+
+/// Downloading files from a worker (protocol v9).
+mod download;

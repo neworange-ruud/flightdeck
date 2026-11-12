@@ -1,9 +1,12 @@
-//! A worker's upload panel (`specs/WORKER_PRD.md` W34, protocol v8): files
-//! from this machine into one folder on the worker.
+//! A worker's Transfer Files panel: its **Upload** tab (`specs/WORKER_PRD.md`
+//! W34, protocol v8) sends files from this machine into one folder on the
+//! worker; its **Download** tab (protocol v9, [`super::download`]) fetches
+//! files from a folder on the worker into a folder here. A worker below v9
+//! has no Download tab, and the panel is the upload panel it always was.
 //!
 //! ```text
 //! +-------------------------------------------------------------+
-//! | Upload files to <worker>                                    |
+//! | Transfer files · <worker>          [ Upload | Download ]    |
 //! | FILES  3 · 1.2 MB                                           |
 //! |   notes.md ............................ 4.0 KB   ×          |
 //! |   (or: drop files here)                                     |
@@ -19,18 +22,20 @@
 //! (**Replace** / **Keep both** / **Cancel**), each file's progress and the
 //! total (**Cancel**), and how it ended (**Upload more** / **Close**).
 //!
-//! The state is the core's reducer, held by the [`RemoteModel`]'s session,
-//! which asks the worker and runs the transfers; this view only draws it and
-//! turns clicks and keys into the model's upload calls. Choose… is the
-//! project picker in its choose-a-folder mode ([`super::projects`]); the
-//! panel is hidden while it is up and comes back with the folder set.
+//! The state is the core's reducers, held by the [`RemoteModel`]'s session,
+//! which asks the worker and runs the transfers; this view only draws them
+//! and turns clicks and keys into the model's transfer calls. Upload's
+//! Choose… is the project picker in its choose-a-folder mode
+//! ([`super::projects`]); the panel is hidden while it is up and comes back
+//! with the folder set.
 //!
-//! Keys, while the panel has the keyboard (not its folder field): Enter
-//! uploads, Esc closes; ↑/↓ and Delete edit the list; `a` adds files, `f`
-//! chooses the folder. Asked about taken names: `r` Replace, `k` or Enter
-//! Keep both, Esc Cancel. While uploading, Esc twice cancels — one stray
-//! press never cuts a long upload off. Done: Enter or Esc closes, `u`
-//! uploads more.
+//! Keys, while the panel has the keyboard (not a field): Tab (or Shift-Tab)
+//! switches tabs, except while a transfer is asked for or moving bytes.
+//! Upload: Enter uploads, Esc closes; ↑/↓ and Delete edit the list; `a` adds
+//! files, `f` chooses the folder. Asked about taken names: `r` Replace, `k`
+//! or Enter Keep both, Esc Cancel. While uploading, Esc twice cancels — one
+//! stray press never cuts a long upload off. Done: Enter or Esc closes, `u`
+//! uploads more. The Download tab's keys are in [`super::download`].
 
 use flightdeck::host::{ButtonRole, DialogButton};
 use flightdeck::web::client::upload::{ItemState, Resolution, UploadItem, UploadPhase};
@@ -45,7 +50,7 @@ use gpui::{
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 
-use super::RemoteModel;
+use super::{RemoteModel, TransferTab};
 use crate::fonts::MONO_FAMILY;
 use crate::theme::{Hex, Palette, SCRIM_ALPHA};
 use crate::views::icons;
@@ -53,24 +58,75 @@ use crate::views::icons;
 /// The card's width.
 const WIDTH: f32 = 560.;
 
-pub struct UploadPanelView {
-    remote: Entity<RemoteModel>,
-    focus: FocusHandle,
-    /// The target folder, editable.
+/// A tab's body, its footer and the note under the body.
+pub(super) type Parts = (Vec<gpui::AnyElement>, Div, Option<String>);
+
+/// The panel's key context.
+const KEY_CONTEXT: &str = "TransferPanel";
+
+/// Set once the panel's own key bindings are in.
+struct KeysBound;
+
+impl gpui::Global for KeysBound {}
+
+/// Tab and Shift-Tab switch the panel's tabs, but gpui-component's `Root`
+/// binds them for focus traversal, and a binding wins over the focused
+/// view's key handler. Disabled under the panel's (deeper) context, they
+/// reach [`TransferPanelView`]'s handler — the terminal's
+/// [`flightdeck_desktop::keys::TERMINAL_KEEPS`] fix. Bound once per app.
+fn bind_keys(cx: &mut gpui::App) {
+    if cx.has_global::<KeysBound>() {
+        return;
+    }
+    cx.bind_keys(
+        ["tab", "shift-tab"]
+            .into_iter()
+            .map(|key| gpui::KeyBinding::new(key, gpui::NoAction {}, Some(KEY_CONTEXT))),
+    );
+    cx.set_global(KeysBound);
+}
+
+pub struct TransferPanelView {
+    pub(super) remote: Entity<RemoteModel>,
+    pub(super) focus: FocusHandle,
+    /// The upload's target folder, editable.
     folder: Entity<InputState>,
     /// The folder the field was last set to from the panel, so a folder
     /// chosen elsewhere moves it and typing in it is not overwritten.
     shown_dir: Option<String>,
-    /// The file row the keyboard is on.
+    /// The upload file row the keyboard is on.
     selected: Option<usize>,
-    /// Esc was pressed once while uploading: the next one cancels.
-    cancel_armed: bool,
+    /// Esc was pressed once while moving bytes: the next one cancels.
+    pub(super) cancel_armed: bool,
+    /// The download's destination here, editable.
+    pub(super) dest: Entity<InputState>,
+    /// The destination the field was last set to from the panel.
+    pub(super) shown_dest: Option<String>,
+    /// The download row (folders, then files) the keyboard is on.
+    pub(super) cursor: Option<usize>,
 }
 
-impl UploadPanelView {
+impl TransferPanelView {
     pub fn new(remote: Entity<RemoteModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        bind_keys(cx);
         cx.observe(&remote, |_, _, cx| cx.notify()).detach();
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("~/folder"));
+        let dest = cx.new(|cx| InputState::new(window, cx).placeholder("~/Downloads"));
+        cx.subscribe_in(
+            &dest,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let typed = input.read(cx).value().to_string();
+                    this.shown_dest = Some(typed.clone());
+                    this.remote
+                        .update(cx, |model, _| model.set_download_dest(&typed));
+                }
+                InputEvent::PressEnter { .. } => window.focus(&this.focus, cx),
+                _ => {}
+            },
+        )
+        .detach();
         cx.subscribe_in(
             &folder,
             window,
@@ -97,6 +153,9 @@ impl UploadPanelView {
             shown_dir: None,
             selected: None,
             cancel_armed: false,
+            dest,
+            shown_dest: None,
+            cursor: None,
         }
     }
 
@@ -126,7 +185,7 @@ impl UploadPanelView {
         }
     }
 
-    fn model(
+    pub(super) fn model(
         &self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut RemoteModel, &mut Context<RemoteModel>),
@@ -146,10 +205,26 @@ impl UploadPanelView {
         if m.control || m.alt || m.platform || m.function {
             return;
         }
+        let key = event.keystroke.key.as_str();
+        let tab = self.remote.read(cx).transfer_tab();
+        if key == "tab" {
+            let other = match tab {
+                Some(TransferTab::Upload) => TransferTab::Download,
+                _ => TransferTab::Upload,
+            };
+            self.switch_tab(other, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if tab == Some(TransferTab::Download) {
+            if self.download_key(key, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
         let Some(panel) = self.remote.read(cx).upload().cloned() else {
             return;
         };
-        let key = event.keystroke.key.as_str();
         let handled = match &panel.phase {
             UploadPhase::Choosing => self.choosing_key(key, &panel, cx),
             UploadPhase::Requested { .. } => match key {
@@ -237,9 +312,21 @@ impl UploadPanelView {
         self.selected = None;
         self.model(cx, |m, _| m.upload_more());
     }
+
+    /// Switch to `tab`, unless a transfer is asked for or moving bytes (or
+    /// the worker gives no downloads).
+    pub(super) fn switch_tab(&mut self, tab: TransferTab, cx: &mut Context<Self>) {
+        let switched = self
+            .remote
+            .update(cx, |model, _| model.set_transfer_tab(tab));
+        if switched {
+            self.cancel_armed = false;
+            cx.notify();
+        }
+    }
 }
 
-impl Focusable for UploadPanelView {
+impl Focusable for TransferPanelView {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
     }
@@ -265,7 +352,7 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// "1 file" / "3 files".
-fn files_word(n: usize) -> String {
+pub(super) fn files_word(n: usize) -> String {
     if n == 1 {
         "1 file".to_string()
     } else {
@@ -274,7 +361,7 @@ fn files_word(n: usize) -> String {
 }
 
 /// How far an item is, `0.0..=1.0`. An empty file is done when written.
-fn fraction(sent: u64, total: u64) -> f32 {
+pub(super) fn fraction(sent: u64, total: u64) -> f32 {
     if total == 0 {
         return 0.0;
     }
@@ -293,7 +380,7 @@ pub fn item_status(item: &UploadItem) -> String {
 
 /// A panel button in the dialogs' family: `role` styles it, `default` makes
 /// it the solid one, and `keycap` is drawn beside the label.
-fn panel_button(
+pub(super) fn panel_button(
     p: &Palette,
     id: &str,
     label: &str,
@@ -312,7 +399,7 @@ fn panel_button(
 }
 
 /// A muted, upper-case section heading with an optional detail after it.
-fn section(p: &Palette, title: &str, detail: Option<String>) -> Div {
+pub(super) fn section(p: &Palette, title: &str, detail: Option<String>) -> Div {
     h_flex()
         .gap_2()
         .text_size(px(11.))
@@ -326,7 +413,7 @@ fn section(p: &Palette, title: &str, detail: Option<String>) -> Div {
 }
 
 /// A thin progress bar, `fraction` full, in `colour`.
-fn bar(p: &Palette, fraction: f32, colour: Hex) -> Div {
+pub(super) fn bar(p: &Palette, fraction: f32, colour: Hex) -> Div {
     div()
         .h(px(4.))
         .w_full()
@@ -341,7 +428,7 @@ fn bar(p: &Palette, fraction: f32, colour: Hex) -> Div {
         )
 }
 
-fn mono(p: &Palette, text: String) -> Div {
+pub(super) fn mono(p: &Palette, text: String) -> Div {
     div()
         .font_family(MONO_FAMILY)
         .text_size(px(11.5))
@@ -349,7 +436,51 @@ fn mono(p: &Palette, text: String) -> Div {
         .child(text)
 }
 
-impl UploadPanelView {
+/// The tab strip: Upload and Download, the one on screen raised; both dim
+/// and inert while a transfer is under way.
+fn tab_strip(
+    p: &Palette,
+    tab: TransferTab,
+    busy: bool,
+    cx: &mut Context<TransferPanelView>,
+) -> impl IntoElement {
+    let pill = |id: &'static str, label: &'static str, this: TransferTab| {
+        let active = this == tab;
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .px(px(10.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if active { p.ink } else { p.muted }.hsla())
+            .when(active, |pill| pill.bg(p.surface_raised.hsla()))
+            .when(!active && !busy, |pill| {
+                pill.cursor_pointer()
+                    .hover(|s| s.bg(p.surface_raised_nested.hsla()))
+            })
+            .when(busy && !active, |pill| pill.opacity(0.5))
+            .child(label)
+            .on_click(cx.listener(move |view, _, _, cx| view.switch_tab(this, cx)))
+    };
+    h_flex()
+        .debug_selector(|| "transfer-tabs".into())
+        .flex_none()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(p.border.hsla())
+        .child(pill("transfer-tab-upload", "Upload", TransferTab::Upload))
+        .child(pill(
+            "transfer-tab-download",
+            "Download",
+            TransferTab::Download,
+        ))
+}
+
+impl TransferPanelView {
     fn choosing_body(
         &self,
         panel: &UploadPanel,
@@ -683,25 +814,26 @@ impl UploadPanelView {
             ));
         (summary, footer)
     }
-}
 
-impl Render for UploadPanelView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *Palette::global(cx);
-        let Some(panel) = self.remote.read(cx).upload().cloned() else {
-            return div().id("upload-closed");
-        };
+    /// The Upload tab's parts.
+    fn upload_parts(
+        &mut self,
+        panel: &UploadPanel,
+        label: &str,
+        p: &Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Parts {
+        let p = *p;
         if !panel.is_uploading() {
             self.cancel_armed = false;
         }
         if self.selected.is_some_and(|i| i >= panel.files.len()) {
             self.selected = None;
         }
-        self.follow_dir(&panel, window, cx);
-        let label = self.remote.read(cx).label().to_string();
-
+        self.follow_dir(panel, window, cx);
         let (body, footer) = match &panel.phase {
-            UploadPhase::Choosing => self.choosing_body(&panel, &p, cx),
+            UploadPhase::Choosing => self.choosing_body(panel, &p, cx),
             UploadPhase::Requested { .. } => {
                 let body = vec![div()
                     .debug_selector(|| "upload-asking-worker".into())
@@ -725,7 +857,7 @@ impl Render for UploadPanelView {
             }
             UploadPhase::Asking { dir, conflicts } => self.asking_body(dir, conflicts, &p, cx),
             UploadPhase::Uploading { dir, items, .. } => {
-                self.uploading_body(dir, items, &panel, &p, cx)
+                self.uploading_body(dir, items, panel, &p, cx)
             }
             UploadPhase::Done {
                 dir,
@@ -761,20 +893,65 @@ impl Render for UploadPanelView {
                 self.ended_body(summary, &p, cx)
             }
         };
+        (body, footer, panel.note.clone())
+    }
+}
 
-        let note = panel.note.clone().map(|note| {
+impl Render for TransferPanelView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = *Palette::global(cx);
+        let model = self.remote.read(cx);
+        let Some(tab) = model.transfer_tab() else {
+            return div().id("transfer-closed");
+        };
+        let label = model.label().to_string();
+        let tabs = model.supports_download();
+        let busy = model.transfer_busy();
+        let upload = model.upload().cloned();
+        let download = model.download().cloned();
+        let parts = match (tab, upload, download) {
+            (TransferTab::Upload, Some(panel), _) => {
+                Some(self.upload_parts(&panel, &label, &p, window, cx))
+            }
+            (TransferTab::Download, _, Some(panel)) => {
+                Some(self.download_parts(&panel, &label, &p, window, cx))
+            }
+            _ => None,
+        };
+        let Some((body, footer, note)) = parts else {
+            return div().id("transfer-closed");
+        };
+        let (note_id, title) = match (tab, tabs) {
+            (TransferTab::Download, _) => ("download-note", format!("Transfer files · {label}")),
+            (TransferTab::Upload, true) => ("upload-note", format!("Transfer files · {label}")),
+            (TransferTab::Upload, false) => ("upload-note", format!("Upload files to {label}")),
+        };
+        let note = note.map(|note| {
             div()
-                .debug_selector(|| "upload-note".into())
+                .debug_selector(move || note_id.into())
                 .text_size(px(12.))
                 .text_color(p.status_attention.hsla())
                 .child(note)
         });
+        let heading = h_flex()
+            .w_full()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .when(tabs, |row| row.child(tab_strip(&p, tab, busy, cx)));
 
         let mut scrim = p.scrim.hsla();
         scrim.a = SCRIM_ALPHA;
         div()
-            .id("upload-panel")
-            .debug_selector(|| "upload-panel".into())
+            .id("transfer-panel")
+            .debug_selector(|| "transfer-panel".into())
             .absolute()
             .top_0()
             .left_0()
@@ -786,8 +963,8 @@ impl Render for UploadPanelView {
             .justify_center()
             .child(
                 dialog_card(&p, WIDTH)
-                    .id("upload-card")
-                    .key_context("UploadPanel")
+                    .id("transfer-card")
+                    .key_context(KEY_CONTEXT)
                     .track_focus(&self.focus)
                     .on_key_down(cx.listener(Self::on_key))
                     // Esc in the folder field hands the keyboard back.
@@ -799,12 +976,7 @@ impl Render for UploadPanelView {
                         v_flex()
                             .gap_2()
                             .p(px(16.))
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("Upload files to {label}")),
-                            )
+                            .child(heading)
                             .children(body)
                             .children(note),
                     )
