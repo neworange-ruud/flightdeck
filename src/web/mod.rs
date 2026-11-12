@@ -26,6 +26,7 @@
 //! | [`client`] | R1–R7 | a native client: FlightDeck Desktop controlling another instance |
 //! | [`cert`] | §33 | reading a PEM certificate's expiry (every platform) |
 //! | [`upload`] | v8 | a worker's upload grants: one ticket per file, single use |
+//! | [`download`] | v9 | a worker's download grants: one ticket per file, single use |
 //! | `tls` | §33 | HTTPS beside plain HTTP on one port (worker; unix only) |
 
 pub mod access;
@@ -36,6 +37,7 @@ pub mod cert;
 pub mod client;
 pub mod commands;
 pub mod credentials;
+pub mod download;
 pub mod interfaces;
 pub mod protocol;
 pub mod replay;

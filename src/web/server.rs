@@ -111,6 +111,8 @@ use crate::web::credentials::{
     AccessScreen, AuthFailure, CredentialStore, TokenId, BOOTSTRAP_CODE_TTL_MS,
     RATE_LIMIT_LOCKOUT_MS,
 };
+use crate::web::download::DownloadGrants;
+pub use crate::web::download::{DownloadGrantRequest, DOWNLOAD_GRANT_TTL_MS, DOWNLOAD_PATH};
 use crate::web::protocol::{
     check_version, negotiated, Ack, AckOutcome, ActivityEvent, Attach, ClientMsg, ConnectionKind,
     ConnectionsView, Delta, DialogView, ErrorCode, Geometry, Health, HostKind, HostMessage,
@@ -938,6 +940,28 @@ impl WebServerHandle {
         tickets
     }
 
+    /// Grant one download per file for the window that authenticated with
+    /// `token` (v9): what a worker does when it accepts a
+    /// [`crate::web::protocol::worker_command::BEGIN_DOWNLOAD`]. `home` and
+    /// every file's path are canonical, each file inside `home`; the path is
+    /// resolved again when the file is fetched. Returns one ticket per file,
+    /// in order, for `GET /download/{ticket}`.
+    ///
+    /// Each grant is single use, bound to `token`, and gone after
+    /// [`DOWNLOAD_GRANT_TTL_MS`] unused.
+    pub fn grant_downloads(
+        &self,
+        token: &TokenId,
+        home: &std::path::Path,
+        files: &[DownloadGrantRequest],
+    ) -> Vec<String> {
+        let now = self.shared.now_ms();
+        self.shared
+            .downloads
+            .unwrap_or_recover()
+            .grant(token, home, files, now)
+    }
+
     /// Drop the upload grants nobody redeemed in time, telling the host about
     /// each ([`WebInbound::UploadFinished`]). Cheap; a worker calls it every
     /// tick so a batch whose last files were never sent still ends.
@@ -1202,6 +1226,7 @@ pub fn start_with(
         tls,
         https_host: Mutex::new(None),
         uploads: Mutex::new(UploadGrants::default()),
+        downloads: Mutex::new(DownloadGrants::default()),
     });
 
     // Rendezvous: the task reports the bind result, then serves. Blocking the
@@ -1678,14 +1703,22 @@ fn router(shared: Arc<Shared>) -> Router {
         .route(WS_PATH, get(ws_route))
         .route(AUTH_EXCHANGE_PATH, post(exchange_route))
         .route(AUTH_SESSION_PATH, get(session_route));
-    // Only a worker takes files (v8), and only where it runs (W2).
+    // Only a worker takes files (v8) and gives them (v9), and only where it
+    // runs (W2). The download route takes every method and answers all but
+    // `GET` with 405 itself: axum would otherwise run a `get` route for
+    // `HEAD` too.
     #[cfg(unix)]
     let routes = if shared.is_worker() {
-        routes.route(
-            upload_route::UPLOAD_ROUTE,
-            axum::routing::put(upload_route::upload_route)
-                .layer(axum::extract::DefaultBodyLimit::disable()),
-        )
+        routes
+            .route(
+                upload_route::UPLOAD_ROUTE,
+                axum::routing::put(upload_route::upload_route)
+                    .layer(axum::extract::DefaultBodyLimit::disable()),
+            )
+            .route(
+                download_route::DOWNLOAD_ROUTE,
+                axum::routing::any(download_route::download_route),
+            )
     } else {
         routes
     };
@@ -1752,6 +1785,10 @@ struct Shared {
     /// Upload tickets the worker granted and nobody has redeemed yet (v8,
     /// [`WebServerHandle::grant_uploads`]). Always empty on a TUI or Desktop.
     uploads: Mutex<UploadGrants>,
+    /// Download tickets the worker granted and nobody has redeemed yet (v9,
+    /// [`WebServerHandle::grant_downloads`]). Always empty on a TUI or
+    /// Desktop.
+    downloads: Mutex<DownloadGrants>,
 }
 
 impl Shared {
@@ -2806,6 +2843,12 @@ async fn asset_route(
     if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
         return method_not_allowed();
     }
+    // Nor is a download a page: `GET /download/…` on a host that gives no
+    // files (a TUI, a Desktop) is not found, never the SPA with a 200 that a
+    // client would save as the file.
+    if is_protocol_path(uri.path(), DOWNLOAD_PATH) {
+        return not_found();
+    }
     // Deliberately unauthenticated. The SPA's own shell has to load before it
     // can show the code-entry screen at all, and it contains nothing secret —
     // every fact the app renders arrives over the authenticated WebSocket.
@@ -2820,10 +2863,11 @@ async fn asset_route(
 /// plus the path and query, when this server has a certificate and knows
 /// the name it is for ([`WebServerHandle::set_https_host`]).
 ///
-/// Only `GET`/`HEAD` of the SPA and its assets. `/ws`, `/auth/*` and
-/// `/upload/*` are never redirected: FlightDeck Desktop dials them over plain
-/// `ws://`/`http://` on purpose, and a redirect would break it (an upload is a
-/// `PUT`, which is never redirected anyway — the exclusion says so twice). The name is the server's own,
+/// Only `GET`/`HEAD` of the SPA and its assets. `/ws`, `/auth/*`,
+/// `/upload/*` and `/download/*` are never redirected: FlightDeck Desktop
+/// dials them over plain `ws://`/`http://` on purpose, and a redirect would
+/// break it (an upload is a `PUT`, which is never redirected anyway — the
+/// exclusion says so twice). The name is the server's own,
 /// never the request's `Host` header, so this cannot be turned into an open
 /// redirect; the port is the one the request came in on, which is the one
 /// that also speaks TLS.
@@ -2838,10 +2882,9 @@ fn https_redirect(
     }
     let path = uri.path();
     if path == WS_PATH
-        || path == "/auth"
-        || path.starts_with("/auth/")
-        || path == "/upload"
-        || path.starts_with("/upload/")
+        || is_protocol_path(path, "/auth")
+        || is_protocol_path(path, UPLOAD_PATH)
+        || is_protocol_path(path, DOWNLOAD_PATH)
     {
         return None;
     }
@@ -2851,6 +2894,13 @@ fn https_redirect(
         "https://{host}:{}{path_and_query}",
         peer.local_port
     ))
+}
+
+/// Whether `path` is `prefix` or below it (`/upload`, `/upload/abc`, not
+/// `/uploads`).
+fn is_protocol_path(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// `308 Permanent Redirect` to `location`, never cached: the certificate can
@@ -4195,9 +4245,29 @@ async fn handle_worker_op(
                     "Uploading files needs a newer FlightDeck on this side: update it, then try again.",
                 ))
             }
+            // Likewise the download plan is a v9 frame.
+            (Ok(WorkerOp::BeginDownload { .. }), _) if version < DOWNLOAD_MIN_VERSION => {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Downloading files needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
             // Gone between the frame and here: nobody to answer.
             (Ok(_), None) => None,
             (Ok(op), Some(token)) => {
+                // Files are listed for a v9 peer only (DOWNLOAD_MIN_VERSION).
+                let op = match op {
+                    WorkerOp::BrowseDir {
+                        path,
+                        show_hidden,
+                        include_files,
+                    } => WorkerOp::BrowseDir {
+                        path,
+                        show_hidden,
+                        include_files: include_files && version >= DOWNLOAD_MIN_VERSION,
+                    },
+                    other => other,
+                };
                 shared.notify(WebInbound::WorkerOp {
                     viewer_id: viewer_id.clone(),
                     token,
@@ -4232,6 +4302,10 @@ fn applied(seq: u64) -> ServerMsg {
 // the very `authenticate` every other route uses. Unix only, like the worker.
 #[cfg(unix)]
 mod upload_route;
+
+// `GET /download/{ticket}` (v9): the same, for reading a file.
+#[cfg(unix)]
+mod download_route;
 
 #[cfg(test)]
 mod tests;

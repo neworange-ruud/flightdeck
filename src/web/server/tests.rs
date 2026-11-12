@@ -857,6 +857,7 @@ fn test_shared_for(host_kind: HostKind) -> Arc<Shared> {
             .flatten(),
         https_host: Mutex::new(None),
         uploads: Mutex::new(crate::web::upload::UploadGrants::default()),
+        downloads: Mutex::new(crate::web::download::DownloadGrants::default()),
     })
 }
 

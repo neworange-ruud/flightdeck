@@ -52,15 +52,20 @@ const TEMP_MARKER: &str = ".fdupload-";
 /// still fits a 255-byte file name.
 const TEMP_NAME_PREFIX_MAX: usize = 200;
 
-/// Why a request was refused or failed.
-struct Failure {
+/// Why a request was refused or failed. The download route answers in the
+/// same shape (`download_route.rs`).
+pub(super) struct Failure {
     status: StatusCode,
     reason: &'static str,
     message: String,
 }
 
 impl Failure {
-    fn new(status: StatusCode, reason: &'static str, message: impl Into<String>) -> Self {
+    pub(super) fn new(
+        status: StatusCode,
+        reason: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Failure {
             status,
             reason,
@@ -68,7 +73,12 @@ impl Failure {
         }
     }
 
-    fn response(&self) -> Response {
+    /// The stable code, for a log line.
+    pub(super) fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub(super) fn response(&self) -> Response {
         json_response(
             self.status,
             serde_json::json!({
