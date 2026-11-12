@@ -24,6 +24,15 @@ import {
 import type { Resolution, UploadRequest } from "./state/upload";
 import { putUpload, type UploadTransfer } from "./wire/upload";
 import {
+  beginDownloadCommand,
+  downloadBrowseCommand,
+  downloadBrowseTarget,
+  downloadRequest,
+  nextDownloadHandoff,
+} from "./state/download";
+import type { DownloadIntent } from "./state/download";
+import { startDownloads } from "./wire/download";
+import {
   cellsFor,
   onScreenTerminalId,
   WORKER_COMMAND,
@@ -185,6 +194,23 @@ const app = createApp({
         return;
       case "upload/cancel":
         abortTransfer();
+        return;
+      /** The Transfer files panel's Download tab (v9): its listings and its
+       * `begin_download`. The tickets are handed to the browser by
+       * `pumpDownloads`, below. */
+      case "transfer/open":
+        listDownloadFolder();
+        return;
+      case "download/intent":
+        runDownloadIntent(action.intent);
+        return;
+      case "download/startOver":
+        /** The same folder again, freshly listed: what was just downloaded
+         * may have changed since. */
+        runDownloadIntent({ kind: "open" });
+        return;
+      case "download/submit":
+        submitDownload();
         return;
       default:
         return;
@@ -675,6 +701,99 @@ function pumpUploads(): void {
   });
 }
 app.store.subscribe(pumpUploads);
+
+// ---------------------------------------------------------------------------
+// Downloading files from a worker (v9)
+// ---------------------------------------------------------------------------
+
+/** The Download tab is showing with nothing listed and nothing asked: list
+ * its starting folder. */
+function listDownloadFolder(): void {
+  const state = app.store.getState();
+  const download = state.download;
+  if (
+    state.upload === null ||
+    state.transferTab !== "download" ||
+    download === null ||
+    download.cwd !== null ||
+    download.browse !== null
+  ) {
+    return;
+  }
+  runDownloadIntent({ kind: "open" });
+}
+
+/** One Download-tab intent → the `browse_dir` it means, sent, and its seq
+ * handed back so the tab can tell its listing from the picker's. */
+function runDownloadIntent(intent: DownloadIntent): void {
+  const download = app.store.getState().download;
+  if (download === null) {
+    return;
+  }
+  const path = downloadBrowseTarget(download, intent);
+  if (path === undefined) {
+    return;
+  }
+  if (session === null || app.store.getState().connection !== "connected") {
+    app.store.dispatch({ type: "download/browsing", seq: null });
+    return;
+  }
+  const command = downloadBrowseCommand(download, path);
+  const seq = session.sendCommand(command.name, command.args);
+  app.store.dispatch({ type: "download/browsing", seq });
+}
+
+/** Download pressed: the folder and the ticked files, or why nothing. */
+function submitDownload(): void {
+  const download = app.store.getState().download;
+  if (download === null) {
+    return;
+  }
+  const request = downloadRequest(download);
+  if (request === null) {
+    return;
+  }
+  if ("note" in request) {
+    app.store.dispatch({ type: "download/note", note: request.note });
+    return;
+  }
+  if (session === null || app.store.getState().connection !== "connected") {
+    app.store.dispatch({ type: "download/requested", seq: null });
+    return;
+  }
+  const command = beginDownloadCommand(request);
+  const seq = session.sendCommand(command.name, command.args);
+  app.store.dispatch({ type: "download/requested", seq });
+}
+
+/**
+ * Hand granted files to the browser, once: marked handed off first, so the
+ * notification this dispatch causes cannot start them twice. Deferred to a
+ * microtask so it never dispatches from inside the store's own notification
+ * pass.
+ */
+let handoffScheduled = false;
+function pumpDownloads(): void {
+  if (handoffScheduled) {
+    return;
+  }
+  const download = app.store.getState().download;
+  if (download === null || nextDownloadHandoff(download) === null) {
+    return;
+  }
+  handoffScheduled = true;
+  queueMicrotask(() => {
+    handoffScheduled = false;
+    const current = app.store.getState().download;
+    const handoff = current === null ? null : nextDownloadHandoff(current);
+    if (handoff === null) {
+      return;
+    }
+    app.store.dispatch({ type: "download/handedOff" });
+    startDownloads({ files: handoff.files });
+  });
+}
+app.store.subscribe(pumpDownloads);
 
 /**
  * Go to the project the picker had the worker open, once it shows up in a

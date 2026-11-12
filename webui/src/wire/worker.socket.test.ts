@@ -403,6 +403,102 @@ describe("the upload panel's answers (v8)", () => {
   });
 });
 
+describe("the Download tab's answers (v9)", () => {
+  /** Attached, the Download tab open, its folder listed with two files. */
+  function listed(h: ReturnType<typeof harness>): void {
+    h.attach();
+    h.store.dispatch({ type: "transfer/open", tab: "download" });
+    const seq = h.session.sendCommand("browse_dir", {
+      path: "/home/me",
+      show_hidden: false,
+      include_files: true,
+    });
+    h.store.dispatch({ type: "download/browsing", seq });
+    h.deliver({
+      type: "dir_listing",
+      seq,
+      path: "/home/me",
+      home: "/home/me",
+      entries: [{ name: "code", path: "/home/me/code" }],
+      files: [
+        { name: "a.txt", path: "/home/me/a.txt", size: 3 },
+        { name: "b.bin", path: "/home/me/b.bin", size: 5 },
+      ],
+    });
+    h.deliver({ type: "ack", seq, outcome: "applied" });
+  }
+
+  function asking(h: ReturnType<typeof harness>): number {
+    listed(h);
+    h.store.dispatch({ type: "download/toggle", name: "a.txt" });
+    const seq = h.session.sendCommand("begin_download", { dir: "/home/me", names: ["a.txt"] });
+    h.store.dispatch({ type: "download/requested", seq });
+    return seq;
+  }
+
+  it("a dir_listing with files reaches the tab, not the picker", () => {
+    const h = harness();
+    listed(h);
+    const download = h.store.getState().download;
+    expect(download?.cwd).toBe("/home/me");
+    expect(download?.folders.map((f) => f.name)).toEqual(["code"]);
+    expect(download?.files.map((f) => [f.name, f.size])).toEqual([
+      ["a.txt", 3],
+      ["b.bin", 5],
+    ]);
+    expect(h.store.getState().picker).toBeNull();
+  });
+
+  it("a download_plan grants the tab its tickets, and its ack does not unsettle it", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({
+      type: "download_plan",
+      seq,
+      dir: "/home/me",
+      files: [{ name: "a.txt", size: 3, ticket: "t-1" }],
+    });
+    h.deliver({ type: "ack", seq, outcome: "applied" });
+    expect(h.store.getState().download?.phase).toEqual({
+      kind: "granted",
+      dir: "/home/me",
+      files: [{ name: "a.txt", size: 3, ticket: "t-1" }],
+    });
+  });
+
+  it("a plan for another seq is dropped", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({
+      type: "download_plan",
+      seq: seq + 100,
+      dir: "/home/me",
+      files: [{ name: "a.txt", size: 3, ticket: "t-x" }],
+    });
+    expect(h.store.getState().download?.phase).toEqual({ kind: "requested", seq });
+  });
+
+  it("a refusal, by plan or by error, is the tab's note", () => {
+    const h = harness();
+    const seq = asking(h);
+    h.deliver({ type: "ack", seq, outcome: "applied" });
+    h.deliver({
+      type: "download_plan",
+      seq,
+      dir: "/home/me",
+      files: [],
+      refusal: "a.txt is not in that folder.",
+    });
+    expect(h.store.getState().download?.phase).toEqual({ kind: "browsing" });
+    expect(h.store.getState().download?.note).toBe("a.txt is not in that folder.");
+
+    const again = h.session.sendCommand("begin_download", {});
+    h.store.dispatch({ type: "download/requested", seq: again });
+    h.deliver({ type: "error", code: "not_supported", message: "`dir` is missing", seq: again });
+    expect(h.store.getState().download?.note).toBe("`dir` is missing");
+  });
+});
+
 /** The TUI fixture as a wire snapshot — enough of one for a socket to attach. */
 function fixtureWire(): WireSnapshot {
   const snapshot = fixtureSnapshot();

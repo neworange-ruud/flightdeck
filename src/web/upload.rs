@@ -260,7 +260,8 @@ pub fn size_label(bytes: u64) -> String {
 }
 
 /// A fresh ticket: 128 random bits, base64url without padding (22 chars).
-fn new_ticket() -> String {
+/// Download tickets ([`crate::web::download`]) are made the same way.
+pub(crate) fn new_ticket() -> String {
     let mut bytes = [0u8; TICKET_BYTES];
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)

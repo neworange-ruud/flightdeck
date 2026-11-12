@@ -35,6 +35,7 @@ function listing(seq: number, path: string): PickerListing {
     parent: path === HOME ? null : HOME,
     home: HOME,
     entries: [{ name: "code", path: `${HOME}/code`, isGitRepo: false, isOpenProject: false }],
+    files: [],
     truncated: false,
   };
 }

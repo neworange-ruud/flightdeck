@@ -47,13 +47,28 @@ export interface PickerScan {
   readonly repos: readonly PickerRepo[];
 }
 
-/** `ServerMsg::DirListing`, as the picker takes it. */
+/** One regular file in a listing (`protocol::FileEntryView`, v9). */
+export interface ListedFile {
+  readonly name: string;
+  /** Absolute on the worker, as listed (not resolved). */
+  readonly path: string;
+  /** Bytes, when listed. */
+  readonly size: number;
+}
+
+/**
+ * `ServerMsg::DirListing`, as the picker — and the Transfer files panel's
+ * Download tab — take it. Each matches it against its own seq.
+ */
 export interface PickerListing {
   readonly seq: number;
   readonly path: string;
   readonly parent: string | null;
   readonly home: string;
   readonly entries: readonly PickerEntry[];
+  /** The folder's files (v9), only when `browse_dir` asked with
+   * `include_files`; empty otherwise. The picker never asks. */
+  readonly files: readonly ListedFile[];
   readonly truncated: boolean;
 }
 

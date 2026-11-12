@@ -129,15 +129,16 @@ impl AppCommand {
     /// The item a palette front-end row stands for: the host queues the row
     /// and the window performs it (`crate::host::HostModel::dispatch`).
     /// `None` for a row about what the window shows (Open Worktree in VS
-    /// Code, a remote window's Rename Remote and Upload Files), which the window performs
-    /// itself rather than the app.
+    /// Code, a remote window's Rename Remote, Upload Files and Download
+    /// Files), which the window performs itself rather than the app.
     pub fn for_front_end(action: FrontEndAction) -> Option<AppCommand> {
         match action {
             FrontEndAction::ConnectToRemote => Some(AppCommand::ConnectRemote),
             FrontEndAction::NewWindow => Some(AppCommand::NewWindow),
             FrontEndAction::OpenInVsCode
             | FrontEndAction::RenameRemote
-            | FrontEndAction::UploadFiles => None,
+            | FrontEndAction::UploadFiles
+            | FrontEndAction::DownloadFiles => None,
         }
     }
 

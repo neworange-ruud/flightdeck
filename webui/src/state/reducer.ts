@@ -41,7 +41,32 @@ import {
   uploadStartOver,
 } from "./upload";
 import type { UploadState } from "./upload";
-import { awayText, messageLine, uploadAvailable } from "./worker";
+import {
+  downloadAck,
+  downloadBrowsing,
+  downloadCancel,
+  downloadCursor,
+  downloadHandedOff,
+  downloadLinkLost,
+  downloadListing,
+  downloadMove,
+  downloadNote,
+  downloadPlan,
+  downloadRequested,
+  downloadSelectAll,
+  downloadStartOver,
+  downloadToggle,
+  downloadToggleCursor,
+  downloadToggleHidden,
+  newDownload,
+} from "./download";
+import type { DownloadState } from "./download";
+import {
+  awayText,
+  downloadAvailable,
+  messageLine,
+  uploadAvailable,
+} from "./worker";
 import { widthClass } from "./viewport";
 import { ACCESS_CODE_LENGTH } from "./model";
 import { dropAckedInput, isTerminalConnection } from "./types";
@@ -136,9 +161,13 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           staleness: null,
         };
       }
-      /** An upload request still out will not be answered across a
-       * reconnect; a transfer carries on, since its ticket needs no socket. */
-      return withUpload({ ...state, connection: action.status }, uploadLinkLost);
+      /** An upload or download request still out will not be answered
+       * across a reconnect; a transfer carries on, since its ticket needs no
+       * socket. */
+      return withDownload(
+        withUpload({ ...state, connection: action.status }, uploadLinkLost),
+        downloadLinkLost,
+      );
     }
 
     case "geometry/set":
@@ -252,8 +281,9 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         /** The picker only exists on a worker. */
         picker: snapshot.hostKind === "worker" ? state.picker : null,
         protocolVersion: snapshot.protocolVersion ?? null,
-        /** So does the upload panel (v8). */
+        /** So does the Transfer files panel (v8, v9). */
         upload: snapshot.hostKind === "worker" ? state.upload : null,
+        download: snapshot.hostKind === "worker" ? state.download : null,
       };
     }
 
@@ -751,6 +781,21 @@ function reduceAction(state: AppState, action: AppAction): AppState {
        */
       /** So does the upload panel (v8): a refusal of its `begin_upload` is
        * its note, in the worker's words. */
+      /** So does the Download tab (v9): its listings and its
+       * `begin_download`. */
+      if (state.download !== null) {
+        const answered = downloadAck(
+          state.download,
+          action.seq,
+          action.outcome,
+          action.detail ?? null,
+        );
+        if (answered.owned) {
+          return answered.download === state.download
+            ? state
+            : { ...state, download: answered.download };
+        }
+      }
       if (state.upload !== null) {
         const answered = uploadAck(
           state.upload,
@@ -1360,10 +1405,16 @@ function reduceAction(state: AppState, action: AppAction): AppState {
             picker: pickerSent(state.picker, action.sent, action.seq),
           };
 
-    case "picker/listing":
-      return state.picker === null
-        ? state
-        : { ...state, picker: pickerListing(state.picker, action.listing) };
+    case "picker/listing": {
+      /** One frame, two possible askers: the picker and the Download tab
+       * each take only the listing that answers their own seq. */
+      const listed = withDownload(state, (download) =>
+        downloadListing(download, action.listing),
+      );
+      return listed.picker === null
+        ? listed
+        : { ...listed, picker: pickerListing(listed.picker, action.listing) };
+    }
 
     case "picker/scan":
       return state.picker === null
@@ -1430,6 +1481,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         /** An upload request out will not be answered; a transfer under way
          * keeps going on its ticket. */
         upload: state.upload === null ? null : uploadLinkLost(state.upload),
+        download: state.download === null ? null : downloadLinkLost(state.download),
       };
 
     case "connection/reclaim":
@@ -1460,9 +1512,14 @@ function reduceAction(state: AppState, action: AppAction): AppState {
           /** One overlay at a time: the palette is usually what opened this. */
           palette: null,
           upload: uploadAdd(newUpload(defaultUploadDir(state)), action.picked),
+          transferTab: "upload",
         };
       }
-      return withUpload(state, (upload) => uploadAdd(upload, action.picked));
+      /** Files picked or dropped are for the Upload tab, wherever the panel
+       * was. */
+      const shown: AppState =
+        state.transferTab === "upload" ? state : { ...state, transferTab: "upload" };
+      return withUpload(shown, (upload) => uploadAdd(upload, action.picked));
     }
 
     case "upload/remove":
@@ -1515,10 +1572,87 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       return withUpload(state, uploadStartOver);
 
     case "upload/close":
+    case "transfer/close":
       if (state.upload === null || isUploading(state.upload)) {
         return state;
       }
-      return { ...state, upload: null, picker: null };
+      return { ...state, upload: null, download: null, picker: null };
+
+    /* --- The Transfer files panel (v9) ------------------------------------ */
+
+    case "transfer/open": {
+      if (!uploadAvailable(state)) {
+        return state;
+      }
+      const wanted = action.tab ?? state.transferTab;
+      const tab = wanted === "download" && !downloadAvailable(state) ? "upload" : wanted;
+      if (state.upload !== null && isUploading(state.upload) && tab !== state.transferTab) {
+        /** Switching tabs waits for the files going out: Cancel first. */
+        return state;
+      }
+      const upload = state.upload ?? newUpload(defaultUploadDir(state));
+      const download =
+        tab === "download" && state.download === null
+          ? newDownload(defaultUploadDir(state), state.worker?.home ?? "")
+          : state.download;
+      if (
+        upload === state.upload &&
+        download === state.download &&
+        tab === state.transferTab &&
+        state.palette === null
+      ) {
+        return state;
+      }
+      return { ...state, palette: null, upload, download, transferTab: tab };
+    }
+
+    /* --- Downloading files from a worker (v9) ------------------------------ */
+
+    case "download/intent":
+      /** `main.ts` sends the listing it means; Show hidden flips here first. */
+      return action.intent.kind === "toggle_hidden"
+        ? withDownload(state, downloadToggleHidden)
+        : state;
+
+    case "download/browsing":
+      return withDownload(state, (download) => downloadBrowsing(download, action.seq));
+
+    case "download/toggle":
+      return withDownload(state, (download) => downloadToggle(download, action.name));
+
+    case "download/selectAll":
+      return withDownload(state, downloadSelectAll);
+
+    case "download/cursor":
+      return withDownload(state, (download) => downloadCursor(download, action.index));
+
+    case "download/move":
+      return withDownload(state, (download) => downloadMove(download, action.delta));
+
+    case "download/toggleCursor":
+      return withDownload(state, downloadToggleCursor);
+
+    case "download/submit":
+      /** `main.ts` sends the request this means; nothing local changes. */
+      return state;
+
+    case "download/requested":
+      return withDownload(state, (download) => downloadRequested(download, action.seq));
+
+    case "download/note":
+      return withDownload(state, (download) => downloadNote(download, action.note));
+
+    case "download/plan":
+      return withDownload(state, (download) => downloadPlan(download, action.plan));
+
+    case "download/handedOff":
+      return withDownload(state, downloadHandedOff);
+
+    case "download/cancel":
+      return withDownload(state, downloadCancel);
+
+    case "download/startOver":
+      return withDownload(state, downloadStartOver);
 
     case "picker/chosen": {
       if (state.picker === null || state.picker.purpose !== "choose_folder") {
@@ -1667,6 +1801,19 @@ function withUpload(
   }
   const upload = step(state.upload);
   return upload === state.upload ? state : { ...state, upload };
+}
+
+/** The Download tab moved by `step`, when there is one — `withUpload`'s
+ * twin. */
+function withDownload(
+  state: AppState,
+  step: (download: DownloadState) => DownloadState,
+): AppState {
+  if (state.download === null) {
+    return state;
+  }
+  const download = step(state.download);
+  return download === state.download ? state : { ...state, download };
 }
 
 /**

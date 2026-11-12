@@ -3,6 +3,7 @@ import { checkSession } from "../access/client";
 import {
   cloneResultOf,
   dirListingOf,
+  downloadPlanOf,
   hostKindOf,
   hostMessageOf,
   projectScanOf,
@@ -76,7 +77,7 @@ describe("a worker's snapshot", () => {
     /** Empty or absent — a host that predates the field — is no folder. */
     expect(sessions[1] !== undefined && "worktreePath" in sessions[1]).toBe(false);
     expect(sessions[2]?.worktreePath).toBeUndefined();
-    expect(snapshot.protocolVersion).toBe(8);
+    expect(snapshot.protocolVersion).toBe(9);
   });
 
   it("an upload plan keeps every field, and reads each absence as one", () => {
@@ -152,8 +153,68 @@ describe("a worker's answers", () => {
       parent: null,
       home: "/home/me",
       entries: [{ name: "a", path: "/home/me/a", isGitRepo: false, isOpenProject: false }],
+      /** No `files`: a host below v9, or a browse that did not ask. */
+      files: [],
       truncated: false,
     });
+  });
+
+  it("keeps a v9 listing's files, reading an absent size as zero", () => {
+    expect(
+      dirListingOf({
+        type: "dir_listing",
+        seq: 3,
+        path: "/home/me/dir",
+        parent: "/home/me",
+        home: "/home/me",
+        entries: [],
+        files: [
+          { name: "notes.txt", path: "/home/me/dir/notes.txt", size: 23 },
+          { name: "empty", path: "/home/me/dir/empty" },
+        ],
+        truncated: true,
+      }),
+    ).toMatchObject({
+      parent: "/home/me",
+      files: [
+        { name: "notes.txt", path: "/home/me/dir/notes.txt", size: 23 },
+        { name: "empty", path: "/home/me/dir/empty", size: 0 },
+      ],
+      truncated: true,
+    });
+  });
+
+  it("a download plan keeps every ticket, and reads each absence as one", () => {
+    expect(
+      downloadPlanOf({
+        type: "download_plan",
+        seq: 7,
+        dir: "/home/me/dir",
+        files: [
+          { name: "a.txt", size: 3, ticket: "t-a" },
+          { name: "b.bin", ticket: null },
+          { name: "c" },
+        ],
+      }),
+    ).toEqual({
+      seq: 7,
+      dir: "/home/me/dir",
+      files: [
+        { name: "a.txt", size: 3, ticket: "t-a" },
+        { name: "b.bin", size: 0, ticket: null },
+        { name: "c", size: 0, ticket: null },
+      ],
+      refusal: null,
+    });
+    expect(
+      downloadPlanOf({
+        type: "download_plan",
+        seq: 8,
+        dir: "~/x",
+        files: [],
+        refusal: "x is a folder.",
+      }).refusal,
+    ).toBe("x is a folder.");
   });
 
   it("keeps a scan's refusal and a clone's failure in the worker's words", () => {

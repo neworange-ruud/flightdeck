@@ -413,6 +413,68 @@
   box-shadow: inset 0 0 0 1px var(--fd-rule);
 }
 
+/* --- The Transfer files panel's tabs and Download tab (v9) ------------- */
+
+.fd-transfer__tabs {
+  display: flex;
+  gap: 2px;
+}
+.fd-transfer__tab {
+  font: inherit;
+  font-size: var(--fd-t-body);
+  padding: 1px 10px;
+  border: 0;
+  background: none;
+  color: var(--fd-text-quiet);
+  cursor: pointer;
+  box-shadow: inset 0 -2px 0 transparent;
+}
+.fd-transfer__tab[aria-selected="true"] {
+  color: var(--fd-accent);
+  box-shadow: inset 0 -2px 0 var(--fd-accent);
+}
+.fd-transfer__tab[disabled] {
+  color: var(--fd-text-decor);
+  cursor: default;
+}
+.fd-transfer__tab:focus-visible {
+  outline: 1px solid var(--fd-focus);
+}
+.fd-download__path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.fd-download__list {
+  max-height: 300px;
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--fd-rule-inner);
+}
+.fd-download__list:focus {
+  box-shadow: inset 0 0 0 1px var(--fd-focus);
+}
+.fd-download__row {
+  cursor: pointer;
+}
+.fd-download__row[data-cursor="true"] {
+  background: var(--fd-rule-inner);
+}
+.fd-download__list:focus .fd-download__row[data-cursor="true"] {
+  background: var(--fd-tui-select);
+}
+.fd-download__row[aria-selected="true"] .fd-picker__name {
+  color: var(--fd-text);
+}
+.fd-download__mark {
+  width: 13px;
+  text-align: center;
+  color: var(--fd-accent);
+}
+.fd-download__check {
+  margin: 0;
+  width: 13px;
+  accent-color: var(--fd-accent);
+}
+
 /* Files dragged over a worker's window: the whole frame is the target. It
  * takes no pointer events, so the drag keeps reaching the frame under it. */
 .fd-dropzone {

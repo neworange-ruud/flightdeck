@@ -107,7 +107,7 @@ give you a shell, and tell you something went wrong.
 | W31 | Browser | *Added after v1 (remote-control-ougi).* A worker **serves FlightDeck Web** as well as the protocol, on by default (`[worker] web`). A browser pairs with the same `worker pair` code and attaches as a **window**, so a browser and a Desktop take the worker over from each other (W17). Supersedes the earlier "protocol routes only, no browser SPA" rule (design note A5). |
 | W32 | HTTPS | *Added after v1.* The same port answers **TLS and plain** connections, told apart by the first byte. TLS uses a certificate from `tailscale cert` for the machine's MagicDNS name, fetched only when the tailnet has HTTPS turned on (`CertDomains`) and `[worker] https` is on, renewed daily. Plain HTTP stays for the Desktop and as the browser's fallback; a plain page request redirects to HTTPS once a certificate is loaded. |
 | W33 | Browser scope | *Added after v1.* The browser does what the Desktop's worker window does: terminals sized to the browser (W5), the worker shell (W15), Open Project (W9), the takeover screen, host messages, health and notifications. The configuration manager in the browser is a follow-up (remote-control-knuy). |
-| W34 | Upload | *Added after v1 (remote-control-usem).* The Desktop and the browser **upload one or more files into one folder** on the worker, chosen from a file chooser or by dropping files on the window. The folder must be inside the worker account's home, like browse and clone (W16). The window asks first (`begin_upload` over the socket); the worker checks the folder, the names and the free space and answers with one single-use ticket per file (`upload_plan`, protocol v8). The bytes then go over HTTP (`PUT /upload/<ticket>`) on the same port, into a temporary file that is renamed into place only when complete. A name that already exists is never overwritten silently: the worker reports it and the window asks **Replace**, **Keep both** (`name (1).ext`) or **Cancel**. Only the window holding the seat can upload; background links cannot. Folders are not uploaded (follow-up). |
+| W34 | Transfer files | *Added after v1 (remote-control-usem, remote-control-pz6d).* The window's **Transfer files** panel moves files both ways, with an **Upload** and a **Download** tab (titlebar button "Transfer files"; palette rows **Upload Files…** and **Download Files…** each open their tab; dropping files on the window opens Upload). Every folder involved must be inside the worker account's home, like browse and clone (W16), and only the window holding the seat can transfer; background links cannot. Files only: folders are a follow-up either way. **Upload** (protocol v8): the Desktop and the browser upload one or more files into one folder on the worker, chosen from a file chooser or by dropping files on the window. The window asks first (`begin_upload` over the socket); the worker checks the folder, the names and the free space and answers with one single-use ticket per file (`upload_plan`). The bytes then go over HTTP (`PUT /upload/<ticket>`) on the same port, into a temporary file that is renamed into place only when complete. A name that already exists is never overwritten silently: the worker reports it and the window asks **Replace**, **Keep both** (`name (1).ext`) or **Cancel**. **Download** (protocol v9): the window browses a worker folder (folders to open, files with checkboxes and sizes; `browse_dir` with `include_files`), picks files and asks with `begin_download`; the worker checks that each is a regular file inside the home and answers with each file's size and one single-use ticket (`download_plan`), all or nothing. The bytes come over HTTP (`GET /download/<ticket>`) on the same port. The Desktop saves into a chosen local folder (default: the OS Downloads folder) and asks **Replace**, **Keep both** or **Cancel** for a name already there; the browser hands each file to its own downloads, one per file. |
 
 ## 4. Requirements
 
@@ -268,15 +268,27 @@ releases must both ship v7.
 - A `Health` delta, and host messages with replay on attach.
 - Upload (W34, protocol v8): a `BeginUpload` op answered by an `UploadPlan` frame,
   and the `PUT /upload/<ticket>` route.
+- Download (W34, protocol v9): `BrowseDir` takes `include_files` and its listing
+  carries the folder's regular files (`files`, each with its size); a
+  `BeginDownload` op answered by a `DownloadPlan` frame; and the
+  `GET /download/<ticket>` route. A v7 or v8 window still works against a v9
+  worker: it is never offered Download Files…, never listed files, and its
+  `begin_download` is refused.
 
 ## 6. Security model
 
 - **Pairing a Desktop or a browser with a worker gives it the worker account's full
   power**: a shell (W15) and the whole home directory (W16). The docs must say so
   plainly.
-- Upload (W34) adds no power beyond that: it writes only inside the home
-  directory, needs a ticket the worker granted to that device's token a moment
-  earlier, and checks the folder again before the file is moved into place.
+- Transferring files (W34) adds no power beyond that. An upload writes only
+  inside the home directory, needs a ticket the worker granted to that device's
+  token a moment earlier, and checks the folder again before the file is moved
+  into place. A download reads only regular files inside the home directory
+  (a link is followed only when it ends inside it), needs a ticket the worker
+  granted to that device's token for that one file within the last two
+  minutes, single use, and checks the file again when it is fetched: a file
+  moved, removed, swapped for a link or taken out of the home since the grant
+  is refused.
 - The outer boundary is the tailnet. The worker listens nowhere else (W8), so
   Tailscale ACLs decide who can even reach the port.
 - Codes are minted only on demand, over a control socket that only the account

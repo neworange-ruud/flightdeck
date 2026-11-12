@@ -541,3 +541,250 @@ fn the_folder_picker_lists_the_folder_asked_for_and_scans_nothing() {
         );
     }
 }
+
+// -- downloads (v9, `remote-control-pz6d`) ---------------------------------------
+
+mod downloads {
+    use super::*;
+    use crate::web::client::download::{DownloadPhase, NOT_GRANTED};
+    use crate::web::protocol::{
+        worker_command, Ack, DirListing, DownloadPlan, DownloadPlanFile, FileEntryView,
+        DOWNLOAD_MIN_VERSION,
+    };
+
+    const START: &str = "/repo/.flightdeck/worktrees/search";
+
+    fn listing(seq: u64, path: &str, files: &[&str]) -> LinkEvent {
+        LinkEvent::DirListing(DirListing {
+            seq,
+            path: path.to_string(),
+            parent: Some("/home/dev".to_string()),
+            home: "/home/dev".to_string(),
+            entries: Vec::new(),
+            files: files
+                .iter()
+                .map(|name| FileEntryView {
+                    name: name.to_string(),
+                    path: format!("{path}/{name}"),
+                    size: 3,
+                })
+                .collect(),
+            truncated: false,
+        })
+    }
+
+    /// A v9 worker's session with the Download tab open on [`START`], its
+    /// listing in (`a.txt`, `b.txt`), saving into a fresh folder here.
+    fn browsing() -> (RemoteSession, Script, tempfile::TempDir) {
+        let (mut session, mut script) = open(snapshot(true, Vec::new()));
+        script.sent();
+        session.open_download();
+        let sent = commands_sent(&mut script);
+        let [(seq, name, Some(args))] = sent.as_slice() else {
+            panic!("one browse: {sent:?}");
+        };
+        assert_eq!(name, worker_command::BROWSE_DIR);
+        assert_eq!(args["path"], START);
+        assert_eq!(args["include_files"], true);
+        script.send(listing(*seq, START, &["a.txt", "b.txt"]));
+        session.pump();
+        let dest = tempfile::tempdir().unwrap();
+        session.set_download_dest(&dest.path().display().to_string());
+        (session, script, dest)
+    }
+
+    #[test]
+    fn the_download_tab_opens_only_on_a_worker_that_gives_files() {
+        let (mut session, _script) = open(snapshot(false, Vec::new()));
+        session.open_download();
+        assert!(session.download().is_none());
+        assert_eq!(session.transfer_tab(), None);
+        assert_eq!(session.notice(), Some(UPLOAD_NOT_A_WORKER));
+
+        // A v8 worker takes uploads but gives no downloads: the panel opens
+        // on Upload, and its Download tab is refused.
+        let mut v8 = snapshot(true, Vec::new());
+        v8.protocol_version = DOWNLOAD_MIN_VERSION - 1;
+        let (mut session, mut script) = open(v8);
+        script.sent();
+        session.open_download();
+        assert!(session.download().is_none());
+        assert_eq!(session.notice(), Some(DOWNLOAD_WORKER_TOO_OLD));
+        session.open_transfer(Some(TransferTab::Download));
+        assert_eq!(session.transfer_tab(), Some(TransferTab::Upload));
+        assert!(!session.set_transfer_tab(TransferTab::Download));
+        assert!(
+            commands_sent(&mut script).is_empty(),
+            "nothing asked of a v8 worker"
+        );
+    }
+
+    #[test]
+    fn the_panel_opens_on_the_tab_it_was_last_on() {
+        let (mut session, _script) = open(snapshot(true, Vec::new()));
+        session.open_transfer(None);
+        assert_eq!(session.transfer_tab(), Some(TransferTab::Upload));
+        assert!(session.set_transfer_tab(TransferTab::Download));
+        assert_eq!(session.transfer_tab(), Some(TransferTab::Download));
+        session.close_transfer();
+        assert_eq!(session.transfer_tab(), None);
+        assert!(session.upload().is_none() && session.download().is_none());
+        session.open_transfer(None);
+        assert_eq!(session.transfer_tab(), Some(TransferTab::Download));
+    }
+
+    #[test]
+    fn a_listing_with_files_is_the_download_tabs_not_the_pickers() {
+        let (mut session, mut script, _dest) = browsing();
+        let panel = session.download().unwrap();
+        assert_eq!(panel.cwd, START);
+        assert_eq!(panel.files.len(), 2);
+        assert!(panel.dest.len() > 1);
+
+        // The picker open meanwhile keeps its own listing.
+        session.open_folder_picker("~");
+        let picker_seq = commands_sent(&mut script)[0].0;
+        session.download_up();
+        let up_seq = commands_sent(&mut script)[0].0;
+        script.send(listing(picker_seq, "/home/dev", &[]));
+        session.pump();
+        assert_eq!(session.picker().unwrap().cwd.as_deref(), Some("/home/dev"));
+        assert_eq!(session.download().unwrap().cwd, START, "not the picker's");
+        script.send(listing(up_seq, "/home/dev", &["c.txt"]));
+        session.pump();
+        assert_eq!(session.download().unwrap().cwd, "/home/dev");
+    }
+
+    #[test]
+    fn hidden_home_and_up_browse_with_files() {
+        let (mut session, mut script, _dest) = browsing();
+        session.download_toggle_hidden();
+        session.download_home();
+        let sent = commands_sent(&mut script);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].2.as_ref().unwrap()["path"], START);
+        assert_eq!(sent[0].2.as_ref().unwrap()["show_hidden"], true);
+        assert!(sent[1].2.as_ref().unwrap().get("path").is_none(), "home");
+        assert_eq!(sent[1].2.as_ref().unwrap()["include_files"], true);
+    }
+
+    #[test]
+    fn a_name_already_here_is_asked_about_and_keep_both_asks_the_worker() {
+        let (mut session, mut script, dest) = browsing();
+        std::fs::write(dest.path().join("a.txt"), "mine").unwrap();
+        session.download_select_all();
+        session.start_download();
+        assert!(
+            matches!(&session.download().unwrap().phase,
+                DownloadPhase::Asking { clashes, .. } if clashes == &["a.txt".to_string()]),
+            "{:?}",
+            session.download().unwrap().phase
+        );
+        assert!(commands_sent(&mut script).is_empty(), "nothing asked yet");
+
+        session.resolve_download(Resolution::KeepBoth);
+        let sent = commands_sent(&mut script);
+        let [(seq, name, Some(args))] = sent.as_slice() else {
+            panic!("one begin_download: {sent:?}");
+        };
+        assert_eq!(name, worker_command::BEGIN_DOWNLOAD);
+        assert_eq!(args["dir"], START);
+        assert_eq!(args["names"], serde_json::json!(["a.txt", "b.txt"]));
+        let DownloadPhase::Requested { planned, .. } = &session.download().unwrap().phase else {
+            panic!()
+        };
+        assert_eq!(planned[0].final_name, "a (1).txt");
+
+        // While the worker is asked, the tab does not change.
+        assert!(session.transfer_busy());
+        assert!(!session.set_transfer_tab(TransferTab::Upload));
+        assert_eq!(session.transfer_tab(), Some(TransferTab::Download));
+
+        // Granted: this scripted client has nowhere to fetch from, so each
+        // file fails in words — and the next is still tried.
+        script.send(LinkEvent::DownloadPlan(DownloadPlan {
+            seq: *seq,
+            dir: START.to_string(),
+            files: vec![DownloadPlanFile {
+                name: "a.txt".into(),
+                size: 3,
+                ticket: Some("t-a".into()),
+            }],
+            refusal: None,
+        }));
+        session.pump();
+        let DownloadPhase::Done { saved, failed, .. } = &session.download().unwrap().phase else {
+            panic!("{:?}", session.download().unwrap().phase)
+        };
+        assert!(saved.is_empty());
+        assert_eq!(
+            failed,
+            &[
+                ("a.txt".to_string(), DOWNLOAD_NO_ACCESS.to_string()),
+                ("b.txt".to_string(), NOT_GRANTED.to_string()),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("a.txt")).unwrap(),
+            "mine",
+            "left alone"
+        );
+        assert!(session.set_transfer_tab(TransferTab::Upload), "free again");
+
+        // Download more: browsing the same folder afresh.
+        session.set_transfer_tab(TransferTab::Download);
+        session.download_more();
+        assert!(session.download().unwrap().is_browsing());
+        assert_eq!(commands_sent(&mut script)[0].1, worker_command::BROWSE_DIR);
+    }
+
+    #[test]
+    fn a_refused_download_is_the_tabs_note_not_a_message_overlay() {
+        let (mut session, mut script, _dest) = browsing();
+        session.download_toggle("b.txt");
+        session.start_download();
+        let (seq, _, _) = commands_sent(&mut script).remove(0);
+        script.send(LinkEvent::Ack(
+            Ack {
+                seq,
+                outcome: AckOutcome::Rejected,
+                detail: Some("b.txt is not in your home folder.".into()),
+            },
+            crate::web::client::AckFor::Command,
+        ));
+        session.pump();
+        let panel = session.download().unwrap();
+        assert!(panel.is_browsing());
+        assert_eq!(
+            panel.note.as_deref(),
+            Some("b.txt is not in your home folder.")
+        );
+        assert!(!matches!(session.overlay(), Some(OverlayView::Message(_))));
+    }
+
+    #[test]
+    fn a_destination_that_is_not_a_folder_here_sends_nothing() {
+        let (mut session, mut script, dest) = browsing();
+        session.set_download_dest(&dest.path().join("nope").display().to_string());
+        session.download_toggle("a.txt");
+        session.start_download();
+        assert!(commands_sent(&mut script).is_empty());
+        assert_eq!(
+            session.download().unwrap().note.as_deref(),
+            Some(crate::web::client::download::NO_DESTINATION)
+        );
+    }
+
+    #[test]
+    fn cancel_and_close_stop_everything() {
+        let (mut session, mut script, _dest) = browsing();
+        session.download_toggle("a.txt");
+        session.start_download();
+        assert_eq!(commands_sent(&mut script).len(), 1);
+        session.cancel_download();
+        assert_eq!(session.download().unwrap().phase, DownloadPhase::Cancelled);
+        session.close_transfer();
+        assert!(session.download().is_none());
+        assert_eq!(session.transfer_tab(), None);
+    }
+}

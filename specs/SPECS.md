@@ -1793,7 +1793,8 @@ configuration manager (numbers and a path, not toggles): edit the file.
 ### Network and pairing
 
 The worker serves the web protocol's `/ws`, `/auth/exchange`,
-`/auth/session` and `/upload/<ticket>`, and FlightDeck Web's page unless `[worker] web = false`,
+`/auth/session`, `/upload/<ticket>` and `/download/<ticket>`, and FlightDeck
+Web's page unless `[worker] web = false`,
 **only on the addresses Tailscale reports**, never on loopback, `0.0.0.0` or
 another network. With no Tailscale
 address it keeps running, reports "not listening: no Tailscale address", polls
@@ -1814,15 +1815,22 @@ stored in `~/.flightdeck/worker/tls/` (key mode 0600), loaded at start and
 re-fetched every 24 h; a renewal swaps it in without rebinding. Without a
 certificate a TLS connection is closed and the page is served over plain HTTP.
 With one, a plain request for the page redirects (308) to
-`https://<magicdns-name>:<port>`; `/ws` and `/auth/*` never redirect, because
-the Desktop speaks plain `ws://`. A cookie issued over TLS is `Secure`.
+`https://<magicdns-name>:<port>`; `/ws`, `/auth/*`, `/upload/*` and
+`/download/*` never redirect, because the Desktop speaks plain `ws://` and
+`http://`. A cookie issued over TLS is `Secure`.
 
 `worker pair` prints the browser link with the code in its fragment
 (`https://<name>:<port>/#NNNN`, or `http://<address>/#NNNN` without a
 certificate) beside the Desktop's address.
 
-**Uploading files** (protocol v8, `specs/WORKER_PRD.md` W34). The window
-holding the seat sends the `begin_upload` command with
+**Transferring files** (`specs/WORKER_PRD.md` W34). The window's **Transfer
+files** panel has an **Upload** and a **Download** tab: the titlebar button
+"Transfer files" opens it, the palette rows Upload Files… and Download Files…
+each open their tab, and dropping files on the window opens Upload. Only the
+window holding the seat transfers; background links cannot. Files only:
+folders are a follow-up either way.
+
+*Uploading* (protocol v8). The window holding the seat sends the `begin_upload` command with
 `{dir, files: [{name, size}], on_conflict: "ask" | "replace" | "keep_both"}`.
 The worker resolves `dir` inside `$HOME` (it must be an existing directory),
 checks each name is a single path component and that the total fits in the
@@ -1835,8 +1843,37 @@ is then sent as the body of `PUT /upload/<ticket>` (same cookie, exact
 `Content-Length`, plain or TLS, never redirected), streamed into a temporary
 `.<name>.fdupload-…` beside the target and moved into place only when
 complete; the folder is checked again at that moment. When a batch is done
-the worker posts one host message naming the folder. Background links cannot
-upload, and folders are not uploaded.
+the worker posts one host message naming the folder.
+
+*Downloading* (protocol v9). The Download tab browses a worker folder with
+`browse_dir {path, show_hidden, include_files: true}`: the listing's `files`
+are its regular files (dotfiles only with `show_hidden`; a link only when it
+resolves to a regular file inside `$HOME`), sorted like the folders, each with
+its `size`, and at most 2000 folders and files together, folders first
+(`truncated` past that). The person ticks files and the window sends
+`begin_download {dir, names}` (1 to 256 names, each a single path component,
+none twice). The worker resolves `dir` inside `$HOME` and every `dir/<name>`
+to a regular file inside `$HOME`, and answers that window alone with a
+`download_plan` frame: per name its `size` and a single-use `ticket` bound to
+the window's token and valid for two minutes. All or nothing: the first name
+that is missing, a folder, or a link leaving `$HOME` refuses the whole request
+in a sentence naming it, with no tickets. A download changes nothing on the
+worker, so it posts no host message. Each file is then fetched with
+`GET /download/<ticket>` (same cookie, plain or TLS, never redirected). The
+route answers `GET` only (`405` otherwise); an unknown, used, expired or
+other device's ticket is `403 invalid_ticket`; the granted path is resolved
+again and must still be the same regular file inside `$HOME` (`409
+file_changed` when it moved, went, or became a link or folder); a read that
+fails before the first byte is `500 read_failed`. A `200` is
+`application/octet-stream` with `Content-Disposition: attachment;
+filename="<ASCII fallback>"; filename*=UTF-8''<name>`, `Cache-Control:
+no-store`, `X-Content-Type-Options: nosniff` and a `Content-Length` of the
+size when opened; exactly that many bytes follow (a file still growing is cut
+there). Every refusal is JSON `{ok: false, reason, message}`. A TUI or
+Desktop host has no `/download` (`404`). The Desktop saves into a chosen
+local folder (by default the OS Downloads folder) and asks Replace, Keep both
+or Cancel for a name already there; the browser hands each file to its own
+downloads, one per file.
 
 ### The phone
 
@@ -1969,6 +2006,7 @@ never missing.
 - No credentials cross the wire unencrypted: everything travels inside
   WireGuard, and HTTPS is added only for the browser's sake. The worker never stores, forwards or injects agent or git
   credentials: agents and git run with the account's own environment.
-- Opening, browsing, cloning and uploading are confined to `$HOME`: paths are
+- Opening, browsing, cloning, uploading and downloading are confined to
+  `$HOME`: paths are
   canonicalised and anything resolving outside it, through a symlink too, is
   refused.

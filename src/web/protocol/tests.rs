@@ -312,6 +312,7 @@ fn dir_listing() -> DirListing {
             is_git_repo: true,
             is_open_project: true,
         }],
+        files: Vec::new(),
         truncated: true,
     }
 }
@@ -701,11 +702,15 @@ fn protocol_version_is_seven_and_still_serves_six() {
     // kind, `UploadPlan`. The range widens rather than moves: a v6 Desktop
     // still drives a TUI host, a v7 Desktop still drives a worker (it just
     // cannot upload), and only `UploadPlan` is held back below v8.
-    assert_eq!(PROTOCOL_VERSION, 8);
+    //
+    // **v9 is downloading files from a worker** (`remote-control-pz6d`): one
+    // frame kind, `DownloadPlan`, held back below v9 the same way.
+    assert_eq!(PROTOCOL_VERSION, 9);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 8);
+    assert_eq!(MAX_SUPPORTED_VERSION, 9);
     assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
     assert_eq!(UPLOAD_MIN_VERSION, 8);
+    assert_eq!(DOWNLOAD_MIN_VERSION, 9);
     // That the preferred version sits inside the advertised range is asserted at
     // compile time in `protocol.rs`, not here.
 }
@@ -784,15 +789,15 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round. v8 keeps v6 in its range and still refuses v5.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v8 host");
+    // refused both ways round. v9 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v9 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 8,
+            local: 9,
             peer: 5,
             min_supported: 6,
-            max_supported: 8,
+            max_supported: 9,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
@@ -801,7 +806,7 @@ fn mismatched_version_is_representable_and_detectable() {
     }
     // Newer than our ceiling is equally a mismatch. A native client that
     // dialled too new may redial at `max_supported`; a browser reloads.
-    assert!(check_version(9).is_err());
+    assert!(check_version(10).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -809,7 +814,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 8);
+    assert_eq!(value["version"]["max_supported"], 9);
     assert_eq!(round_trip(&frame), frame);
 }
 
@@ -2164,6 +2169,7 @@ fn every_worker_command_parses_into_its_op() {
             WorkerOp::BrowseDir {
                 path: Some("/home/u/code".into()),
                 show_hidden: true,
+                include_files: false,
             },
         ),
         (
@@ -2172,6 +2178,7 @@ fn every_worker_command_parses_into_its_op() {
             WorkerOp::BrowseDir {
                 path: None,
                 show_hidden: false,
+                include_files: false,
             },
         ),
         (worker_command::SCAN_PROJECTS, None, WorkerOp::ScanProjects),

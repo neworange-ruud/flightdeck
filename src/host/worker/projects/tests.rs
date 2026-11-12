@@ -141,12 +141,12 @@ fn resolve_allows_a_symlink_inside_home() {
 fn browse_lists_dirs_only_hides_hidden_and_sorts_case_insensitively() {
     let fs = base().with_dir("/home/u/apple").with_dir("/home/u/Zebra");
     let c = conf(&fs);
-    let l = browse(&fs, &c, None, false).unwrap();
+    let l = browse(&fs, &c, None, false, false).unwrap();
     assert_eq!(names(&l), ["apple", "code", "Docs", "Zebra"]);
     assert_eq!(l.path, PathBuf::from(HOME));
     assert_eq!(l.parent, None);
     assert!(!l.truncated);
-    let l = browse(&fs, &c, Some("~"), true).unwrap();
+    let l = browse(&fs, &c, Some("~"), true, false).unwrap();
     assert_eq!(names(&l), [".cache", "apple", "code", "Docs", "Zebra"]);
 }
 
@@ -154,7 +154,7 @@ fn browse_lists_dirs_only_hides_hidden_and_sorts_case_insensitively() {
 fn browse_flags_repositories_and_reports_the_parent() {
     let fs = base();
     let c = conf(&fs);
-    let l = browse(&fs, &c, Some("code"), false).unwrap();
+    let l = browse(&fs, &c, Some("code"), false, false).unwrap();
     assert_eq!(names(&l), ["app", "lib"]);
     assert!(l.entries[0].is_git_repo);
     assert!(!l.entries[1].is_git_repo);
@@ -165,7 +165,7 @@ fn browse_flags_repositories_and_reports_the_parent() {
 #[test]
 fn browse_a_worktree_style_git_file_is_a_repo() {
     let fs = FakeFs::new().with_file("/home/u/wt/.git", "gitdir: x");
-    assert!(browse(&fs, &conf(&fs), None, false).unwrap().entries[0].is_git_repo);
+    assert!(browse(&fs, &conf(&fs), None, false, false).unwrap().entries[0].is_git_repo);
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn browse_omits_entries_escaping_home_and_dangling_links() {
         .unwrap();
     fs.symlink(Path::new("/home/u/code"), Path::new("/home/u/shortcut"))
         .unwrap();
-    let l = browse(&fs, &conf(&fs), None, false).unwrap();
+    let l = browse(&fs, &conf(&fs), None, false, false).unwrap();
     assert_eq!(names(&l), ["code", "Docs", "shortcut"]);
 }
 
@@ -186,15 +186,15 @@ fn browse_refuses_outside_missing_and_files() {
     let fs = base();
     let c = conf(&fs);
     assert!(matches!(
-        browse(&fs, &c, Some("/outside"), false),
+        browse(&fs, &c, Some("/outside"), false, false),
         Err(ProjectOpError::OutsideHome(_))
     ));
     assert!(matches!(
-        browse(&fs, &c, Some("nope"), false),
+        browse(&fs, &c, Some("nope"), false, false),
         Err(ProjectOpError::NotFound(_))
     ));
     assert!(matches!(
-        browse(&fs, &c, Some("notes.txt"), false),
+        browse(&fs, &c, Some("notes.txt"), false, false),
         Err(ProjectOpError::NotADirectory(_))
     ));
 }
@@ -205,7 +205,7 @@ fn browse_truncates_at_the_cap() {
     for i in 0..MAX_ENTRIES + 5 {
         fs = fs.with_dir(format!("/home/u/d{i:05}"));
     }
-    let l = browse(&fs, &conf(&fs), None, false).unwrap();
+    let l = browse(&fs, &conf(&fs), None, false, false).unwrap();
     assert_eq!(l.entries.len(), MAX_ENTRIES);
     assert!(l.truncated);
     assert_eq!(l.entries[0].name, "d00000");
@@ -342,11 +342,115 @@ fn real_symlink_escape_is_refused_and_inside_link_allowed() {
     let inside = c.resolve(&fs, Some("inside")).unwrap();
     assert_eq!(inside, c.home().join("code/app"));
 
-    let l = browse(&fs, &c, None, false).unwrap();
+    let l = browse(&fs, &c, None, false, false).unwrap();
     assert_eq!(names(&l), ["code", "inside"]);
     assert!(l.entries[1].is_git_repo);
     assert!(matches!(
         validate_open(&fs, &c, outside.to_str().unwrap()),
         Err(ProjectOpError::OutsideHome(_))
     ));
+}
+
+// -- files (v9, the Download tab) ---------------------------------------------
+
+fn file_names(listing: &Listing) -> Vec<&str> {
+    listing.files.iter().map(|f| f.name.as_str()).collect()
+}
+
+#[test]
+fn without_include_files_no_file_is_listed() {
+    let fs = base().with_file("/home/u/b.txt", "bb");
+    let l = browse(&fs, &conf(&fs), None, true, false).unwrap();
+    assert!(l.files.is_empty(), "{:?}", l.files);
+}
+
+#[test]
+fn include_files_lists_regular_files_sorted_with_sizes_hiding_dotfiles() {
+    let fs = base()
+        .with_file("/home/u/b.txt", "bb")
+        .with_file("/home/u/Apple.md", "a")
+        .with_file("/home/u/.env", "SECRET=1");
+    let c = conf(&fs);
+    let l = browse(&fs, &c, None, false, true).unwrap();
+    assert_eq!(names(&l), ["code", "Docs"], "folders are unchanged");
+    assert_eq!(file_names(&l), ["Apple.md", "b.txt", "notes.txt"]);
+    let b = &l.files[1];
+    assert_eq!(b.size, 2);
+    assert_eq!(b.path, PathBuf::from("/home/u/b.txt"));
+
+    let l = browse(&fs, &c, Some("~"), true, true).unwrap();
+    assert_eq!(file_names(&l), [".env", "Apple.md", "b.txt", "notes.txt"]);
+}
+
+#[test]
+fn a_link_is_listed_only_when_it_resolves_to_a_file_inside_home() {
+    let fs = base().with_file("/outside/secret/key", "k");
+    for (target, link) in [
+        ("/home/u/notes.txt", "/home/u/to-notes"),
+        ("/outside/secret/key", "/home/u/to-key"),
+        ("/home/u/gone.txt", "/home/u/dangling"),
+    ] {
+        fs.symlink(Path::new(target), Path::new(link)).unwrap();
+    }
+    let l = browse(&fs, &conf(&fs), None, false, true).unwrap();
+    assert_eq!(file_names(&l), ["notes.txt", "to-notes"]);
+    let link = &l.files[1];
+    assert_eq!(link.path, PathBuf::from("/home/u/to-notes"), "as listed");
+    assert_eq!(link.size, 1);
+}
+
+#[test]
+fn folders_and_files_share_the_cap_folders_first() {
+    let mut fs = FakeFs::new().with_dir(HOME);
+    for i in 0..MAX_ENTRIES - 2 {
+        fs = fs.with_dir(format!("/home/u/d{i:05}"));
+    }
+    for i in 0..5 {
+        fs = fs.with_file(format!("/home/u/f{i}.txt"), "x");
+    }
+    let l = browse(&fs, &conf(&fs), None, false, true).unwrap();
+    assert_eq!(l.entries.len(), MAX_ENTRIES - 2);
+    assert_eq!(file_names(&l), ["f0.txt", "f1.txt"]);
+    assert!(l.truncated);
+
+    // Folders alone over the cap: no room for any file.
+    let mut fs = FakeFs::new().with_dir(HOME);
+    for i in 0..MAX_ENTRIES + 1 {
+        fs = fs.with_dir(format!("/home/u/d{i:05}"));
+    }
+    let fs = fs.with_file("/home/u/a.txt", "x");
+    let l = browse(&fs, &conf(&fs), None, false, true).unwrap();
+    assert_eq!(l.entries.len(), MAX_ENTRIES);
+    assert!(l.files.is_empty());
+    assert!(l.truncated);
+
+    // Exactly at the cap is not truncated.
+    let mut fs = FakeFs::new().with_dir(HOME);
+    for i in 0..MAX_ENTRIES - 1 {
+        fs = fs.with_dir(format!("/home/u/d{i:05}"));
+    }
+    let fs = fs.with_file("/home/u/a.txt", "x");
+    let l = browse(&fs, &conf(&fs), None, false, true).unwrap();
+    assert_eq!(file_names(&l), ["a.txt"]);
+    assert!(!l.truncated);
+}
+
+#[test]
+fn a_real_fifo_and_a_link_out_of_home_are_not_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("a.txt"), "hello").unwrap();
+    std::fs::write(outside.path().join("secret"), "s").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), home.join("leak")).unwrap();
+    std::os::unix::fs::symlink(home.join("a.txt"), home.join("alias")).unwrap();
+    let fifo = std::ffi::CString::new(home.join("pipe").to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let fs = crate::contracts::RealFs;
+    let c = Confinement::new(&fs, &home).unwrap();
+    let l = browse(&fs, &c, None, false, true).unwrap();
+    assert_eq!(file_names(&l), ["a.txt", "alias"]);
+    assert!(l.files.iter().all(|f| f.size == 5));
 }

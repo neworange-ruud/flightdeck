@@ -38,10 +38,12 @@
 //! open, a version-skew banner under the titlebar when its FlightDeck is
 //! not this app's, and Reconnect when another window took it over.
 //!
-//! A worker that takes uploads (protocol v8) also gets **Upload files…** in
-//! the titlebar, files dropped anywhere on the window (a highlight while they
-//! hover), and the upload panel ([`super::upload`]) over everything while it
-//! is open — hidden while its Choose… has the picker up.
+//! A worker that takes uploads (protocol v8) also gets **Transfer files…**
+//! in the titlebar, files dropped anywhere on the window (a highlight while
+//! they hover), and the Transfer Files panel ([`super::transfer`]) over
+//! everything while it is open — hidden while its Upload tab's Choose… has
+//! the picker up. A worker at v9 gives downloads too: the panel's Download
+//! tab ([`super::download`]).
 
 use std::rc::Rc;
 
@@ -63,7 +65,7 @@ use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 
 use super::projects::ProjectPickerView;
-use super::upload::UploadPanelView;
+use super::transfer::TransferPanelView;
 use super::{RemoteModel, Tab};
 use crate::commands::{
     intent_for, keycap, keymap, perform_remote_entry, perform_remote_id, Intent,
@@ -109,7 +111,7 @@ pub struct RemoteWindow {
     /// Rename Remote's name field, while the model has the dialog open.
     rename: Option<Entity<InputState>>,
     /// The upload panel's view, while the model has the panel open.
-    upload: Option<Entity<UploadPanelView>>,
+    upload: Option<Entity<TransferPanelView>>,
     /// macOS: a press that then moves drags the window, as the local
     /// titlebar does.
     #[cfg(target_os = "macos")]
@@ -370,18 +372,18 @@ impl RemoteWindow {
 
     /// The upload panel's view, while it is open.
     #[cfg(test)]
-    pub(crate) fn upload_view(&self) -> Option<Entity<UploadPanelView>> {
+    pub(crate) fn upload_view(&self) -> Option<Entity<TransferPanelView>> {
         self.upload.clone()
     }
 
     /// Build the upload panel's view when the model opened the panel (it
     /// takes the keyboard), drop it when the model closed it.
     fn sync_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let open = self.remote.read(cx).upload().is_some();
+        let open = self.remote.read(cx).transfer_tab().is_some();
         match (open, &self.upload) {
             (true, None) => {
                 let remote = self.remote.clone();
-                let view = cx.new(|cx| UploadPanelView::new(remote, window, cx));
+                let view = cx.new(|cx| TransferPanelView::new(remote, window, cx));
                 let focus = view.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
                 self.upload = Some(view);
@@ -556,7 +558,7 @@ impl RemoteWindow {
 
         let upload = model
             .supports_upload()
-            .then(|| upload_files_button(p, &self.remote));
+            .then(|| transfer_files_button(p, &self.remote));
         let emit_remote = self.remote.clone();
         let command = h_flex()
             .id("remote-command-field")
@@ -1078,12 +1080,13 @@ fn drop_target(p: &Palette, cx: &mut Context<RemoteWindow>) -> impl IntoElement 
         .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| this.drop_files(paths, cx)))
 }
 
-/// A worker's Upload files…, in the titlebar (W34).
-fn upload_files_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+/// A worker's Transfer files…, in the titlebar (W34): the Transfer Files
+/// panel, on the tab it was last on.
+fn transfer_files_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
     let remote = remote.clone();
     h_flex()
-        .id("remote-upload-files")
-        .debug_selector(|| "remote-upload-files".into())
+        .id("remote-transfer-files")
+        .debug_selector(|| "remote-transfer-files".into())
         .flex_none()
         .h(px(30.))
         .px(px(10.))
@@ -1094,8 +1097,13 @@ fn upload_files_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoEl
         .text_color(p.ink_2.hsla())
         .cursor_pointer()
         .hover(|s| s.bg(p.surface_raised.hsla()))
-        .child("Upload files…")
-        .on_click(move |_, _, cx| remote.update(cx, |model, cx| model.pick_upload_files(cx)))
+        .child("Transfer files…")
+        .on_click(move |_, _, cx| {
+            remote.update(cx, |model, cx| {
+                model.open_transfer(None);
+                cx.notify();
+            })
+        })
 }
 
 /// The SSH shell's tab, first in the row, before the project tabs.

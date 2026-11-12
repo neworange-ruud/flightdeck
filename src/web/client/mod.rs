@@ -24,6 +24,9 @@
 //! | [`worker`] | [`ProjectPicker`]: a worker's browse / scan / clone picker (v7) |
 //! | [`upload`] | [`UploadPanel`]: uploading files to a worker, as a reducer (v8) |
 //! | [`upload_http`] | `PUT /upload/{ticket}`: streaming one file's bytes (v8) |
+//! | [`download`] | [`DownloadPanel`]: downloading files from a worker, as a reducer (v9) |
+//! | [`download_http`] | `GET /download/{ticket}`: streaming one file to disk (v9) |
+//! | [`http`] | the hand-rolled HTTP/1.1 both transfers share |
 //! | [`config`] | [`RemoteConfigEditor`]: the host's configuration manager, staged here |
 //!
 //! [`RemoteClient`] ties them together for a synchronous front-end: start it,
@@ -35,9 +38,12 @@
 //! [`RemoteClient::is_worker`] first and sends nothing otherwise.
 
 pub mod config;
+pub mod download;
+pub mod download_http;
 pub mod exchange;
 #[cfg(test)]
 pub(crate) mod fake_host;
+pub mod http;
 pub mod input;
 pub mod link;
 pub mod messages;
@@ -55,12 +61,13 @@ use std::sync::mpsc::{channel, Receiver};
 
 use crate::contracts::{PtySize, TabId};
 use crate::web::protocol::{
-    command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, GitStatusView,
-    HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan, ResizeTerminal, SeatRequest,
-    TerminalId, UploadFile, UploadPlan, WireError,
+    command as names, worker_command, Ack, AckOutcome, ConfigView, DirListing, DownloadPlan,
+    GitStatusView, HostMessage, NotificationView, OnConflict, ProjectId, ProjectScan,
+    ResizeTerminal, SeatRequest, TerminalId, UploadFile, UploadPlan, WireError,
 };
 
 pub use config::{EditorEffect, RemoteConfigEditor};
+pub use download::DownloadPanel;
 pub use exchange::{exchange_code, probe_session, AccessToken, ExchangeError, Probe};
 pub use input::AckFor;
 pub use link::{LinkConfig, LinkEnd, LinkEvent, LinkHandle, LinkOut, LinkState, Outbound};
@@ -254,6 +261,8 @@ pub struct RemoteClient {
     clone_events: Vec<CloneEvent>,
     /// A worker's latest upload plan, until taken (v8).
     upload_plan: Option<UploadPlan>,
+    /// A worker's latest download plan, until taken (v9).
+    download_plan: Option<DownloadPlan>,
     /// Where and as whom an upload's `PUT` goes: the link's own address,
     /// token and agent. `None` for a scripted client.
     http_access: Option<upload_http::HttpAccess>,
@@ -288,6 +297,7 @@ impl RemoteClient {
             project_scan: None,
             clone_events: Vec::new(),
             upload_plan: None,
+            download_plan: None,
             http_access: Some(http_access),
             resync: None,
         }
@@ -316,6 +326,7 @@ impl RemoteClient {
             project_scan: None,
             clone_events: Vec::new(),
             upload_plan: None,
+            download_plan: None,
             http_access: None,
             resync: None,
         };
@@ -414,6 +425,10 @@ impl RemoteClient {
             }
             LinkEvent::UploadPlan(plan) => {
                 self.upload_plan = Some(plan);
+                true
+            }
+            LinkEvent::DownloadPlan(plan) => {
+                self.download_plan = Some(plan);
                 true
             }
         }
@@ -534,6 +549,21 @@ impl RemoteClient {
         self.worker_command(worker_command::BROWSE_DIR, Some(args))
     }
 
+    /// List a directory on the worker with its files too (v9, the Transfer
+    /// Files panel's Download tab): as [`RemoteClient::browse_dir`], with
+    /// `include_files`, so the answer's [`DirListing::files`] is filled.
+    /// `None` — nothing sent — unless [`RemoteClient::supports_download`].
+    pub fn browse_files(&self, path: Option<&str>, show_hidden: bool) -> Option<u64> {
+        if !self.supports_download() {
+            return None;
+        }
+        let mut args = serde_json::json!({ "show_hidden": show_hidden, "include_files": true });
+        if let Some(path) = path {
+            args["path"] = serde_json::json!(path);
+        }
+        self.worker_command(worker_command::BROWSE_DIR, Some(args))
+    }
+
     /// Scan the worker's projects root for repositories. The answer arrives as
     /// [`RemoteClient::take_project_scan`].
     pub fn scan_projects(&self) -> Option<u64> {
@@ -610,6 +640,29 @@ impl RemoteClient {
     /// The upload plan the last `begin_upload` produced, once.
     pub fn take_upload_plan(&mut self) -> Option<UploadPlan> {
         self.upload_plan.take()
+    }
+
+    /// Whether this worker gives downloads and lists files: a worker attached
+    /// at protocol v9 or later ([`crate::web::protocol::DOWNLOAD_MIN_VERSION`]).
+    pub fn supports_download(&self) -> bool {
+        self.workspace.takes_downloads()
+    }
+
+    /// Ask the worker for `names` in `dir` (v9). The answer arrives as
+    /// [`RemoteClient::take_download_plan`]: one ticket per file for
+    /// `GET /download/{ticket}`, or a refusal. `None` — nothing sent — unless
+    /// [`RemoteClient::supports_download`] and the link is up.
+    pub fn begin_download(&self, dir: &str, names: &[String]) -> Option<u64> {
+        if !self.supports_download() {
+            return None;
+        }
+        let args = serde_json::json!({ "dir": dir, "names": names });
+        self.worker_command(worker_command::BEGIN_DOWNLOAD, Some(args))
+    }
+
+    /// The download plan the last `begin_download` produced, once.
+    pub fn take_download_plan(&mut self) -> Option<DownloadPlan> {
+        self.download_plan.take()
     }
 
     /// Where an upload's bytes go, as whom: this link's address, token and
@@ -837,6 +890,7 @@ mod tests {
             parent: Some("/home/u".to_string()),
             home: "/home/u".to_string(),
             entries: Vec::new(),
+            files: Vec::new(),
             truncated: false,
         }));
         assert!(client.pump());

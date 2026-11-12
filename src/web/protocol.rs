@@ -93,6 +93,7 @@
 //! | [`worker_command`], [`WorkerOp`], [`DirListing`], [`ProjectScan`], [`CloneProgress`], [`CloneResult`] | PRD W9/W16 — the worker's project picker: browse, scan, open, clone |
 //! | [`ResizeTerminal`] | PRD W5 — a worker has no pane of its own, so its one window sizes the PTYs |
 //! | [`worker_command::BEGIN_UPLOAD`], [`UploadPlan`], [`UPLOAD_MIN_VERSION`] | uploading files to a worker: a grant over the socket, the bytes over `PUT /upload/{ticket}` (v8) |
+//! | [`worker_command::BEGIN_DOWNLOAD`], [`DownloadPlan`], [`FileEntryView`], [`DOWNLOAD_MIN_VERSION`] | downloading files from a worker: a grant over the socket, the bytes over `GET /download/{ticket}` (v9) |
 //!
 //! # Forward compatibility
 //!
@@ -236,6 +237,17 @@ mod tests;
 /// upload plan: the command is refused for a peer below
 /// [`UPLOAD_MIN_VERSION`], and the frame is dropped on the way out.
 ///
+/// **v9 is downloading files from a worker** (`remote-control-pz6d`, the
+/// Transfer Files panel). [`worker_command::BROWSE_DIR`] takes
+/// `include_files` and [`DirListing`] carries the folder's files
+/// ([`DirListing::files`], additive under rule 4); a window asks with
+/// [`worker_command::BEGIN_DOWNLOAD`] and the worker answers with a new frame,
+/// [`ServerMsg::DownloadPlan`] — each file's size and one single-use ticket
+/// for `GET /download/{ticket}`, or why it refused. A new frame kind, hence
+/// the bump. As with v8, a worker still serves a v7 or v8 window but never
+/// sends it a download plan: the command is refused for a peer below
+/// [`DOWNLOAD_MIN_VERSION`], and the frame is dropped on the way out.
+///
 /// That co-shipping is exactly why the constant matters. The SPA is baked in, so
 /// `flightdeck update` on the host while a tab is open leaves that tab running
 /// **last version's JavaScript against this version's server**. The browser
@@ -247,21 +259,26 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
-/// not, and a v6 Desktop keeps working against a v7 or v8 host — neither ever
+/// not, and a v6 Desktop keeps working against a v7, v8 or v9 host — none ever
 /// sends a TUI's or Desktop's viewers a frame newer than v6. A worker host
 /// raises the floor to [`WORKER_MIN_CLIENT_VERSION`].
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 8;
+pub const MAX_SUPPORTED_VERSION: u16 = 9;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
 pub const UPLOAD_MIN_VERSION: u16 = 8;
+
+/// The oldest peer a worker sends a [`DownloadPlan`] to, and so the oldest
+/// that may ask for one with [`worker_command::BEGIN_DOWNLOAD`] (v9). Also the
+/// oldest a worker lists files for ([`DirListing::files`]).
+pub const DOWNLOAD_MIN_VERSION: u16 = 9;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -1947,9 +1964,27 @@ pub struct DirListing {
     pub home: String,
     /// The subdirectories, in the host's order.
     pub entries: Vec<DirEntryView>,
+    /// The regular files, in the host's order (v9) — only when the request
+    /// said `include_files: true`; empty otherwise, and from a host below v9.
+    #[serde(default)]
+    pub files: Vec<FileEntryView>,
     /// True when the host stopped listing before the end.
     #[serde(default)]
     pub truncated: bool,
+}
+
+/// One regular file in a [`DirListing`] (v9), for the Transfer Files panel's
+/// download side. A symlink is listed when it resolves to a regular file
+/// inside `$HOME`; anything else (sockets, devices, links leaving home) is
+/// not listed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntryView {
+    /// The file's name in the folder.
+    pub name: String,
+    /// The file's absolute path, as listed (not resolved).
+    pub path: String,
+    /// Its size in bytes when listed.
+    pub size: u64,
 }
 
 /// One subdirectory in a [`DirListing`].
@@ -2090,6 +2125,41 @@ pub struct UploadPlan {
     /// Why nothing was granted, in words for a person.
     #[serde(default)]
     pub refusal: Option<String>,
+}
+
+/// A worker's answer to [`worker_command::BEGIN_DOWNLOAD`] (v9), to the
+/// window that asked, beside the [`Ack`] for the same `seq`.
+///
+/// Either every file has a `ticket` (granted — `GET /download/{ticket}` within
+/// two minutes, with the same cookie), or `refusal` says why nothing was
+/// granted. All or nothing: one name that is missing, a folder, or a link
+/// leaving `$HOME` refuses the whole request, naming it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadPlan {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The source folder, canonical and absolute on the worker (as asked,
+    /// when the refusal is that it cannot be used).
+    pub dir: String,
+    /// One row per name asked for, in the order asked.
+    pub files: Vec<DownloadPlanFile>,
+    /// Why nothing was granted, in words for a person.
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+/// One file of a [`DownloadPlan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadPlanFile {
+    /// The name asked for (and the name the download suggests).
+    pub name: String,
+    /// Its size in bytes at grant time. The `GET`'s `Content-Length` is the
+    /// size when the file is opened, which wins if the file changed since.
+    #[serde(default)]
+    pub size: u64,
+    /// The single-use ticket for `GET /download/{ticket}`, when granted.
+    #[serde(default)]
+    pub ticket: Option<String>,
 }
 
 /// One file of an [`UploadPlan`].
@@ -2896,6 +2966,10 @@ pub enum ServerMsg {
     /// (v8): tickets, the conflicts to resolve, or a refusal. Never sent to a
     /// peer below [`UPLOAD_MIN_VERSION`].
     UploadPlan(UploadPlan),
+    /// The worker's answer to this window's
+    /// [`worker_command::BEGIN_DOWNLOAD`] (v9): tickets, or a refusal. Never
+    /// sent to a peer below [`DOWNLOAD_MIN_VERSION`].
+    DownloadPlan(DownloadPlan),
     /// Another window attached to this worker and took it over (v7, PRD W17).
     /// The socket closes right after this frame. The credential stays valid:
     /// the recipient may reconnect, and then takes it back.
@@ -3178,8 +3252,9 @@ pub mod command {
 /// [`WorkerOp::parse`], which is the one place their arguments are read.
 pub mod worker_command {
     /// List one directory under `$HOME`. Args `{path?: string, show_hidden?:
-    /// bool}`; no `path` lists `$HOME`. Answered with
-    /// [`super::ServerMsg::DirListing`].
+    /// bool, include_files?: bool}`; no `path` lists `$HOME`. Answered with
+    /// [`super::ServerMsg::DirListing`]; `include_files` (v9) fills its
+    /// `files`.
     pub const BROWSE_DIR: &str = "browse_dir";
     /// Scan the projects root for repositories. No args. Answered with
     /// [`super::ServerMsg::ProjectScan`].
@@ -3196,6 +3271,10 @@ pub mod worker_command {
     /// "replace" | "keep_both"}` (`ask` when absent). Answered with
     /// [`super::ServerMsg::UploadPlan`].
     pub const BEGIN_UPLOAD: &str = "begin_upload";
+    /// Ask to download files from one folder under `$HOME` (v9). Args `{dir:
+    /// string, names: [string]}`. Answered with
+    /// [`super::ServerMsg::DownloadPlan`].
+    pub const BEGIN_DOWNLOAD: &str = "begin_download";
     /// Every worker command name.
     pub const ALL: &[&str] = &[
         BROWSE_DIR,
@@ -3204,6 +3283,7 @@ pub mod worker_command {
         CLONE_PROJECT,
         RESTART_WORKER_SHELL,
         BEGIN_UPLOAD,
+        BEGIN_DOWNLOAD,
     ];
 }
 
@@ -3214,8 +3294,10 @@ pub enum WorkerOp {
     BrowseDir {
         /// The directory to list; `None` is `$HOME`.
         path: Option<String>,
-        /// Whether to list dot-directories too.
+        /// Whether to list dot-directories (and dotfiles) too.
         show_hidden: bool,
+        /// Whether to list the folder's regular files too (v9).
+        include_files: bool,
     },
     /// [`worker_command::SCAN_PROJECTS`].
     ScanProjects,
@@ -3242,6 +3324,13 @@ pub enum WorkerOp {
         /// What to do about names already taken.
         on_conflict: OnConflict,
     },
+    /// [`worker_command::BEGIN_DOWNLOAD`] (v9).
+    BeginDownload {
+        /// The source folder, as asked (`~`, `~/x`, relative or absolute).
+        dir: String,
+        /// The files' names in it, in the order asked.
+        names: Vec<String>,
+    },
 }
 
 impl WorkerOp {
@@ -3265,6 +3354,7 @@ impl WorkerOp {
                 Ok(WorkerOp::BrowseDir {
                     path: args.optional_str("path")?,
                     show_hidden: args.optional_bool("show_hidden")?.unwrap_or(false),
+                    include_files: args.optional_bool("include_files")?.unwrap_or(false),
                 })
             }
             worker_command::SCAN_PROJECTS => Ok(WorkerOp::ScanProjects),
@@ -3288,6 +3378,13 @@ impl WorkerOp {
                     dir: args.required_str("dir")?,
                     files: args.upload_files("files")?,
                     on_conflict: args.on_conflict("on_conflict")?,
+                })
+            }
+            worker_command::BEGIN_DOWNLOAD => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::BeginDownload {
+                    dir: args.required_str("dir")?,
+                    names: args.string_list("names")?,
                 })
             }
             _ => Err(format!("`{name}` is not a worker command")),
@@ -3373,6 +3470,19 @@ impl<'a> WorkerArgs<'a> {
                 }
             })
             .collect()
+    }
+
+    /// A required list of strings.
+    fn string_list(&self, key: &str) -> Result<Vec<String>, String> {
+        let shape = || format!("`{}`: `{key}` must be a list of strings", self.name);
+        match self.get(key) {
+            None => Err(format!("`{}` needs `{key}`", self.name)),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string).ok_or_else(shape))
+                .collect(),
+            Some(_) => Err(shape()),
+        }
     }
 
     /// An optional [`OnConflict`]; absent is [`OnConflict::Ask`].

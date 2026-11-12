@@ -155,6 +155,7 @@ fn worker_op(seq: u64, name: &str) -> WebInbound {
         "url": "https://example.invalid/r.git",
         "dir": "~",
         "files": [{ "name": "a.txt", "size": 1 }],
+        "names": ["a.txt"],
     });
     let op = WorkerOp::parse(name, Some(&args))
         .expect("a worker command")
@@ -1368,4 +1369,178 @@ fn a_whole_batch_written_is_an_info_message() {
             "Nothing was uploaded to ~. a: The upload did not start in time; send it again (and 1 more).".to_string()
         )
     );
+}
+
+// ---------------------------------------------------------------------------
+// Downloads (v9)
+// ---------------------------------------------------------------------------
+
+/// A `begin_download` from the test window.
+fn begin_download(seq: u64, dir: &str, names: &[&str]) -> WebInbound {
+    worker_op_with(
+        seq,
+        worker_command::BEGIN_DOWNLOAD,
+        json!({ "dir": dir, "names": names }),
+    )
+}
+
+/// The download plan among a routed op's answers.
+fn download_plan_in(out: &[WebOutbound]) -> &crate::web::protocol::DownloadPlan {
+    out.iter()
+        .find_map(|f| match f {
+            WebOutbound::Viewer {
+                msg: ServerMsg::DownloadPlan(plan),
+                ..
+            } => Some(plan),
+            _ => None,
+        })
+        .expect("a download plan frame")
+}
+
+/// The directory listing among a routed op's answers.
+fn listing_in(out: &[WebOutbound]) -> &DirListing {
+    out.iter()
+        .find_map(|f| match f {
+            WebOutbound::Viewer {
+                msg: ServerMsg::DirListing(listing),
+                ..
+            } => Some(listing),
+            _ => None,
+        })
+        .expect("a directory listing frame")
+}
+
+#[test]
+fn browse_dir_lists_files_only_when_asked() {
+    let fakes = Fakes::new();
+    fakes
+        .fs
+        .create_dir_all(Path::new("/home/me/proj/src"))
+        .unwrap();
+    fakes
+        .fs
+        .write(Path::new("/home/me/proj/README.md"), "hello")
+        .unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(worker_op_with(
+        1,
+        worker_command::BROWSE_DIR,
+        json!({ "path": "~/proj" }),
+    ));
+    let listing = listing_in(&out);
+    assert_eq!(listing.entries.len(), 1);
+    assert!(listing.files.is_empty(), "{listing:?}");
+
+    let out = host.route_inbound(worker_op_with(
+        2,
+        worker_command::BROWSE_DIR,
+        json!({ "path": "~/proj", "include_files": true }),
+    ));
+    let listing = listing_in(&out);
+    assert_eq!(
+        listing.files,
+        vec![crate::web::protocol::FileEntryView {
+            name: "README.md".to_string(),
+            path: "/home/me/proj/README.md".to_string(),
+            size: 5,
+        }]
+    );
+}
+
+#[test]
+fn a_download_outside_home_is_refused_in_its_own_frame() {
+    let fakes = Fakes::new();
+    fakes.fs.write(Path::new("/etc/x/a.txt"), "x").unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_download(3, "/etc/x", &["a.txt"]));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert_eq!(
+        ack.detail.as_deref(),
+        Some("/etc/x is outside your home folder.")
+    );
+    let plan = download_plan_in(&out);
+    assert_eq!(plan.seq, 3);
+    assert_eq!(plan.dir, "/etc/x", "as asked");
+    assert_eq!(plan.refusal, ack.detail);
+    let names: Vec<(&str, Option<&String>)> = plan
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.ticket.as_ref()))
+        .collect();
+    assert_eq!(names, vec![("a.txt", None)]);
+}
+
+#[test]
+fn a_folder_among_the_names_refuses_the_whole_download() {
+    let fakes = Fakes::new();
+    fakes.fs.write(Path::new("/home/me/p/a.txt"), "x").unwrap();
+    fakes
+        .fs
+        .create_dir_all(Path::new("/home/me/p/notes"))
+        .unwrap();
+    let mut host = loopback_worker(&fakes, |_| {});
+    let out = host.route_inbound(begin_download(4, "~/p", &["a.txt", "notes"]));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Rejected);
+    let plan = download_plan_in(&out);
+    assert_eq!(
+        plan.refusal.as_deref(),
+        Some("notes is a folder; download files, not folders.")
+    );
+    assert!(
+        plan.files.iter().all(|f| f.ticket.is_none()),
+        "nothing granted"
+    );
+    host.stop_worker();
+}
+
+#[test]
+fn a_worker_that_is_not_listening_grants_no_download() {
+    let fakes = Fakes::new();
+    fakes.fs.write(Path::new("/home/me/a.txt"), "x").unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(begin_download(5, "~", &["a.txt"]));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Rejected);
+    assert!(download_plan_in(&out)
+        .refusal
+        .as_deref()
+        .is_some_and(|r| r.contains("not listening")));
+}
+
+#[test]
+fn a_granted_download_has_a_ticket_and_size_per_file_and_is_logged() {
+    let fakes = Fakes::new();
+    fakes
+        .fs
+        .write(Path::new("/home/me/p/a.txt"), "hello")
+        .unwrap();
+    fakes.fs.write(Path::new("/home/me/p/b.bin"), "xy").unwrap();
+    let mut host = loopback_worker(&fakes, |_| {});
+    host.take_log_lines();
+    let out = host.route_inbound(begin_download(6, "~/p", &["b.bin", "a.txt"]));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    let plan = download_plan_in(&out);
+    assert_eq!(plan.dir, "/home/me/p");
+    assert_eq!(plan.refusal, None);
+    let rows: Vec<(&str, u64)> = plan
+        .files
+        .iter()
+        .map(|f| (f.name.as_str(), f.size))
+        .collect();
+    assert_eq!(rows, vec![("b.bin", 2), ("a.txt", 5)]);
+    assert!(plan.files.iter().all(|f| f.ticket.is_some()));
+    assert_ne!(plan.files[0].ticket, plan.files[1].ticket);
+    let lines = host.take_log_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "download of 2 file(s) from ~/p granted"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("message")),
+        "a download posts no host message: {lines:?}"
+    );
+    host.stop_worker();
 }

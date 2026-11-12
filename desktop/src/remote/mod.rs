@@ -51,10 +51,14 @@
 //!   Other hosts keep D4: their grid is letterboxed or panned here.
 //! - **Projects.** Open Project is the project picker ([`projects`]): scan,
 //!   browse, clone.
-//! - **Uploads (W34, v8).** Upload files… (the titlebar button, the palette
-//!   row, or files dropped on the window) opens the upload panel
-//!   ([`upload`]): files from this machine into a folder on the worker, its
-//!   Choose… the project picker in a choose-a-folder mode.
+//! - **Transfer files (W34 v8, downloads v9).** Transfer files… in the
+//!   titlebar opens the Transfer Files panel ([`transfer`]) on the tab it was
+//!   last on. Its **Upload** tab (the palette's Upload Files…, files dropped
+//!   on the window) sends files from this machine into a folder on the
+//!   worker, its Choose… the project picker in a choose-a-folder mode; its
+//!   **Download** tab (the palette's Download Files…, on a worker that gives
+//!   downloads) fetches files from a folder on the worker into a folder here
+//!   ([`download`]).
 //! - **Host messages and notifications** ([`messages`]): a message is a
 //!   status-bar notice (an error also an overlay); the ones kept while no
 //!   window was attached come back together as one overlay; notifications
@@ -79,11 +83,13 @@ use flightdeck::terminal::session::Terminal;
 use flightdeck::tui::palette::FrontEndAction;
 use flightdeck::view::{MissionView, SessionKey, TerminalRef};
 use flightdeck::web::client::session::RemoteSession;
+pub use flightdeck::web::client::session::TransferTab;
 #[cfg(test)]
 pub use flightdeck::web::client::session::WORKER_SHELL_COMMAND_REFUSAL;
 pub use flightdeck::web::client::session::{Dialer, Tab};
 use flightdeck::web::client::store::SavedRemote;
 use flightdeck::web::client::upload::Resolution;
+use flightdeck::web::client::DownloadPanel;
 use flightdeck::web::client::{client_label, LinkConfig};
 use flightdeck::web::client::{LinkEnd, ProjectPicker, RemoteClient, RemoteWorkspace, UploadPanel};
 use flightdeck::web::protocol::SeatRequest;
@@ -93,10 +99,11 @@ use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
 
 pub mod connect;
+pub mod download;
 pub mod messages;
 pub mod projects;
 pub mod shell;
-pub mod upload;
+pub mod transfer;
 pub mod window;
 
 #[cfg(test)]
@@ -510,12 +517,13 @@ impl RemoteModel {
         }
     }
 
-    /// Close the upload panel (and a folder choice it had open).
+    /// Close the Transfer Files panel, both tabs (and a folder choice its
+    /// Upload tab had open). A file moving is stopped.
     pub fn close_upload(&mut self) {
         if self.choosing_upload_dir {
             self.close_picker();
         }
-        self.session.close_upload();
+        self.session.close_transfer();
     }
 
     /// The panel's Choose…: the project picker, listing the panel's folder,
@@ -543,6 +551,145 @@ impl RemoteModel {
     pub fn upload_dir_chosen(&mut self, path: &str) {
         self.set_upload_dir(path);
         self.close_picker();
+    }
+
+    // -- the Transfer Files panel and its Download tab (v9) -------------------
+
+    /// Whether this worker gives downloads: the Download tab exists only then.
+    pub fn supports_download(&self) -> bool {
+        self.session.client().supports_download()
+    }
+
+    /// The Transfer Files panel's tab on screen; `None` while it is closed.
+    pub fn transfer_tab(&self) -> Option<TransferTab> {
+        self.session.transfer_tab()
+    }
+
+    /// Open the Transfer Files panel on `tab` (`None`: the one it was last
+    /// on) — the titlebar's Transfer files….
+    pub fn open_transfer(&mut self, tab: Option<TransferTab>) {
+        self.session.open_transfer(tab);
+    }
+
+    /// Switch the open panel to `tab`; refused while a transfer is under way.
+    pub fn set_transfer_tab(&mut self, tab: TransferTab) -> bool {
+        self.session.set_transfer_tab(tab)
+    }
+
+    /// Whether an upload or a download is being asked for or moving bytes.
+    pub fn transfer_busy(&self) -> bool {
+        self.session.transfer_busy()
+    }
+
+    /// The Download tab, once opened.
+    pub fn download(&self) -> Option<&DownloadPanel> {
+        self.session.download()
+    }
+
+    /// List `path` on the worker (`None`: its `$HOME`).
+    pub fn download_browse(&mut self, path: Option<&str>) {
+        self.session.download_browse(path);
+    }
+
+    /// Up one folder.
+    pub fn download_up(&mut self) {
+        self.session.download_up();
+    }
+
+    /// The worker's `$HOME`.
+    pub fn download_home(&mut self) {
+        self.session.download_home();
+    }
+
+    /// List hidden files and folders too, or not.
+    pub fn download_toggle_hidden(&mut self) {
+        self.session.download_toggle_hidden();
+    }
+
+    /// Tick or untick file `name`.
+    pub fn download_toggle(&mut self, name: &str) {
+        self.session.download_toggle(name);
+    }
+
+    /// Tick every file, or (all ticked) none.
+    pub fn download_select_all(&mut self) {
+        self.session.download_select_all();
+    }
+
+    /// Save into `dest` (typed in the tab's Save to field).
+    pub fn set_download_dest(&mut self, dest: &str) {
+        self.session.set_download_dest(dest);
+    }
+
+    /// The Save to field's Choose…: the platform's folder chooser, which
+    /// sets the destination. A cancelled chooser changes nothing.
+    pub fn choose_download_dest(&mut self, cx: &mut Context<Self>) {
+        if !self.download().is_some_and(DownloadPanel::is_browsing) {
+            return;
+        }
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Save here".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |model, cx| {
+                model.set_download_dest(&path.display().to_string());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Download: ask about names already here, else ask the worker.
+    pub fn start_download(&mut self) {
+        self.session.start_download();
+    }
+
+    /// The person's answer to names already in the destination.
+    pub fn resolve_download(&mut self, resolution: Resolution) {
+        self.session.resolve_download(resolution);
+    }
+
+    /// Stop the download; what was saved stays saved.
+    pub fn cancel_download(&mut self) {
+        self.session.cancel_download();
+    }
+
+    /// After Done or Cancelled: browse again, nothing ticked.
+    pub fn download_more(&mut self) {
+        self.session.download_more();
+    }
+
+    /// Where the last download landed, to show in the platform's file
+    /// manager: the first file saved (selected there), else the folder.
+    pub fn downloaded_path(&self) -> Option<std::path::PathBuf> {
+        use flightdeck::web::client::download::DownloadPhase;
+        match &self.download()?.phase {
+            DownloadPhase::Done { saved, dest, .. } => Some(
+                saved
+                    .first()
+                    .map(|(_, path)| path.clone())
+                    .unwrap_or_else(|| dest.clone()),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Show in folder: the platform's file manager (Finder, Explorer, the
+    /// desktop's own) on what the download saved.
+    pub fn reveal_download(&self, cx: &mut Context<Self>) {
+        if let Some(path) = self.downloaded_path() {
+            cx.reveal_path(&path);
+        }
     }
 
     /// The pane size the terminal element measured. On a worker it is sent
@@ -687,7 +834,9 @@ impl RemoteModel {
 
     /// [`RemoteModel::dispatch`] without a GPUI context. The palette rows
     /// only this window answers (Open in VS Code, Rename Remote, Upload
-    /// Files — whose file chooser `dispatch` then opens) are answered here; the app's own are kept for [`RemoteModel::take_front_end_actions`].
+    /// Files — whose file chooser `dispatch` then opens — and Download
+    /// Files) are answered here; the app's own are kept for
+    /// [`RemoteModel::take_front_end_actions`].
     pub fn apply(&mut self, event: HostEvent) {
         self.session.apply(event);
         for action in self.session.take_front_end_actions() {
@@ -700,6 +849,9 @@ impl RemoteModel {
                 }
                 FrontEndAction::RenameRemote => self.open_rename(),
                 FrontEndAction::UploadFiles => self.pick_files = true,
+                FrontEndAction::DownloadFiles => {
+                    self.session.open_transfer(Some(TransferTab::Download))
+                }
                 action => self.front_end.push(action),
             }
         }

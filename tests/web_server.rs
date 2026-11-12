@@ -5796,6 +5796,7 @@ mod worker {
                 WorkerOp::BrowseDir {
                     path: Some("/home/ruud/src".to_string()),
                     show_hidden: true,
+                    include_files: false,
                 }
             );
 
@@ -5827,7 +5828,7 @@ mod worker {
             assert_eq!(ack.outcome, AckOutcome::Rejected);
             assert_eq!(
                 ack.detail.as_deref(),
-                Some("Use the window's upload panel.")
+                Some("Use the window's Transfer Files panel.")
             );
             assert_eq!(ack.detail, upload.refusal);
         });
@@ -5925,7 +5926,7 @@ mod worker {
         // -- uploads (v8, `remote-control-usem`) ---------------------------------
 
         /// A worker on loopback whose server reads `clock` (for grant expiry).
-        fn start_worker_on(clock: Arc<dyn Clock + Send + Sync>) -> Harness {
+        pub(super) fn start_worker_on(clock: Arc<dyn Clock + Send + Sync>) -> Harness {
             let dir = tempfile::tempdir().expect("a temp dir");
             let store =
                 CredentialStore::open(Arc::new(RealFs), clock.clone(), dir.path().join("web.json"));
@@ -5954,7 +5955,9 @@ mod worker {
 
         /// A home for the upload to land in, canonical (macOS's temp dir is
         /// behind a symlink), with `sub` made inside it.
-        fn upload_home(sub: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        pub(super) fn upload_home(
+            sub: &str,
+        ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
             let home = tempfile::tempdir().expect("a temp home");
             let canonical = home.path().canonicalize().expect("canonical");
             let dir = canonical.join(sub);
@@ -6620,6 +6623,543 @@ mod worker {
             assert_eq!(std::fs::read(dir.join("tls.txt")).unwrap(), b"hello world");
             no_temp_left(&dir);
             harness.handle.stop(ShutdownNotice::server_stopped());
+        }
+    }
+
+    /// Downloads (v9, `remote-control-pz6d`): the grant over the socket, the
+    /// bytes over `GET /download/{ticket}`. The route is unix-only, like the
+    /// worker.
+    #[cfg(unix)]
+    mod download {
+        use super::upload::{start_worker_on, upload_home};
+        use super::*;
+        use flightdeck::web::credentials::TokenId;
+        use flightdeck::web::server::DownloadGrantRequest;
+
+        /// A response read to the end, its body as bytes.
+        struct RawResponse {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl RawResponse {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+            }
+
+            fn json(&self) -> serde_json::Value {
+                serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+            }
+        }
+
+        /// `<method> /download/{ticket}` with `cookie`, read to EOF.
+        async fn fetch(
+            addr: &str,
+            method: &str,
+            ticket: &str,
+            cookie: Option<&str>,
+        ) -> RawResponse {
+            let mut stream = TcpStream::connect(addr).await.expect("the server is up");
+            let mut head = format!(
+                "{method} /download/{ticket} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n"
+            );
+            if let Some(cookie) = cookie {
+                head.push_str(&format!("Cookie: {cookie}\r\n"));
+            }
+            if method == "POST" {
+                head.push_str("Content-Length: 0\r\n");
+            }
+            head.push_str("\r\n");
+            stream.write_all(head.as_bytes()).await.expect("writable");
+            let mut raw = Vec::new();
+            let _ = stream.read_to_end(&mut raw).await;
+            let split = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("a response head");
+            let head = String::from_utf8_lossy(&raw[..split]).to_string();
+            let body = raw[split + 4..].to_vec();
+            let mut lines = head.split("\r\n");
+            let status = lines
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .unwrap_or(0);
+            let headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                .collect();
+            RawResponse {
+                status,
+                headers,
+                body,
+            }
+        }
+
+        async fn get_download(addr: &str, ticket: &str, cookie: Option<&str>) -> RawResponse {
+            fetch(addr, "GET", ticket, cookie).await
+        }
+
+        /// Ask for a download over a window socket the way the Desktop does,
+        /// and return the credential the server forwarded with it: what the
+        /// worker host binds the grant to.
+        async fn begin_download_over(
+            ws: &mut Ws,
+            harness: &Harness,
+            seq: u64,
+            names: &[&str],
+        ) -> TokenId {
+            command(
+                ws,
+                seq,
+                worker_command::BEGIN_DOWNLOAD,
+                Some(serde_json::json!({ "dir": "~/out", "names": names })),
+            )
+            .await;
+            wait_for(harness, |event| match event {
+                WebInbound::WorkerOp {
+                    token,
+                    seq: got,
+                    op: WorkerOp::BeginDownload { names: asked, .. },
+                    ..
+                } if got == seq => {
+                    assert_eq!(asked.len(), names.len());
+                    Some(token)
+                }
+                _ => None,
+            })
+        }
+
+        /// A window's credential on `harness`, through `begin_download`.
+        fn window_token(harness: &Harness, cookie: &str) -> TokenId {
+            let addr = harness.addr();
+            on_runtime(async {
+                let mut ws = ws_connect(&addr, Some(cookie)).await.expect("upgrade");
+                attach_as(&mut ws, ConnectionKind::Window, "box-a", None).await;
+                begin_download_over(&mut ws, harness, 1, &["a"]).await
+            })
+        }
+
+        /// A grant for `name` in `dir`, as the host makes it: canonical.
+        fn grant(dir: &std::path::Path, name: &str) -> DownloadGrantRequest {
+            let path = dir.join(name).canonicalize().expect("the file exists");
+            DownloadGrantRequest {
+                size: std::fs::metadata(&path).expect("a file").len(),
+                path,
+                name: name.to_string(),
+            }
+        }
+
+        /// The whole path: `begin_download` over the window's socket carries
+        /// the window's credential to the host, the host's grant is a ticket,
+        /// and a `GET` with that credential returns exactly the file's bytes,
+        /// as an attachment named for it — once.
+        #[test]
+        fn a_granted_download_sends_exactly_the_file_once() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            let body: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+            let name = "résumé \"final\".bin";
+            std::fs::write(dir.join(name), &body).unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness
+                .handle
+                .grant_downloads(&token, &home, &[grant(&dir, name)]);
+            assert_eq!(tickets.len(), 1);
+
+            on_runtime(async {
+                let got = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+                assert_eq!(got.body, body, "exactly the file's bytes");
+                assert_eq!(got.header("content-length"), Some("300000"));
+                assert_eq!(got.header("content-type"), Some("application/octet-stream"));
+                assert_eq!(
+                    got.header("content-disposition"),
+                    Some(
+                        "attachment; filename=\"r_sum_ _final_.bin\"; \
+                         filename*=UTF-8''r%C3%A9sum%C3%A9%20%22final%22.bin"
+                    )
+                );
+                assert_eq!(got.header("cache-control"), Some("no-store"));
+                assert_eq!(got.header("x-content-type-options"), Some("nosniff"));
+
+                // Single use.
+                let again = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(again.status, 403);
+                assert_eq!(again.json()["ok"], false);
+                assert_eq!(again.json()["reason"], "invalid_ticket");
+                assert_eq!(again.header("cache-control"), Some("no-store"));
+            });
+        }
+
+        /// An empty file is a `200` with no body, not a failure.
+        #[test]
+        fn an_empty_file_downloads_as_nothing() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            std::fs::write(dir.join("empty"), b"").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness
+                .handle
+                .grant_downloads(&token, &home, &[grant(&dir, "empty")]);
+            on_runtime(async {
+                let got = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(got.status, 200);
+                assert_eq!(got.header("content-length"), Some("0"));
+                assert!(got.body.is_empty());
+            });
+        }
+
+        /// A ticket answers only to the credential it was granted to: another
+        /// paired device is told nothing (and spends nothing), no cookie or a
+        /// forged one is the ordinary refusal, and the owner can still use it.
+        #[test]
+        fn a_ticket_is_refused_to_any_other_credential() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let other = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            std::fs::write(dir.join("a.txt"), b"secret").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness
+                .handle
+                .grant_downloads(&token, &home, &[grant(&dir, "a.txt")]);
+            on_runtime(async {
+                let theirs = get_download(&addr, &tickets[0], Some(&other)).await;
+                assert_eq!(theirs.status, 403);
+                assert_eq!(theirs.json()["reason"], "invalid_ticket");
+                assert!(!theirs.body.windows(6).any(|w| w == b"secret"));
+                let nobody = get_download(&addr, &tickets[0], None).await;
+                assert_eq!(nobody.status, 401);
+                let forged = get_download(&addr, &tickets[0], Some("flightdeck_web=forged")).await;
+                assert_eq!(forged.status, 401);
+                let unknown = get_download(&addr, "AAAAAAAAAAAAAAAAAAAAAA", Some(&cookie)).await;
+                assert_eq!(unknown.status, 403);
+                assert_eq!(unknown.json()["reason"], "invalid_ticket");
+
+                let mine = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(mine.status, 200);
+                assert_eq!(mine.body, b"secret");
+            });
+        }
+
+        /// A grant lives two minutes of the server's clock.
+        #[test]
+        fn an_expired_ticket_is_refused() {
+            let clock = Arc::new(flightdeck::testing::FakeClock::default());
+            clock.set_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+            let harness = start_worker_on(clock.clone());
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness.handle.grant_downloads(
+                &token,
+                &home,
+                &[grant(&dir, "a.txt"), grant(&dir, "a.txt")],
+            );
+            clock.advance_millis(server::DOWNLOAD_GRANT_TTL_MS as u64 + 1);
+            on_runtime(async {
+                for ticket in &tickets {
+                    let late = get_download(&addr, ticket, Some(&cookie)).await;
+                    assert_eq!(late.status, 403);
+                    assert_eq!(late.json()["reason"], "invalid_ticket");
+                }
+            });
+        }
+
+        /// The file is checked again when it is fetched: swapped for a link
+        /// (even to another file inside home), removed, or replaced by a
+        /// folder since the grant, it is `409 file_changed` and no byte of
+        /// anything is sent.
+        #[test]
+        fn a_file_changed_after_the_grant_is_refused() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            for name in ["linked.txt", "removed.txt", "folder.txt"] {
+                std::fs::write(dir.join(name), b"granted").unwrap();
+            }
+            std::fs::write(dir.join("other.txt"), b"not granted").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness.handle.grant_downloads(
+                &token,
+                &home,
+                &[
+                    grant(&dir, "linked.txt"),
+                    grant(&dir, "removed.txt"),
+                    grant(&dir, "folder.txt"),
+                ],
+            );
+            std::fs::remove_file(dir.join("linked.txt")).unwrap();
+            std::os::unix::fs::symlink(dir.join("other.txt"), dir.join("linked.txt")).unwrap();
+            std::fs::remove_file(dir.join("removed.txt")).unwrap();
+            std::fs::remove_file(dir.join("folder.txt")).unwrap();
+            std::fs::create_dir(dir.join("folder.txt")).unwrap();
+            on_runtime(async {
+                for (ticket, name) in
+                    tickets
+                        .iter()
+                        .zip(["linked.txt", "removed.txt", "folder.txt"])
+                {
+                    let got = get_download(&addr, ticket, Some(&cookie)).await;
+                    assert_eq!(got.status, 409, "{name}");
+                    assert_eq!(got.json()["ok"], false);
+                    assert_eq!(got.json()["reason"], "file_changed");
+                    assert_eq!(
+                        got.json()["message"],
+                        format!("{name} changed on the worker. Choose it again.")
+                    );
+                    assert_eq!(got.header("cache-control"), Some("no-store"));
+                    // The ticket was spent on the refusal.
+                    let again = get_download(&addr, ticket, Some(&cookie)).await;
+                    assert_eq!(again.status, 403, "{name}");
+                }
+            });
+        }
+
+        /// A folder above the file swapped for a link out of home is refused
+        /// too: the canonical path is no longer the one granted.
+        #[test]
+        fn a_folder_swapped_for_a_link_is_refused() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            std::fs::write(dir.join("a.txt"), b"mine").unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("a.txt"), b"theirs").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness
+                .handle
+                .grant_downloads(&token, &home, &[grant(&dir, "a.txt")]);
+            std::fs::rename(&dir, home.join("moved")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+            on_runtime(async {
+                let got = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(got.status, 409);
+                assert_eq!(got.json()["reason"], "file_changed");
+            });
+        }
+
+        /// Only `GET`: a `HEAD` or a `POST` is `405`, and spends nothing.
+        #[test]
+        fn only_get_is_answered() {
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let (_home, home, dir) = upload_home("out");
+            std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+            let token = window_token(&harness, &cookie);
+            let tickets = harness
+                .handle
+                .grant_downloads(&token, &home, &[grant(&dir, "a.txt")]);
+            on_runtime(async {
+                for method in ["HEAD", "POST", "PUT", "DELETE"] {
+                    let got = fetch(&addr, method, &tickets[0], Some(&cookie)).await;
+                    assert_eq!(got.status, 405, "{method}");
+                    assert_eq!(got.header("allow"), Some("GET"), "{method}");
+                }
+                let got = get_download(&addr, &tickets[0], Some(&cookie)).await;
+                assert_eq!(got.status, 200, "the ticket is still good");
+                assert_eq!(got.body, b"hello");
+            });
+        }
+
+        /// A TUI host gives no files: `/download/…` is not found, never the
+        /// page with a 200 that a client would save as the file.
+        #[test]
+        fn a_tui_host_has_no_download_route() {
+            let harness = Harness::start();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            on_runtime(async {
+                for path in ["/download/abc", "/download"] {
+                    let got = get(&addr, path, &[("Cookie", &cookie)]).await;
+                    assert_eq!(got.status, 404, "{path}");
+                    assert!(!got.body.contains("<html"), "{path} served the page");
+                }
+                // The page itself is still served.
+                assert_eq!(get(&addr, "/", &[]).await.status, 200);
+            });
+        }
+
+        /// `/download` is protocol, not a page: with a certificate and an
+        /// HTTPS name, a plain-HTTP download is never redirected.
+        #[test]
+        fn a_plain_http_download_is_never_redirected() {
+            let harness = start_https_worker();
+            harness
+                .handle
+                .set_https_host(Some("box.tail1234.ts.net".to_string()));
+            let addr = harness.addr();
+            on_runtime(async {
+                assert_eq!(get(&addr, "/", &[]).await.status, 308, "pages are");
+                let got = get_download(&addr, "abc", None).await;
+                assert_eq!(got.status, 401);
+                let bare = get(&addr, "/download", &[]).await;
+                assert_ne!(bare.status, 308);
+                assert_ne!(bare.status, 200);
+            });
+            harness.handle.stop(ShutdownNotice::server_stopped());
+        }
+
+        /// A v8 window — which would drop a download plan — is not offered
+        /// Download Files…, is told to update when it asks anyway, never gets
+        /// files listed, and never receives a plan; a v9 window does.
+        #[test]
+        fn only_a_v9_window_may_download() {
+            use flightdeck::web::protocol::{DownloadPlan, DownloadPlanFile};
+            use flightdeck::web::server::WebOutbound;
+            let harness = start_worker();
+            let addr = harness.addr();
+            let cookie = on_runtime(harness.authenticate());
+            let plan = ServerMsg::DownloadPlan(DownloadPlan {
+                seq: 1,
+                dir: "/home/ruud".to_string(),
+                files: vec![DownloadPlanFile {
+                    name: "a".to_string(),
+                    size: 1,
+                    ticket: Some("t".to_string()),
+                }],
+                refusal: None,
+            });
+            on_runtime(async {
+                let mut old = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                send(
+                    &mut old,
+                    &ClientMsg::Attach(Attach {
+                        protocol_version: 8,
+                        seat: SeatRequest::Write,
+                        cursors: Vec::new(),
+                        resume_viewer: None,
+                        viewport: None,
+                        client: None,
+                        connection: ConnectionKind::Window,
+                    }),
+                )
+                .await;
+                let snapshot = await_snapshot(&mut old).await;
+                assert_eq!(snapshot.protocol_version, 8);
+                assert!(
+                    !snapshot
+                        .commands
+                        .iter()
+                        .any(|row| row.id == "download_files"),
+                    "a v8 peer cannot download, so it is not offered the row"
+                );
+                assert!(snapshot.commands.iter().any(|row| row.id == "upload_files"));
+                command(
+                    &mut old,
+                    2,
+                    worker_command::BEGIN_DOWNLOAD,
+                    Some(serde_json::json!({ "dir": "~", "names": ["a"] })),
+                )
+                .await;
+                let refused = frame_matching(&mut old, |frame| match frame {
+                    ServerMsg::Error(error) if error.seq == Some(2) => Some(error),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(refused.code, ErrorCode::NotSupported);
+                assert!(refused.message.contains("newer FlightDeck"), "{refused:?}");
+
+                // Its browse_dir reaches the host without files.
+                command(
+                    &mut old,
+                    3,
+                    worker_command::BROWSE_DIR,
+                    Some(serde_json::json!({ "include_files": true })),
+                )
+                .await;
+                let op = wait_for(&harness, |event| match event {
+                    WebInbound::WorkerOp { seq: 3, op, .. } => Some(op),
+                    _ => None,
+                });
+                assert_eq!(
+                    op,
+                    WorkerOp::BrowseDir {
+                        path: None,
+                        show_hidden: false,
+                        include_files: false,
+                    }
+                );
+
+                harness.handle.send(WebOutbound::All(plan.clone()));
+                let (frames, _) = drain_frames(&mut old, Duration::from_millis(300)).await;
+                assert!(
+                    !frames
+                        .iter()
+                        .any(|f| matches!(f, ServerMsg::DownloadPlan(_))),
+                    "{frames:?}"
+                );
+            });
+            let events = harness.inbound();
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    WebInbound::WorkerOp {
+                        op: WorkerOp::BeginDownload { .. },
+                        ..
+                    }
+                )),
+                "{events:?}"
+            );
+
+            on_runtime(async {
+                let mut window = ws_connect(&addr, Some(&cookie)).await.expect("upgrade");
+                let snapshot = attach_as(&mut window, ConnectionKind::Window, "box-a", None).await;
+                let row = snapshot
+                    .commands
+                    .iter()
+                    .find(|row| row.id == "download_files")
+                    .expect("a v9 worker lists Download Files…");
+                assert_eq!(row.label, "Download Files…");
+                command(
+                    &mut window,
+                    4,
+                    worker_command::BROWSE_DIR,
+                    Some(serde_json::json!({ "include_files": true })),
+                )
+                .await;
+                let op = wait_for(&harness, |event| match event {
+                    WebInbound::WorkerOp { seq: 4, op, .. } => Some(op),
+                    _ => None,
+                });
+                assert!(
+                    matches!(
+                        op,
+                        WorkerOp::BrowseDir {
+                            include_files: true,
+                            ..
+                        }
+                    ),
+                    "{op:?}"
+                );
+                harness.handle.send(WebOutbound::All(plan.clone()));
+                let got = frame_matching(&mut window, |frame| match frame {
+                    ServerMsg::DownloadPlan(plan) => Some(plan),
+                    _ => None,
+                })
+                .await;
+                assert_eq!(got.files[0].ticket.as_deref(), Some("t"));
+            });
         }
     }
 }

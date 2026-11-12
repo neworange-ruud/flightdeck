@@ -119,7 +119,7 @@ fn plan(seq: u64, files: Vec<UploadPlanFile>, conflicts: bool) -> LinkEvent {
 #[gpui::test]
 fn a_host_that_is_not_a_worker_offers_no_upload(app: &mut TestAppContext) {
     let (model, _script, _window, cx) = open_on(app, snapshot());
-    assert!(cx.debug_bounds("remote-upload-files").is_none());
+    assert!(cx.debug_bounds("remote-transfer-files").is_none());
     assert!(cx.debug_bounds("remote-drop-target").is_none());
     assert!(!palette_labels(&model, cx).contains(&"Upload Files…"));
 }
@@ -130,7 +130,7 @@ fn a_v7_worker_offers_no_upload(app: &mut TestAppContext) {
     v7.protocol_version = UPLOAD_MIN_VERSION - 1;
     let (model, _script, _window, cx) = open_on(app, v7);
     assert!(model.read_with(cx, |m, _| m.is_worker()));
-    assert!(cx.debug_bounds("remote-upload-files").is_none());
+    assert!(cx.debug_bounds("remote-transfer-files").is_none());
     assert!(cx.debug_bounds("remote-drop-target").is_none());
     assert!(!palette_labels(&model, cx).contains(&"Upload Files…"));
 }
@@ -139,7 +139,7 @@ fn a_v7_worker_offers_no_upload(app: &mut TestAppContext) {
 fn a_v8_worker_offers_upload_in_the_titlebar_and_the_palette(app: &mut TestAppContext) {
     let (model, _script, _window, cx) = open_on(app, worker_snapshot());
     let button = cx
-        .debug_bounds("remote-upload-files")
+        .debug_bounds("remote-transfer-files")
         .expect("Upload files… in the titlebar");
     let command = cx.debug_bounds("remote-command-field").unwrap();
     assert!(button.right() <= command.left(), "before the command field");
@@ -164,21 +164,30 @@ fn the_palette_row_asks_for_files_and_opens_the_panel_with_them(app: &mut TestAp
     assert_eq!(names(&panel), ["notes.md", "data.csv"]);
     assert_eq!(panel.files[0].size, 5);
     assert_eq!(panel.dir, DEFAULT_DIR, "the worktree on screen");
-    assert!(cx.debug_bounds("upload-panel").is_some());
+    assert!(cx.debug_bounds("transfer-panel").is_some());
     assert!(cx.debug_bounds("upload-file-1").is_some());
 }
 
 #[gpui::test]
-fn the_titlebar_button_asks_for_files_and_a_cancelled_chooser_opens_nothing(
-    app: &mut TestAppContext,
-) {
+fn the_palette_rows_file_chooser_cancelled_opens_nothing(app: &mut TestAppContext) {
     let (model, _script, _window, cx) = open_on(app, worker_snapshot());
-    click(cx, "remote-upload-files");
+    model.update(cx, |m, cx| m.dispatch(upload_row(), cx));
+    cx.run_until_parked();
     assert!(cx.did_prompt_for_paths());
     cx.simulate_path_prompt_response(|_| None);
     cx.run_until_parked();
     assert!(panel(&model, cx).is_none());
-    assert!(cx.debug_bounds("upload-panel").is_none());
+    assert!(cx.debug_bounds("transfer-panel").is_none());
+}
+
+#[gpui::test]
+fn the_titlebar_button_opens_the_panel_on_upload_with_no_chooser(app: &mut TestAppContext) {
+    let (model, _script, _window, cx) = open_on(app, worker_snapshot());
+    click(cx, "remote-transfer-files");
+    assert!(!cx.did_prompt_for_paths(), "the panel, not a file chooser");
+    assert!(cx.debug_bounds("transfer-panel").is_some());
+    assert!(cx.debug_bounds("upload-empty").is_some(), "the Upload tab");
+    assert!(panel(&model, cx).unwrap().files.is_empty());
 }
 
 #[gpui::test]
@@ -250,7 +259,7 @@ fn upload_is_disabled_with_no_files_and_esc_closes_the_panel(app: &mut TestAppCo
     assert!(begin_uploads(&mut script).is_empty(), "nothing to send");
     cx.simulate_keystrokes("escape");
     assert!(panel(&model, cx).is_none());
-    assert!(cx.debug_bounds("upload-panel").is_none());
+    assert!(cx.debug_bounds("transfer-panel").is_none());
 }
 
 #[gpui::test]
@@ -322,7 +331,7 @@ fn choose_browses_the_workers_folders_and_sets_the_target(app: &mut TestAppConte
     assert!(model.read_with(cx, |m, _| m.choosing_upload_dir()));
     assert!(cx.debug_bounds("remote-picker").is_some());
     assert!(
-        cx.debug_bounds("upload-panel").is_none(),
+        cx.debug_bounds("transfer-panel").is_none(),
         "hidden meanwhile"
     );
 
@@ -337,6 +346,7 @@ fn choose_browses_the_workers_folders_and_sets_the_target(app: &mut TestAppConte
             is_git_repo: true,
             is_open_project: false,
         }],
+        files: Vec::new(),
         truncated: false,
     }));
     turn(&model, cx);
@@ -349,7 +359,7 @@ fn choose_browses_the_workers_folders_and_sets_the_target(app: &mut TestAppConte
     assert!(model.read_with(cx, |m, _| m.picker().is_none()));
     assert_eq!(panel(&model, cx).unwrap().dir, "/home/dev/data");
     assert!(
-        cx.debug_bounds("upload-panel").is_some(),
+        cx.debug_bounds("transfer-panel").is_some(),
         "back to the panel"
     );
 
@@ -365,7 +375,7 @@ fn back_from_choose_keeps_the_folder(app: &mut TestAppContext) {
     open_panel(&model, cx, &paths);
     click(cx, "overlay-button-upload-choose");
     click(cx, "remote-picker-close");
-    assert!(cx.debug_bounds("upload-panel").is_some());
+    assert!(cx.debug_bounds("transfer-panel").is_some());
     assert_eq!(panel(&model, cx).unwrap().dir, DEFAULT_DIR);
 }
 

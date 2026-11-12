@@ -1,9 +1,10 @@
 /**
  * @vitest-environment jsdom
  *
- * The upload panel, rendered (W34, R30): where its entry points appear (a
- * worker at v8 — never a TUI host, never a v7 peer), the panel through its
- * phases, the keyboard, and a drop. Everything is driven through the store;
+ * The Transfer files panel's Upload tab, rendered (W34, R30): where its entry
+ * points appear (a worker at v8 — never a TUI host, never a v7 peer), the
+ * panel through its phases, the keyboard, and a drop. The Download tab is
+ * `downloadView.test.ts`. Everything is driven through the store;
  * `main.ts`'s sending is out of scope, so what a click *means* is read off
  * the dispatched actions.
  */
@@ -22,10 +23,20 @@ const UPLOAD_ROW: WireCommandView = {
   label: "Upload Files…",
   group: "Projects",
   run: { name: "upload_files" },
-  refusal: "Use the window's upload panel.",
+  refusal: "Use the window's Transfer Files panel.",
 };
 
-function render(snapshot: WireSnapshot | "tui" = workerSnapshotWire({ commands: [UPLOAD_ROW] })) {
+const DOWNLOAD_ROW: WireCommandView = {
+  id: "download_files",
+  label: "Download Files…",
+  group: "Projects",
+  run: { name: "download_files" },
+  refusal: "Use the window's Transfer Files panel.",
+};
+
+function render(
+  snapshot: WireSnapshot | "tui" = workerSnapshotWire({ commands: [UPLOAD_ROW, DOWNLOAD_ROW] }),
+) {
   const dispatched: AppAction[] = [];
   const ran: string[] = [];
   const app = createApp({
@@ -81,13 +92,20 @@ afterEach(() => {
   click.mockRestore();
 });
 
-describe("where Upload files appears", () => {
-  it("beside Open Project on a worker at v8, opening the file chooser", () => {
+describe("where Transfer files appears", () => {
+  it("beside Open Project on a worker, opening the panel on Upload", () => {
     const h = render();
-    const button = h.q('.fd-projects [data-action="upload-files"]');
-    expect(button.textContent).toBe("Upload files");
+    const button = h.q('.fd-projects [data-action="transfer-files"]');
+    expect(button.textContent).toBe("Transfer files");
     expect(button.nextElementSibling?.getAttribute("data-action")).toBe("open-project");
     button.click();
+    expect(h.dispatched).toContainEqual({ type: "transfer/open", tab: null });
+    expect(visible(h.q(".fd-upload"))).toBe(true);
+    expect(h.q(".fd-upload").getAttribute("data-tab")).toBe("upload");
+    expect(h.q(".fd-upload .fd-picker__title").textContent).toBe("Transfer files");
+    /** Opening the panel opens no chooser: Add files… does that. */
+    expect(click).not.toHaveBeenCalled();
+    h.q('.fd-upload [data-action="add-files"]').click();
     expect(click).toHaveBeenCalledTimes(1);
     expect(h.q("[data-upload-input]").getAttribute("type")).toBe("file");
     expect(h.q("[data-upload-input]").hasAttribute("multiple")).toBe(true);
@@ -95,31 +113,67 @@ describe("where Upload files appears", () => {
 
   it("nowhere on a TUI host", () => {
     const h = render("tui");
-    expect(h.maybe('[data-action="upload-files"]')).toBeNull();
+    expect(h.maybe('[data-action="transfer-files"]')).toBeNull();
     h.app.store.dispatch({ type: "upload/open", picked: pick(file("a.txt")) });
+    h.app.store.dispatch({ type: "transfer/open", tab: "download" });
     expect(h.app.store.getState().upload).toBeNull();
+    expect(h.app.store.getState().download).toBeNull();
     expect(visible(h.maybe(".fd-upload"))).toBe(false);
+    h.app.store.dispatch({ type: "palette/open" });
+    expect(h.q(".fd-palette").textContent).not.toContain("Upload Files…");
+    expect(h.q(".fd-palette").textContent).not.toContain("Download Files…");
   });
 
   it("nowhere on a worker that answered at v7", () => {
-    const h = render(workerSnapshotWire({ protocol_version: 7, commands: [UPLOAD_ROW] }));
-    expect(h.maybe('[data-action="upload-files"]')).toBeNull();
+    const h = render(
+      workerSnapshotWire({ protocol_version: 7, commands: [UPLOAD_ROW, DOWNLOAD_ROW] }),
+    );
+    expect(h.maybe('[data-action="transfer-files"]')).toBeNull();
     h.app.store.dispatch({ type: "palette/open" });
     expect(h.q(".fd-palette").textContent).not.toContain("Upload Files…");
+    expect(h.q(".fd-palette").textContent).not.toContain("Download Files…");
   });
 
-  it("in the palette, where it opens the chooser rather than being sent", () => {
-    const h = render();
-    h.app.store.dispatch({ type: "palette/open" });
-    const row = [...h.app.el.querySelectorAll<HTMLElement>(".fd-palette__row")].find((r) =>
-      (r.textContent ?? "").includes("Upload Files…"),
+  it("on a worker at v8 with no Download tab and no Download Files…", () => {
+    const h = render(
+      workerSnapshotWire({ protocol_version: 8, commands: [UPLOAD_ROW, DOWNLOAD_ROW] }),
     );
-    expect(row).toBeDefined();
-    expect(row?.textContent).not.toContain("Use the window's upload panel.");
-    row?.click();
-    expect(click).toHaveBeenCalledTimes(1);
-    expect(h.ran).toEqual([]);
+    h.q('[data-action="transfer-files"]').click();
+    expect(visible(h.q(".fd-upload"))).toBe(true);
+    expect(visible(h.q(".fd-transfer__tabs"))).toBe(false);
+    expect(h.q(".fd-upload").getAttribute("data-tab")).toBe("upload");
+    h.app.store.dispatch({ type: "transfer/close" });
+    h.app.store.dispatch({ type: "palette/open" });
+    expect(h.q(".fd-palette").textContent).toContain("Upload Files…");
+    expect(h.q(".fd-palette").textContent).not.toContain("Download Files…");
+  });
+
+  it("in the palette, where each row opens its tab rather than being sent", () => {
+    const h = render();
+    const paletteRow = (label: string): HTMLElement | undefined =>
+      [...h.app.el.querySelectorAll<HTMLElement>(".fd-palette__row")].find((r) =>
+        (r.textContent ?? "").includes(label),
+      );
+    h.app.store.dispatch({ type: "palette/open" });
+    const upload = paletteRow("Upload Files…");
+    expect(upload).toBeDefined();
+    expect(upload?.textContent).not.toContain("Transfer Files panel");
+    upload?.click();
     expect(h.app.store.getState().palette).toBeNull();
+    expect(h.app.store.getState().transferTab).toBe("upload");
+    expect(visible(h.q(".fd-upload"))).toBe(true);
+    h.app.store.dispatch({ type: "transfer/close" });
+
+    h.app.store.dispatch({ type: "palette/open" });
+    const download = paletteRow("Download Files…");
+    expect(download).toBeDefined();
+    expect(download?.textContent).not.toContain("Transfer Files panel");
+    download?.click();
+    expect(h.app.store.getState().palette).toBeNull();
+    expect(h.app.store.getState().transferTab).toBe("download");
+    expect(h.q(".fd-upload").getAttribute("data-tab")).toBe("download");
+    expect(h.ran).toEqual([]);
+    expect(click).not.toHaveBeenCalled();
   });
 });
 
@@ -180,6 +234,7 @@ describe("the panel", () => {
         parent: WORKER_HOME,
         home: WORKER_HOME,
         entries: [],
+        files: [],
         truncated: false,
       },
     });
@@ -194,6 +249,7 @@ describe("the panel", () => {
         parent: WORKER_HOME,
         home: WORKER_HOME,
         entries: [],
+        files: [],
         truncated: false,
       },
     });

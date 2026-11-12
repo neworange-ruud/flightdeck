@@ -202,6 +202,7 @@ describe("the project picker (W9)", () => {
           { name: "code", path: "/home/me/code", isGitRepo: false, isOpenProject: false },
           { name: "alpha", path: "/home/me/alpha", isGitRepo: true, isOpenProject: true },
         ],
+        files: [],
         truncated: false,
       },
     });
