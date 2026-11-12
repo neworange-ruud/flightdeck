@@ -2065,3 +2065,83 @@ fn the_session_uploads_picked_files_to_the_folder_on_screen() {
     );
     session.close_upload();
 }
+
+/// The core client's own download path — what FlightDeck Desktop runs —
+/// against a real worker: `browse_files` lists the folder's files, the plan
+/// grants them, and `get_file` streams each one into a local folder, keeping
+/// a local file of the same name beside the new one, with no temp left over.
+#[test]
+fn the_core_client_downloads_into_a_local_folder_and_keeps_both() {
+    use flightdeck::web::client::download::DownloadJob;
+    use flightdeck::web::client::download_http::get_file;
+
+    let worker = Worker::start();
+    let home = std::fs::canonicalize(worker.home()).unwrap();
+    let out = home.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(out.join("build.bin"), &big).unwrap();
+    std::fs::write(out.join("log.txt"), "fresh").unwrap();
+    let here = tempfile::tempdir().unwrap();
+    std::fs::write(here.path().join("log.txt"), "mine").unwrap();
+
+    let (_token, mut client) = worker.window("laptop");
+    let seq = client.browse_files(Some("~/out"), false);
+    worker.applied(&mut client, seq, "browse_files");
+    let mut listing = None;
+    worker.wait("the listing with files", || {
+        client.pump();
+        listing = client.take_dir_listing();
+        listing.is_some()
+    });
+    let names: Vec<String> = listing
+        .unwrap()
+        .files
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    assert_eq!(names, vec!["build.bin".to_string(), "log.txt".to_string()]);
+
+    let seq = client.begin_download("~/out", &names);
+    worker.applied(&mut client, seq, "begin_download");
+    let plan = download_plan(&worker, &mut client, seq, "core client");
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    let access = client.http_access().expect("a dialled client").clone();
+    for (index, row) in plan.files.iter().enumerate() {
+        let job = DownloadJob {
+            index,
+            ticket: row.ticket.clone().expect("granted"),
+            dest: here.path().to_path_buf(),
+            name: row.name.clone(),
+            final_name: if row.name == "log.txt" {
+                "log (1).txt".to_string()
+            } else {
+                row.name.clone()
+            },
+            replace: false,
+            size: row.size,
+        };
+        let mut last = 0;
+        let got = on_runtime(get_file(&access, &job, |received, _| last = received))
+            .unwrap_or_else(|e| panic!("{} downloads: {e:?}{}", row.name, worker.log_tail()));
+        assert_eq!(got.bytes, row.size);
+        assert_eq!(last, row.size);
+    }
+    assert_eq!(std::fs::read(here.path().join("build.bin")).unwrap(), big);
+    assert_eq!(
+        std::fs::read_to_string(here.path().join("log.txt")).unwrap(),
+        "mine"
+    );
+    assert_eq!(
+        std::fs::read_to_string(here.path().join("log (1).txt")).unwrap(),
+        "fresh"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(here.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".fddownload-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    client.stop();
+}
