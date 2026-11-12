@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.35.0] - 2026-11-12
+
+### New features
+
 - **Download files from a worker: Upload files is now Transfer files.** The worker's window has **Transfer files…** with **Upload** and **Download** tabs, in FlightDeck Desktop and in a browser; the command palette has **Upload Files…** and **Download Files…**. On the Download tab, browse a folder on the worker, tick one or more files and choose **Download**. The Desktop saves them to a folder you pick (your Downloads folder by default), with progress per file, and asks **Replace**, **Keep both** or **Cancel** when a name is already there. A browser hands each file to its own downloads. Downloads come from the worker account's home folder only; folders can't be downloaded yet. The web protocol goes to v9; an older Desktop still connects, without the Download tab.
 
 ### Improvements
