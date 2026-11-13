@@ -25,6 +25,10 @@ mod proxy_macos;
 #[cfg(target_os = "macos")]
 pub mod smoke;
 #[cfg(target_os = "macos")]
+mod tls_macos;
+#[cfg(target_os = "macos")]
+pub mod trust;
+#[cfg(target_os = "macos")]
 pub mod view;
 
 /// Why this computer cannot run a session browser, or `None` when it can.

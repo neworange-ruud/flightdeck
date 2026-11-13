@@ -90,6 +90,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 # The session browser's macOS proxy with credentials (B23): a Network.framework
 # configuration set on the web view's data store, which wry does not expose.
 objc2 = "0.6"
+# The session browser's "Continue anyway" for a self-signed certificate (B21):
+# the server-trust challenge's completion handler is an Objective-C block.
+# Already in the graph through wry and GPUI.
+block2 = "0.6"
 
 # The session browser (`specs/SESSION_BROWSER_PRD.md`, `src/browser/`): the
 # system web view (WKWebView, WebView2) as a child of the GPUI window. macOS

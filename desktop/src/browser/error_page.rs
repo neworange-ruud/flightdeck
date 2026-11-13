@@ -29,6 +29,22 @@ pub fn page(title: &str, detail: &str, via: Option<&str>) -> String {
     )
 }
 
+/// The message our pages post when the person chooses their button
+/// (`window.ipc.postMessage`, `wry`'s channel back to the view).
+pub const CONTINUE_MESSAGE: &str = "flightdeck:continue";
+
+/// [`page`], with one button that posts [`CONTINUE_MESSAGE`]: the
+/// certificate page's **Continue anyway** (B21).
+pub fn page_with_action(title: &str, detail: &str, via: Option<&str>, action: &str) -> String {
+    let button = format!(
+        "<p style='margin-top:20px'><button onclick=\"window.ipc.postMessage('{CONTINUE_MESSAGE}')\" \
+         style='font:inherit;padding:6px 14px;border-radius:6px;border:1px solid var(--muted);\
+         background:transparent;color:var(--ink);cursor:pointer'>{}</button></p>",
+        escape(action)
+    );
+    page(title, detail, via).replacen("</main>", &format!("{button}</main>"), 1)
+}
+
 /// HTML-escape text for an element or attribute.
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -64,5 +80,14 @@ mod tests {
         assert!(html.contains("<b>studio &amp; co</b>"));
         assert!(!html.contains("<localhost"));
         assert!(!page("t", "d", None).contains("class=via"));
+    }
+
+    #[test]
+    fn the_certificate_page_has_one_button_that_posts_continue() {
+        let html = page_with_action("Untrusted", "<self-signed>", None, "Continue <anyway>");
+        assert_eq!(html.matches("<button").count(), 1);
+        assert!(html.contains(CONTINUE_MESSAGE));
+        assert!(html.contains("Continue &lt;anyway&gt;"));
+        assert!(html.contains("&lt;self-signed&gt;"));
     }
 }
