@@ -138,10 +138,10 @@ function dialogOf_(state: AppState): DialogState {
 }
 
 describe("the origin label (D13)", () => {
-  it("names the browser that opened it, verbatim", () => {
+  it("is null for a dialog a browser opened", () => {
     expect(
       dialogOriginLabel({ kind: "browser", label: "192.168.2.20" }),
-    ).toBe("opened from browser · 192.168.2.20");
+    ).toBeNull();
   });
 
   it("says so when the desktop opened it", () => {

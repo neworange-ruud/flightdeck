@@ -56,8 +56,14 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
         .children(facts(p, &view.kind))
         .children(origin_line(p, view.origin_label.as_deref()));
 
-    // The close menu offers four answers; give them one row.
-    dialog_card(p, if view.buttons.len() > 3 { 640. } else { 460. })
+    // The close menu offers up to five answers (four ways to stop the
+    // processes, and Abandon worktree); give them one row.
+    let width = match view.buttons.len() {
+        n if n > 5 => 780.,
+        n if n > 3 => 640.,
+        _ => 460.,
+    };
+    dialog_card(p, width)
         .child(
             div()
                 .flex()

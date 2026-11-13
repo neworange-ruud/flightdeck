@@ -93,8 +93,9 @@ pub struct DialogView {
     pub buttons: Vec<DialogButton>,
     /// Who opened it (D13). A browser-opened dialog should say so.
     pub origin: DialogOrigin,
-    /// The TUI's origin line (`opened from browser · 192.168.2.20`), or `None`
-    /// for a dialog this desktop opened.
+    /// The origin line under the title, or `None`. The host never sets one;
+    /// a remote window shows `opened on the host` for a dialog the host's own
+    /// keyboard opened.
     pub origin_label: Option<String>,
 }
 

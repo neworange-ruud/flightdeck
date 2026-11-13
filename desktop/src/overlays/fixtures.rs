@@ -118,6 +118,7 @@ pub fn close_session() -> DialogView {
             b("2", "Ctrl-C all", ButtonRole::Secondary, false),
             b("3", "force terminate", ButtonRole::Destructive, false),
             b("4", "if all stopped", ButtonRole::Secondary, false),
+            b("a", "Abandon worktree", ButtonRole::Secondary, false),
             b("Esc", "Cancel", ButtonRole::Cancel, false),
         ],
     )

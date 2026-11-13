@@ -13,7 +13,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 ### Improvements
 
 - **Create waits for a task name.** In the New Agent Session Tab form, **Create** stays disabled until you've typed a task name for the new branch, in the TUI, FlightDeck Desktop and a browser. Existing-branch and base-branch targets are unchanged.
-- **No more "opened from …" line in a remote window.** A dialog you open in a window connected to a worker (or to another FlightDeck) no longer shows your own address and app version under its title. A dialog someone opened at the host's keyboard still says "opened on the host".
+- **No more "opened from …" line under dialog titles.** A dialog opened from a remote window or a browser no longer shows the address and app version it came from, anywhere: not in the window that opened it, not in the TUI or FlightDeck Desktop at the host, and not in another browser. A dialog someone opened at the host's keyboard still says "opened on the host" in a remote window ("opened on the desktop" in a browser).
+- **Abandon the worktree from Close agent.** The close menu ("Close tab — how should running processes be handled?") now has an **Abandon worktree** button (`a`) next to the four ways to stop the agent, in FlightDeck Desktop's **Close agent…**, the TUI and a browser. It opens the usual abandon confirmation, which warns when there are uncommitted changes; nothing is removed until you confirm. A tab running on the base branch has no worktree, so it doesn't get the button, and the TUI sidebar's `✕` menu, which already asks Abandon or Close, doesn't ask twice.
 
 ### Bug fixes
 

@@ -1112,7 +1112,12 @@ enum Prompt {
     /// Pick a manual status (or clear); dispatches `SetManualStatus`.
     SetManualStatus,
     /// Choose how to handle running processes when closing (SPECS §25).
-    CloseTab { actions: Vec<CloseAction> },
+    /// `abandon` adds an `a` "Abandon worktree" answer that opens
+    /// [`Prompt::AbandonConfirm`]; false for a tab on the base branch.
+    CloseTab {
+        actions: Vec<CloseAction>,
+        abandon: bool,
+    },
     /// Confirm closing a child shell terminal (from the tab's `✕` or Ctrl-w).
     /// `label` is the shell's display name, e.g. "shell 2".
     CloseChildConfirm { label: String },
@@ -1333,9 +1338,8 @@ struct Ui {
     /// like [`Ui::web_outcome`]. Two things read it, both for the same reason —
     /// *who asked* changes what the right answer is:
     ///
-    /// * **D13** stamps it on any dialog the dispatch opens, so the desktop can
-    ///   say `opened from browser · 192.168.2.20` about a modal nobody at this
-    ///   keyboard requested. `start_prompt` is the only place a dialog is
+    /// * **D13** stamps it on any dialog the dispatch opens, so the dialog
+    ///   carries who asked for it. `start_prompt` is the only place a dialog is
     ///   opened, so a dialog cannot be published without an origin.
     /// * **§6.5 R16** uses its mere presence to decide where a read-only
     ///   overlay lands: `show_git_status` from the desktop opens the desktop's
@@ -6103,6 +6107,7 @@ fn apply_effect(effect: Effect, _state: &AppState, ui: &mut Ui) {
                 ui,
                 Prompt::CloseTab {
                     actions: opts.actions,
+                    abandon: opts.abandon,
                 },
             );
         }
@@ -6362,10 +6367,9 @@ fn start_prompt(ui: &mut Ui, prompt: Prompt) {
         .web_origin
         .clone()
         .unwrap_or(crate::web::protocol::DialogOrigin::Desktop);
-    let mut dialog = prompt_dialog(&prompt);
-    if let Some(label) = dialog_origin_label(&origin) {
-        dialog = dialog.from_origin(label);
-    }
+    // The origin travels as a structured fact (the wire's `DialogOrigin`), but
+    // no surface prints an "opened from …" line under the title any more.
+    let dialog = prompt_dialog(&prompt);
     let id = ui.mint_dialog_id();
     ui.palette = None;
     ui.overlay = UiOverlay::None;
@@ -6378,26 +6382,11 @@ fn start_prompt(ui: &mut Ui, prompt: Prompt) {
     });
 }
 
-/// D13's origin line, or `None` for a dialog this keyboard opened.
-///
-/// `None` for [`DialogOrigin::Desktop`] is not an omission: the person reading
-/// the modal is the person who asked for it, and a line telling them so would be
-/// the decoration D13 is explicit this is not.
-fn dialog_origin_label(origin: &crate::web::protocol::DialogOrigin) -> Option<String> {
-    match origin {
-        crate::web::protocol::DialogOrigin::Desktop => None,
-        crate::web::protocol::DialogOrigin::Browser { label, .. } => {
-            Some(format!("opened from browser · {label}"))
-        }
-    }
-}
-
 /// The ack detail for a browser command whose outcome is a dialog (D13). One
 /// sentence, so every dialog-opening row reads the same, and it says the thing
 /// the browser has to know: it is a shared question, answerable from here.
 const DIALOG_OPENED_DETAIL: &str =
-    "A dialog is open. It is on the desktop too, tagged with where it came from, \
-     and either surface can answer it.";
+    "A dialog is open. It is on the desktop too, and either surface can answer it.";
 
 /// Why an action is unavailable in an isolated run (SPECS §32). One string, so
 /// every refusal reads identically wherever the user meets it.
@@ -7044,12 +7033,18 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 cancel,
             ],
         ),
-        Prompt::CloseTab { actions } => {
+        Prompt::CloseTab { actions, abandon } => {
             let mut buttons: Vec<DialogButton> = actions
                 .iter()
                 .enumerate()
                 .map(|(i, a)| DialogButton::new(digit_accel(i), close_action_label(*a)))
                 .collect();
+            if *abandon {
+                buttons.push(DialogButton::new(
+                    DialogAccel::Char('a'),
+                    "Abandon worktree",
+                ));
+            }
             buttons.push(cancel);
             Dialog::confirm(
                 "Close tab — how should running processes be handled?",
@@ -7699,7 +7694,18 @@ fn handle_prompt_key_project(
                 None => ui.prompt = Some(pstate), // ignore other keys
             }
         }
-        Prompt::CloseTab { actions } => {
+        Prompt::CloseTab { actions, abandon } => {
+            if *abandon && key.code == KeyCode::Char('a') {
+                // The standard abandon flow, which always asks before
+                // discarding (and warns extra loudly when dirty).
+                let result = state.dispatch_to(
+                    Command::AbandonWorktree { confirm: false },
+                    target,
+                    services,
+                );
+                finish_prompt(result, ui);
+                return Ok(());
+            }
             // Number keys 1..=N pick an action.
             if let KeyCode::Char(c @ '1'..='9') = key.code {
                 let idx = (c as usize) - ('1' as usize);
@@ -7753,6 +7759,15 @@ fn handle_prompt_key_project(
                         target,
                         services,
                     ) {
+                        // This menu already offered Abandon and the user chose
+                        // Close; the next menu does not ask again.
+                        Ok(Effect::CloseTabOptions(opts)) => apply_effect_no_state(
+                            Effect::CloseTabOptions(crate::app::commands::CloseTabOptions {
+                                abandon: false,
+                                ..opts
+                            }),
+                            ui,
+                        ),
                         Ok(effect) => apply_effect_no_state(effect, ui),
                         Err(e) => ui.message(format!("Error: {e}")),
                     }
@@ -7889,6 +7904,7 @@ fn apply_effect_no_state(effect: Effect, ui: &mut Ui) {
             ui,
             Prompt::CloseTab {
                 actions: opts.actions,
+                abandon: opts.abandon,
             },
         ),
         Effect::GitStatus { status, pr_url } => {
@@ -10296,6 +10312,7 @@ mod tests {
     fn close_prompt_dialog_lists_numbered_actions() {
         let p = Prompt::CloseTab {
             actions: vec![CloseAction::CtrlCPrimary, CloseAction::ForceTerminate],
+            abandon: false,
         };
         let dialog = prompt_dialog(&p);
         assert_eq!(dialog.buttons[0].accel, DialogAccel::Char('1'));
@@ -14222,11 +14239,11 @@ mod tests {
             let view = view(&ui, &ws);
             assert_eq!(view.kind, "unpair_phone");
             assert_eq!(view.origin, browser_origin(), "D13: tagged with who asked");
-            // And the desktop is rendering the origin sentence, not just holding
-            // the structured fact.
+            // The desktop holds the structured fact but prints no
+            // "opened from …" line under the title.
             assert_eq!(
                 ui.prompt.as_ref().and_then(|p| p.dialog.origin.as_deref()),
-                Some("opened from browser · 192.168.2.20"),
+                None,
             );
         }
 
@@ -14598,6 +14615,7 @@ mod tests {
                 Prompt::CloseAgentChoice { index: 0 },
                 Prompt::CloseTab {
                     actions: vec![CloseAction::CtrlCPrimary],
+                    abandon: true,
                 },
                 Prompt::CloseChildConfirm {
                     label: "shell 2".to_string(),

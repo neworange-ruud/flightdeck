@@ -884,7 +884,7 @@ pub fn heading(p: &Palette, title: &str, body: &[String]) -> Div {
         }))
 }
 
-/// A browser-opened dialog's origin line (D13: `opened from browser · …`).
+/// A dialog's origin line (D13), e.g. `opened on the host` in a remote window.
 pub fn origin_line(p: &Palette, label: Option<&str>) -> Option<Div> {
     label.map(|l| {
         div()

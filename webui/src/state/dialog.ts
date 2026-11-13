@@ -161,19 +161,15 @@ export function gateSatisfied(dialog: DialogState): boolean {
 }
 
 /**
- * D13's origin line, as the browser words it.
+ * D13's origin line, as the browser words it, or `null` for none.
  *
- * Rendered in **both** directions and never omitted, because in both directions
- * it answers the same question: a dialog you did not open has appeared, and this
- * says where it came from. The desktop's half of the same rule is
- * `dialog_origin_label` in `src/lib.rs`, which renders nothing for a dialog the
- * person reading it opened — the asymmetry is the point, since on the desktop
- * there is only ever one keyboard.
+ * Only a dialog the desktop opened gets one (`opened on the desktop`): it
+ * explains a modal that appeared without this browser asking. A dialog a
+ * browser opened gets no "opened from …" line, the same as on the desktop
+ * (`start_prompt` in `src/lib.rs`).
  */
-export function dialogOriginLabel(origin: DialogOrigin): string {
-  return origin.kind === "desktop"
-    ? "opened on the desktop"
-    : `opened from browser · ${origin.label}`;
+export function dialogOriginLabel(origin: DialogOrigin): string | null {
+  return origin.kind === "desktop" ? "opened on the desktop" : null;
 }
 
 /** The row 1e draws as `(•)`: the local move if there was one, else the host's. */

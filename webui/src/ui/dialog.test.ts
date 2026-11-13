@@ -208,20 +208,17 @@ describe("the dialog layer", () => {
 });
 
 describe("the origin line (D13)", () => {
-  it("names the browser that opened it", () => {
+  it("is hidden for a dialog a browser opened", () => {
     const h = render();
     h.open(newAgentFromBrowser());
-    expect(h.text(".fd-dialog__origin")).toBe(
-      "opened from browser · 192.168.2.20",
-    );
-    expect(h.q(".fd-dialog__origin").getAttribute("data-origin")).toBe(
-      "browser",
-    );
+    expect(h.q(".fd-dialog__origin").hidden).toBe(true);
+    expect(h.text(".fd-dialog__origin")).toBe("");
   });
 
   it("says so when the desktop opened it", () => {
     const h = render();
     h.open(newAgentFromDesktop());
+    expect(h.q(".fd-dialog__origin").hidden).toBe(false);
     expect(h.text(".fd-dialog__origin")).toBe("opened on the desktop");
     expect(h.q(".fd-dialog__origin").getAttribute("data-origin")).toBe(
       "desktop",
