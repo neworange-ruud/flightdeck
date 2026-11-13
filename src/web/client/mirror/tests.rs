@@ -243,6 +243,7 @@ fn a_project_whose_remembered_session_closed_lands_on_its_first() {
     ws.select_project(&"/repo/site".into());
     ws.apply_delta(Delta::SessionRemoved {
         session_id: TabId("s2".to_string()),
+        worktree_removed: false,
     });
     ws.select_project(&"/repo/app".into());
     assert_eq!(
@@ -294,6 +295,7 @@ fn deltas_update_status_git_terminals_and_sessions() {
     );
     ws.apply_delta(Delta::SessionRemoved {
         session_id: TabId("s3".to_string()),
+        worktree_removed: false,
     });
 
     assert_eq!(ws.session(&TabId("s1".to_string())).unwrap().git.added, 3);
@@ -650,4 +652,35 @@ fn a_workers_shells_are_upserted_and_closed_by_id() {
         terminal_id: "worker:shell".into(),
     });
     assert_eq!(ids(&ws), ["worker:shell:2", "worker:shell:3"]);
+}
+
+/// A session closed with its worktree removed (abandoned) queues the
+/// worktree for whoever kept something for it; one closed with its worktree
+/// kept does not (B19).
+#[test]
+fn an_abandoned_sessions_worktree_is_queued_and_a_kept_one_is_not() {
+    let mut ws = RemoteWorkspace::new();
+    let mut snap = snapshot();
+    for session in snap.projects.iter_mut().flat_map(|p| p.sessions.iter_mut()) {
+        session.worktree_path = format!("/repo/.flightdeck/worktrees/{}", session.session_id.0);
+    }
+    ws.apply_snapshot(snap);
+    let path = |id: &str| {
+        ws.session(&TabId(id.to_string()))
+            .unwrap()
+            .worktree_path
+            .clone()
+    };
+    let (s1, s2) = (path("s1"), path("s2"));
+    ws.apply_delta(Delta::SessionRemoved {
+        session_id: TabId("s1".to_string()),
+        worktree_removed: false,
+    });
+    assert!(ws.take_removed_worktrees().is_empty(), "kept: {s1}");
+    ws.apply_delta(Delta::SessionRemoved {
+        session_id: TabId("s2".to_string()),
+        worktree_removed: true,
+    });
+    assert_eq!(ws.take_removed_worktrees(), vec![s2]);
+    assert!(ws.take_removed_worktrees().is_empty(), "taken once");
 }

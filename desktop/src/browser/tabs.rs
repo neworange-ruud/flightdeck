@@ -1,6 +1,7 @@
-//! A remote window's session browsers, as state (`specs/SESSION_BROWSER_PRD.md`
-//! B1, B6): which browser tabs exist, which session each belongs to, its
-//! tunnel key once the worker granted one, and which one is on screen.
+//! A window's session browsers, as state (`specs/SESSION_BROWSER_PRD.md` B1,
+//! B6): which browser tabs exist, which session (and worktree) each belongs
+//! to, a remote tab's tunnel key once the worker granted one, and which one is
+//! on screen. A remote window's model and the local window's both keep one.
 //!
 //! The web views themselves are the window's ([`crate::browser`]), built from
 //! this list and dropped with it, so they never outlive the window (B6, B18:
@@ -8,7 +9,6 @@
 //! socket, so its rules are unit tests.
 
 use flightdeck::contracts::TabId;
-use flightdeck::web::protocol::TerminalId;
 
 /// One browser tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +17,10 @@ pub struct BrowserTab {
     pub id: u64,
     /// The session it belongs to.
     pub session: TabId,
+    /// That session's worktree: what its profile is kept for (B10, B19).
+    pub worktree: String,
+    /// A local session's browser, which needs no key (B9).
+    pub direct: bool,
     /// The `open_browser_tunnel` this tab is waiting on.
     pub seq: Option<u64>,
     /// The worker's key, once granted.
@@ -33,7 +37,8 @@ pub struct BrowserTab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shown {
     id: u64,
-    terminal: Option<TerminalId>,
+    /// What the window was looking at, as the window names it.
+    terminal: Option<String>,
 }
 
 /// See the module docs.
@@ -45,19 +50,59 @@ pub struct Browsers {
 }
 
 impl Browsers {
-    /// A new tab for `session`, waiting on `seq` (`None`: the request could
-    /// not be sent), shown at once over `terminal`, the terminal on screen.
-    pub fn open(&mut self, session: TabId, seq: Option<u64>, terminal: Option<TerminalId>) -> u64 {
+    /// A new remote tab for `session` in `worktree`, waiting on `seq`
+    /// (`None`: the request could not be sent), shown at once over
+    /// `terminal`, what is on screen.
+    pub fn open(
+        &mut self,
+        session: TabId,
+        worktree: String,
+        seq: Option<u64>,
+        terminal: Option<String>,
+    ) -> u64 {
+        let refusal = seq.is_none().then(|| NOT_SENT.to_string());
+        self.push(
+            BrowserTab {
+                id: 0,
+                session,
+                worktree,
+                direct: false,
+                seq,
+                key: None,
+                refusal,
+                title: String::new(),
+            },
+            terminal,
+        )
+    }
+
+    /// A new local tab for `session` in `worktree`: no key to wait for (B9).
+    pub fn open_direct(
+        &mut self,
+        session: TabId,
+        worktree: String,
+        terminal: Option<String>,
+    ) -> u64 {
+        self.push(
+            BrowserTab {
+                id: 0,
+                session,
+                worktree,
+                direct: true,
+                seq: None,
+                key: None,
+                refusal: None,
+                title: String::new(),
+            },
+            terminal,
+        )
+    }
+
+    fn push(&mut self, mut tab: BrowserTab, terminal: Option<String>) -> u64 {
         self.next += 1;
-        let id = self.next;
-        self.tabs.push(BrowserTab {
-            id,
-            session,
-            seq,
-            key: None,
-            refusal: seq.is_none().then(|| NOT_SENT.to_string()),
-            title: String::new(),
-        });
+        tab.id = self.next;
+        let id = tab.id;
+        self.tabs.push(tab);
         self.shown = Some(Shown { id, terminal });
         id
     }
@@ -106,7 +151,7 @@ impl Browsers {
     }
 
     /// Put tab `id` on screen over `terminal`.
-    pub fn show(&mut self, id: u64, terminal: Option<TerminalId>) {
+    pub fn show(&mut self, id: u64, terminal: Option<String>) {
         if self.tabs.iter().any(|t| t.id == id) {
             self.shown = Some(Shown { id, terminal });
         }
@@ -119,14 +164,10 @@ impl Browsers {
 
     /// The tab on screen, while the window still looks at `terminal` in
     /// `session`; otherwise none (and it stays off).
-    pub fn on_screen(
-        &mut self,
-        session: Option<&TabId>,
-        terminal: Option<&TerminalId>,
-    ) -> Option<u64> {
+    pub fn on_screen(&mut self, session: Option<&TabId>, terminal: Option<&str>) -> Option<u64> {
         let shown = self.shown.as_ref()?;
         let tab = self.tabs.iter().find(|t| t.id == shown.id)?;
-        if Some(&tab.session) == session && shown.terminal.as_ref() == terminal {
+        if Some(&tab.session) == session && shown.terminal.as_deref() == terminal {
             return Some(tab.id);
         }
         self.shown = None;
@@ -167,16 +208,18 @@ impl Browsers {
         }
     }
 
-    /// Forget the tabs of sessions that no longer exist, returning their
-    /// keys.
-    pub fn retain_sessions(&mut self, live: &[TabId]) -> Vec<String> {
-        let gone: Vec<u64> = self
+    /// Forget the tabs of sessions that no longer exist, returning each
+    /// one's key (when it had one) and worktree.
+    pub fn retain_sessions(&mut self, live: &[TabId]) -> Vec<(Option<String>, String)> {
+        let gone: Vec<(u64, String)> = self
             .tabs
             .iter()
             .filter(|t| !live.contains(&t.session))
-            .map(|t| t.id)
+            .map(|t| (t.id, t.worktree.clone()))
             .collect();
-        gone.into_iter().filter_map(|id| self.close(id)).collect()
+        gone.into_iter()
+            .map(|(id, worktree)| (self.close(id), worktree))
+            .collect()
     }
 
     fn tab_mut(&mut self, id: u64) -> Option<&mut BrowserTab> {
@@ -208,38 +251,43 @@ mod tests {
         TabId(id.to_string())
     }
 
-    fn term(id: &str) -> Option<TerminalId> {
-        Some(TerminalId::new(id))
+    fn term(id: &str) -> Option<String> {
+        Some(id.to_string())
+    }
+
+    fn open(b: &mut Browsers, id: &str, seq: Option<u64>, terminal: Option<String>) -> u64 {
+        b.open(session(id), format!("/wt/{id}"), seq, terminal)
     }
 
     #[test]
     fn a_tab_waits_for_its_key_and_is_shown_at_once() {
         let mut b = Browsers::default();
-        let id = b.open(session("s1"), Some(7), term("s1:primary"));
+        let id = open(&mut b, "s1", Some(7), term("s1:primary"));
         assert_eq!(b.waiting(), vec![(id, 7)]);
         assert_eq!(
-            b.on_screen(Some(&session("s1")), term("s1:primary").as_ref()),
+            b.on_screen(Some(&session("s1")), Some("s1:primary")),
             Some(id)
         );
         b.answered(id, Some("k".into()), None);
         assert!(b.waiting().is_empty());
         assert_eq!(b.tab(id).unwrap().key.as_deref(), Some("k"));
         assert_eq!(b.tab(id).unwrap().refusal, None);
+        assert_eq!(b.tab(id).unwrap().worktree, "/wt/s1");
     }
 
     #[test]
     fn a_refusal_or_an_unsent_request_is_kept_in_words() {
         let mut b = Browsers::default();
-        let a = b.open(session("s1"), Some(1), None);
+        let a = open(&mut b, "s1", Some(1), None);
         b.answered(a, None, Some("Too many browsers.".into()));
         assert_eq!(
             b.tab(a).unwrap().refusal.as_deref(),
             Some("Too many browsers.")
         );
-        let c = b.open(session("s1"), Some(2), None);
+        let c = open(&mut b, "s1", Some(2), None);
         b.answered(c, None, None);
         assert_eq!(b.tab(c).unwrap().refusal.as_deref(), Some(NOT_GRANTED));
-        let d = b.open(session("s1"), None, None);
+        let d = open(&mut b, "s1", None, None);
         assert_eq!(b.tab(d).unwrap().refusal.as_deref(), Some(NOT_SENT));
         assert!(b.waiting().iter().all(|(id, _)| *id != d));
     }
@@ -247,20 +295,14 @@ mod tests {
     #[test]
     fn looking_at_anything_else_takes_the_browser_off_screen_for_good() {
         let mut b = Browsers::default();
-        let id = b.open(session("s1"), Some(1), term("s1:primary"));
+        let id = open(&mut b, "s1", Some(1), term("s1:primary"));
         // Another terminal of the same session.
-        assert_eq!(
-            b.on_screen(Some(&session("s1")), term("s1:child:1").as_ref()),
-            None
-        );
+        assert_eq!(b.on_screen(Some(&session("s1")), Some("s1:child:1")), None);
         // Coming back does not bring it back: the person chose the terminal.
-        assert_eq!(
-            b.on_screen(Some(&session("s1")), term("s1:primary").as_ref()),
-            None
-        );
+        assert_eq!(b.on_screen(Some(&session("s1")), Some("s1:primary")), None);
         b.show(id, term("s1:primary"));
         assert_eq!(
-            b.on_screen(Some(&session("s2")), term("s1:primary").as_ref()),
+            b.on_screen(Some(&session("s2")), Some("s1:primary")),
             None,
             "another session"
         );
@@ -272,7 +314,7 @@ mod tests {
     #[test]
     fn closing_returns_the_key_and_clears_the_screen() {
         let mut b = Browsers::default();
-        let id = b.open(session("s1"), Some(1), None);
+        let id = open(&mut b, "s1", Some(1), None);
         b.answered(id, Some("k".into()), None);
         assert_eq!(b.close(id), Some("k".to_string()));
         assert_eq!(b.shown_id(), None);
@@ -281,21 +323,35 @@ mod tests {
     }
 
     #[test]
-    fn tabs_of_a_closed_session_go_and_give_back_their_keys() {
+    fn tabs_of_a_closed_session_go_and_give_back_their_keys_and_worktrees() {
         let mut b = Browsers::default();
-        let a = b.open(session("s1"), Some(1), None);
-        let c = b.open(session("s2"), Some(2), None);
+        let a = open(&mut b, "s1", Some(1), None);
+        let c = open(&mut b, "s2", Some(2), None);
         b.answered(a, Some("ka".into()), None);
         b.answered(c, Some("kc".into()), None);
-        assert_eq!(b.retain_sessions(&[session("s2")]), vec!["ka".to_string()]);
+        assert_eq!(
+            b.retain_sessions(&[session("s2")]),
+            vec![(Some("ka".to_string()), "/wt/s1".to_string())]
+        );
         assert_eq!(b.all().len(), 1);
         assert_eq!(b.of_session(&session("s2")).count(), 1);
     }
 
     #[test]
+    fn a_local_tab_needs_no_key() {
+        let mut b = Browsers::default();
+        let id = b.open_direct(session("s1"), "/wt/s1".into(), None);
+        let tab = b.tab(id).unwrap();
+        assert!(tab.direct);
+        assert_eq!((tab.seq, tab.refusal.as_deref()), (None, None));
+        assert!(b.waiting().is_empty());
+        assert_eq!(b.retain_sessions(&[]), vec![(None, "/wt/s1".to_string())]);
+    }
+
+    #[test]
     fn a_tab_is_labelled_by_its_title_or_as_a_browser() {
         let mut b = Browsers::default();
-        let id = b.open(session("s1"), Some(1), None);
+        let id = open(&mut b, "s1", Some(1), None);
         assert_eq!(label(b.tab(id).unwrap()), "browser");
         assert!(b.set_title(id, "Vite App".into()));
         assert!(!b.set_title(id, "Vite App".into()), "unchanged");

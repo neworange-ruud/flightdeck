@@ -404,6 +404,7 @@ fn all_deltas() -> Vec<Delta> {
         Delta::SessionUpsert(session_view()),
         Delta::SessionRemoved {
             session_id: TabId("tab_1".into()),
+            worktree_removed: true,
         },
         Delta::Status {
             session_id: TabId("tab_1".into()),
@@ -2381,4 +2382,18 @@ fn the_worker_types_are_eq() {
     eq::<CloneResult>();
     eq::<ResizeTerminal>();
     eq::<WorkerOp>();
+}
+
+/// A host from before B19 says nothing about the worktree: read as kept.
+#[test]
+fn a_session_removed_frame_without_worktree_removed_keeps_the_worktree() {
+    let frame: Delta =
+        serde_json::from_value(json!({ "change": "session_removed", "session_id": "t1" })).unwrap();
+    assert_eq!(
+        frame,
+        Delta::SessionRemoved {
+            session_id: TabId("t1".into()),
+            worktree_removed: false,
+        }
+    );
 }

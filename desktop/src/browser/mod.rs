@@ -10,7 +10,9 @@
 //!   relay it sends through.
 //! - `proxy_macos`: the data-store proxy with credentials (B23).
 //!
-//! Which tabs exist is the window's model's ([`crate::remote::browsers`]).
+//! Which tabs exist is the window's model's ([`tabs`]).
+
+pub mod tabs;
 
 // Only the web view (macOS for now) reads addresses and draws error pages.
 #[cfg(target_os = "macos")]
@@ -41,6 +43,24 @@ pub fn unavailable() -> Option<&'static str> {
         } else {
             Some(NEEDS_MACOS_14)
         }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(NOT_ON_WINDOWS_YET)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Some(NOT_ON_LINUX)
+    }
+}
+
+/// Why this computer cannot run a **local** session's browser, or `None`
+/// when it can. A local browser needs no proxy (B9), so any macOS will do;
+/// the view itself is macOS-only for now.
+pub fn unavailable_here() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        None
     }
     #[cfg(target_os = "windows")]
     {

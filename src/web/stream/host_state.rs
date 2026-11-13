@@ -392,8 +392,12 @@ pub fn deltas(previous: &HostState, next: &HostState) -> Vec<Delta> {
                 .iter()
                 .any(|s| s.session_id == was.session_id)
             {
+                // Whether the worktree went too is a fact about the host's
+                // disk, which a diff of two states cannot see: the host sets
+                // it ([`mark_removed_worktrees`]).
                 out.push(Delta::SessionRemoved {
                     session_id: was.session_id.clone(),
+                    worktree_removed: false,
                 });
             }
         }
@@ -591,6 +595,36 @@ fn session_deltas(was: &SessionView, now: &SessionView, out: &mut Vec<Delta>) {
                 terminal_id: before.terminal_id.clone(),
                 exit_code: before.exit_code,
             });
+        }
+    }
+}
+
+/// Say, on each [`Delta::SessionRemoved`] in `frames`, whether the session's
+/// worktree is gone from the host's disk: `exists` is asked about the
+/// worktree path `published` last gave the session. A session with no
+/// worktree path (one on the base branch) never removed one.
+pub fn mark_removed_worktrees(
+    frames: &mut [Delta],
+    published: &crate::web::server::HostState,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) {
+    for frame in frames.iter_mut() {
+        let Delta::SessionRemoved {
+            session_id,
+            worktree_removed,
+        } = frame
+        else {
+            continue;
+        };
+        let path = published
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| &s.session_id == session_id)
+            .map(|s| s.worktree_path.as_str())
+            .filter(|p| !p.is_empty());
+        if let Some(path) = path {
+            *worktree_removed = !exists(std::path::Path::new(path));
         }
     }
 }

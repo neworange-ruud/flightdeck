@@ -2580,7 +2580,6 @@ mod download;
 mod browser {
     use flightdeck::host::HostEvent;
     use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
-    #[cfg(target_os = "macos")]
     use flightdeck::web::client::LinkEvent;
     #[cfg(target_os = "macos")]
     use flightdeck::web::protocol::BrowserTunnel;
@@ -2673,6 +2672,41 @@ mod browser {
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].1, "close_browser_tunnel");
         assert_eq!(sent[0].2, Some(serde_json::json!({ "key": "k-1" })));
+    }
+
+    /// B19: a session the worker closed **and** whose worktree it removed
+    /// hands its worktree to the window, whose browser profile then goes; a
+    /// session closed with its worktree kept does not.
+    #[gpui::test]
+    fn an_abandoned_sessions_worktree_reaches_the_window(app: &mut TestAppContext) {
+        use flightdeck::web::protocol::Delta;
+        let mut snapshot = worker_snapshot();
+        for session in snapshot
+            .projects
+            .iter_mut()
+            .flat_map(|p| p.sessions.iter_mut())
+        {
+            session.worktree_path = format!("/home/dev/wt/{}", session.session_id.0);
+        }
+        let ids: Vec<flightdeck::contracts::TabId> = snapshot.projects[0]
+            .sessions
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect();
+        let (model, script, _window, cx) = open_on(app, snapshot);
+        script.send(LinkEvent::Delta(Delta::SessionRemoved {
+            session_id: ids[0].clone(),
+            worktree_removed: false,
+        }));
+        script.send(LinkEvent::Delta(Delta::SessionRemoved {
+            session_id: ids[1].clone(),
+            worktree_removed: true,
+        }));
+        let abandoned = model.update(cx, |m, _| {
+            m.pump();
+            m.take_abandoned_worktrees()
+        });
+        assert_eq!(abandoned, vec![format!("/home/dev/wt/{}", ids[1].0)]);
     }
 
     #[gpui::test]

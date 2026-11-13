@@ -74,8 +74,9 @@ type Shared = Rc<RefCell<Option<WebView>>>;
 pub struct BrowserView {
     webview: Shared,
     relay: Option<Arc<Relay>>,
-    /// The worker's name, for the badge and the error pages.
-    via: String,
+    /// The worker's name, for the badge and the error pages; `None` for a
+    /// local session's browser, which connects directly (B9).
+    via: Option<String>,
     address: Entity<InputState>,
     /// The page's address, to put in the field on the next render (which has
     /// the window the field needs), unless someone is typing there.
@@ -104,6 +105,30 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> BrowserView {
+        let mut view = Self::empty(Some(via), window, cx);
+        match Relay::start(access, key) {
+            Ok(relay) => {
+                view.relay = Some(Arc::new(relay));
+                view.build(profile, window);
+            }
+            Err(e) => view.failed = Some(format!("The browser could not start its relay: {e}")),
+        }
+        view
+    }
+
+    /// A local session's browser: this computer's own network, no relay and
+    /// no proxy (B9), in the profile `profile`.
+    pub fn new_direct(
+        profile: [u8; 16],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BrowserView {
+        let mut view = Self::empty(None, window, cx);
+        view.build(profile, window);
+        view
+    }
+
+    fn empty(via: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> BrowserView {
         let address = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Type an address, like localhost:3000")
         });
@@ -123,7 +148,7 @@ impl BrowserView {
                 break;
             }
         });
-        let mut view = BrowserView {
+        BrowserView {
             webview: Rc::default(),
             relay: None,
             via,
@@ -136,22 +161,12 @@ impl BrowserView {
             failed: None,
             _poll,
             _address_events,
-        };
-        match Relay::start(access, key) {
-            Ok(relay) => {
-                view.relay = Some(Arc::new(relay));
-                view.build(profile, window);
-            }
-            Err(e) => view.failed = Some(format!("The browser could not start its relay: {e}")),
         }
-        view
     }
 
     fn build(&mut self, profile: [u8; 16], window: &mut Window) {
         use wry::WebViewBuilderExtDarwin;
-        let Some(relay) = self.relay.clone() else {
-            return;
-        };
+        let relay = self.relay.clone();
         let nav_page = self.page.clone();
         let nav_relay = relay.clone();
         let load_page = self.page.clone();
@@ -165,7 +180,9 @@ impl BrowserView {
             .with_visible(false)
             .with_devtools(true)
             .with_data_store_identifier(profile)
-            .with_navigation_handler(move |url| allow_navigation(&url, &nav_relay, &nav_page))
+            .with_navigation_handler(move |url| {
+                allow_navigation(&url, nav_relay.as_deref(), &nav_page)
+            })
             .with_on_page_load_handler(move |event, url| {
                 let mut page = load_page.borrow_mut();
                 if matches!(event, PageLoadEvent::Started) && is_web(&url) {
@@ -191,9 +208,11 @@ impl BrowserView {
             .build_as_child(window);
         match built {
             Ok(webview) => {
-                let (user, pass) = relay.credentials();
-                super::proxy_macos::install(&webview, relay.port(), user, pass);
-                let _ = webview.load_html(&start_page(&self.via));
+                if let Some(relay) = &relay {
+                    let (user, pass) = relay.credentials();
+                    super::proxy_macos::install(&webview, relay.port(), user, pass);
+                }
+                let _ = webview.load_html(&start_page(self.via.as_deref()));
                 *self.webview.borrow_mut() = Some(webview);
             }
             Err(e) => self.failed = Some(format!("The browser could not start: {e}")),
@@ -255,7 +274,7 @@ impl BrowserView {
 
     fn show_error(&self, title: &str, detail: &str) {
         if let Some(webview) = self.webview.borrow().as_ref() {
-            let _ = webview.load_html(&error_page::page(title, detail, Some(&self.via)));
+            let _ = webview.load_html(&error_page::page(title, detail, self.via.as_deref()));
         }
     }
 
@@ -274,14 +293,14 @@ impl BrowserView {
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
         }
-        if let Some(relay) = self.relay.clone() {
-            for url in opened {
-                if allow_navigation(&url, &relay, &self.page) {
-                    if let Some(webview) = self.webview.borrow().as_ref() {
-                        let _ = webview.load_url(&url);
-                    }
+        for url in opened {
+            if allow_navigation(&url, self.relay.as_deref(), &self.page) {
+                if let Some(webview) = self.webview.borrow().as_ref() {
+                    let _ = webview.load_url(&url);
                 }
             }
+        }
+        if let Some(relay) = self.relay.clone() {
             // A tunnel the worker refused for the page itself is our error
             // page; one for a script or an image is the page's own business.
             for event in relay.take_events() {
@@ -388,7 +407,7 @@ impl Render for BrowserView {
                     entity.update(cx, |view, cx| view.go(&text, cx));
                 }
             }))
-            .child(
+            .children(self.via.clone().map(|via| {
                 div()
                     .flex_none()
                     .px(px(8.))
@@ -398,8 +417,8 @@ impl Render for BrowserView {
                     .border_color(p.border.hsla())
                     .text_size(px(11.5))
                     .text_color(p.muted.hsla())
-                    .child(format!("via {}", self.via)),
-            )
+                    .child(format!("via {via}"))
+            }))
             .child(
                 button("devtools", "DevTools", "Open the page's developer tools").on_click({
                     let entity = entity.clone();
@@ -445,6 +464,25 @@ impl Render for BrowserView {
     }
 }
 
+/// Delete browser profile `profile` (B19: its worktree was abandoned). Done
+/// a moment later on the main thread: WebKit refuses to remove a data store
+/// a web view still uses, and the views of the session that closed are
+/// dropped at the end of this frame.
+pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(Duration::from_secs(1)).await;
+        cx.update(|_| {
+            use wry::WebViewExtDarwin;
+            WebView::remove_data_store(&profile, |result| {
+                if let Err(e) = result {
+                    eprintln!("flightdeck-desktop: could not delete a browser profile: {e}");
+                }
+            });
+        });
+    })
+    .detach();
+}
+
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
 /// lays out and wry places a child view).
 fn place(webview: &Shared, placed: &Cell<Option<Bounds<Pixels>>>, bounds: Bounds<Pixels>) {
@@ -465,7 +503,7 @@ fn place(webview: &Shared, placed: &Cell<Option<Bounds<Pixels>>>, bounds: Bounds
 /// The navigation rule: our own pages and the web load; `file:` is refused
 /// (B12); a loopback address gets its forward first (B22, B24), and a port in
 /// use here is refused with our page instead.
-fn allow_navigation(url: &str, relay: &Relay, page: &RefCell<PageState>) -> bool {
+fn allow_navigation(url: &str, relay: Option<&Relay>, page: &RefCell<PageState>) -> bool {
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("about:") || lower.starts_with("data:") || lower.starts_with("blob:") {
         return true;
@@ -474,7 +512,8 @@ fn allow_navigation(url: &str, relay: &Relay, page: &RefCell<PageState>) -> bool
         block(page, "This page is not shown here", FILE_REFUSED);
         return false;
     }
-    if let Some(port) = address::loopback_port(url) {
+    // A local browser's loopback is this computer's own (B9).
+    if let (Some(port), Some(relay)) = (address::loopback_port(url), relay) {
         if let Err(e) = relay.forward(port) {
             block(
                 page,
@@ -573,13 +612,20 @@ fn download_path(url: &str, suggested: &Path) -> PathBuf {
 }
 
 /// The page a new browser starts on.
-fn start_page(via: &str) -> String {
-    error_page::page(
-        "New browser",
-        "Type an address above, like localhost:3000. Every request this browser makes \
-         is made by the worker, so localhost is the worker's.",
-        Some(via),
-    )
+fn start_page(via: Option<&str>) -> String {
+    match via {
+        Some(via) => error_page::page(
+            "New browser",
+            "Type an address above, like localhost:3000. Every request this browser makes \
+             is made by the worker, so localhost is the worker's.",
+            Some(via),
+        ),
+        None => error_page::page(
+            "New browser",
+            "Type an address above, like localhost:3000.",
+            None,
+        ),
+    }
 }
 
 #[cfg(test)]

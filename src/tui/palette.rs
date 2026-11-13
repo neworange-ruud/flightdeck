@@ -122,10 +122,10 @@ pub enum FrontEndAction {
     /// window's row alone ([`remote_window_rows`]), offered only on a worker
     /// that gives downloads (protocol v9).
     DownloadFiles,
-    /// Open a browser in the selected session whose requests the worker makes
-    /// (`specs/SESSION_BROWSER_PRD.md`). A remote window's row alone
-    /// ([`remote_window_rows`]), offered only on a worker that grants browser
-    /// tunnels (protocol v11).
+    /// Open a browser in the selected session (`specs/SESSION_BROWSER_PRD.md`):
+    /// a local session's on this computer's network (B9), a worker session's
+    /// through the worker. A remote window offers it only on a worker that
+    /// grants browser tunnels (protocol v11).
     NewBrowser,
 }
 
@@ -380,16 +380,16 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
         label: "Open Worktree in VS Code",
         action: PaletteAction::FrontEnd(FrontEndAction::OpenInVsCode),
     },
-];
-
-/// The rows only a desktop remote window adds, after the front-end rows: they
-/// act on the remote the window is on, which a local window does not have.
-const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
         group: "Terminals",
         label: "New Browser",
         action: PaletteAction::FrontEnd(FrontEndAction::NewBrowser),
     },
+];
+
+/// The rows only a desktop remote window adds, after the front-end rows: they
+/// act on the remote the window is on, which a local window does not have.
+const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[
     PaletteEntry {
         group: "Projects",
         label: "Upload Files…",
@@ -798,6 +798,7 @@ mod tests {
             offered,
             [
                 "Open Worktree in VS Code",
+                "New Browser",
                 "Connect to Remote",
                 "New Window"
             ]
@@ -843,10 +844,12 @@ mod tests {
         };
         assert!(!rows(true).any(|e| is_transfer(&e)));
         assert!(!rows(false).any(|e| is_transfer(&e)));
-        // New Browser joins the end of Terminals, in a remote window only.
+        // New Browser joins the end of Terminals, in every desktop window
+        // (and never the TUI's).
         let is_browser =
             |e: &&PaletteEntry| e.action == PaletteAction::FrontEnd(FrontEndAction::NewBrowser);
-        assert!(!rows(true).any(|e| is_browser(&e)));
+        assert!(rows(true).any(|e| is_browser(&e)));
+        assert!(!rows(false).any(|e| is_browser(&e)));
         let terminals: Vec<&str> = remote_window_rows()
             .filter(|e| e.group == "Terminals")
             .map(|e| e.label)
