@@ -2334,3 +2334,98 @@ fn a_browser_tunnel_ends_with_its_key_and_with_its_window() {
     let after = on_runtime(open(&access, &key, &target)).err().unwrap();
     assert_eq!(after.reason, "invalid_tunnel");
 }
+
+/// A SOCKS5 `CONNECT` to `host:port` through the relay at `relay_port`, as
+/// the web view's proxy makes it: the reply code, and the stream.
+fn socks_connect(
+    relay_port: u16,
+    (user, pass): (&str, &str),
+    host: &str,
+    port: u16,
+) -> (u8, std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(&[5, 1, 2]).unwrap();
+    let mut two = [0u8; 2];
+    s.read_exact(&mut two).unwrap();
+    assert_eq!(two, [5, 2], "the relay asks for the password");
+    let mut auth = vec![1, user.len() as u8];
+    auth.extend_from_slice(user.as_bytes());
+    auth.push(pass.len() as u8);
+    auth.extend_from_slice(pass.as_bytes());
+    s.write_all(&auth).unwrap();
+    s.read_exact(&mut two).unwrap();
+    assert_eq!(two, [1, 0], "the password is accepted");
+    let mut req = vec![5, 1, 0, 3, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).unwrap();
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).unwrap();
+    (reply[1], s)
+}
+
+/// `GET /` over `stream`, the whole answer.
+fn get_over(mut stream: std::net::TcpStream, host: &str) -> String {
+    use std::io::{Read, Write};
+    stream
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut out = String::new();
+    let _ = stream.read_to_string(&mut out);
+    out
+}
+
+/// The Desktop's relay: what the web view's proxy reaches by name goes
+/// through the worker, a loopback forward reaches the worker's port, and a
+/// refusal is a SOCKS failure plus the worker's words.
+#[test]
+fn the_desktop_relay_sends_socks_and_loopback_through_the_worker() {
+    use flightdeck::web::client::relay::{Relay, RelayEvent};
+    let worker = Worker::start();
+    let (_token, mut client) = worker.window("laptop");
+    let port = page_server("served-on-the-worker");
+    let key = tunnel_key(&worker, &mut client);
+    let access = client.http_access().expect("a dialled client").clone();
+    let relay = Relay::start(access, key).expect("the relay starts");
+    let credentials = relay.credentials();
+
+    // By name, through SOCKS: the worker resolves `localhost`.
+    let (code, stream) = socks_connect(relay.port(), credentials, "localhost", port);
+    assert_eq!(code, 0, "connected");
+    let page = get_over(stream, &format!("localhost:{port}"));
+    assert!(page.contains("served-on-the-worker"), "{page}");
+
+    // A loopback forward. The "worker" is this machine, so the forward
+    // listens on another local port; the browser never remaps (B24).
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = free.local_addr().unwrap().port();
+    drop(free);
+    relay.forward_to(local, port).expect("the forward listens");
+    let stream = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let page = get_over(stream, &format!("localhost:{local}"));
+    assert!(page.contains("served-on-the-worker"), "{page}");
+
+    // Nothing listening on the worker: SOCKS "connection refused", and the
+    // worker's sentence for the browser's error page.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closed.local_addr().unwrap().port();
+    drop(closed);
+    let (code, _) = socks_connect(relay.port(), credentials, "127.0.0.1", dead);
+    assert_eq!(code, 5, "connection refused");
+    let events = relay.take_events();
+    assert!(
+        events.iter().any(|e| matches!(e,
+            RelayEvent::Refused { target, reason, message }
+                if target == &format!("127.0.0.1:{dead}")
+                    && reason == "refused"
+                    && message.contains("on the worker"))),
+        "{events:?}"
+    );
+    relay.stop();
+    client.stop();
+}

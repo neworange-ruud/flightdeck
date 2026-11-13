@@ -151,7 +151,13 @@ client `src/web/client/tunnel_http.rs`).*
   `wry`'s `with_proxy_config`.
 - **Loopback forwards (B22):** on macOS, listeners on `127.0.0.1:<port>` and
   `[::1]:<port>` for each loopback port the session uses, each connection
-  sent through the tunnel to that port on the worker.
+  sent through the tunnel to that port on the worker. They are bound
+  **without `SO_REUSEADDR`** (std's `bind` sets it, and on macOS that lets a
+  forward sit in front of a program listening on `0.0.0.0:<port>`), so a
+  port in use here is refused, never shared.
+- *Built:* `src/web/client/relay.rs` (`Relay::start`, `forward`,
+  `credentials`, `take_events`). A worker's refusal is the matching SOCKS
+  reply code and a `RelayEvent::Refused` with its words, for the error page.
 - **Browser tab:** "New browser" in the sidebar footer, the palette and a
   chord. Listed with the session's terminals and shown in the same area. The
   toolbar is B8. The address field accepts a bare `localhost:3000` (adds

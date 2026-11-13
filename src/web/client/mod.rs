@@ -49,6 +49,7 @@ pub mod link;
 pub mod messages;
 pub mod mirror;
 pub mod mission;
+pub mod relay;
 pub mod session;
 pub mod store;
 pub mod terminals;

@@ -121,6 +121,10 @@ tokio-tungstenite = "0.30"
 # axoupdater's async `query_new_version` from the update-check thread
 # (src/update.rs), which is why a current-thread runtime used to be enough there.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+# The session browser's relay binds loopback forwards without SO_REUSEADDR
+# (which std's bind turns on), so a forward can never sit in front of a
+# program already listening on the port. Already in the graph through tokio.
+socket2 = "0.6"
 # `Stream`/`Sink` combinators for the relay socket: `split()` so the session can
 # read frames in a `select!` while its handlers write acks/resumes, plus
 # `StreamExt::next` / `SinkExt::send`. `default-features = false` keeps it off
