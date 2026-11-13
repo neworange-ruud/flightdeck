@@ -2531,6 +2531,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "signal-hook 0.3.18",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
