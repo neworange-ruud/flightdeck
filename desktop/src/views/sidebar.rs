@@ -48,6 +48,25 @@ pub struct SidebarData {
     /// A remote window: the row the controlled instance itself is looking at
     /// (R7), marked `host`. Always `None` for the local workspace.
     pub host_marker: Option<usize>,
+    /// The selected agent's session browsers, drawn after its terminals
+    /// (`specs/SESSION_BROWSER_PRD.md` B1). Always empty in a local window.
+    pub browsers: Vec<BrowserRow>,
+    /// Whether one of them is on screen: then no terminal row is the focused
+    /// one.
+    pub browser_on_screen: bool,
+    /// Whether the footer offers New Browser (a remote window on a worker
+    /// that runs session browsers).
+    pub offers_browser: bool,
+}
+
+/// One session browser's row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserRow {
+    pub id: u64,
+    /// Its page title, else "browser".
+    pub label: String,
+    /// Whether it is the browser on screen.
+    pub on_screen: bool,
 }
 
 impl SidebarData {
@@ -62,6 +81,9 @@ impl SidebarData {
                 .selected()
                 .and_then(|tab| tab.session.selected_child()),
             host_marker: None,
+            browsers: Vec::new(),
+            browser_on_screen: false,
+            offers_browser: false,
         }
     }
 }
@@ -120,11 +142,10 @@ pub fn sidebar(data: &SidebarData, host: &Surface, p: &Palette) -> gpui::Div {
         (w, n, _) => format!("{w} working · {n} waiting"),
     };
 
-    let list = v_flex().gap(px(2.)).px_2().children(
-        data.rows
-            .iter()
-            .map(|row| agent_row(row, data.focused_child, data.host_marker, host, p)),
-    );
+    let list = v_flex()
+        .gap(px(2.))
+        .px_2()
+        .children(data.rows.iter().map(|row| agent_row(row, data, host, p)));
 
     v_flex()
         .flex_shrink_0()
@@ -163,7 +184,7 @@ pub fn sidebar(data: &SidebarData, host: &Surface, p: &Palette) -> gpui::Div {
                 .when(data.rows.is_empty(), |d| d.child(empty_state(p)))
                 .child(list),
         )
-        .child(footer(host, p, data.isolated))
+        .child(footer(host, p, data.isolated, data.offers_browser))
 }
 
 fn empty_state(p: &Palette) -> impl IntoElement {
@@ -243,13 +264,8 @@ fn status_words(row: &AgentRowView) -> String {
     }
 }
 
-fn agent_row(
-    row: &AgentRowView,
-    focused_child: Option<usize>,
-    host_marker: Option<usize>,
-    host: &Surface,
-    p: &Palette,
-) -> AnyElement {
+fn agent_row(row: &AgentRowView, data: &SidebarData, host: &Surface, p: &Palette) -> AnyElement {
+    let host_marker = data.host_marker;
     let index = row.index;
     let selected = row.selected;
     let row_bg = if selected {
@@ -458,7 +474,7 @@ fn agent_row(
         })
         .child(head)
         .when(selected, |b| {
-            b.child(terminal_rows(&row.terminals, focused_child, host, p))
+            b.child(terminal_rows(&row.terminals, data, host, p))
         })
         .context_menu(move |menu, _, _| agent_menu(menu, index, &menu_host));
     block.into_any_element()
@@ -517,10 +533,12 @@ fn agent_menu(
 /// The selected agent's terminals, indented under it.
 fn terminal_rows(
     terminals: &[TerminalView],
-    focused_child: Option<usize>,
+    data: &SidebarData,
     host: &Surface,
     p: &Palette,
 ) -> impl IntoElement {
+    let focused_child = data.focused_child;
+    let browser_on_screen = data.browser_on_screen;
     v_flex()
         .pl(px(40.))
         .pr_2()
@@ -528,10 +546,11 @@ fn terminal_rows(
         .gap(px(1.))
         .text_size(px(12.))
         .children(terminals.iter().enumerate().map(|(i, term)| {
-            let focused = match term.target {
-                TerminalRef::Primary => focused_child.is_none(),
-                TerminalRef::Child(c) => focused_child == Some(c),
-            };
+            let focused = !browser_on_screen
+                && match term.target {
+                    TerminalRef::Primary => focused_child.is_none(),
+                    TerminalRef::Child(c) => focused_child == Some(c),
+                };
             let target = term.target;
             let host = host.clone();
             h_flex()
@@ -569,6 +588,49 @@ fn terminal_rows(
                 )
                 .on_click(move |_, _, cx| host.focus_terminal(target, cx))
         }))
+        .children(data.browsers.iter().enumerate().map(|(i, row)| {
+            let focused = row.on_screen;
+            let show = host.clone();
+            let close = host.clone();
+            let id = row.id;
+            h_flex()
+                .id(("browser-row", i))
+                .debug_selector(move || format!("browser-row-{i}"))
+                .h(px(26.))
+                .px_2()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(focused, |r| {
+                    r.bg(p.surface_raised_nested.hsla())
+                        .text_color(p.ink.hsla())
+                })
+                .when(!focused, |r| {
+                    r.text_color(p.ink_2.hsla())
+                        .hover(|s| s.bg(p.surface_raised_nested.hsla()))
+                })
+                .child(icons::icon(
+                    icon::GLOBE,
+                    px(12.),
+                    if focused { p.ink } else { p.ink_2 },
+                ))
+                .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                .child(
+                    div()
+                        .id(("browser-close", i))
+                        .debug_selector(move || format!("browser-close-{i}"))
+                        .flex_none()
+                        .rounded(px(4.))
+                        .p(px(2.))
+                        .hover(|s| s.bg(p.surface_raised.hsla()))
+                        .child(icons::icon(icon::CLOSE, px(10.), p.muted))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            close.close_browser(id, cx);
+                        }),
+                )
+                .on_click(move |_, _, cx| show.show_browser(id, cx))
+        }))
 }
 
 /// The command a terminal runs, as its short name (`/usr/local/bin/claude
@@ -584,7 +646,7 @@ pub fn command_hint(title: &str) -> String {
 
 /// New agent (⌃N) and New shell (⌃T): the keymap's own entries. New agent is
 /// drawn disabled, with no click handler at all, in an isolated run.
-fn footer(host: &Surface, p: &Palette, isolated: bool) -> impl IntoElement {
+fn footer(host: &Surface, p: &Palette, isolated: bool, offers_browser: bool) -> impl IntoElement {
     let new_agent_disabled = keymap()
         .entry("NewAgentTab")
         .is_some_and(|entry| disabled_in(entry, isolated));
@@ -644,6 +706,28 @@ fn footer(host: &Surface, p: &Palette, isolated: bool) -> impl IntoElement {
             )))
             .on_click(move |_, _, cx| host.perform_id("NewChildTerminal", cx))
     };
+    let new_browser = offers_browser.then(|| {
+        let host = host.clone();
+        div()
+            .id("new-browser")
+            .debug_selector(|| "new-browser".into())
+            .flex_none()
+            .size(px(34.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(p.border_strong.hsla())
+            .bg(p.surface_raised.hsla())
+            .hover(|s| s.bg(p.surface_raised_nested.hsla()))
+            .cursor_pointer()
+            .child(icons::icon(icon::GLOBE, px(14.), p.ink_2))
+            .tooltip(icons::tooltip(
+                "New browser: its requests are made by the worker",
+            ))
+            .on_click(move |_, _, cx| host.open_browser(cx))
+    });
     h_flex()
         .p_3()
         .gap_2()
@@ -651,6 +735,7 @@ fn footer(host: &Surface, p: &Palette, isolated: bool) -> impl IntoElement {
         .border_color(p.hairline.hsla())
         .child(new_agent)
         .child(new_shell)
+        .children(new_browser)
 }
 
 #[cfg(test)]

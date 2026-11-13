@@ -51,6 +51,37 @@ impl Surface {
         }
     }
 
+    /// Show session browser `id` (its sidebar row). Only a remote window
+    /// has browsers.
+    pub fn show_browser(&self, id: u64, cx: &mut App) {
+        if let Surface::Remote(remote) = self {
+            remote.update(cx, |model, cx| {
+                model.show_browser(id);
+                cx.notify();
+            });
+        }
+    }
+
+    /// Close session browser `id` (its row's ✕).
+    pub fn close_browser(&self, id: u64, cx: &mut App) {
+        if let Surface::Remote(remote) = self {
+            remote.update(cx, |model, cx| {
+                model.close_browser(id);
+                cx.notify();
+            });
+        }
+    }
+
+    /// Open a session browser in the selected session (the footer's button).
+    pub fn open_browser(&self, cx: &mut App) {
+        if let Surface::Remote(remote) = self {
+            remote.update(cx, |model, cx| {
+                model.open_browser();
+                cx.notify();
+            });
+        }
+    }
+
     /// Perform the keymap entry `id`, as its chord does.
     pub fn perform_id(&self, id: &str, cx: &mut App) {
         match self {

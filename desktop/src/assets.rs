@@ -28,6 +28,8 @@ pub mod icon {
     /// A dropdown's caret. At the path gpui-component's `IconName::ChevronDown`
     /// resolves to, so its buttons' `dropdown_caret` draws this one.
     pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
+    /// A session browser (`specs/SESSION_BROWSER_PRD.md`).
+    pub const GLOBE: &str = "icons/globe.svg";
 }
 
 /// Every embedded file, by path.
@@ -69,6 +71,7 @@ const FILES: &[(&str, &[u8])] = &[
         icon::CHEVRON_DOWN,
         include_bytes!("../assets/icons/chevron-down.svg"),
     ),
+    (icon::GLOBE, include_bytes!("../assets/icons/globe.svg")),
 ];
 
 /// The asset source handed to `Application::with_assets`.

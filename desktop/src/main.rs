@@ -6,6 +6,7 @@
 
 mod app;
 mod assets;
+mod browser;
 mod commands;
 mod fonts;
 mod host;
@@ -33,6 +34,9 @@ fn main() {
         // The same pipeline headless, printing the grid instead of drawing it.
         // M0 spike S4: latency / throughput / idle / scroll measurements.
         Some(flag) if flag == "--bench" => std::process::exit(terminal::bench::run(args.collect())),
+        // The session browser against a stand-in worker (browser::smoke).
+        #[cfg(target_os = "macos")]
+        Some(flag) if flag == "--spike-browser" => std::process::exit(browser::smoke::run()),
         Some(flag) if flag == "--dump-grid" => {
             std::process::exit(terminal::spike::dump(args.collect()))
         }

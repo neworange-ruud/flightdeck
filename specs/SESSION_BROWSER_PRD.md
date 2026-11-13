@@ -144,6 +144,18 @@ client `src/web/client/tunnel_http.rs`).*
 
 ### 4.3 Desktop (`remote-control-cefv.3`, `.4`, `.5`)
 
+*Built for remote sessions on macOS (`.4`): `desktop/src/browser/` (the
+view, the address rules, the error page, the macOS proxy) and
+`desktop/src/remote/browsers.rs` (which tabs exist, which is on screen). New
+Browser is a palette row and a sidebar footer button; each browser is a row
+under its session's terminals with a ✕. The window hides the native view
+whenever a GPUI overlay, the picker, Mission control, the transfer panel or a
+dialog covers it. After a reconnect each tab asks for a new key and its relay
+takes it without changing port or password. `flightdeck-desktop
+--spike-browser` runs the real view against a stand-in worker. Local
+sessions are `remote-control-cefv.9`; Continue anyway for self-signed HTTPS is `remote-control-cefv.10`; Windows
+waits for `remote-control-cefv.8`.*
+
 - **Relay:** SOCKS5 on `127.0.0.1`, random port, random credentials (B23).
   Hostnames are passed through and never resolved on the Desktop. Each
   accepted connection opens one tunnel connection. On macOS the proxy is our

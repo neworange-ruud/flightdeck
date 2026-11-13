@@ -122,6 +122,11 @@ pub enum FrontEndAction {
     /// window's row alone ([`remote_window_rows`]), offered only on a worker
     /// that gives downloads (protocol v9).
     DownloadFiles,
+    /// Open a browser in the selected session whose requests the worker makes
+    /// (`specs/SESSION_BROWSER_PRD.md`). A remote window's row alone
+    /// ([`remote_window_rows`]), offered only on a worker that grants browser
+    /// tunnels (protocol v11).
+    NewBrowser,
 }
 
 impl PaletteAction {
@@ -380,6 +385,11 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
 /// The rows only a desktop remote window adds, after the front-end rows: they
 /// act on the remote the window is on, which a local window does not have.
 const REMOTE_WINDOW_ENTRIES: &[PaletteEntry] = &[
+    PaletteEntry {
+        group: "Terminals",
+        label: "New Browser",
+        action: PaletteAction::FrontEnd(FrontEndAction::NewBrowser),
+    },
     PaletteEntry {
         group: "Projects",
         label: "Upload Files…",
@@ -833,6 +843,19 @@ mod tests {
         };
         assert!(!rows(true).any(|e| is_transfer(&e)));
         assert!(!rows(false).any(|e| is_transfer(&e)));
+        // New Browser joins the end of Terminals, in a remote window only.
+        let is_browser =
+            |e: &&PaletteEntry| e.action == PaletteAction::FrontEnd(FrontEndAction::NewBrowser);
+        assert!(!rows(true).any(|e| is_browser(&e)));
+        let terminals: Vec<&str> = remote_window_rows()
+            .filter(|e| e.group == "Terminals")
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(
+            terminals.last().copied(),
+            Some("New Browser"),
+            "{terminals:?}"
+        );
         let projects: Vec<&str> = remote_window_rows()
             .filter(|e| e.group == "Projects")
             .map(|e| e.label)

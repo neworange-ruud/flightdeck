@@ -78,7 +78,9 @@ impl std::fmt::Display for ForwardError {
 /// Where the relay sends things, shared by its tasks.
 struct Inner {
     access: HttpAccess,
-    key: String,
+    /// The worker's tunnel key. Replaced when the window reconnects (a key
+    /// ends with the connection that was granted it).
+    key: Mutex<String>,
     username: String,
     password: String,
     events: Mutex<Vec<RelayEvent>>,
@@ -106,7 +108,7 @@ impl Relay {
         let (stop, stopped) = watch::channel(false);
         let inner = Arc::new(Inner {
             access,
-            key,
+            key: Mutex::new(key),
             username: crate::web::upload::new_ticket(),
             password: crate::web::upload::new_ticket(),
             events: Mutex::new(Vec::new()),
@@ -176,6 +178,13 @@ impl Relay {
         }
         forwards.insert(local, remote);
         Ok(())
+    }
+
+    /// Send new tunnels with `key` from now on: the window reconnected and
+    /// was granted a new one. Tunnels already open keep running until the
+    /// worker cuts them.
+    pub fn set_key(&self, key: String) {
+        *lock(&self.inner.key) = key;
     }
 
     /// The loopback ports forwarded, in order.
@@ -292,7 +301,8 @@ async fn serve(mut stream: TcpStream, inner: &Inner, door: Door) {
             Err(_) => return,
         },
     };
-    match tunnel_http::open(&inner.access, &inner.key, &target).await {
+    let key = lock(&inner.key).clone();
+    match tunnel_http::open(&inner.access, &key, &target).await {
         Ok(tunnel) => {
             // SOCKS: tell the web view it is connected. A forward is already
             // a plain connection.

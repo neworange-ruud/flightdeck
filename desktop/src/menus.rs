@@ -138,7 +138,8 @@ impl AppCommand {
             FrontEndAction::OpenInVsCode
             | FrontEndAction::RenameRemote
             | FrontEndAction::UploadFiles
-            | FrontEndAction::DownloadFiles => None,
+            | FrontEndAction::DownloadFiles
+            | FrontEndAction::NewBrowser => None,
         }
     }
 

@@ -402,6 +402,12 @@ impl RemoteSession {
         self.client.workspace()
     }
 
+    /// The link itself, mutably: for a front-end's own requests and their
+    /// answers (a remote window's browser tunnels).
+    pub fn client_mut(&mut self) -> &mut RemoteClient {
+        &mut self.client
+    }
+
     pub fn client(&self) -> &RemoteClient {
         &self.client
     }

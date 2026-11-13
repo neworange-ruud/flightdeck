@@ -116,6 +116,14 @@ pub struct RemoteWindow {
     /// titlebar does.
     #[cfg(target_os = "macos")]
     drag_pending: bool,
+    /// The session browsers' views, by tab id, with the key each relay was
+    /// last given (`specs/SESSION_BROWSER_PRD.md`). Built from the model's
+    /// list and dropped with it; macOS only for now.
+    #[cfg(target_os = "macos")]
+    browser_views:
+        std::collections::HashMap<u64, (Entity<crate::browser::view::BrowserView>, String)>,
+    /// The browser the main area shows this frame.
+    shown_browser: Option<u64>,
 }
 
 impl RemoteWindow {
@@ -149,6 +157,9 @@ impl RemoteWindow {
             upload: None,
             #[cfg(target_os = "macos")]
             drag_pending: false,
+            #[cfg(target_os = "macos")]
+            browser_views: std::collections::HashMap::new(),
+            shown_browser: None,
         }
     }
 
@@ -784,6 +795,9 @@ impl RemoteWindow {
                 .child(open_project_button(p, &self.remote))
                 .into_any_element();
         }
+        if let Some(id) = self.shown_browser {
+            return self.browser_area(id, p, cx);
+        }
         if model.active_terminal().is_some() {
             return div()
                 .flex_1()
@@ -801,6 +815,105 @@ impl RemoteWindow {
 }
 
 impl RemoteWindow {
+    /// Build a view for every browser tab the worker granted a key, give a
+    /// relay a reconnect's new key, drop the views of closed tabs, and copy
+    /// page titles into the model for the sidebar. Returns the browser on
+    /// screen.
+    fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
+        let shown = self.remote.update(cx, |model, _| model.browser_on_screen());
+        #[cfg(target_os = "macos")]
+        {
+            let model = self.remote.read(cx);
+            let tabs: Vec<(u64, flightdeck::contracts::TabId, Option<String>)> = model
+                .browsers()
+                .all()
+                .iter()
+                .map(|t| (t.id, t.session.clone(), t.key.clone()))
+                .collect();
+            let access = model.http_access();
+            let via = model.label().to_string();
+            let worker = model.address().to_string();
+            self.browser_views
+                .retain(|id, _| tabs.iter().any(|(tab, ..)| tab == id));
+            for (id, session, key) in tabs {
+                let Some(key) = key else { continue };
+                match self.browser_views.get_mut(&id) {
+                    Some((view, given)) => {
+                        if *given != key {
+                            view.read(cx).set_key(key.clone());
+                            *given = key;
+                        }
+                    }
+                    None => {
+                        let Some(access) = access.clone() else {
+                            continue;
+                        };
+                        let profile = crate::browser::profile_id(&worker, &session.0);
+                        let via = via.clone();
+                        let given = key.clone();
+                        let view = cx.new(|cx| {
+                            crate::browser::view::BrowserView::new(
+                                access, key, via, profile, window, cx,
+                            )
+                        });
+                        cx.observe(&view, |_, _, cx| cx.notify()).detach();
+                        self.browser_views.insert(id, (view, given));
+                    }
+                }
+            }
+            let titles: Vec<(u64, String)> = self
+                .browser_views
+                .iter()
+                .map(|(id, (view, _))| (*id, view.read(cx).title()))
+                .collect();
+            self.remote.update(cx, |model, _| {
+                for (id, title) in titles {
+                    model.set_browser_title(id, title);
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = window;
+        shown
+    }
+
+    /// Show browser `shown`'s web view, hiding every other.
+    fn set_browsers_shown(&mut self, shown: Option<u64>, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        for (id, (view, _)) in &self.browser_views {
+            let on = shown == Some(*id);
+            view.update(cx, |view, _| view.set_shown(on));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (shown, cx);
+    }
+
+    /// Browser `id`'s area: its view once the worker granted its key, else
+    /// what it is waiting for or why it cannot open.
+    fn browser_area(&self, id: u64, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
+        #[cfg(target_os = "macos")]
+        if let Some((view, _)) = self.browser_views.get(&id) {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(view.clone())
+                .into_any_element();
+        }
+        let model = self.remote.read(cx);
+        let (title, detail) = match model.browsers().tab(id) {
+            Some(tab) if tab.refusal.is_some() => (
+                "The browser could not open.".to_string(),
+                tab.refusal.clone().unwrap_or_default(),
+            ),
+            _ => (
+                "Opening a browser on the worker…".to_string(),
+                String::new(),
+            ),
+        };
+        notice_card(p, &title, &detail).into_any_element()
+    }
+
     /// The Worker tab: its row of shells (W35) over the shell on screen,
     /// full width; with Restart shell once that one exited.
     fn worker_shell_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
@@ -953,6 +1066,7 @@ impl Render for RemoteWindow {
         self.sync_rename(window, cx);
         self.sync_upload(window, cx);
         self.sync_title(window, cx);
+        self.shown_browser = self.sync_browsers(window, cx);
         let mission = self.mission_shown(cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
@@ -965,16 +1079,36 @@ impl Render for RemoteWindow {
         let shell_active = model.shell_active();
         // Either shell's tab hides the project's sidebar and git strip.
         let off_project = model.tab() != Tab::Project;
+        let link_down = model.ended().is_some() || !ws.ready;
         let skew = model.skew_warning();
         let picker = self.picker.clone().filter(|_| model.ended().is_none());
         // Hidden, not closed, while its Choose… has the picker up.
         let upload = self.upload.clone().filter(|_| !model.choosing_upload_dir());
         let takes_drops = model.supports_upload();
+        let browser_rows: Vec<crate::views::sidebar::BrowserRow> = ws
+            .selected_session()
+            .map(|session| {
+                model
+                    .browsers()
+                    .of_session(&session.session_id)
+                    .map(|tab| crate::views::sidebar::BrowserRow {
+                        id: tab.id,
+                        label: super::browsers::label(tab),
+                        on_screen: self.shown_browser == Some(tab.id),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let data = SidebarData {
             rows: views::agent_rows(ws),
             focused_child: views::focused_child(ws),
             isolated: false,
             host_marker: views::host_marker(ws),
+            browsers: browser_rows,
+            browser_on_screen: self.shown_browser.is_some(),
+            offers_browser: ws.is_worker()
+                && ws.protocol_version >= flightdeck::web::protocol::BROWSER_TUNNEL_MIN_VERSION
+                && crate::browser::unavailable().is_none(),
         };
         let strip = views::git_strip(ws);
         let context = OverlayContext {
@@ -997,7 +1131,13 @@ impl Render for RemoteWindow {
                 let focus = panel.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }
-        } else if !overlay_open && picker.is_none() && self.rename.is_none() {
+        } else if !overlay_open
+            && picker.is_none()
+            && self.rename.is_none()
+            // A browser on screen keeps whatever has the keyboard: its
+            // address field, or the page itself (a native view).
+            && self.shown_browser.is_none()
+        {
             let shell_focus = self
                 .shell
                 .as_ref()
@@ -1014,6 +1154,18 @@ impl Render for RemoteWindow {
                 window.focus(&want, cx);
             }
         }
+
+        // The web views are native and drawn over everything, so the one on
+        // screen is hidden whenever anything of GPUI's covers the main area
+        // (B13), and every other is hidden always.
+        let covered = overlay_open
+            || self.rename.is_some()
+            || upload.is_some()
+            || picker.is_some()
+            || mission
+            || off_project
+            || link_down;
+        self.set_browsers_shown(if covered { None } else { self.shown_browser }, cx);
 
         let surface = Surface::Remote(self.remote.clone());
         let app_remote = self.remote.clone();
