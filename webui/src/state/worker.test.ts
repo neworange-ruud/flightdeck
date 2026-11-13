@@ -185,19 +185,20 @@ describe("workerCard", () => {
   it("offers a restart for a shell that is missing or exited", () => {
     const shell = worker({ workerShellTab: true });
     expect(workerCard(shell)).toBeNull();
-    const missing = { ...shell, worker: { ...shell.worker!, shell: null } };
+    const missing = { ...shell, worker: { ...shell.worker!, shells: [] } };
     expect(workerCard(missing)).toBe("shell_missing");
     const exited = {
       ...shell,
       worker: {
         ...shell.worker!,
-        shell: { ...shell.worker!.shell!, alive: false, exitCode: 2 },
+        shells: [{ ...shell.worker!.shells[0]!, alive: false, exitCode: 2 }],
       },
     };
     expect(workerCard(exited)).toBe("shell_exited");
-    expect(shellExitLine(exited.worker.shell)).toBe("The worker shell exited (2).");
-    expect(shellExitLine({ ...exited.worker.shell, exitCode: null })).toBe(
-      "The worker shell exited.",
+    const ended = exited.worker.shells[0]!;
+    expect(shellExitLine(ended)).toBe(`${ended.title} exited (2).`);
+    expect(shellExitLine({ ...ended, exitCode: null })).toBe(
+      `${ended.title} exited.`,
     );
     expect(shellExitLine(null)).toBe("The worker shell is not running.");
   });

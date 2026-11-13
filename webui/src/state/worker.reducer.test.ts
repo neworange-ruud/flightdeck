@@ -39,7 +39,7 @@ describe("a worker's snapshot", () => {
     const state = worker();
     expect(state.hostKind).toBe("worker");
     expect(state.worker?.home).toBe("/home/me");
-    expect(state.worker?.shell?.terminalId).toBe("worker:shell");
+    expect(state.worker?.shells[0]?.terminalId).toBe("worker:shell");
     expect(state.terminalGeometry).toEqual({
       "t-agent": { cols: 132, rows: 40 },
       "worker:shell": { cols: 80, rows: 24 },
@@ -84,7 +84,8 @@ describe("the worker shell's tab", () => {
       shell: { terminalId: "worker:shell", title: "sh", alive: false, exitCode: 1 },
       geometry: { cols: 100, rows: 30 },
     });
-    expect(state.worker?.shell?.alive).toBe(false);
+    expect(state.worker?.shells[0]?.alive).toBe(false);
+    expect(state.worker?.shells).toHaveLength(1);
     expect(state.terminalGeometry["worker:shell"]).toEqual({ cols: 100, rows: 30 });
   });
 });

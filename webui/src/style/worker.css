@@ -41,8 +41,7 @@
  * the selected project's sessions and the terminal tabs that session's
  * terminals, and the shell is in neither.
  */
-.fd-frame[data-host="worker"][data-worker-shell="true"] .fd-sidebar,
-.fd-frame[data-host="worker"][data-worker-shell="true"] .fd-tabs {
+.fd-frame[data-host="worker"][data-worker-shell="true"] .fd-sidebar {
   display: none;
 }
 

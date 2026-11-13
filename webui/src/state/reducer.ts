@@ -278,6 +278,8 @@ function reduceAction(state: AppState, action: AppAction): AppState {
         /** The shell's tab only exists on a worker. */
         workerShellTab:
           snapshot.hostKind === "worker" ? state.workerShellTab : false,
+        workerShell: snapshot.hostKind === "worker" ? state.workerShell : null,
+        openingShell: snapshot.hostKind === "worker" ? state.openingShell : null,
         /** The picker only exists on a worker. */
         picker: snapshot.hostKind === "worker" ? state.picker : null,
         protocolVersion: snapshot.protocolVersion ?? null,
@@ -1317,15 +1319,57 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       if (state.worker === null) {
         return state;
       }
-      return {
+      const have = state.worker.shells;
+      const at = have.findIndex((s) => s.terminalId === action.shell.terminalId);
+      const shells =
+        at < 0
+          ? [...have, action.shell]
+          : have.map((s, i) => (i === at ? action.shell : s));
+      return followShells({
         ...state,
-        worker: { ...state.worker, shell: action.shell },
+        worker: { ...state.worker, shells },
         terminalGeometry: {
           ...state.terminalGeometry,
           [action.shell.terminalId]: action.geometry,
         },
+      });
+    }
+
+    case "worker/shellClosed": {
+      if (state.worker === null) {
+        return state;
+      }
+      const shells = state.worker.shells.filter(
+        (s) => s.terminalId !== action.terminalId,
+      );
+      return followShells({ ...state, worker: { ...state.worker, shells } });
+    }
+
+    case "workerShell/select": {
+      const shells = state.worker?.shells ?? [];
+      const index = shells.findIndex((s) => s.terminalId === action.terminalId);
+      if (index < 0) {
+        return state;
+      }
+      return {
+        ...state,
+        workerShellTab: true,
+        workerShell: { id: action.terminalId, index },
       };
     }
+
+    case "workerShell/open":
+      if (state.worker === null) {
+        return state;
+      }
+      return {
+        ...state,
+        workerShellTab: true,
+        openingShell: state.worker.shells.map((s) => s.terminalId),
+      };
+
+    case "workerShell/close":
+      return state;
 
     case "worker/health":
       return state.worker === null
@@ -1393,6 +1437,7 @@ function reduceAction(state: AppState, action: AppAction): AppState {
 
     case "workerShell/restart":
       return state;
+
 
     case "picker/close":
       return state.picker === null ? state : { ...state, picker: null };
@@ -1882,4 +1927,28 @@ function blankAccess(): AccessState {
     codeTtlSeconds: null,
     revokedAgo: null,
   };
+}
+
+/**
+ * Keep the Worker tab on a shell that exists (W35): a shell this window asked
+ * for once it arrives, a neighbour of one that closed.
+ */
+function followShells(state: AppState): AppState {
+  const ids = (state.worker?.shells ?? []).map((s) => s.terminalId);
+  if (state.openingShell !== null) {
+    const index = ids.findIndex((id) => !state.openingShell!.includes(id));
+    if (index >= 0) {
+      return {
+        ...state,
+        openingShell: null,
+        workerShell: { id: ids[index]!, index },
+      };
+    }
+  }
+  const chosen = state.workerShell;
+  if (chosen === null || ids.includes(chosen.id) || ids.length === 0) {
+    return state;
+  }
+  const index = Math.min(chosen.index, ids.length - 1);
+  return { ...state, workerShell: { id: ids[index]!, index } };
 }

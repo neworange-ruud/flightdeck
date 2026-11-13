@@ -448,8 +448,8 @@ export type HostKind = "tui" | "desktop" | "worker";
 export interface WorkerInfo {
   /** `$HOME` on the worker: the picker's root and its boundary (W16). */
   readonly home: string;
-  /** The worker shell, or `null` when none has been started. */
-  readonly shell: WorkerShell | null;
+  /** Every worker shell, in the order they were opened (W35). */
+  readonly shells: readonly WorkerShell[];
   readonly health: WorkerHealth | null;
   readonly status: WorkerStatus;
   readonly connections: WorkerConnections;

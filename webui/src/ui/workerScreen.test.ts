@@ -104,7 +104,7 @@ describe("a fresh worker", () => {
     const h = render();
     expect(h.app.el.getAttribute("data-host")).toBe("worker");
     const tabs = [...h.app.el.querySelectorAll<HTMLElement>('.fd-projects [role="tab"]')];
-    expect(tabs[0]?.textContent).toContain("Worker shell");
+    expect(tabs[0]?.textContent).toContain("Worker");
     expect(h.q(".fd-workercard").getAttribute("data-kind")).toBe("empty");
     expect(h.text(".fd-workercard")).toContain("This worker has no projects yet.");
     expect(h.app.el.getAttribute("data-worker-card")).toBe("empty");
@@ -162,16 +162,74 @@ describe("the worker shell's tab (W15)", () => {
       geometry: { cols: 80, rows: 24 },
     });
     expect(h.q(".fd-workercard").getAttribute("data-kind")).toBe("shell_exited");
-    expect(h.text(".fd-workercard")).toContain("The worker shell exited (127).");
+    expect(h.text(".fd-workercard")).toContain("Worker shell exited (127).");
     h.q('[data-action="restart-shell"]').click();
-    expect(h.dispatched).toContainEqual({ type: "workerShell/restart" });
+    expect(h.dispatched).toContainEqual({
+      type: "workerShell/restart",
+      terminalId: "worker:shell",
+    });
   });
 
-  it("says the shell is not running when the worker has none", () => {
+  it("offers to open a shell when every shell is closed", () => {
     const h = render(workerSnapshotWire({ worker: workerWire({ shell: null }) }));
     h.q(".fd-project__select--shell").click();
     expect(h.q(".fd-workercard").getAttribute("data-kind")).toBe("shell_missing");
+    expect(h.text(".fd-workercard")).toContain("No shells are open on this worker.");
+    h.q('[data-action="open-shell"]').click();
+    expect(h.dispatched).toContainEqual({ type: "workerShell/open" });
+  });
+
+  it("says the shell is not running on a worker older than v10", () => {
+    const h = render(
+      workerSnapshotWire({ protocol_version: 9, worker: workerWire({ shell: null }) }),
+    );
+    h.q(".fd-project__select--shell").click();
     expect(h.text(".fd-workercard")).toContain("The worker shell is not running.");
+    expect(h.app.el.querySelector('[data-action="open-shell"]')).toBeNull();
+  });
+
+  it("lists the worker's shells to pick, open and close (W35)", () => {
+    const shell = (n: number) => ({
+      terminal_id: n === 1 ? "worker:shell" : `worker:shell:${n}`,
+      title: `Shell ${n}`,
+      geometry: { cols: 80, rows: 24 },
+      byte_len: 0,
+      replay_from: 0,
+      alive: true,
+      exit_code: null,
+    });
+    const h = render(workerSnapshotWire({ worker: workerWire({ shells: [shell(1), shell(2)] }) }));
+    h.q(".fd-project__select--shell").click();
+    const tabs = () => [...h.app.el.querySelectorAll<HTMLElement>(".fd-tabs .fd-tab")];
+    expect(tabs().map((t) => t.textContent)).toEqual(["shell 1✕", "shell 2✕"]);
+    expect(tabs()[0]?.getAttribute("data-selected")).toBe("true");
+
+    tabs()[1]!.querySelector<HTMLElement>(".fd-tab__label")!.click();
+    expect(tabs()[1]?.getAttribute("data-selected")).toBe("true");
+    expect(h.dispatched).toContainEqual({
+      type: "workerShell/select",
+      terminalId: "worker:shell:2",
+    });
+
+    h.q('[data-action="new-worker-shell"]').click();
+    expect(h.dispatched).toContainEqual({ type: "workerShell/open" });
+    /** The new shell is shown once it arrives. */
+    h.app.store.dispatch({
+      type: "worker/shell",
+      shell: { terminalId: "worker:shell:3", title: "Shell 3", alive: true, exitCode: null },
+      geometry: { cols: 80, rows: 24 },
+    });
+    expect(tabs()[2]?.getAttribute("data-selected")).toBe("true");
+
+    tabs()[2]!.querySelector<HTMLElement>(".fd-tab__close")!.click();
+    expect(h.dispatched).toContainEqual({
+      type: "workerShell/close",
+      terminalId: "worker:shell:3",
+    });
+    /** Closed: its neighbour is shown. */
+    h.app.store.dispatch({ type: "worker/shellClosed", terminalId: "worker:shell:3" });
+    expect(tabs()).toHaveLength(2);
+    expect(tabs()[1]?.getAttribute("data-selected")).toBe("true");
   });
 });
 

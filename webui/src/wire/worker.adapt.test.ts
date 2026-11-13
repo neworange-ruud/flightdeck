@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "./frames";
 import { describe, expect, it } from "vitest";
 import { checkSession } from "../access/client";
 import {
@@ -25,7 +26,9 @@ describe("a worker's snapshot", () => {
     expect(snapshot.hostKind).toBe("worker");
     expect(snapshot.worker).toEqual({
       home: "/home/me",
-      shell: { terminalId: "worker:shell", title: "Worker shell", alive: true, exitCode: null },
+      shells: [
+        { terminalId: "worker:shell", title: "Worker shell", alive: true, exitCode: null },
+      ],
       health: {
         version: "9.9.9",
         uptimeSecs: 60,
@@ -77,7 +80,7 @@ describe("a worker's snapshot", () => {
     /** Empty or absent — a host that predates the field — is no folder. */
     expect(sessions[1] !== undefined && "worktreePath" in sessions[1]).toBe(false);
     expect(sessions[2]?.worktreePath).toBeUndefined();
-    expect(snapshot.protocolVersion).toBe(9);
+    expect(snapshot.protocolVersion).toBe(PROTOCOL_VERSION);
   });
 
   it("an upload plan keeps every field, and reads each absence as one", () => {
@@ -117,7 +120,7 @@ describe("a worker's snapshot", () => {
     const snapshot = snapshotFromWire(
       workerSnapshotWire({ worker: workerWire({ shell: null, health: null }) }),
     );
-    expect(snapshot.worker?.shell).toBeNull();
+    expect(snapshot.worker?.shells).toEqual([]);
     expect(snapshot.worker?.health).toBeNull();
     expect(snapshot.terminalGeometry).toEqual({});
   });
