@@ -183,6 +183,10 @@ pub struct RemoteWorkspace {
     pub host_kind: Option<HostKind>,
     /// The worker's own state. `Some` only on a worker host.
     pub worker: Option<WorkerMirror>,
+    /// Worktree paths of sessions the host closed **and** whose worktree it
+    /// removed (abandoned), not yet taken
+    /// ([`RemoteWorkspace::take_removed_worktrees`]).
+    removed_worktrees: Vec<String>,
     /// How many snapshots have been applied: a new one restates everything,
     /// so whoever dated changes since the last ([`super::mission::ActivityWatch`])
     /// starts over.
@@ -209,6 +213,12 @@ impl RemoteWorkspace {
     /// An empty mirror, waiting for its first snapshot.
     pub fn new() -> RemoteWorkspace {
         RemoteWorkspace::default()
+    }
+
+    /// The worktrees abandoned since the last call: what a front-end kept for
+    /// them can go (the session browser's profile, B19).
+    pub fn take_removed_worktrees(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.removed_worktrees)
     }
 
     // -- frames in ----------------------------------------------------------
@@ -290,7 +300,19 @@ impl RemoteWorkspace {
                 }
                 changed
             }
-            Delta::SessionRemoved { session_id } => {
+            Delta::SessionRemoved {
+                session_id,
+                worktree_removed,
+            } => {
+                if worktree_removed {
+                    if let Some(path) = self
+                        .session(&session_id)
+                        .map(|s| s.worktree_path.clone())
+                        .filter(|p| !p.is_empty())
+                    {
+                        self.removed_worktrees.push(path);
+                    }
+                }
                 for project in &mut self.projects {
                     project.sessions.retain(|s| s.session_id != session_id);
                 }

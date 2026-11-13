@@ -1436,3 +1436,50 @@ mod delta {
         assert!(deltas(&before, &after).is_empty());
     }
 }
+
+/// A removed session's frame says whether its worktree is gone from the
+/// host's disk (B19), asked about the path last published for it.
+#[test]
+fn a_removed_sessions_frame_says_whether_its_worktree_went_too() {
+    let mut before = crate::web::server::HostState::default();
+    let with_path = |id: &str, path: &str| {
+        let mut session = crate::web::client::session::tests::session(id, id);
+        session.worktree_path = path.to_string();
+        session
+    };
+    let gone = with_path("gone", "/repo/.flightdeck/worktrees/gone");
+    let kept = with_path("kept", "/repo/.flightdeck/worktrees/kept");
+    let base = with_path("base", "");
+    before.projects = vec![crate::web::protocol::ProjectView {
+        project_id: "/repo".into(),
+        name: "repo".into(),
+        root: "/repo".into(),
+        base_branch: "main".into(),
+        dot: None,
+        sessions: vec![gone, kept, base],
+    }];
+    let mut after = before.clone();
+    after.projects[0].sessions.clear();
+    let mut frames = deltas(&before, &after);
+    crate::web::stream::mark_removed_worktrees(&mut frames, &before, &|p| {
+        p == std::path::Path::new("/repo/.flightdeck/worktrees/kept")
+    });
+    let removed: Vec<(String, bool)> = frames
+        .iter()
+        .filter_map(|f| match f {
+            crate::web::protocol::Delta::SessionRemoved {
+                session_id,
+                worktree_removed,
+            } => Some((session_id.0.clone(), *worktree_removed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        removed,
+        [
+            ("gone".to_string(), true),
+            ("kept".to_string(), false),
+            ("base".to_string(), false),
+        ]
+    );
+}

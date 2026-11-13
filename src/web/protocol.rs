@@ -2540,6 +2540,13 @@ pub enum Delta {
     SessionRemoved {
         /// The session that went away.
         session_id: TabId,
+        /// Whether its worktree is gone from the host too: it was abandoned,
+        /// not closed with the worktree kept. A front-end forgets what it kept
+        /// for that worktree then — the session browser's profile
+        /// (`specs/SESSION_BROWSER_PRD.md` B19). Additive and `false` when a
+        /// host does not say, which keeps everything.
+        #[serde(default)]
+        worktree_removed: bool,
     },
     /// The cheap, frequent one: a status transition on one session.
     Status {

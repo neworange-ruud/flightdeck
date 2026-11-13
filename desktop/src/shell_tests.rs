@@ -842,3 +842,76 @@ fn the_spinner_clock_holds_still_while_the_window_is_inactive_or_hidden(app: &mu
     advance(cx, 2);
     assert!(steps(cx) > hidden);
 }
+
+/// The session browser in a local session (`specs/SESSION_BROWSER_PRD.md`
+/// B9): the window's rules. No web view is built here (the test platform has
+/// no native window); `--spike-browser` drives the real one.
+#[cfg(target_os = "macos")]
+mod local_browser {
+    use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
+
+    use super::*;
+
+    fn new_browser(model: &Entity<HostModel>, cx: &mut VisualTestContext) {
+        // As `app::run` does: the desktop performs the front-end rows.
+        model.update(cx, |m, _| m.host_mut().set_desktop_front_end());
+        dispatch(
+            model,
+            HostEvent::RunPaletteAction(PaletteAction::FrontEnd(FrontEndAction::NewBrowser)),
+            cx,
+        );
+    }
+
+    fn on_screen(model: &Entity<HostModel>, cx: &mut VisualTestContext) -> Option<u64> {
+        model.update(cx, |m, _| m.browser_on_screen())
+    }
+
+    #[gpui::test]
+    fn new_browser_lists_the_tab_and_a_terminal_click_takes_it_off_screen(
+        app: &mut TestAppContext,
+    ) {
+        let (_f, model, cx) = open(app, two_projects());
+        assert!(
+            cx.debug_bounds("new-browser").is_some(),
+            "the footer offers it"
+        );
+        new_browser(&model, cx);
+        let id = on_screen(&model, cx).expect("on screen at once");
+        assert!(model.read_with(cx, |m, _| m.browsers().tab(id).unwrap().direct));
+        assert!(
+            cx.debug_bounds("browser-row-0").is_some(),
+            "listed under the agent"
+        );
+
+        click(cx, "terminal-row-0");
+        assert_eq!(on_screen(&model, cx), None);
+        click(cx, "browser-row-0");
+        assert_eq!(on_screen(&model, cx), Some(id));
+        click(cx, "browser-close-0");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("browser-row-0").is_none());
+        assert!(model.read_with(cx, |m, _| m.browsers().all().is_empty()));
+    }
+
+    #[gpui::test]
+    fn a_session_gone_with_its_worktree_is_an_abandoned_worktree(app: &mut TestAppContext) {
+        let (_f, model, cx) = open(app, two_projects());
+        new_browser(&model, cx);
+        let worktree = model.read_with(cx, |m, _| m.browsers().all()[0].worktree.clone());
+        assert!(
+            !std::path::Path::new(&worktree).exists(),
+            "a fixture path: {worktree}"
+        );
+        model.update(cx, |m, cx| {
+            let state = m.host_mut().active_state_mut();
+            let selected = state.selected_tab.expect("a selected session");
+            state.tabs.remove(selected);
+            m.turn(cx);
+        });
+        assert!(model.read_with(cx, |m, _| m.browsers().all().is_empty()));
+        assert_eq!(
+            model.update(cx, |m, _| m.take_abandoned_worktrees()),
+            vec![worktree]
+        );
+    }
+}

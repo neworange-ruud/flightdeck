@@ -171,6 +171,13 @@ pub struct HostModel {
     #[cfg(test)]
     pub opened_urls: Vec<String>,
     _ticker: Option<Task<()>>,
+    /// The local sessions' browsers (`specs/SESSION_BROWSER_PRD.md` B9):
+    /// which tabs exist and which is on screen. The web views are the
+    /// window's.
+    browsers: crate::browser::tabs::Browsers,
+    /// Worktrees found gone (abandoned) whose browser profiles the window is
+    /// still to delete (B19).
+    abandoned: Vec<String>,
 }
 
 impl HostModel {
@@ -196,6 +203,110 @@ impl HostModel {
             #[cfg(test)]
             opened_urls: Vec::new(),
             _ticker: None,
+            browsers: crate::browser::tabs::Browsers::default(),
+            abandoned: Vec::new(),
+        }
+    }
+
+    // -- the session browsers (specs/SESSION_BROWSER_PRD.md B9) -------------
+
+    /// What the window looks at, as the browser list remembers it: the
+    /// active project's selected session and its focused terminal.
+    fn browser_view_key(&self) -> (Option<flightdeck::contracts::TabId>, Option<String>) {
+        let state = self.host.active_state();
+        match state.selected() {
+            Some(tab) => (
+                Some(browser_session(&state.repo_root, &tab.meta.id)),
+                Some(format!("{:?}", tab.session.selected_child())),
+            ),
+            None => (None, None),
+        }
+    }
+
+    /// Open a browser in the selected session (New Browser): a local one,
+    /// on this computer's own network.
+    pub fn open_browser(&mut self) {
+        if let Some(why) = crate::browser::unavailable_here() {
+            self.host.message(why.to_string());
+            return;
+        }
+        let state = self.host.active_state();
+        let Some(tab) = state.selected() else {
+            self.host
+                .message("Select an agent session to open a browser in.".to_string());
+            return;
+        };
+        let worktree = tab
+            .meta
+            .worktree_path_relative
+            .resolve(&state.repo_root)
+            .display()
+            .to_string();
+        let (session, terminal) = self.browser_view_key();
+        if let Some(session) = session {
+            self.browsers.open_direct(session, worktree, terminal);
+        }
+    }
+
+    /// Show browser `id` (its sidebar row).
+    pub fn show_browser(&mut self, id: u64) {
+        let (_, terminal) = self.browser_view_key();
+        self.browsers.show(id, terminal);
+    }
+
+    /// Close browser `id`.
+    pub fn close_browser(&mut self, id: u64) {
+        self.browsers.close(id);
+    }
+
+    /// Take the browser off screen (a terminal or another agent was chosen).
+    pub fn hide_browser(&mut self) {
+        self.browsers.hide();
+    }
+
+    /// The browser on screen, while the window still looks at what it was
+    /// opened over.
+    pub fn browser_on_screen(&mut self) -> Option<u64> {
+        let (session, terminal) = self.browser_view_key();
+        self.browsers
+            .on_screen(session.as_ref(), terminal.as_deref())
+    }
+
+    /// Every browser tab.
+    pub fn browsers(&self) -> &crate::browser::tabs::Browsers {
+        &self.browsers
+    }
+
+    /// Record browser `id`'s page title.
+    #[cfg(target_os = "macos")]
+    pub fn set_browser_title(&mut self, id: u64, title: String) -> bool {
+        self.browsers.set_title(id, title)
+    }
+
+    /// Worktrees found abandoned since the last call (B19).
+    pub fn take_abandoned_worktrees(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.abandoned)
+    }
+
+    /// Forget the browsers of sessions that are gone, and note the worktrees
+    /// that went with them (abandoned): their profiles can go (B19).
+    fn prune_browsers(&mut self) {
+        if self.browsers.all().is_empty() {
+            return;
+        }
+        let live: Vec<flightdeck::contracts::TabId> = (0..self.host.project_count())
+            .filter_map(|i| self.host.project_state(i))
+            .flat_map(|state| {
+                state
+                    .tabs
+                    .iter()
+                    .map(|tab| browser_session(&state.repo_root, &tab.meta.id))
+            })
+            .collect();
+        for (_, worktree) in self.browsers.retain_sessions(&live) {
+            if !worktree.is_empty() && !std::path::Path::new(&worktree).exists() {
+                self.abandoned.push(worktree);
+            }
         }
     }
 
@@ -276,6 +387,7 @@ impl HostModel {
         }
         self.sync_terminal_sizes();
         let changed = self.host.tick();
+        self.prune_browsers();
         // A program on screen that draws its own selection (Claude Code's
         // fullscreen renderer) copies with OSC 52, not through our selection.
         if let Some(text) = self.host.take_clipboard() {
@@ -340,6 +452,10 @@ impl HostModel {
         // Window, Open Worktree in VS Code): the host queued them; open them
         // once this update is done.
         for action in self.host.take_front_end_actions() {
+            if action == flightdeck::tui::palette::FrontEndAction::NewBrowser {
+                self.open_browser();
+                continue;
+            }
             let Some(command) = crate::menus::AppCommand::for_front_end(action) else {
                 let url = flightdeck::host::vscode::local_folder_url(&self.host.selected_folder());
                 #[cfg(test)]
@@ -442,4 +558,10 @@ impl HostModel {
         self.host.terminate_sessions();
         self.host.cleanup_isolated();
     }
+}
+
+/// A local session as the browser list names it: its project's root and its
+/// tab id, since a tab id is only unique within its project.
+pub fn browser_session(root: &std::path::Path, tab_id: &str) -> flightdeck::contracts::TabId {
+    flightdeck::contracts::TabId(format!("{}\0{tab_id}", root.display()))
 }

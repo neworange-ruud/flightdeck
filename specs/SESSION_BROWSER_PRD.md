@@ -84,7 +84,7 @@ domains need no changes.
 | B16 | Agent use | **Phase 2.** Agents get browser tools over MCP (§6). |
 | B17 | Agent permission | A **per-session switch**, "Let the agent use the browser", **off by default**. `browser_eval` is part of phase 2. |
 | B18 | Restoring tabs | The Desktop does **not** reopen a session's browser tabs after it restarts. |
-| B19 | Profile lifetime | A session's profile is **deleted when its worktree is abandoned** (the close menu's Abandon worktree). |
+| B19 | Profile lifetime | A session's profile is **deleted when its worktree is abandoned** (the close menu's Abandon worktree). *Built:* a profile is keyed by the worker (or this computer) and the **worktree path**, so closing a session but keeping its worktree keeps its cookies for when it is reopened. A host says, on each `session_removed` frame, whether the worktree went too (`worktree_removed`, additive, checked on the host's own disk); a local window checks its own disk. Only then is the profile deleted, a moment after its web views are gone. |
 | B20 | macOS version | The browser needs **macOS 14 or later** (WKWebView proxy support). Older macOS shows "New browser" disabled with the reason. |
 | B21 | Self-signed HTTPS | A certificate error page offers **Continue anyway**, remembered for that host and port in that session's profile. |
 | B22 | Loopback | *From the spike (§4.1).* WKWebView never sends `localhost`, `127.0.0.1` or `[::1]` through a proxy, so on macOS the Desktop **forwards loopback ports itself**: for each loopback port a remote session uses (a port typed in the address field, and every port B11 reports for the session) it listens on `127.0.0.1:<port>` and `[::1]:<port>` and sends each connection through the same tunnel to that port on the worker. The page still asks for `localhost:<port>`. A port already in use on the Mac is shown on our error page by number, never loaded from the Mac. A forward exists only while a browser tab of that session is open. On Windows, WebView2's `<-loopback>` bypass rule may make forwards unnecessary (Windows spike). |
@@ -144,7 +144,7 @@ client `src/web/client/tunnel_http.rs`).*
 
 ### 4.3 Desktop (`remote-control-cefv.3`, `.4`, `.5`)
 
-*Built for remote sessions on macOS (`.4`): `desktop/src/browser/` (the
+*Local sessions (`.9`) are built too: the same view with no relay or proxy (B9), New Browser in every Desktop window's palette and sidebar.* *Built for remote sessions on macOS (`.4`): `desktop/src/browser/` (the
 view, the address rules, the error page, the macOS proxy) and
 `desktop/src/remote/browsers.rs` (which tabs exist, which is on screen). New
 Browser is a palette row and a sidebar footer button; each browser is a row

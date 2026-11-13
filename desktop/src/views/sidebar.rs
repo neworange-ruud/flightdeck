@@ -70,9 +70,26 @@ pub struct BrowserRow {
 }
 
 impl SidebarData {
-    /// Read the active project's rows from the host.
-    pub fn read(model: &HostModel) -> SidebarData {
+    /// Read the active project's rows from the host; `shown` is the browser
+    /// on screen.
+    pub fn read(model: &HostModel, shown: Option<u64>) -> SidebarData {
         let host = model.host();
+        let state = host.active_state();
+        let browsers = state
+            .selected()
+            .map(|tab| {
+                let session = crate::host::browser_session(&state.repo_root, &tab.meta.id);
+                model
+                    .browsers()
+                    .of_session(&session)
+                    .map(|b| BrowserRow {
+                        id: b.id,
+                        label: crate::browser::tabs::label(b),
+                        on_screen: shown == Some(b.id),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         SidebarData {
             isolated: host.is_isolated(),
             rows: host.agent_rows(),
@@ -81,9 +98,9 @@ impl SidebarData {
                 .selected()
                 .and_then(|tab| tab.session.selected_child()),
             host_marker: None,
-            browsers: Vec::new(),
-            browser_on_screen: false,
-            offers_browser: false,
+            browsers,
+            browser_on_screen: shown.is_some(),
+            offers_browser: crate::browser::unavailable_here().is_none(),
         }
     }
 }
@@ -92,6 +109,7 @@ impl SidebarData {
 /// (the Alt-N chord's command), then enter APP mode.
 pub fn select_agent(host: &Entity<HostModel>, index: usize, cx: &mut App) {
     host.update(cx, |model, cx| {
+        model.hide_browser();
         model.dispatch(
             HostEvent::Command(Command::SwitchAgentTab(Selector::Index(index))),
             cx,
@@ -104,6 +122,7 @@ pub fn select_agent(host: &Entity<HostModel>, index: usize, cx: &mut App) {
 /// TUI's terminal-tab click does.
 pub fn focus_terminal(host: &Entity<HostModel>, target: TerminalRef, cx: &mut App) {
     host.update(cx, |model, cx| {
+        model.hide_browser();
         match target {
             TerminalRef::Primary => {
                 // No command selects the primary by index (its chords cycle);

@@ -85,6 +85,10 @@ pub const NOMINAL_PTY_SIZE: PtySize = PtySize {
     cols: 123,
 };
 
+/// The "worker" a local browser's profile is named for (B10).
+#[cfg(target_os = "macos")]
+const LOCAL_PROFILES: &str = "this computer";
+
 pub struct FlightDeckWindow {
     host: Entity<HostModel>,
     titlebar: Entity<TitleBar>,
@@ -102,6 +106,11 @@ pub struct FlightDeckWindow {
     /// The window's activation and visibility, watched for the spinner
     /// clock; set up on the first frame (the constructor has no window).
     window_watch: Vec<Subscription>,
+    /// The local sessions' browser views, by tab id (B9); macOS only for now.
+    #[cfg(target_os = "macos")]
+    browser_views: std::collections::HashMap<u64, Entity<crate::browser::view::BrowserView>>,
+    /// The browser the main area shows this frame.
+    shown_browser: Option<u64>,
 }
 
 impl FlightDeckWindow {
@@ -129,7 +138,92 @@ impl FlightDeckWindow {
             update_dismissed: false,
             panes: Panes::default(),
             window_watch: Vec::new(),
+            #[cfg(target_os = "macos")]
+            browser_views: std::collections::HashMap::new(),
+            shown_browser: None,
         }
+    }
+
+    /// Build a view for every local browser tab, drop the views of closed
+    /// ones, copy page titles into the model for the sidebar, and delete the
+    /// profiles of abandoned worktrees (B19). Returns the browser on screen.
+    fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
+        let shown = self.host.update(cx, |model, _| model.browser_on_screen());
+        let abandoned = self
+            .host
+            .update(cx, |model, _| model.take_abandoned_worktrees());
+        #[cfg(target_os = "macos")]
+        {
+            let tabs: Vec<(u64, String)> = self
+                .host
+                .read(cx)
+                .browsers()
+                .all()
+                .iter()
+                .map(|t| (t.id, t.worktree.clone()))
+                .collect();
+            self.browser_views
+                .retain(|id, _| tabs.iter().any(|(tab, _)| tab == id));
+            for (id, worktree) in tabs {
+                // GPUI's test platform has no native window to hang a web
+                // view on; the tests pin the rules, `--spike-browser` the view.
+                if self.browser_views.contains_key(&id) || cfg!(test) {
+                    continue;
+                }
+                let profile = crate::browser::profile_id(LOCAL_PROFILES, &worktree);
+                let view =
+                    cx.new(|cx| crate::browser::view::BrowserView::new_direct(profile, window, cx));
+                cx.observe(&view, |_, _, cx| cx.notify()).detach();
+                self.browser_views.insert(id, view);
+            }
+            let titles: Vec<(u64, String)> = self
+                .browser_views
+                .iter()
+                .map(|(id, view)| (*id, view.read(cx).title()))
+                .collect();
+            self.host.update(cx, |model, _| {
+                for (id, title) in titles {
+                    model.set_browser_title(id, title);
+                }
+            });
+            for worktree in abandoned {
+                crate::browser::view::forget_profile(
+                    crate::browser::profile_id(LOCAL_PROFILES, &worktree),
+                    cx,
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (window, abandoned);
+        shown
+    }
+
+    /// Show browser `shown`'s web view, hiding every other.
+    fn set_browsers_shown(&mut self, shown: Option<u64>, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        for (id, view) in &self.browser_views {
+            let on = shown == Some(*id);
+            view.update(cx, |view, _| view.set_shown(on));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (shown, cx);
+    }
+
+    /// The browser on screen, full size.
+    fn browser_main(&self, id: u64) -> Option<AnyElement> {
+        #[cfg(target_os = "macos")]
+        if let Some(view) = self.browser_views.get(&id) {
+            return Some(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .size_full()
+                    .child(view.clone())
+                    .into_any_element(),
+            );
+        }
+        let _ = id;
+        None
     }
 
     /// Report the window's state to the spinner clock now and on every
@@ -258,12 +352,13 @@ impl Render for FlightDeckWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = *Palette::global(cx);
         self.watch_window(window, cx);
+        self.shown_browser = self.sync_browsers(window, cx);
         let model = self.host.read(cx);
         let host = model.host();
         let overlay = host.overlay();
         let has_terminal = host.active_terminal().is_some();
         let mode = host.active_state().mode();
-        let sidebar_data = SidebarData::read(model);
+        let sidebar_data = SidebarData::read(model, self.shown_browser);
         let strip = host.git_strip();
         let leave = crate::commands::keycap("FocusApp").unwrap_or_default();
         let help = crate::commands::keycap("OpenHelp").unwrap_or_default();
@@ -298,8 +393,17 @@ impl Render for FlightDeckWindow {
             layer.set_view(overlay, window, cx);
         });
 
-        // Focus follows the host (see the module docs).
-        if !overlay_open {
+        // The web view is native and drawn over everything, so it is hidden
+        // whenever GPUI's overlay, Mission control or split view has the
+        // main area (B13).
+        let covered = overlay_open || view == MainView::Mission || split.is_some();
+        let shown_browser = self.shown_browser;
+        self.set_browsers_shown(if covered { None } else { shown_browser }, cx);
+
+        // Focus follows the host (see the module docs), except that a browser
+        // on screen keeps whatever has the keyboard: its address field, or
+        // the page itself (a native view).
+        if !overlay_open && shown_browser.is_none() {
             let want = if mode == InputMode::Terminal && has_terminal {
                 self.terminal.read(cx).focus_handle().clone()
             } else {
@@ -328,7 +432,10 @@ impl Render for FlightDeckWindow {
             Some(layout) => self.split_main(layout, &p, cx),
             None => {
                 self.panes.retain(&[]);
-                self.single_main(has_terminal, sidebar_data.rows.is_empty(), &p)
+                match shown_browser.and_then(|id| self.browser_main(id)) {
+                    Some(browser) => browser,
+                    None => self.single_main(has_terminal, sidebar_data.rows.is_empty(), &p),
+                }
             }
         };
         let main = v_flex()

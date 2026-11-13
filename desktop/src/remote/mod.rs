@@ -98,7 +98,6 @@ use gpui::{App, AppContext, Context, Global, Subscription, Task};
 use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
 
-pub mod browsers;
 pub mod connect;
 pub mod download;
 pub mod messages;
@@ -167,11 +166,14 @@ pub struct RemoteModel {
     choosing_upload_dir: bool,
     /// The session browsers (`specs/SESSION_BROWSER_PRD.md`): which tabs
     /// exist and which is on screen. The web views are the window's.
-    browsers: browsers::Browsers,
+    browsers: crate::browser::tabs::Browsers,
     /// The viewer this window attached as when the browsers' keys were
     /// granted: a reconnect is a new viewer, whose keys the worker must
     /// grant again (a key ends with its connection).
     keyed_as: Option<flightdeck::web::protocol::ViewerId>,
+    /// Worktrees the worker abandoned whose browser profiles the window is
+    /// still to delete (B19).
+    abandoned: Vec<String>,
 }
 
 impl RemoteModel {
@@ -200,8 +202,9 @@ impl RemoteModel {
             rename_error: None,
             pick_files: false,
             choosing_upload_dir: false,
-            browsers: browsers::Browsers::default(),
+            browsers: crate::browser::tabs::Browsers::default(),
             keyed_as: None,
+            abandoned: Vec::new(),
         }
     }
 
@@ -852,6 +855,13 @@ impl RemoteModel {
     /// [`RemoteModel::turn`] without the redraw, for tests and the loop.
     pub fn pump(&mut self) -> bool {
         let mut changed = self.session.pump();
+        // Kept even with no browser open: a profile outlives its tabs.
+        let gone = self
+            .session
+            .client_mut()
+            .workspace_mut()
+            .take_removed_worktrees();
+        self.abandoned.extend(gone);
         changed |= self.pump_browsers();
         // A picker the session closed itself (a reconnect) ends a folder
         // choice with it, so the next picker is the project picker again.
@@ -951,7 +961,10 @@ impl RemoteModel {
             return;
         }
         let ws = self.session.workspace();
-        let Some(session) = ws.selected_session().map(|s| s.session_id.clone()) else {
+        let Some((session, worktree)) = ws
+            .selected_session()
+            .map(|s| (s.session_id.clone(), s.worktree_path.clone()))
+        else {
             self.session
                 .set_notice("Select an agent session to open a browser in.".to_string());
             return;
@@ -965,12 +978,12 @@ impl RemoteModel {
             .session
             .workspace()
             .selected_terminal()
-            .map(|t| t.terminal_id.clone());
+            .map(|t| t.terminal_id.to_string());
         let seq = self.session.client().open_browser_tunnel();
         if seq.is_some() {
             self.keyed_as = self.session.workspace().viewer_id.clone();
         }
-        self.browsers.open(session, seq, terminal);
+        self.browsers.open(session, worktree, seq, terminal);
     }
 
     /// Close browser `id`, telling the worker its key is done.
@@ -986,7 +999,7 @@ impl RemoteModel {
             .session
             .workspace()
             .selected_terminal()
-            .map(|t| t.terminal_id.clone());
+            .map(|t| t.terminal_id.to_string());
         self.browsers.show(id, terminal);
     }
 
@@ -999,13 +1012,20 @@ impl RemoteModel {
         }
         let ws = self.session.workspace();
         let session = ws.selected_session().map(|s| s.session_id.clone());
-        let terminal = ws.selected_terminal().map(|t| t.terminal_id.clone());
-        self.browsers.on_screen(session.as_ref(), terminal.as_ref())
+        let terminal = ws.selected_terminal().map(|t| t.terminal_id.to_string());
+        self.browsers
+            .on_screen(session.as_ref(), terminal.as_deref())
     }
 
     /// Every browser tab.
-    pub fn browsers(&self) -> &browsers::Browsers {
+    pub fn browsers(&self) -> &crate::browser::tabs::Browsers {
         &self.browsers
+    }
+
+    /// Worktrees the worker abandoned since the last call: their browser
+    /// profiles can go (B19).
+    pub fn take_abandoned_worktrees(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.abandoned)
     }
 
     /// Record browser `id`'s page title (the window reads it off the view).
@@ -1053,8 +1073,10 @@ impl RemoteModel {
             .iter()
             .flat_map(|p| p.sessions.iter().map(|s| s.session_id.clone()))
             .collect();
-        for key in self.browsers.retain_sessions(&live) {
-            self.session.client().close_browser_tunnel(&key);
+        for (key, _) in self.browsers.retain_sessions(&live) {
+            if let Some(key) = key {
+                self.session.client().close_browser_tunnel(&key);
+            }
             changed = true;
         }
         changed

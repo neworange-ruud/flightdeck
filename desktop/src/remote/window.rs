@@ -831,18 +831,18 @@ impl RemoteWindow {
         #[cfg(target_os = "macos")]
         {
             let model = self.remote.read(cx);
-            let tabs: Vec<(u64, flightdeck::contracts::TabId, Option<String>)> = model
+            let tabs: Vec<(u64, String, Option<String>)> = model
                 .browsers()
                 .all()
                 .iter()
-                .map(|t| (t.id, t.session.clone(), t.key.clone()))
+                .map(|t| (t.id, t.worktree.clone(), t.key.clone()))
                 .collect();
             let access = model.http_access();
             let via = model.label().to_string();
             let worker = model.address().to_string();
             self.browser_views
                 .retain(|id, _| tabs.iter().any(|(tab, ..)| tab == id));
-            for (id, session, key) in tabs {
+            for (id, worktree, key) in tabs {
                 let Some(key) = key else { continue };
                 match self.browser_views.get_mut(&id) {
                     Some((view, given)) => {
@@ -855,7 +855,7 @@ impl RemoteWindow {
                         let Some(access) = access.clone() else {
                             continue;
                         };
-                        let profile = crate::browser::profile_id(&worker, &session.0);
+                        let profile = crate::browser::profile_id(&worker, &worktree);
                         let via = via.clone();
                         let given = key.clone();
                         let view = cx.new(|cx| {
@@ -879,8 +879,23 @@ impl RemoteWindow {
                 }
             });
         }
+        // The profiles of worktrees the worker abandoned go (B19), once the
+        // views that used them are gone.
+        let abandoned = self
+            .remote
+            .update(cx, |model, _| model.take_abandoned_worktrees());
+        #[cfg(target_os = "macos")]
+        {
+            let worker = self.remote.read(cx).address().to_string();
+            for worktree in abandoned {
+                crate::browser::view::forget_profile(
+                    crate::browser::profile_id(&worker, &worktree),
+                    cx,
+                );
+            }
+        }
         #[cfg(not(target_os = "macos"))]
-        let _ = window;
+        let _ = (window, abandoned);
         shown
     }
 
@@ -1211,7 +1226,7 @@ impl Render for RemoteWindow {
                     .of_session(&session.session_id)
                     .map(|tab| crate::views::sidebar::BrowserRow {
                         id: tab.id,
-                        label: super::browsers::label(tab),
+                        label: crate::browser::tabs::label(tab),
                         on_screen: self.shown_browser == Some(tab.id),
                     })
                     .collect()

@@ -1144,6 +1144,12 @@ impl<'a> AppHost<'a> {
                 // D13: the diff can only say `Superseded` about a dialog that is
                 // gone. Where somebody actually decided, say so.
                 resolve_dialog_outcomes(&mut frames, &decided);
+                // And whether a closed session's worktree went with it (B19).
+                crate::web::stream::mark_removed_worktrees(
+                    &mut frames,
+                    &web_surface.published,
+                    &|path| env.fs.exists(path),
+                );
                 if let Some(handle) = web_surface.handle.as_ref() {
                     handle.publish_state(next.clone());
                     for delta in frames {
