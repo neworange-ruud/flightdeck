@@ -189,7 +189,7 @@ fn is_destructive(prompt: &Prompt, accel: DialogAccel) -> bool {
         | Prompt::UnpairConfirm
         | Prompt::QuitConfirm => accel == DialogAccel::Char('y'),
         // SPECS §25: of the close actions, only force-terminating kills.
-        Prompt::CloseTab { actions } => actions
+        Prompt::CloseTab { actions, .. } => actions
             .iter()
             .position(|a| *a == crate::app::commands::CloseAction::ForceTerminate)
             .is_some_and(|i| crate::digit_accel(i) == accel),
@@ -253,7 +253,7 @@ fn dialog_kind(prompt: &Prompt) -> DialogKind {
         },
         Prompt::RenameTab { .. } => DialogKind::RenameSession,
         Prompt::SetManualStatus => DialogKind::SetManualStatus,
-        Prompt::CloseTab { actions } => DialogKind::CloseSession {
+        Prompt::CloseTab { actions, .. } => DialogKind::CloseSession {
             actions: actions.clone(),
         },
         Prompt::CloseChildConfirm { label } => DialogKind::CloseTerminal {

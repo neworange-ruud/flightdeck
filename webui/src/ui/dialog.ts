@@ -36,12 +36,11 @@ import type { Region } from "./dom";
  * closes it on both surfaces. So there is no `dialog/close` action, and nothing
  * here hides the panel except the host taking the dialog away.
  *
- * ## The origin line, and why it is always drawn
+ * ## The origin line
  *
- * D13's accepted cost is a modal you did not ask for, and the origin label is
- * what makes that acceptable. The browser draws it in both directions —
- * `opened on the desktop` or `opened from browser · 192.168.2.20` — because in
- * both directions it answers the question the modal raises. `--fd-elsewhere` is
+ * D13's accepted cost is a modal you did not ask for. A dialog the desktop
+ * opened says so (`opened on the desktop`); a dialog a browser opened gets no
+ * "opened from …" line, on any surface. `--fd-elsewhere` is
  * 2g's "another actor acted" hue, shared with drift, App mode and the takeover
  * panel, which is exactly the fact being reported.
  *
@@ -149,8 +148,10 @@ export function createDialog(
       ? "no worktree"
       : keyHintFor(dialog);
 
-    /** D13: always drawn, never conditional. */
-    originEl.textContent = dialogOriginLabel(dialog.origin);
+    /** D13: drawn for a dialog the desktop opened; no "opened from …" line. */
+    const origin = dialogOriginLabel(dialog.origin);
+    originEl.textContent = origin ?? "";
+    originEl.hidden = origin === null;
     originEl.setAttribute("data-origin", dialog.origin.kind);
 
     renderRefusal(dialog);

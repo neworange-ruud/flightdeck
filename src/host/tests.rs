@@ -1042,7 +1042,45 @@ mod overlays {
         assert!(pty.terminated());
     }
 
-    /// The sidebar `✕` opens this prompt from a click, which has no command;
+    /// "Close agent…" offers Abandon worktree next to the four ways to stop
+    /// the processes; it opens the abandon confirmation and removes nothing.
+    #[test]
+    fn the_close_menu_offers_abandon_worktree_which_only_asks() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        command(&mut host, Command::CloseAgentTab { action: None });
+        let d = dialog(&host);
+        assert_eq!(
+            d.buttons.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4", "a", "Esc"]
+        );
+        assert_eq!(button(&d, "a").label, "Abandon worktree");
+        assert_ne!(button(&d, "a").role, ButtonRole::Destructive);
+
+        choose(&mut host, "a");
+        assert!(matches!(
+            dialog(&host).kind,
+            DialogKind::ConfirmAbandon { .. }
+        ));
+        assert!(fakes.git.removed_worktrees().is_empty());
+        assert_eq!(host.active_state().tabs.len(), 1);
+    }
+
+    /// The sidebar menu already offered Abandon; its Close leads to a close
+    /// menu that does not ask again.
+    #[test]
+    fn the_sidebar_menus_close_does_not_offer_abandon_twice() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        start_close_agent_choice(&mut host);
+        choose(&mut host, "c");
+        let d = dialog(&host);
+        assert!(matches!(d.kind, DialogKind::CloseSession { .. }), "{d:?}");
+        assert!(d.buttons.iter().all(|b| b.id != "a"), "{d:?}");
+    }
+
     /// open it the way the mouse handler does.
     fn start_close_agent_choice(host: &mut AppHost) {
         let (_, _, ui) = host.tui_parts();

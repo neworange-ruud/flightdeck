@@ -1359,8 +1359,7 @@ impl<'a> AppHost<'a> {
                 }];
             }
             // D13: a dialog this command opens is tagged with the seat that
-            // asked, so the desktop can say `opened from browser ·
-            // 192.168.2.20` about a modal nobody at this keyboard requested.
+            // asked.
             let origin = crate::web::protocol::DialogOrigin::Browser {
                 viewer_id: Some(viewer_id.clone()),
                 label: label.clone(),

@@ -1704,7 +1704,10 @@ impl AppState {
         };
 
         let Some(action) = action else {
-            return Ok(Effect::CloseTabOptions(CloseTabOptions::standard()));
+            return Ok(Effect::CloseTabOptions(CloseTabOptions {
+                abandon: !self.tabs[idx].meta.runs_on_base,
+                ..CloseTabOptions::standard()
+            }));
         };
 
         let tab = &mut self.tabs[idx];
@@ -4208,9 +4211,20 @@ mod tests {
                 assert_eq!(opts.default_action(), CloseAction::CtrlCPrimary);
                 // No auto-escalation: force is not the default.
                 assert_ne!(opts.actions[0], CloseAction::ForceTerminate);
+                assert!(opts.abandon, "a worktree tab also offers Abandon");
             }
             other => panic!("expected CloseTabOptions, got {other:?}"),
         }
+        // A tab on the base branch has no worktree to abandon.
+        app.tabs[0].meta.runs_on_base = true;
+        match app
+            .dispatch(Command::CloseAgentTab { action: None }, &svc)
+            .unwrap()
+        {
+            Effect::CloseTabOptions(opts) => assert!(!opts.abandon),
+            other => panic!("expected CloseTabOptions, got {other:?}"),
+        }
+        app.tabs[0].meta.runs_on_base = false;
         // Tab still present (not closed without an action).
         assert_eq!(app.tabs.len(), 1);
 

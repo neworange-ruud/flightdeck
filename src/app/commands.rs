@@ -95,6 +95,10 @@ impl CloseAction {
 pub struct CloseTabOptions {
     /// The actions to offer, in display order; `actions[0]` is the default.
     pub actions: Vec<CloseAction>,
+    /// Whether the menu also offers abandoning the worktree. False for a tab
+    /// that runs on the base branch, which has no worktree to abandon. Picking
+    /// it opens the abandon confirmation (SPECS §5/§15); it removes nothing itself.
+    pub abandon: bool,
 }
 
 impl CloseTabOptions {
@@ -107,6 +111,7 @@ impl CloseTabOptions {
                 CloseAction::ForceTerminate,
                 CloseAction::IfAllStopped,
             ],
+            abandon: true,
         }
     }
 

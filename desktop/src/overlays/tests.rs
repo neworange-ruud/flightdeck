@@ -561,6 +561,11 @@ fn confirmations_press_their_buttons_and_never_confirm_on_enter(app: &mut TestAp
 
     h.show(Some(OverlayView::Dialog(close_session())));
     assert_eq!(h.keys("3"), vec![ev(OverlayInput::Choose("3".into()))]);
+    assert_eq!(h.keys("a"), vec![ev(OverlayInput::Choose("a".into()))]);
+    assert_eq!(
+        h.click("overlay-button-a", 1),
+        vec![ev(OverlayInput::Choose("a".into()))]
+    );
     assert_eq!(
         h.click("overlay-button-3", 1),
         vec![ev(OverlayInput::Choose("3".into()))]
