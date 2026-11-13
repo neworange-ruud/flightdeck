@@ -1022,6 +1022,20 @@ impl RemoteModel {
         &self.browsers
     }
 
+    /// The ports browser `id`'s session listens on, as the worker last said
+    /// (B11).
+    #[cfg(target_os = "macos")]
+    pub fn browser_ports(&self, id: u64) -> Vec<u16> {
+        let Some(tab) = self.browsers.tab(id) else {
+            return Vec::new();
+        };
+        self.session
+            .workspace()
+            .session(&tab.session)
+            .map(|s| s.listening_ports.clone())
+            .unwrap_or_default()
+    }
+
     /// Worktrees the worker abandoned since the last call: their browser
     /// profiles can go (B19).
     pub fn take_abandoned_worktrees(&mut self) -> Vec<String> {

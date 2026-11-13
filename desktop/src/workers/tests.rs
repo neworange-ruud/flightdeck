@@ -153,6 +153,7 @@ fn session(id: &str, bucket: StatusBucket) -> SessionView {
         worktree_path: format!("/home/u/flightdeck/app/.flightdeck/worktrees/{id}"),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

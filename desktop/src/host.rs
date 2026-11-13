@@ -283,6 +283,30 @@ impl HostModel {
         self.browsers.set_title(id, title)
     }
 
+    /// The ports browser `id`'s session listens on (B11), as last seen.
+    #[cfg(target_os = "macos")]
+    pub fn browser_ports(&self, id: u64) -> Vec<u16> {
+        let Some(tab) = self.browsers.tab(id) else {
+            return Vec::new();
+        };
+        let dirs: Vec<std::path::PathBuf> = (0..self.host.project_count())
+            .filter_map(|i| self.host.project_state(i))
+            .flat_map(|state| {
+                state
+                    .tabs
+                    .iter()
+                    .map(|t| t.meta.worktree_path_relative.resolve(&state.repo_root))
+            })
+            .collect();
+        let at = dirs
+            .iter()
+            .position(|d| d.display().to_string() == tab.worktree);
+        match at {
+            Some(at) => self.host.listening_ports(&dirs).swap_remove(at),
+            None => Vec::new(),
+        }
+    }
+
     /// Worktrees found abandoned since the last call (B19).
     pub fn take_abandoned_worktrees(&mut self) -> Vec<String> {
         std::mem::take(&mut self.abandoned)
@@ -294,6 +318,8 @@ impl HostModel {
         if self.browsers.all().is_empty() {
             return;
         }
+        // A browser is open: keep looking for the sessions' ports (B11).
+        self.host.want_listening_ports();
         let live: Vec<flightdeck::contracts::TabId> = (0..self.host.project_count())
             .filter_map(|i| self.host.project_state(i))
             .flat_map(|state| {

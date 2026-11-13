@@ -73,6 +73,7 @@ fn session(id: &str, name: &str, shells: &[&str]) -> SessionView {
         worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 
@@ -2707,6 +2708,34 @@ mod browser {
             m.take_abandoned_worktrees()
         });
         assert_eq!(abandoned, vec![format!("/home/dev/wt/{}", ids[1].0)]);
+    }
+
+    /// B11: a browser's ports are its session's, as the worker reports them.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn a_browsers_ports_are_its_sessions(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        let selected = snapshot
+            .selection
+            .session_id
+            .clone()
+            .expect("a selected session");
+        for session in snapshot
+            .projects
+            .iter_mut()
+            .flat_map(|p| p.sessions.iter_mut())
+        {
+            if session.session_id == selected {
+                session.listening_ports = vec![3000, 5173];
+            }
+        }
+        let (model, _script, _window, cx) = open_on(app, snapshot);
+        new_browser(&model, cx);
+        let id = on_screen(&model, cx).expect("a browser");
+        assert_eq!(
+            model.read_with(cx, |m, _| m.browser_ports(id)),
+            vec![3000, 5173]
+        );
     }
 
     #[gpui::test]

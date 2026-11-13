@@ -53,6 +53,7 @@ fn session(id: &str, name: &str, status: InterpretedStatus, git: GitBar) -> Sess
         worktree_path: String::new(),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

@@ -95,6 +95,9 @@ pub struct BrowserView {
     profile: [u8; 16],
     /// The certificate failure our page is showing, until Continue anyway.
     pending_cert: Option<super::tls_macos::CertFailure>,
+    /// The ports the session listens on (B11), each with whether this
+    /// computer has it in use (a worker session's forward was refused).
+    ports: Vec<(u16, bool)>,
     _poll: Task<()>,
     _address_events: Subscription,
 }
@@ -167,6 +170,7 @@ impl BrowserView {
             failed: None,
             profile: [0; 16],
             pending_cert: None,
+            ports: Vec::new(),
             _poll,
             _address_events,
         }
@@ -285,6 +289,32 @@ impl BrowserView {
             // Placed again on the next frame.
             self.placed.set(None);
         }
+    }
+
+    /// The session's listening ports (B11): offered under the toolbar, and —
+    /// in a worker session — forwarded now, so a page's own requests to them
+    /// reach the worker too (B24).
+    pub fn set_ports(&mut self, ports: &[u16], cx: &mut Context<Self>) {
+        let same = self.ports.len() == ports.len()
+            && self
+                .ports
+                .iter()
+                .zip(ports)
+                .all(|((have, _), want)| have == want);
+        if same {
+            return;
+        }
+        self.ports = ports
+            .iter()
+            .map(|port| {
+                let in_use = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.forward(*port).is_err());
+                (*port, in_use)
+            })
+            .collect();
+        cx.notify();
     }
 
     /// The `host:port` whose certificate the page on screen failed on, while
@@ -509,6 +539,42 @@ impl Render for BrowserView {
                     move |_, _, cx| entity.read(cx).devtools()
                 }),
             );
+        let ports = (!self.ports.is_empty()).then(|| {
+            h_flex()
+                .flex_none()
+                .px(px(14.))
+                .py(px(4.))
+                .gap(px(6.))
+                .text_size(px(11.5))
+                .text_color(p.muted.hsla())
+                .child("Listening:")
+                .children(self.ports.iter().enumerate().map(|(i, (port, in_use))| {
+                    let entity = entity.clone();
+                    let port = *port;
+                    let chip = div()
+                        .id(("browser-port", i))
+                        .debug_selector(move || format!("browser-port-{i}"))
+                        .px(px(7.))
+                        .py(px(1.))
+                        .rounded(px(9.))
+                        .border_1()
+                        .border_color(p.border.hsla())
+                        .font_family(crate::fonts::MONO_FAMILY)
+                        .child(format!("localhost:{port}"));
+                    if *in_use {
+                        chip.opacity(0.5).tooltip(crate::views::icons::tooltip(format!(
+                            "Port {port} is in use on this computer, so the worker's cannot be shown here"
+                        )))
+                    } else {
+                        chip.cursor_pointer()
+                            .text_color(p.ink_2.hsla())
+                            .hover(|s| s.bg(p.surface_raised.hsla()))
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |view, cx| view.go(&format!("localhost:{port}"), cx))
+                            })
+                    }
+                }))
+        });
         let note = self.note.clone().map(|why| {
             div()
                 .flex_none()
@@ -543,6 +609,7 @@ impl Render for BrowserView {
             .size_full()
             .min_h_0()
             .child(toolbar)
+            .children(ports)
             .children(note)
             .child(body)
     }

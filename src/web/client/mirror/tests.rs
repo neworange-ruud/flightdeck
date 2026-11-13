@@ -57,6 +57,7 @@ fn session(project: &str, id: &str, name: &str, shells: &[&str]) -> SessionView 
         worktree_path: String::new(),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

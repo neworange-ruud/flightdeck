@@ -94,6 +94,7 @@ fn session_view() -> SessionView {
         worktree_path: String::new(),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

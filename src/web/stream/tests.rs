@@ -1483,3 +1483,29 @@ fn a_removed_sessions_frame_says_whether_its_worktree_went_too() {
         ]
     );
 }
+
+/// A session's listening ports changing (B11) is a whole-row upsert: there
+/// is no cheaper delta for them, and a window must see the new list.
+#[test]
+fn a_change_in_a_sessions_listening_ports_is_an_upsert() {
+    let before = crate::web::server::HostState {
+        projects: vec![crate::web::protocol::ProjectView {
+            project_id: "/repo".into(),
+            name: "repo".into(),
+            root: "/repo".into(),
+            base_branch: "main".into(),
+            dot: None,
+            sessions: vec![crate::web::client::session::tests::session("s1", "login")],
+        }],
+        ..Default::default()
+    };
+    let mut after = before.clone();
+    after.projects[0].sessions[0].listening_ports = vec![3000, 5173];
+    match deltas(&before, &after).as_slice() {
+        [crate::web::protocol::Delta::SessionUpsert(view)] => {
+            assert_eq!(view.listening_ports, vec![3000, 5173])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(deltas(&after, &after).is_empty());
+}

@@ -55,6 +55,7 @@ fn session(
             ..TabActivity::default()
         }),
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

@@ -868,6 +868,16 @@ impl RemoteWindow {
                     }
                 }
             }
+            let ports: Vec<(u64, Vec<u16>)> = self
+                .browser_views
+                .keys()
+                .map(|id| (*id, self.remote.read(cx).browser_ports(*id)))
+                .collect();
+            for (id, ports) in ports {
+                if let Some((view, _)) = self.browser_views.get(&id) {
+                    view.update(cx, |view, cx| view.set_ports(&ports, cx));
+                }
+            }
             let titles: Vec<(u64, String)> = self
                 .browser_views
                 .iter()

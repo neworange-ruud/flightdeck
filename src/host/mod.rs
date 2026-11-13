@@ -255,6 +255,9 @@ pub struct AppHost<'a> {
     interfaces: crate::web::interfaces::RealInterfaceEnumerator,
     #[cfg(debug_assertions)]
     web_test_code: Option<String>,
+    /// The ports the sessions' processes listen on (B11), looked for only
+    /// while a browser wants them ([`AppHost::want_listening_ports`]).
+    ports: crate::ports::PortWatch,
 }
 
 impl<'a> AppHost<'a> {
@@ -385,6 +388,7 @@ impl<'a> AppHost<'a> {
             remote_first_tasks: Vec::new(),
             remote_has_persisted_pairing: false,
             web_surface,
+            ports: crate::ports::PortWatch::new(std::sync::Arc::new(crate::ports::SystemProbe)),
             interfaces: crate::web::interfaces::RealInterfaceEnumerator,
             #[cfg(debug_assertions)]
             web_test_code: None,
@@ -1116,10 +1120,22 @@ impl<'a> AppHost<'a> {
             Vec::new()
         };
 
+        // A worker with a browser open (a tunnel key granted) looks for the
+        // sessions' ports for it (B11, B24).
+        if self
+            .web_surface
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_tunnels())
+        {
+            self.ports.want();
+        }
+
         let env = &self.env;
         let workspace = &mut self.workspace;
         let ui = &mut self.ui;
         let web_surface = &mut self.web_surface;
+        let ports = &self.ports;
         let now_ms = self.now_ms;
 
         if web_surface.running() {
@@ -1135,6 +1151,7 @@ impl<'a> AppHost<'a> {
             );
             next.worker = worker_state;
             fill_prompts(&mut next, prompts);
+            fill_listening_ports(&mut next, ports);
             let decided = std::mem::take(&mut ui.dialog_decisions);
             if next != web_surface.published {
                 // Publish, *then* the matching deltas: publishing changes what
@@ -1534,6 +1551,19 @@ impl<'a> AppHost<'a> {
     /// Whether this is an `--isolated` run (SPECS §32).
     pub fn is_isolated(&self) -> bool {
         self.isolated
+    }
+
+    /// Look for the sessions' listening ports for a while (B11): a session
+    /// browser is open. Renew it every turn a browser is; it lapses on its
+    /// own ([`crate::ports::LEASE`]).
+    pub fn want_listening_ports(&self) {
+        self.ports.want();
+    }
+
+    /// Each of `dirs`' (the sessions' worktrees') listening ports, as last
+    /// seen, a port going to the deepest dir its process runs in.
+    pub fn listening_ports(&self, dirs: &[std::path::PathBuf]) -> Vec<Vec<u16>> {
+        self.ports.assign(dirs)
     }
 
     /// Number of open projects (always at least one).
@@ -2162,4 +2192,24 @@ fn status_fingerprint(
                 .map(move |t| (i, t.display_status(now_ms).interpreted))
         })
         .collect()
+}
+
+/// Each published session's listening ports (B11), from the watch: empty
+/// while nobody wants them.
+fn fill_listening_ports(next: &mut crate::web::server::HostState, ports: &crate::ports::PortWatch) {
+    let dirs: Vec<std::path::PathBuf> = next
+        .projects
+        .iter()
+        .flat_map(|p| p.sessions.iter())
+        .map(|s| std::path::PathBuf::from(&s.worktree_path))
+        .collect();
+    let assigned = ports.assign(&dirs);
+    for (session, found) in next
+        .projects
+        .iter_mut()
+        .flat_map(|p| p.sessions.iter_mut())
+        .zip(assigned)
+    {
+        session.listening_ports = found;
+    }
 }
