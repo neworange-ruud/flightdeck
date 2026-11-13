@@ -124,6 +124,12 @@ pub struct RemoteWindow {
         std::collections::HashMap<u64, (Entity<crate::browser::view::BrowserView>, String)>,
     /// The browser the main area shows this frame.
     shown_browser: Option<u64>,
+    /// The Worker tab's read-only panes, side by side (W35): every shell but
+    /// the one on screen, which is [`RemoteWindow::terminal`].
+    shell_panes: std::collections::HashMap<
+        flightdeck::web::protocol::TerminalId,
+        Entity<crate::views::split::PaneView>,
+    >,
 }
 
 impl RemoteWindow {
@@ -160,6 +166,7 @@ impl RemoteWindow {
             #[cfg(target_os = "macos")]
             browser_views: std::collections::HashMap::new(),
             shown_browser: None,
+            shell_panes: std::collections::HashMap::new(),
         }
     }
 
@@ -991,9 +998,119 @@ impl RemoteWindow {
             .min_h_0()
             .size_full()
             .child(row)
-            .child(div().flex_1().min_h_0().child(self.terminal.clone()))
+            .child(self.worker_shells_body(p, cx))
             .children(exited)
             .into_any_element()
+    }
+
+    /// Keep a read-only pane for every worker shell but the one on screen
+    /// while the Worker tab is split, and none otherwise.
+    fn sync_shell_panes(&mut self, cx: &mut Context<Self>) {
+        let model = self.remote.read(cx);
+        let wanted: Vec<flightdeck::web::protocol::TerminalId> =
+            if model.worker_shell_active() && model.worker_split() {
+                let on_screen = model.worker_shell().map(|s| s.terminal_id.clone());
+                model
+                    .worker_shells()
+                    .iter()
+                    .map(|s| s.terminal_id.clone())
+                    .filter(|id| Some(id) != on_screen.as_ref())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        self.shell_panes.retain(|id, _| wanted.contains(id));
+        for id in wanted {
+            if !self.shell_panes.contains_key(&id) {
+                let remote = self.remote.clone();
+                let pane =
+                    cx.new(|cx| crate::views::split::PaneView::for_remote(remote, id.clone(), cx));
+                self.shell_panes.insert(id, pane);
+            }
+        }
+    }
+
+    /// The Worker tab's terminal area: the shell on screen, or every shell
+    /// side by side (W35) — the one on screen live, the others read-only and
+    /// dimmed, as the local split view draws a session's terminals. A click
+    /// in another pane makes it the shell on screen.
+    fn worker_shells_body(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
+        use crate::views::split::{PANE_HEADER, PANE_PAD_X, PANE_PAD_Y};
+        let model = self.remote.read(cx);
+        let shells = model.worker_shells();
+        if !model.worker_split() || shells.len() < 2 {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .child(self.terminal.clone())
+                .into_any_element();
+        }
+        let on_screen = model.worker_shell().map(|s| s.terminal_id.clone());
+        let mut row = h_flex().flex_1().min_h_0().w_full().items_start();
+        for (i, shell) in shells.iter().enumerate() {
+            let active = on_screen.as_ref() == Some(&shell.terminal_id);
+            if i > 0 {
+                row = row.child(div().flex_none().w(px(1.)).h_full().bg(p.hairline.hsla()));
+            }
+            let body: gpui::AnyElement = match (active, self.shell_panes.get(&shell.terminal_id)) {
+                (true, _) => self.terminal.clone().into_any_element(),
+                (false, Some(pane)) => {
+                    let mut dim = p.pane_dim.hsla();
+                    dim.a = crate::theme::PANE_DIM_ALPHA;
+                    div()
+                        .relative()
+                        .size_full()
+                        .py(PANE_PAD_Y)
+                        .px(PANE_PAD_X)
+                        .child(pane.clone())
+                        .child(div().absolute().inset_0().bg(dim))
+                        .into_any_element()
+                }
+                (false, None) => div().into_any_element(),
+            };
+            let id = shell.terminal_id.clone();
+            let remote = self.remote.clone();
+            let header = h_flex()
+                .flex_none()
+                .h(PANE_HEADER)
+                .px(px(12.))
+                .gap_2()
+                .border_b_1()
+                .border_color(p.hairline.hsla())
+                .text_size(px(12.))
+                .when(active, |h| {
+                    h.bg(p.surface_raised.hsla())
+                        .text_color(p.ink.hsla())
+                        .font_weight(FontWeight::MEDIUM)
+                })
+                .when(!active, |h| h.text_color(p.muted.hsla()))
+                .child(icons::icon(
+                    crate::assets::icon::TERMINAL,
+                    px(11.),
+                    if active { p.ink } else { p.muted },
+                ))
+                .child(shell.title.to_lowercase());
+            row = row.child(
+                v_flex()
+                    .id(("remote-worker-shell-pane", i))
+                    .debug_selector(move || format!("remote-worker-shell-pane-{i}"))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .when(!active, |pane| {
+                        pane.cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                remote.update(cx, |model, cx| {
+                                    model.select_worker_shell(&id);
+                                    cx.notify();
+                                })
+                            })
+                    })
+                    .child(header)
+                    .child(div().flex_1().min_h_0().w_full().child(body)),
+            );
+        }
+        row.into_any_element()
     }
 
     /// The SSH shell, full width; with Reconnect once it ended, or why it
@@ -1067,6 +1184,7 @@ impl Render for RemoteWindow {
         self.sync_upload(window, cx);
         self.sync_title(window, cx);
         self.shown_browser = self.sync_browsers(window, cx);
+        self.sync_shell_panes(cx);
         let mission = self.mission_shown(cx);
         let model = self.remote.read(cx);
         if model.close_requested() {
@@ -1431,6 +1549,43 @@ fn worker_shell_row(
                 })
             })
     });
+    // Side by side, once there is more than one shell to show (W35).
+    let split = (model.worker_shells().len() > 1).then(|| {
+        let remote = remote.clone();
+        let on = model.worker_split();
+        let hint = match keycap("ToggleSplitView") {
+            Some(cap) => format!("Side by side ({cap})"),
+            None => "Side by side".to_string(),
+        };
+        div()
+            .id("remote-worker-shell-split")
+            .debug_selector(|| "remote-worker-shell-split".into())
+            .flex_none()
+            .h(px(24.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(11.5))
+            .when(on, |b| {
+                b.bg(p.surface_raised.hsla()).text_color(p.ink.hsla())
+            })
+            .when(!on, |b| {
+                b.text_color(p.muted.hsla())
+                    .hover(|s| s.bg(p.surface_raised.hsla()))
+            })
+            .child(if on { "One at a time" } else { "Side by side" })
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(hint.clone()).build(window, cx)
+            })
+            .on_click(move |_, _, cx| {
+                remote.update(cx, |model, cx| {
+                    model.set_worker_split(!on);
+                    cx.notify();
+                })
+            })
+    });
     let add = manage.then(|| {
         let remote = remote.clone();
         let hint = match keycap("NewChildTerminal") {
@@ -1474,6 +1629,8 @@ fn worker_shell_row(
         .text_size(px(12.))
         .children(tabs)
         .children(add)
+        .child(div().flex_1())
+        .children(split)
         .into_any_element()
 }
 

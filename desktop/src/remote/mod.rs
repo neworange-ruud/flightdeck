@@ -398,6 +398,27 @@ impl RemoteModel {
         self.session.select_worker_shell(id);
     }
 
+    /// Whether the Worker tab shows its shells side by side (Ctrl-B there).
+    pub fn worker_split(&self) -> bool {
+        self.session.worker_split()
+    }
+
+    /// Show the worker's shells side by side, or one at a time (the row's
+    /// button).
+    pub fn set_worker_split(&mut self, split: bool) {
+        self.session.set_worker_split(split);
+    }
+
+    /// Size worker terminal `id` to its split pane.
+    pub fn size_pane(&mut self, id: &flightdeck::web::protocol::TerminalId, size: PtySize) {
+        self.session.size_pane(id, size);
+    }
+
+    /// The mirrored terminal `id`, for a pane that draws it.
+    pub fn terminal(&self, id: &flightdeck::web::protocol::TerminalId) -> Option<&Terminal> {
+        self.session.terminal(id)
+    }
+
     /// Ask the worker for another shell (the row's **+**, Ctrl-T).
     pub fn open_worker_shell(&mut self) {
         self.session.open_worker_shell();

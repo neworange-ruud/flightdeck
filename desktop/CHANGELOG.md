@@ -19,7 +19,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **Worker shells side by side.** On a worker window's **Worker** tab, press Ctrl-B, or click **Side by side** in the row of shells, to see every shell at once in its own column. The one you are typing in is live; the others are dimmed, and a click on one switches to it. Each shell is sized to its own column. Press Ctrl-B again, or click **One at a time**, to go back.
 
 ### Bug fixes
 

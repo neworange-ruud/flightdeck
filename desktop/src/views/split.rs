@@ -56,12 +56,14 @@ use gpui::{
 };
 
 use crate::host::HostModel;
+use crate::remote::RemoteModel;
 use crate::terminal::element::{measure_cell, paint_box, shape_text, CellMetrics};
 use crate::terminal::layout::TermPalette;
 use crate::terminal::rowcache::RowCache;
 use crate::terminal::view::grid_identity;
 use crate::terminal::zoom::{app_font_size, TerminalZoom};
 use crate::theme::Palette;
+use flightdeck::web::protocol::TerminalId;
 
 /// A pane's header row: the terminal's label and command.
 pub const PANE_HEADER: Pixels = px(28.);
@@ -220,7 +222,17 @@ impl Panes {
     ) -> Entity<PaneView> {
         self.views
             .entry(key.clone())
-            .or_insert_with(|| cx.new(|cx| PaneView::new(host.clone(), key, cx)))
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    PaneView::new(
+                        PaneSource::Local {
+                            host: host.clone(),
+                            key,
+                        },
+                        cx,
+                    )
+                })
+            })
             .clone()
     }
 
@@ -230,11 +242,26 @@ impl Panes {
     }
 }
 
-/// One read-only pane: a terminal of the selected agent that is not the
-/// active one. See the module docs.
+/// Where a read-only pane's terminal lives.
+#[derive(Clone)]
+pub enum PaneSource {
+    /// A terminal of the local workspace's selected agent.
+    Local {
+        host: Entity<HostModel>,
+        key: PaneKey,
+    },
+    /// A terminal a remote window mirrors from a worker (the Worker tab's
+    /// shells side by side, W35).
+    Remote {
+        remote: Entity<RemoteModel>,
+        id: TerminalId,
+    },
+}
+
+/// One read-only pane: a terminal that is not the active one. See the
+/// module docs.
 pub struct PaneView {
-    host: Entity<HostModel>,
-    key: PaneKey,
+    source: PaneSource,
     palette: TermPalette,
     cache: RowCache<Vec<ShapedLine>>,
     /// The cell size the cached lines were shaped at.
@@ -242,13 +269,17 @@ pub struct PaneView {
 }
 
 impl PaneView {
-    fn new(host: Entity<HostModel>, key: PaneKey, cx: &mut Context<Self>) -> Self {
+    /// A read-only pane over a worker's terminal `id`.
+    pub fn for_remote(remote: Entity<RemoteModel>, id: TerminalId, cx: &mut Context<Self>) -> Self {
+        Self::new(PaneSource::Remote { remote, id }, cx)
+    }
+
+    fn new(source: PaneSource, cx: &mut Context<Self>) -> Self {
         // A zoom chord resizes every terminal, the panes included.
         cx.observe_global::<TerminalZoom>(|_, cx| cx.notify())
             .detach();
         Self {
-            host,
-            key,
+            source,
             palette: TermPalette::from_palette(Palette::global(cx)),
             cache: RowCache::default(),
             shaped_at: None,
@@ -260,8 +291,7 @@ impl Render for PaneView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         PaneGrid {
             pane: cx.entity(),
-            host: self.host.clone(),
-            key: self.key.clone(),
+            source: self.source.clone(),
             palette: self.palette,
         }
     }
@@ -270,8 +300,7 @@ impl Render for PaneView {
 /// The grid of a [`PaneView`].
 struct PaneGrid {
     pane: Entity<PaneView>,
-    host: Entity<HostModel>,
-    key: PaneKey,
+    source: PaneSource,
     palette: TermPalette,
 }
 
@@ -330,32 +359,46 @@ impl Element for PaneGrid {
         let shaped_at = self.pane.read(cx).shaped_at;
         // The active terminal's size (setting plus zoom), so a pane's grid is
         // the one it has when it gains focus.
-        let points = app_font_size(self.host.read(cx).host(), cx);
+        let points = match &self.source {
+            PaneSource::Local { host, .. } => app_font_size(host.read(cx).host(), cx),
+            PaneSource::Remote { remote, .. } => {
+                TerminalZoom::current(cx).size_for(remote.read(cx).font_size())
+            }
+        };
         let (width, height) = measure_cell(window, points);
         // The grid follows the pane, as the terminal element's does.
         let size = flightdeck::contracts::PtySize {
             rows: (bounds.size.height / height).floor().max(1.0) as u16,
             cols: (bounds.size.width / width).floor().max(1.0) as u16,
         };
-        let target = self.key.target();
-        let (project, tab_id) = (self.key.project, self.key.tab_id.clone());
-        self.host.update(cx, |model, _| {
-            model.set_pane_size(project, &tab_id, target, size)
-        });
-        let host = self.host.read(cx).host();
-        let Some(terminal) = host.tab_terminal_at(project, &tab_id, target) else {
+        // Only the rows that changed since this pane last drew are laid out.
+        let palette = self.palette;
+        let mut refresh = |terminal: &flightdeck::terminal::session::Terminal| {
+            cache.refresh(grid_identity(terminal), terminal.screen(), &palette, false);
+        };
+        let drawn = match &self.source {
+            PaneSource::Local { host, key } => {
+                let target = key.target();
+                let (project, tab_id) = (key.project, key.tab_id.clone());
+                host.update(cx, |model, _| {
+                    model.set_pane_size(project, &tab_id, target, size)
+                });
+                host.read(cx)
+                    .host()
+                    .tab_terminal_at(project, &tab_id, target)
+                    .map(&mut refresh)
+            }
+            PaneSource::Remote { remote, id } => {
+                remote.update(cx, |model, _| model.size_pane(id, size));
+                remote.read(cx).terminal(id).map(&mut refresh)
+            }
+        };
+        if drawn.is_none() {
             return Prepared {
                 cache,
                 metrics: None,
             };
-        };
-        // Only the rows that changed since this pane last drew are laid out.
-        cache.refresh(
-            grid_identity(terminal),
-            terminal.screen(),
-            &self.palette,
-            false,
-        );
+        }
         if shaped_at != Some((width, height)) {
             cache.invalidate_derived();
         }
