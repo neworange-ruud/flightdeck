@@ -28,7 +28,7 @@ import { PROTOCOL_VERSION } from "../src/wire/frames";
  * rendered what the PTY emitted, so that is what these tests look at — rendered
  * text in the DOM.
  *
- * Three tests, not ten. Each one is here because it proves a link no unit test
+ * Four tests, not ten. Each one is here because it proves a link no unit test
  * can reach.
  */
 
@@ -38,6 +38,51 @@ function marker(): string {
 }
 
 test.describe("FlightDeck Web, end to end", () => {
+
+  test("renders the terminal in DejaVu Sans Mono and the rest in Inter, from the binary", async ({
+    page,
+    request,
+    host,
+  }) => {
+    /** Both families are served out of the binary, as fonts. */
+    for (const file of ["dejavu-sans-mono-400.woff2", "inter-latin-400.woff2"]) {
+      const font = await request.get(`${host.baseURL}/fonts/${file}`);
+      expect(font.status(), file).toBe(200);
+      expect(font.headers()["content-type"], file).toContain("font/woff2");
+    }
+
+    await authenticate(page, host);
+    await expect
+      .poll(async () => renderedTerminal(page), { timeout: 45_000 })
+      .toContain("fake-agent: starting");
+
+    /**
+     * What the glyphs were **painted** with, per Chromium itself — not what a
+     * stylesheet asked for, which a missing file would still satisfy.
+     * `CSS.getPlatformFontsForNode` names the font that rendered a node's
+     * text, so a fallback (the platform monospace, the system UI font) shows
+     * up here as the wrong family.
+     */
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("DOM.enable");
+    await cdp.send("CSS.enable");
+    const painted = async (selector: string): Promise<string[]> => {
+      const { root } = await cdp.send("DOM.getDocument", { depth: -1 });
+      const { nodeId } = await cdp.send("DOM.querySelector", {
+        nodeId: root.nodeId,
+        selector,
+      });
+      const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
+      return fonts.map((f) => f.familyName);
+    };
+    await expect
+      .poll(async () => painted(".xterm-rows > div"), { timeout: 15_000 })
+      .toContain("DejaVu Sans Mono");
+    await expect
+      .poll(async () => painted(".fd-conn"), { timeout: 15_000 })
+      .toContain("Inter");
+    expect(await painted(".fd-conn")).not.toContain("DejaVu Sans Mono");
+  });
   test("serves the embedded SPA and renders what the PTY emitted", async ({
     page,
     request,

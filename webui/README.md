@@ -198,19 +198,30 @@ test failing twice consecutively on `main` is quarantined the same working day
 with `test.fixme` and a filed `bd` issue; the CI job is non-blocking until
 **2026-09-10** and required after. Never raise `retries` to quiet it.
 
-## Font
+## Fonts
 
-Single family, **JetBrains Mono**, vendored rather than linked from a CDN.
-Three static weights (400/500/700, Latin subset, WOFF2 only) are committed
-under `public/fonts/`, sourced from the upstream
-`@fontsource/jetbrains-mono` npm package (glyphs unmodified, just subsetted;
-SIL OFL 1.1, license copied to `public/fonts/JETBRAINS-MONO-LICENSE.txt`). See
-`src/style/fonts.css` for the full rationale — in short: this app ships inside
-a binary that may be running on a loopback-only or LAN-only host (D1/D5), so a
-CDN `@font-face` or a runtime font fetch would silently degrade exactly the
-deployment this server exists for. `--fd-font-mono` in `tokens.css` is the one
-place code should reach for the family; it falls back to the platform
-monospace stack if the vendored font somehow fails to load.
+Two families, both vendored rather than linked from a CDN:
+
+- **DejaVu Sans Mono** for terminals: Apple's Menlo is a modified DejaVu Sans
+  Mono, so this is the Menlo look. Book and Bold, upright and oblique.
+- **Inter** for everything else: the closest freely licensed match for Apple's
+  SF Pro Text. 400, 500, 700 and 400 italic.
+
+Menlo and SF Pro themselves can't be bundled: Apple's licences don't allow
+redistributing them, and these files ship in every binary of a public repo. The
+look-alikes are used on every client, Apple's included.
+
+The cuts are committed under `public/fonts/` as WOFF2, subsetted with
+`pyftsubset` from the official releases (DejaVu 2.37, Inter 4.1; glyphs
+unmodified), with their licences beside them (`DEJAVU-SANS-MONO-LICENSE.txt`,
+`INTER-LICENSE.txt`). See `src/style/fonts.css` for the subsets and the full
+rationale. In short: this app ships inside a binary that may be running on a
+loopback-only or LAN-only host (D1/D5), so a CDN `@font-face` or a runtime font
+fetch would silently degrade exactly the deployment this server exists for.
+`--fd-font-mono` and `--fd-font-ui` in `tokens.css` are the one place code
+should reach for a family; each falls back to the platform stack for a glyph
+the bundled font lacks. The terminal re-measures its cells once DejaVu Sans
+Mono has loaded (`src/term/terminal.ts`).
 
 ## The no-`FitAddon` invariant
 
@@ -234,7 +245,7 @@ behaviour, not a bug to fix.
 ```
 webui/
 ├── index.html          entry point
-├── public/fonts/        vendored JetBrains Mono (WOFF2, Latin subset)
+├── public/fonts/        vendored DejaVu Sans Mono + Inter (WOFF2, subsetted)
 ├── src/
 │   ├── main.ts          entry point: fixture in, main screen out
 │   ├── state/           model.ts, status.ts, fixture.ts + the reducer seam

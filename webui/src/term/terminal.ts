@@ -49,7 +49,40 @@ export function mountTerminal(
   });
 
   term.open(container);
+  remeasureWhenFontLoads(term);
   return term;
+}
+
+/**
+ * Re-measure the terminal's cells once the bundled DejaVu Sans Mono has loaded.
+ *
+ * xterm measures a cell when it opens. On a first visit the font is usually
+ * still downloading then (`font-display: block`), so the cells would be sized
+ * for whatever fallback was measured, and stay that way: a grid that is too
+ * wide or too narrow for the glyphs it draws. Handing xterm the resolved
+ * family stack, a different string from `var(--fd-font-mono)`, makes it measure
+ * again with the real font. Harmless when the font was already cached.
+ */
+function remeasureWhenFontLoads(term: Terminal): void {
+  const fonts = typeof document === "undefined" ? undefined : document.fonts;
+  const family = readToken("--fd-font-mono");
+  if (fonts === undefined || family === null) {
+    return;
+  }
+  void Promise.all([
+    fonts.load('1em "DejaVu Sans Mono"'),
+    fonts.load('bold 1em "DejaVu Sans Mono"'),
+  ])
+    .then(() => {
+      try {
+        term.options.fontFamily = family;
+      } catch {
+        // Disposed before the font arrived: nothing left to measure.
+      }
+    })
+    .catch(() => {
+      // The font failed to load; the fallback measured at open stands.
+    });
 }
 
 /**

@@ -12,11 +12,11 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **New fonts in FlightDeck Web.** Terminals use DejaVu Sans Mono, the open font Apple's Menlo is built on, and the rest of the interface uses Inter, a close open match for SF Pro Text. Both are built into FlightDeck, so every browser shows the same fonts, with or without internet access. (Menlo and SF Pro themselves can't be shipped: Apple's licences don't allow it.)
 
 ### Bug fixes
 
-- None yet.
+- **Terminal text in FlightDeck Web is no longer spaced too wide.** The browser terminal measured its character cells before its font had loaded and kept that size, so every character was padded with extra space. It now measures again once the font is ready.
 
 ## [1.35.0] - 2026-11-12
 

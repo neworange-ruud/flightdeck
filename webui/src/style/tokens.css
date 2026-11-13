@@ -88,9 +88,12 @@
   /* the pairing code — the one place the app shouts */
   --fd-t-code: 30px;
 
-  /* --- Type family --------------------------------------------------------
-   * See src/style/fonts.css for the @font-face rule and the offline-fallback
-   * rationale (webui/README.md "Font"). */
-  --fd-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code",
-    "DejaVu Sans Mono", monospace;
+  /* --- Type families ------------------------------------------------------
+   * See src/style/fonts.css for the @font-face rules and the offline-fallback
+   * rationale (webui/README.md "Fonts"). The bundled family comes first on
+   * every client; what follows only supplies glyphs it does not have. */
+  /* Terminals: DejaVu Sans Mono, the open original Menlo was made from. */
+  --fd-font-mono: "DejaVu Sans Mono", ui-monospace, "Cascadia Code", monospace;
+  /* Everything else: Inter, the open match for SF Pro Text. */
+  --fd-font-ui: "Inter", system-ui, sans-serif;
 }
