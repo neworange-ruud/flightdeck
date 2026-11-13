@@ -971,6 +971,11 @@ impl WebServerHandle {
         self.shared.tunnels.unwrap_or_recover().grant(token, viewer)
     }
 
+    /// Whether any browser tunnel key is granted (a browser is open, B11).
+    pub fn has_tunnels(&self) -> bool {
+        !self.shared.tunnels.unwrap_or_recover().is_empty()
+    }
+
     /// End tunnel `key` for `token`, closing every tunnel open on it;
     /// whether it was theirs.
     pub fn end_tunnel(&self, key: &str, token: &TokenId) -> bool {

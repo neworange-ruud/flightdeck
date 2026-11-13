@@ -52,6 +52,7 @@ pub(crate) fn session(id: &str, name: &str) -> SessionView {
         worktree_path: format!("/repo/.flightdeck/worktrees/{name}"),
         activity: None,
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 

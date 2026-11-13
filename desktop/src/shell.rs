@@ -176,6 +176,16 @@ impl FlightDeckWindow {
                 cx.observe(&view, |_, _, cx| cx.notify()).detach();
                 self.browser_views.insert(id, view);
             }
+            let ports: Vec<(u64, Vec<u16>)> = self
+                .browser_views
+                .keys()
+                .map(|id| (*id, self.host.read(cx).browser_ports(*id)))
+                .collect();
+            for (id, ports) in ports {
+                if let Some(view) = self.browser_views.get(&id) {
+                    view.update(cx, |view, cx| view.set_ports(&ports, cx));
+                }
+            }
             let titles: Vec<(u64, String)> = self
                 .browser_views
                 .iter()

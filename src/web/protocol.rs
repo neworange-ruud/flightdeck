@@ -1087,6 +1087,13 @@ pub struct SessionView {
     /// the session itself.
     #[serde(default)]
     pub prompt: Option<Box<PendingPrompt>>,
+    /// The TCP ports this session's processes listen on, sorted
+    /// (`specs/SESSION_BROWSER_PRD.md` B11): what a session browser's address
+    /// field offers, and the loopback ports a Desktop forwards before a page
+    /// asks. A host fills it only while a browser is open (it costs a system
+    /// tool run); empty from a host that does not.
+    #[serde(default)]
+    pub listening_ports: Vec<u16>,
 }
 
 /// A waiting session's pending prompt, as Mission control answers it inline

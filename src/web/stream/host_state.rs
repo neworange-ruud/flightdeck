@@ -268,6 +268,7 @@ pub fn session_view(facts: &SessionFacts<'_>, streams: &TerminalStreams) -> Sess
         // Filled in by the host, which alone holds the prompt tracker
         // (`AppHost::publish`).
         prompt: None,
+        listening_ports: Vec::new(),
     }
 }
 
@@ -537,6 +538,7 @@ fn session_deltas(was: &SessionView, now: &SessionView, out: &mut Vec<Delta>) {
         || was.recovered != now.recovered
         || was.attached_existing_branch != now.attached_existing_branch
         || was.prompt != now.prompt
+        || was.listening_ports != now.listening_ports
     {
         out.push(Delta::SessionUpsert(now.clone()));
         return;

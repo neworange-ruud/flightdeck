@@ -276,6 +276,7 @@ impl Host {
                 worktree_path: String::new(),
                 activity: None,
                 prompt: None,
+                listening_ports: Vec::new(),
             })
             .collect::<Vec<_>>();
         let selected = self

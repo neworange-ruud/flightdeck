@@ -23,6 +23,7 @@ uses that version's section as the GitHub Release notes.
 - **The session browser in local sessions too.** **New Browser** (palette, or the globe button at the bottom of the sidebar) now also works in a local window, on this computer's own network.
 - **Browser data is cleaned up with its worktree.** A session browser's cookies and storage belong to its worktree: closing a session but keeping the worktree keeps them for when you open it again, and abandoning the worktree deletes them.
 - **Continue anyway for a self-signed certificate.** When a page in a session browser fails on its certificate, as a local dev server's self-signed one does, the browser says so and offers **Continue anyway**. Choosing it trusts that certificate for that host and port in that session from then on, until the worktree is abandoned.
+- **The browser shows the ports your session is serving.** Under a session browser's toolbar, **Listening:** lists the ports the session's processes listen on, such as the dev server an agent started; click one to open it. In a worker session those ports also work when a page calls them itself (an API or hot-reload port), and a port already in use on your Mac is shown dimmed.
 
 ### Bug fixes
 
