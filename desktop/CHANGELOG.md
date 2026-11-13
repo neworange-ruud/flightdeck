@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.15.0] - 2026-11-13
+
+### New features
+
 - **Choose which agent backends a worker offers.** You can now stop a worker offering agents its machine hasn't set up (Codex, Cursor, …). Run `flightdeck worker agents` to list them, `flightdeck worker agents disable codex` to stop offering one, and `flightdeck worker agents enable codex` to offer it again. The choice is saved as `[worker] disabled_agents` in your global `config.toml` (everything is enabled by default) and a running worker applies it immediately. The New Agent form and the **+ agent** picker in a Desktop, a browser or `flightdeck connect` then only list the enabled agents. Sessions already running keep running.
 
 ### Improvements
@@ -21,10 +35,6 @@ uses that version's section as the GitHub Release notes.
 - **Create waits for a task name.** In the New Agent Session Tab form, **Create** stays disabled until you've typed a task name for the new branch, in the TUI, FlightDeck Desktop and a browser. Existing-branch and base-branch targets are unchanged.
 - **No more "opened from …" line under dialog titles.** A dialog opened from a remote window or a browser no longer shows the address and app version it came from, anywhere: not in the window that opened it, not in the TUI or FlightDeck Desktop at the host, and not in another browser. A dialog someone opened at the host's keyboard still says "opened on the host" in a remote window ("opened on the desktop" in a browser).
 - **Abandon the worktree from Close agent.** The close menu ("Close tab — how should running processes be handled?") now has an **Abandon worktree** button (`a`) next to the four ways to stop the agent, in FlightDeck Desktop's **Close agent…**, the TUI and a browser. It opens the usual abandon confirmation, which warns when there are uncommitted changes; nothing is removed until you confirm. A tab running on the base branch has no worktree, so it doesn't get the button, and the TUI sidebar's `✕` menu, which already asks Abandon or Close, doesn't ask twice.
-
-### Bug fixes
-
-- None yet.
 
 ## [0.14.0] - 2026-11-12
 
