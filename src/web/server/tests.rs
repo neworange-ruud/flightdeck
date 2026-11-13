@@ -858,6 +858,7 @@ fn test_shared_for(host_kind: HostKind) -> Arc<Shared> {
         https_host: Mutex::new(None),
         uploads: Mutex::new(crate::web::upload::UploadGrants::default()),
         downloads: Mutex::new(crate::web::download::DownloadGrants::default()),
+        tunnels: Mutex::new(crate::web::tunnel::TunnelGrants::default()),
     })
 }
 
@@ -1225,7 +1226,7 @@ fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_tui_host_serves_v6_to_v10_and_a_worker_v7_to_v10() {
+fn a_tui_host_serves_v6_to_v11_and_a_worker_v7_to_v11() {
     assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Tui, 8), Ok(8));
@@ -1236,8 +1237,9 @@ fn a_tui_host_serves_v6_to_v10_and_a_worker_v7_to_v10() {
     assert_eq!(accept_version(HostKind::Worker, 9), Ok(9));
     assert_eq!(accept_version(HostKind::Tui, 10), Ok(10));
     assert_eq!(accept_version(HostKind::Worker, 10), Ok(10));
+    assert_eq!(accept_version(HostKind::Worker, 11), Ok(11));
 
-    for peer in [5, 6, 11] {
+    for peer in [5, 6, 12] {
         let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
         assert_eq!(refused.peer, peer);
         assert_eq!(refused.min_supported, 7, "the worker's own floor");

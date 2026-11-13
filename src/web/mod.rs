@@ -43,6 +43,7 @@ pub mod protocol;
 pub mod replay;
 pub mod server;
 pub mod stream;
+pub mod tunnel;
 pub mod upload;
 // The TLS half of the server rides on rustls, which is only in the dependency
 // graph off Windows (see Cargo.toml). The worker that uses it is unix-only.
