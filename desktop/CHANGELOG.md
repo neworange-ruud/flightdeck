@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **More than one worker shell.** In a worker window, the first tab is now called **Worker** and holds a row of the worker's shells. Click one to show it, press **+** or Ctrl-T to open another, and close one with its **✕** or Ctrl-W. Alt-Left/Right switch between them. The shells live on the worker, so every window sees the same ones, and they keep running when you disconnect. When every shell is closed, the tab offers **Open a shell**. A worker keeps at most 16. Update the worker too: an older worker keeps its one shell, without **+** or **✕**.
 
 ### Improvements
 
