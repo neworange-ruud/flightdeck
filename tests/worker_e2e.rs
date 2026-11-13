@@ -2194,3 +2194,143 @@ fn the_core_client_downloads_into_a_local_folder_and_keeps_both() {
     assert!(leftovers.is_empty(), "{leftovers:?}");
     client.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Browser tunnels (v11, specs/SESSION_BROWSER_PRD.md)
+// ---------------------------------------------------------------------------
+
+/// A one-page HTTP server on this machine's loopback: what a dev server on
+/// the worker looks like (the test's worker runs on the same machine).
+fn page_server(body: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+/// The key the worker grants this window.
+fn tunnel_key(worker: &Worker, client: &mut RemoteClient) -> String {
+    let seq = client.open_browser_tunnel();
+    worker.applied(client, seq, "open_browser_tunnel");
+    let seq = seq.unwrap();
+    let mut answer = None;
+    worker.wait("the tunnel key", || {
+        client.pump();
+        answer = client.take_browser_tunnel(seq);
+        answer.is_some()
+    });
+    let answer = answer.unwrap();
+    assert_eq!(answer.refusal, None, "{answer:?}");
+    answer.key.expect("a key")
+}
+
+/// `GET /` through an open tunnel, the whole answer.
+async fn fetch_through(tunnel: flightdeck::web::client::tunnel_http::Tunnel, host: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tunnel.stream;
+    stream
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut out = tunnel.early;
+    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A window's browser reaches a server on the worker's loopback through a
+/// tunnel, and every refusal says what the worker could not do.
+#[test]
+fn a_browser_tunnel_reaches_the_workers_localhost_and_refuses_in_words() {
+    use flightdeck::web::client::tunnel_http::open;
+    let worker = Worker::start();
+    let (_token, mut client) = worker.window("laptop");
+    let port = page_server("hello-from-the-worker");
+    let key = tunnel_key(&worker, &mut client);
+    let access = client.http_access().expect("a dialled client").clone();
+
+    let target = format!("localhost:{port}");
+    let tunnel = on_runtime(open(&access, &key, &target)).expect("the tunnel opens");
+    let page = on_runtime(fetch_through(tunnel, &target));
+    assert!(page.contains("hello-from-the-worker"), "{page}");
+
+    // Nothing listening on the worker.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closed.local_addr().unwrap().port();
+    drop(closed);
+    let refused = on_runtime(open(&access, &key, &format!("127.0.0.1:{dead}")))
+        .err()
+        .expect("refused");
+    assert_eq!(refused.reason, "refused", "{refused:?}");
+    assert!(
+        refused.message.contains(&format!("127.0.0.1:{dead}")),
+        "{refused:?}"
+    );
+
+    // A name the worker cannot find.
+    let unresolved = on_runtime(open(&access, &key, "no-such-host.invalid:80"))
+        .err()
+        .expect("unresolved");
+    assert_eq!(unresolved.reason, "unresolved", "{unresolved:?}");
+
+    // A malformed target, and a key nobody granted.
+    let bad = on_runtime(open(&access, &key, "localhost")).err().unwrap();
+    assert_eq!(bad.reason, "bad_target", "{bad:?}");
+    let forged = on_runtime(open(&access, "not-a-key", &target))
+        .err()
+        .unwrap();
+    assert_eq!(forged.reason, "invalid_tunnel", "{forged:?}");
+    client.stop();
+}
+
+/// Closing the key, or the window going away, ends the tunnels open on it
+/// and refuses new ones.
+#[test]
+fn a_browser_tunnel_ends_with_its_key_and_with_its_window() {
+    use flightdeck::web::client::tunnel_http::open;
+    use tokio::io::AsyncReadExt;
+    let worker = Worker::start();
+    let (_token, mut client) = worker.window("laptop");
+    // A server that accepts and then says nothing, so a tunnel stays open.
+    let quiet = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = quiet.local_addr().unwrap().port();
+    let _held: std::thread::JoinHandle<Vec<std::net::TcpStream>> =
+        std::thread::spawn(move || quiet.incoming().flatten().take(2).collect());
+    let access = client.http_access().expect("a dialled client").clone();
+    let target = format!("127.0.0.1:{port}");
+
+    let key = tunnel_key(&worker, &mut client);
+    let tunnel = on_runtime(open(&access, &key, &target)).expect("the tunnel opens");
+    let seq = client.close_browser_tunnel(&key);
+    worker.applied(&mut client, seq, "close_browser_tunnel");
+    let mut stream = tunnel.stream;
+    let mut buf = [0u8; 16];
+    let read = on_runtime(async {
+        tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await
+    });
+    assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "cut: {read:?}");
+    let again = on_runtime(open(&access, &key, &target)).err().unwrap();
+    assert_eq!(again.reason, "invalid_tunnel");
+
+    // The window detaching ends its keys too.
+    let key = tunnel_key(&worker, &mut client);
+    let tunnel = on_runtime(open(&access, &key, &target)).expect("the tunnel opens");
+    client.stop();
+    let mut stream = tunnel.stream;
+    let read = on_runtime(async {
+        tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await
+    });
+    assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "cut: {read:?}");
+    let after = on_runtime(open(&access, &key, &target)).err().unwrap();
+    assert_eq!(after.reason, "invalid_tunnel");
+}

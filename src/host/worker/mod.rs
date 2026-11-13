@@ -42,10 +42,11 @@ use crate::web::credentials::TokenId;
 use crate::web::credentials::{BrowserToken, BOOTSTRAP_CODE_TTL_MS};
 use crate::web::protocol::is_worker_shell_terminal_id;
 use crate::web::protocol::{
-    Ack, AckOutcome, Delta, DirEntryView, DirListing, DownloadPlan, DownloadPlanFile,
-    FileEntryView, HostKind, MessageLevel, NotificationSoundView, NotificationView, ProjectId,
-    ProjectScan, ScannedRepo, ServerMsg, TerminalId, UploadPlan, UploadPlanFile, ViewerId,
-    WorkerOp, WorkerShellView, WorkerStatusView, WORKER_SHELL_TERMINAL_ID,
+    Ack, AckOutcome, BrowserTunnel, Delta, DirEntryView, DirListing, DownloadPlan,
+    DownloadPlanFile, FileEntryView, HostKind, MessageLevel, NotificationSoundView,
+    NotificationView, ProjectId, ProjectScan, ScannedRepo, ServerMsg, TerminalId, UploadPlan,
+    UploadPlanFile, ViewerId, WorkerOp, WorkerShellView, WorkerStatusView,
+    WORKER_SHELL_TERMINAL_ID,
 };
 use crate::web::server::{
     ConnectionInfo, DownloadGrantRequest, ListenPlan, ListenStatus, ServerOptions, ShutdownNotice,
@@ -1029,7 +1030,7 @@ impl<'a> AppHost<'a> {
         seq: u64,
         op: WorkerOp,
     ) -> Vec<WebOutbound> {
-        let (outcome, detail, answer) = match self.worker_op(token, seq, op) {
+        let (outcome, detail, answer) = match self.worker_op(viewer_id, token, seq, op) {
             Ok((detail, answer)) => (AckOutcome::Applied, detail, answer),
             Err(refusal) => (
                 AckOutcome::Rejected,
@@ -1056,7 +1057,13 @@ impl<'a> AppHost<'a> {
 
     /// One worker op: `Ok((ack detail, answer frame))` when applied,
     /// `Err(refusal)` when refused.
-    fn worker_op(&mut self, token: &TokenId, seq: u64, op: WorkerOp) -> OpOutcome {
+    fn worker_op(
+        &mut self,
+        viewer_id: &ViewerId,
+        token: &TokenId,
+        seq: u64,
+        op: WorkerOp,
+    ) -> OpOutcome {
         let fs = self.env.fs;
         let Some(w) = self.worker.as_mut() else {
             return Err(OpRefusal::new("This FlightDeck is not a worker."));
@@ -1185,6 +1192,47 @@ impl<'a> AppHost<'a> {
                     }
                     Err(e) => Err(OpRefusal::new(e.to_string())),
                 }
+            }
+            WorkerOp::OpenBrowserTunnel => {
+                // A refusal answers in the tunnel's own frame, so the
+                // browser tab can say why.
+                let refused = |reason: &str| OpRefusal {
+                    reason: reason.to_string(),
+                    frame: Some(Box::new(ServerMsg::BrowserTunnel(BrowserTunnel {
+                        seq,
+                        key: None,
+                        refusal: Some(reason.to_string()),
+                    }))),
+                };
+                let Some(handle) = self.web_surface.handle.as_ref() else {
+                    return Err(refused(
+                        "The worker is not listening, so it cannot open a browser right now.",
+                    ));
+                };
+                let Some(key) = handle.grant_tunnel(token, viewer_id) else {
+                    return Err(refused(
+                        "This window has too many browsers open on the worker. Close one first.",
+                    ));
+                };
+                w.log("browser tunnel granted");
+                Ok((
+                    None,
+                    Some(ServerMsg::BrowserTunnel(BrowserTunnel {
+                        seq,
+                        key: Some(key),
+                        refusal: None,
+                    })),
+                ))
+            }
+            WorkerOp::CloseBrowserTunnel { key } => {
+                // Already gone (the window closed it twice, or the worker
+                // restarted) is still the outcome asked for.
+                if let Some(handle) = self.web_surface.handle.as_ref() {
+                    if handle.end_tunnel(&key, token) {
+                        w.log("browser tunnel closed");
+                    }
+                }
+                Ok((None, None))
             }
             WorkerOp::CloseWorkerShell { terminal_id } => match w.shells.close(&terminal_id) {
                 Ok(()) => {

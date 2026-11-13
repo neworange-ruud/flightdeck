@@ -12,7 +12,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **Groundwork for the session browser.** A worker can now open network connections on behalf of a FlightDeck Desktop window it is attached to, through its existing port and pairing. Nothing uses it yet; it is for the browser tabs that are coming to Desktop sessions. Update the worker and the client together, as with any protocol change.
 
 ### Bug fixes
 

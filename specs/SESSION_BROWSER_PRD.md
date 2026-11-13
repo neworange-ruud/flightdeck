@@ -122,16 +122,25 @@ arguments are given, so the whole argument line is ours.
 
 ### 4.2 Worker (`remote-control-cefv.2`)
 
-- `open_browser_tunnel` over the socket returns a token. Only the window
-  holding the seat may ask. The token is withdrawn when the tab closes, on
-  detach and on takeover.
-- A tunnel route on the worker's port (TLS when the worker has a certificate)
-  takes the token and `host:port`, resolves and connects from the worker, and
-  pipes both ways until either side closes.
-- A cap on concurrent tunnel connections per window. The log records per-tab
-  totals, never URLs or hostnames.
-- Needs the next protocol version. An older worker: the "New browser" action
-  in a remote session explains that the worker needs updating.
+*Built (protocol v11; `src/web/tunnel.rs`, `src/web/server/tunnel_route.rs`,
+client `src/web/client/tunnel_http.rs`).*
+
+- `open_browser_tunnel` over the socket is answered with a `browser_tunnel`
+  frame: a **key**, or a refusal in words. The key is reusable (a page opens
+  many connections), bound to the window's credential and connection, and
+  ends with `close_browser_tunnel`, when that connection ends (detach, or a
+  takeover, which closes the window taken over), or when the worker stops.
+  Ending a key cuts every tunnel open on it. At most 32 keys per window.
+- `GET /tunnel` on the worker's port (plain or TLS), with `Upgrade:
+  flightdeck-tunnel`, the window's cookie, `X-FlightDeck-Tunnel: <key>` and
+  `X-FlightDeck-Target: host:port`. The worker resolves and connects **before**
+  answering, so a failure is a worded refusal the browser can show:
+  `refused` ("Nothing is listening on localhost:3000 on the worker."),
+  `unresolved`, `timed_out` (10 s), `bad_target`, `invalid_tunnel`. Then
+  `101 Switching Protocols` and bytes both ways. At most 256 tunnels per key.
+- The log has one line per tunnel with byte counts, never the target.
+- An older worker (below v11): the "New browser" action in a remote session
+  explains that the worker needs updating.
 
 ### 4.3 Desktop (`remote-control-cefv.3`, `.4`, `.5`)
 

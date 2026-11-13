@@ -86,7 +86,7 @@
  * `GET /download/{ticket}`, or a refusal. A worker never sends
  * `download_plan` to a peer below v9, and refuses `begin_download` from one.
  */
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";

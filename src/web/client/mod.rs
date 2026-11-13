@@ -52,6 +52,7 @@ pub mod mission;
 pub mod session;
 pub mod store;
 pub mod terminals;
+pub mod tunnel_http;
 pub mod upload;
 pub mod upload_http;
 pub mod views;
@@ -263,6 +264,8 @@ pub struct RemoteClient {
     upload_plan: Option<UploadPlan>,
     /// A worker's latest download plan, until taken (v9).
     download_plan: Option<DownloadPlan>,
+    /// A worker's answers to `open_browser_tunnel`, until taken by seq (v11).
+    browser_tunnels: Vec<crate::web::protocol::BrowserTunnel>,
     /// Where and as whom an upload's `PUT` goes: the link's own address,
     /// token and agent. `None` for a scripted client.
     http_access: Option<upload_http::HttpAccess>,
@@ -298,6 +301,7 @@ impl RemoteClient {
             clone_events: Vec::new(),
             upload_plan: None,
             download_plan: None,
+            browser_tunnels: Vec::new(),
             http_access: Some(http_access),
             resync: None,
         }
@@ -327,6 +331,7 @@ impl RemoteClient {
             clone_events: Vec::new(),
             upload_plan: None,
             download_plan: None,
+            browser_tunnels: Vec::new(),
             http_access: None,
             resync: None,
         };
@@ -429,6 +434,10 @@ impl RemoteClient {
             }
             LinkEvent::DownloadPlan(plan) => {
                 self.download_plan = Some(plan);
+                true
+            }
+            LinkEvent::BrowserTunnel(tunnel) => {
+                self.browser_tunnels.push(tunnel);
                 true
             }
         }
@@ -675,6 +684,42 @@ impl RemoteClient {
         }
         let args = serde_json::json!({ "dir": dir, "names": names });
         self.worker_command(worker_command::BEGIN_DOWNLOAD, Some(args))
+    }
+
+    /// Whether the host grants browser tunnels (v11,
+    /// `specs/SESSION_BROWSER_PRD.md`): a worker attached at
+    /// [`crate::web::protocol::BROWSER_TUNNEL_MIN_VERSION`] or later.
+    pub fn supports_browser_tunnel(&self) -> bool {
+        self.is_worker()
+            && self.workspace().protocol_version >= crate::web::protocol::BROWSER_TUNNEL_MIN_VERSION
+    }
+
+    /// Ask the worker for a browser tunnel key; its answer arrives as
+    /// [`RemoteClient::take_browser_tunnel`] for the returned seq. `None` —
+    /// nothing sent — unless [`RemoteClient::supports_browser_tunnel`] and
+    /// the link is up.
+    pub fn open_browser_tunnel(&self) -> Option<u64> {
+        if !self.supports_browser_tunnel() {
+            return None;
+        }
+        self.worker_command(worker_command::OPEN_BROWSER_TUNNEL, None)
+    }
+
+    /// End browser tunnel `key` and every tunnel open on it.
+    pub fn close_browser_tunnel(&self, key: &str) -> Option<u64> {
+        if !self.supports_browser_tunnel() {
+            return None;
+        }
+        self.worker_command(
+            worker_command::CLOSE_BROWSER_TUNNEL,
+            Some(serde_json::json!({ "key": key })),
+        )
+    }
+
+    /// The worker's answer to the `open_browser_tunnel` sent as `seq`, once.
+    pub fn take_browser_tunnel(&mut self, seq: u64) -> Option<crate::web::protocol::BrowserTunnel> {
+        let at = self.browser_tunnels.iter().position(|t| t.seq == seq)?;
+        Some(self.browser_tunnels.remove(at))
     }
 
     /// The download plan the last `begin_download` produced, once.

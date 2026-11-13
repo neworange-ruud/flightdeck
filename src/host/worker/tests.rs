@@ -157,6 +157,7 @@ fn worker_op(seq: u64, name: &str) -> WebInbound {
         "files": [{ "name": "a.txt", "size": 1 }],
         "names": ["a.txt"],
         "terminal_id": WORKER_SHELL_TERMINAL_ID,
+        "key": "no-such-key",
     });
     let op = WorkerOp::parse(name, Some(&args))
         .expect("a worker command")
@@ -808,6 +809,31 @@ fn a_window_opens_closes_and_restarts_worker_shells() {
         shell_ids(&host),
         ["worker:shell", "worker:shell:3", "worker:shell:4"]
     );
+}
+
+#[test]
+fn a_browser_tunnel_asked_of_a_worker_not_listening_is_refused_in_its_own_frame() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(worker_op(7, worker_command::OPEN_BROWSER_TUNNEL));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Rejected);
+    let answer = out
+        .iter()
+        .find_map(|f| match f {
+            WebOutbound::Viewer {
+                msg: ServerMsg::BrowserTunnel(answer),
+                viewer_id,
+            } if *viewer_id == viewer() => Some(answer),
+            _ => None,
+        })
+        .expect("the tunnel's own frame");
+    assert_eq!(answer.seq, 7);
+    assert_eq!(answer.key, None);
+    assert!(answer
+        .refusal
+        .as_deref()
+        .unwrap_or("")
+        .contains("not listening"));
 }
 
 #[test]

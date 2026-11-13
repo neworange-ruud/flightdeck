@@ -168,6 +168,8 @@ pub enum LinkEvent {
     UploadPlan(UploadPlan),
     /// A worker's answer to `begin_download` (v9).
     DownloadPlan(DownloadPlan),
+    /// A worker's answer to `open_browser_tunnel` (v11).
+    BrowserTunnel(crate::web::protocol::BrowserTunnel),
 }
 
 /// What the client asks the link task to send.
@@ -787,6 +789,9 @@ async fn session(
                     ServerMsg::UploadPlan(plan) => events.send(LinkEvent::UploadPlan(plan)),
                     ServerMsg::DownloadPlan(plan) => {
                         events.send(LinkEvent::DownloadPlan(plan))
+                    }
+                    ServerMsg::BrowserTunnel(tunnel) => {
+                        events.send(LinkEvent::BrowserTunnel(tunnel))
                     }
                     ServerMsg::TakenOver { by } => {
                         return SessionEnd::Ended(LinkEnd::TakenOver { by });

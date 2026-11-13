@@ -963,6 +963,20 @@ impl WebServerHandle {
             .grant(token, home, files, now)
     }
 
+    /// Grant the window `viewer`, which authenticated with `token`, a browser
+    /// tunnel key (v11): what a worker does when it accepts a
+    /// [`crate::web::protocol::worker_command::OPEN_BROWSER_TUNNEL`]. `None`
+    /// when the window already holds as many as it may.
+    pub fn grant_tunnel(&self, token: &TokenId, viewer: &ViewerId) -> Option<String> {
+        self.shared.tunnels.unwrap_or_recover().grant(token, viewer)
+    }
+
+    /// End tunnel `key` for `token`, closing every tunnel open on it;
+    /// whether it was theirs.
+    pub fn end_tunnel(&self, key: &str, token: &TokenId) -> bool {
+        self.shared.tunnels.unwrap_or_recover().end(key, token)
+    }
+
     /// Drop the upload grants nobody redeemed in time, telling the host about
     /// each ([`WebInbound::UploadFinished`]). Cheap; a worker calls it every
     /// tick so a batch whose last files were never sent still ends.
@@ -1060,6 +1074,8 @@ impl WebServerHandle {
     /// Callable from any thread, including from inside an async context: it
     /// waits on a plain channel rather than `block_on`.
     pub fn stop(mut self, notice: ShutdownNotice) {
+        // Every browser tunnel ends with the server.
+        self.shared.tunnels.unwrap_or_recover().end_all();
         self.signal(Some(notice));
         if let Some(done) = self.done.take() {
             // `Err` means the task already finished, or the grace elapsed;
@@ -1228,6 +1244,7 @@ pub fn start_with(
         https_host: Mutex::new(None),
         uploads: Mutex::new(UploadGrants::default()),
         downloads: Mutex::new(DownloadGrants::default()),
+        tunnels: Mutex::new(crate::web::tunnel::TunnelGrants::default()),
     });
 
     // Rendezvous: the task reports the bind result, then serves. Blocking the
@@ -1720,6 +1737,10 @@ fn router(shared: Arc<Shared>) -> Router {
                 download_route::DOWNLOAD_ROUTE,
                 axum::routing::any(download_route::download_route),
             )
+            .route(
+                crate::web::tunnel::TUNNEL_PATH,
+                axum::routing::any(tunnel_route::tunnel_route),
+            )
     } else {
         routes
     };
@@ -1790,6 +1811,9 @@ struct Shared {
     /// [`WebServerHandle::grant_downloads`]). Always empty on a TUI or
     /// Desktop.
     downloads: Mutex<DownloadGrants>,
+    /// Browser tunnel keys the worker granted (v11,
+    /// [`WebServerHandle::grant_tunnel`]). Always empty on a TUI or Desktop.
+    tunnels: Mutex<crate::web::tunnel::TunnelGrants>,
 }
 
 impl Shared {
@@ -2610,6 +2634,7 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
             | ServerMsg::CloneResult(_)
             | ServerMsg::UploadPlan(_)
             | ServerMsg::DownloadPlan(_)
+            | ServerMsg::BrowserTunnel(_)
             | ServerMsg::Delta(Delta::HostMessage(_))
     )
 }
@@ -2622,6 +2647,7 @@ fn min_version_for(msg: &ServerMsg) -> u16 {
     match msg {
         ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
         ServerMsg::DownloadPlan(_) => DOWNLOAD_MIN_VERSION,
+        ServerMsg::BrowserTunnel(_) => crate::web::protocol::BROWSER_TUNNEL_MIN_VERSION,
         // A pre-v10 peer reads any shell delta as "the" shell: it only hears
         // about the first (W35).
         ServerMsg::Delta(Delta::WorkerShell(shell))
@@ -2864,7 +2890,9 @@ async fn asset_route(
     // Nor is a download a page: `GET /download/…` on a host that gives no
     // files (a TUI, a Desktop) is not found, never the SPA with a 200 that a
     // client would save as the file.
-    if is_protocol_path(uri.path(), DOWNLOAD_PATH) {
+    if is_protocol_path(uri.path(), DOWNLOAD_PATH)
+        || is_protocol_path(uri.path(), crate::web::tunnel::TUNNEL_PATH)
+    {
         return not_found();
     }
     // Deliberately unauthenticated. The SPA's own shell has to load before it
@@ -2903,6 +2931,7 @@ fn https_redirect(
         || is_protocol_path(path, "/auth")
         || is_protocol_path(path, UPLOAD_PATH)
         || is_protocol_path(path, DOWNLOAD_PATH)
+        || is_protocol_path(path, crate::web::tunnel::TUNNEL_PATH)
     {
         return None;
     }
@@ -3516,6 +3545,9 @@ async fn serve_viewer(shared: Arc<Shared>, socket: WebSocket, identity: ViewerId
         let mut registry = shared.registry();
         registry.remove(&viewer_id);
     }
+    // Its browser tunnels end with it: a detach, or a takeover (W17), which
+    // closes the window that was taken over.
+    shared.tunnels.unwrap_or_recover().end_viewer(&viewer_id);
     // A closed socket must not hold the terminal for the rest of the idle
     // window: nobody is coming back to finish that burst.
     shared
@@ -4324,6 +4356,10 @@ mod upload_route;
 // `GET /download/{ticket}` (v9): the same, for reading a file.
 #[cfg(unix)]
 mod download_route;
+// `GET /tunnel` (v11): a TCP connection from the worker, for the session
+// browser.
+#[cfg(unix)]
+mod tunnel_route;
 
 #[cfg(test)]
 mod tests;

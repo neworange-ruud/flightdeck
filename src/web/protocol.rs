@@ -260,7 +260,7 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
@@ -270,7 +270,7 @@ pub const PROTOCOL_VERSION: u16 = 10;
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 10;
+pub const MAX_SUPPORTED_VERSION: u16 = 11;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
@@ -289,6 +289,12 @@ pub const DOWNLOAD_MIN_VERSION: u16 = 9;
 /// [`Delta::WorkerShell`] as "the" shell, so it is only ever sent the first
 /// one's ([`WORKER_SHELL_TERMINAL_ID`]).
 pub const WORKER_SHELLS_MIN_VERSION: u16 = 10;
+
+/// The oldest peer a worker grants browser tunnels to
+/// (`specs/SESSION_BROWSER_PRD.md`, v11): it may send
+/// [`worker_command::OPEN_BROWSER_TUNNEL`] and is sent a
+/// [`ServerMsg::BrowserTunnel`].
+pub const BROWSER_TUNNEL_MIN_VERSION: u16 = 11;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -2204,6 +2210,22 @@ pub struct DownloadPlanFile {
     pub ticket: Option<String>,
 }
 
+/// A worker's answer to [`worker_command::OPEN_BROWSER_TUNNEL`] (v11): a key
+/// for `GET /tunnel`, or why there is none (`specs/SESSION_BROWSER_PRD.md`
+/// B4, B14). The key is reusable until it is closed, the window's connection
+/// ends, or the worker stops; see [`crate::web::tunnel`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTunnel {
+    /// The `seq` of the [`Command`] this answers.
+    pub seq: u64,
+    /// The key, when granted.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Why no key was granted, in words for a person.
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
 /// One file of an [`UploadPlan`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadPlanFile {
@@ -3019,6 +3041,10 @@ pub enum ServerMsg {
     /// [`worker_command::BEGIN_DOWNLOAD`] (v9): tickets, or a refusal. Never
     /// sent to a peer below [`DOWNLOAD_MIN_VERSION`].
     DownloadPlan(DownloadPlan),
+    /// The worker's answer to this window's
+    /// [`worker_command::OPEN_BROWSER_TUNNEL`] (v11): a key, or a refusal.
+    /// Never sent to a peer below [`BROWSER_TUNNEL_MIN_VERSION`].
+    BrowserTunnel(BrowserTunnel),
     /// Another window attached to this worker and took it over (v7, PRD W17).
     /// The socket closes right after this frame. The credential stays valid:
     /// the recipient may reconnect, and then takes it back.
@@ -3321,6 +3347,12 @@ pub mod worker_command {
     /// Close a worker shell, ending its process (W35, v10). Args
     /// `{terminal_id: string}`.
     pub const CLOSE_WORKER_SHELL: &str = "close_worker_shell";
+    /// Ask for a browser tunnel key (v11). No args. Answered with
+    /// [`super::ServerMsg::BrowserTunnel`].
+    pub const OPEN_BROWSER_TUNNEL: &str = "open_browser_tunnel";
+    /// End a browser tunnel key and every tunnel open on it (v11). Args
+    /// `{key: string}`.
+    pub const CLOSE_BROWSER_TUNNEL: &str = "close_browser_tunnel";
     /// Ask to upload files into one folder under `$HOME` (v8). Args `{dir:
     /// string, files: [{name: string, size: number}], on_conflict?: "ask" |
     /// "replace" | "keep_both"}` (`ask` when absent). Answered with
@@ -3339,6 +3371,8 @@ pub mod worker_command {
         RESTART_WORKER_SHELL,
         OPEN_WORKER_SHELL,
         CLOSE_WORKER_SHELL,
+        OPEN_BROWSER_TUNNEL,
+        CLOSE_BROWSER_TUNNEL,
         BEGIN_UPLOAD,
         BEGIN_DOWNLOAD,
     ];
@@ -3381,6 +3415,13 @@ pub enum WorkerOp {
     CloseWorkerShell {
         /// The shell to close.
         terminal_id: TerminalId,
+    },
+    /// [`worker_command::OPEN_BROWSER_TUNNEL`] (v11).
+    OpenBrowserTunnel,
+    /// [`worker_command::CLOSE_BROWSER_TUNNEL`] (v11).
+    CloseBrowserTunnel {
+        /// The key to end.
+        key: String,
     },
     /// [`worker_command::BEGIN_UPLOAD`] (v8).
     BeginUpload {
@@ -3445,6 +3486,13 @@ impl WorkerOp {
                 })
             }
             worker_command::OPEN_WORKER_SHELL => Ok(WorkerOp::OpenWorkerShell),
+            worker_command::OPEN_BROWSER_TUNNEL => Ok(WorkerOp::OpenBrowserTunnel),
+            worker_command::CLOSE_BROWSER_TUNNEL => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::CloseBrowserTunnel {
+                    key: args.required_str("key")?,
+                })
+            }
             worker_command::CLOSE_WORKER_SHELL => {
                 let args = WorkerArgs::new(name, args)?;
                 Ok(WorkerOp::CloseWorkerShell {
