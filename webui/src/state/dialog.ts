@@ -79,6 +79,10 @@ export interface DialogKey {
    * in the push confirmation, `Esc` in the forms — and reading the labels to
    * find out would be the browser authoring a fact the host never sent. */
   readonly cancels: boolean;
+  /** Whether this button waits for a non-blank text field
+   * (`protocol::DialogKey::needs_input`): the New Agent form's Create, which
+   * needs a task name. Optional so a hand-built key reads as "does not wait". */
+  readonly needsInput?: boolean;
 }
 
 /**
@@ -210,6 +214,12 @@ export function runsOnBase(dialog: DialogState): boolean {
  * action in every dialog the host builds. `null` when there is none. */
 export function primaryKey(dialog: DialogState): DialogKey | null {
   return dialog.buttons[0] ?? null;
+}
+
+/** Whether `button` is disabled for the draft: it waits for text and the
+ * field is blank (Create before the New Agent form has a task name). */
+export function waitsForInput(dialog: DialogState, button: DialogKey): boolean {
+  return button.needsInput === true && dialog.draft.text.trim() === "";
 }
 
 /** Whether the dialog offers a `Tab` option at all (only 1e's form does). */

@@ -22,7 +22,7 @@ use crate::worker::control::{self, ControlRequest};
 use crate::worker::paths::WorkerPaths;
 use crate::worker::service::{self, RealServiceOs, ServiceStart};
 use crate::worker::state::{self, SupervisorPhase};
-use crate::worker::{daemon, lock, log, status_cli, supervisor};
+use crate::worker::{agents_cli, daemon, lock, log, status_cli, supervisor};
 
 /// Printed (to stderr, exit 2) by every worker command off Linux and macOS.
 pub const NOT_SUPPORTED: &str =
@@ -48,6 +48,11 @@ COMMANDS:
                          under [worker]); waits until the phone has paired
     devices [--json]     List paired devices (and, as text, paired phones)
     revoke <device>      Revoke a device's access, or unpair a phone
+    agents [--json]      List the agent backends a Desktop can start here
+    agents disable <name>
+                         Stop offering an agent this machine has not set up
+                         (e.g. codex, cursor); everything is enabled by default
+    agents enable <name> Offer it again
     logs [-f] [-n N]     Print (or follow) the worker log
     enable [--dry-run]   Start the worker on boot (macOS: at login) with launchd
                          or systemd, and start it now; run again to refresh
@@ -91,6 +96,7 @@ enum Command {
     Revoke {
         device: String,
     },
+    Agents(agents_cli::AgentsCommand),
     Logs {
         follow: bool,
         lines: usize,
@@ -163,6 +169,9 @@ fn parse(args: &[String]) -> Result<Command, ParseError> {
                     .to_string(),
             )),
         },
+        "agents" => agents_cli::parse(rest)
+            .map(Command::Agents)
+            .map_err(ParseError::Usage),
         "logs" => parse_logs(rest),
         "enable" => dry_run_only(command, rest).map(|dry_run| Command::Enable { dry_run }),
         "disable" => dry_run_only(command, rest).map(|dry_run| Command::Disable { dry_run }),
@@ -287,6 +296,7 @@ fn dispatch(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Command::Run => crate::worker::run::run(&paths),
         Command::Enable { dry_run } => enable(&paths, dry_run, out, err),
         Command::Disable { dry_run } => disable(&paths, dry_run, out, err),
+        Command::Agents(agents) => agents_cli::run(&agents, &paths),
         Command::Supervise => match supervisor::supervise(&paths) {
             Ok(code) => code,
             Err(e) => {

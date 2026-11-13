@@ -655,6 +655,7 @@ pub fn dialog_overlay(view: &wire::DialogView, draft: &DialogDraft) -> HostDialo
                 label: key.label.clone(),
                 role,
                 default: key.key == "Enter",
+                disabled: waits_for_input(key, draft),
             }
         })
         .collect();
@@ -681,9 +682,13 @@ pub fn dialog_overlay(view: &wire::DialogView, draft: &DialogDraft) -> HostDialo
         list_filter: body.list_filter,
         buttons,
         origin: view.origin.clone(),
+        // A dialog a remote seat opened is nearly always this window's own
+        // (a worker has no keyboard, so every one of its dialogs is), and
+        // naming this machine's address back to it is noise. One opened at
+        // the host's keyboard is worth saying: nobody here asked for it.
         origin_label: match &view.origin {
             wire::DialogOrigin::Desktop => Some("opened on the host".to_string()),
-            wire::DialogOrigin::Browser { label, .. } => Some(format!("opened from {label}")),
+            wire::DialogOrigin::Browser { .. } => None,
         },
     }
 }
@@ -749,15 +754,22 @@ pub fn dialog_input(
         OverlayInput::Submit => body
             .buttons
             .iter()
-            .any(|b| b.key == "Enter")
+            .any(|b| b.key == "Enter" && !waits_for_input(b, draft))
             .then(|| confirm(view, draft, &body, "Enter")),
         OverlayInput::Choose(id) => match body.buttons.iter().find(|b| &b.key == id) {
             Some(button) if button.cancels => Some(cancel()),
+            Some(button) if waits_for_input(button, draft) => None,
             Some(_) => Some(confirm(view, draft, &body, id)),
             None => None,
         },
         _ => None,
     }
+}
+
+/// Whether `button` is disabled for this draft: it needs text and the field
+/// is blank (the New Agent form's Create before a task name is typed).
+fn waits_for_input(button: &wire::DialogKey, draft: &DialogDraft) -> bool {
+    button.needs_input && draft.text.as_deref().is_none_or(|t| t.trim().is_empty())
 }
 
 fn confirm(

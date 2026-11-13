@@ -7,6 +7,7 @@ import {
   gatedKey,
   hasToggle,
   primaryKey,
+  waitsForInput,
 } from "../state/dialog";
 import { highlightedCommand } from "../state/commands";
 import type { PaletteCommand } from "../state/commands";
@@ -1135,6 +1136,9 @@ export function createApp(options: AppOptions): App {
       event.preventDefault();
       const primary = primaryKey(dialog);
       const key = primary === null ? "Enter" : primary.key;
+      if (primary !== null && waitsForInput(dialog, primary)) {
+        return true;
+      }
       if (gatedKey(dialog, key)) {
         store.dispatch({ type: "dialog/advance" });
         return true;

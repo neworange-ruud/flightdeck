@@ -13,6 +13,7 @@ import {
   selectedChoice,
   toggleButton,
   visibleChoices,
+  waitsForInput,
 } from "../state/dialog";
 import type { DialogKey } from "../state/dialog";
 import type { AppState, DialogState } from "../state/types";
@@ -323,8 +324,11 @@ export function createDialog(
        * and the cancel beside it, and they must not look alike. */
       const gated = gatedKey(dialog, button.key);
       actionsEl.append(
-        action(gated ? "danger" : "primary", button, dialog.confirmable, () =>
-          gated ? onAdvance?.() : options.onConfirm?.(button.key),
+        action(
+          gated ? "danger" : "primary",
+          button,
+          dialog.confirmable && !waitsForInput(dialog, button),
+          () => (gated ? onAdvance?.() : options.onConfirm?.(button.key)),
         ),
       );
     }

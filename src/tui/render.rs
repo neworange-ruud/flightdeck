@@ -145,6 +145,9 @@ pub struct DialogButton {
     pub accel: DialogAccel,
     /// Set by [`DialogButton::cancelling`]: this button dismisses the dialog.
     cancel: bool,
+    /// Set by [`DialogButton::needing_input`]: this button does nothing while
+    /// the dialog's text field is blank, so it is drawn disabled then.
+    needs_input: bool,
 }
 
 impl DialogButton {
@@ -154,7 +157,28 @@ impl DialogButton {
             accel,
             label: label.into(),
             cancel: false,
+            needs_input: false,
         }
+    }
+
+    /// This button, disabled while the dialog's text field is blank (the New
+    /// Agent form's Create, which needs a task name). One rule every surface
+    /// reads: the TUI dims it, the desktop and a browser disable it.
+    pub fn needing_input(self) -> DialogButton {
+        DialogButton {
+            needs_input: true,
+            ..self
+        }
+    }
+
+    /// Whether this button waits for a non-blank text field.
+    pub fn needs_input(&self) -> bool {
+        self.needs_input
+    }
+
+    /// Whether this button is disabled for `input`, the dialog's text field.
+    pub fn disabled_for(&self, input: Option<&str>) -> bool {
+        self.needs_input && input.is_none_or(|text| text.trim().is_empty())
     }
 
     /// A button that dismisses the dialog (`Cancel`, `No`): whatever its label.
@@ -4032,13 +4056,20 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
         if rect.width == 0 {
             continue;
         }
-        let base = Style::default().bg(Color::DarkGray).fg(Color::White);
+        let disabled = button.disabled_for(dialog.input.as_deref());
+        let base = if disabled {
+            Style::default().bg(Color::Black).fg(Color::DarkGray)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        };
+        let accel = if disabled {
+            base
+        } else {
+            base.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        };
         let line = Line::from(vec![
             Span::styled(" [", base),
-            Span::styled(
-                button.accel.key_label(),
-                base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(button.accel.key_label(), accel),
             Span::styled(format!("] {} ", button.label), base),
         ]);
         frame.render_widget(Paragraph::new(line).style(base), rect);

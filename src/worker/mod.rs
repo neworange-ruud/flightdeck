@@ -17,6 +17,7 @@
 //! Start on boot (`worker enable` / `disable`) hands the same supervisor to
 //! launchd or systemd, which only ever start it: see [`service`].
 
+pub mod agents_cli;
 pub mod cli;
 pub mod control;
 pub mod daemon;

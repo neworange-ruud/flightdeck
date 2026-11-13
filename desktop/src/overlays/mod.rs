@@ -781,9 +781,17 @@ pub fn dialog_button_with(
         .text_color(ink)
         .text_size(px(12.5))
         .font_weight(FontWeight::MEDIUM)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover))
-        .on_click(on_click)
+        .map(|d| {
+            // Disabled: drawn faded and not pressable (Create before the New
+            // Agent form has a task name).
+            if b.disabled {
+                d.opacity(0.4)
+            } else {
+                d.cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(on_click)
+            }
+        })
         .child(b.label.clone())
         .children(keycap.map(|k| {
             div()
@@ -895,6 +903,7 @@ fn message(text: &str, cx: &OverlayCx) -> AnyElement {
         label: "OK".to_string(),
         role: ButtonRole::Primary,
         default: true,
+        disabled: false,
     };
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
     dialog_card(p, 440.)
@@ -930,6 +939,7 @@ pub fn placeholder(title: &str, lines: Vec<String>, cx: &OverlayCx) -> AnyElemen
         label: "Close".to_string(),
         role: ButtonRole::Cancel,
         default: false,
+        disabled: false,
     };
     dialog_card(p, 560.)
         .child(

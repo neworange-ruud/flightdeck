@@ -515,6 +515,7 @@ impl<'a> AppHost<'a> {
             host.remote_wiring = None;
         }
         host.ui.capture_messages = true;
+        host.ui.worker_agents_only = true;
         for p in host.workspace.projects.iter_mut() {
             p.state.set_pty_size(size);
         }
@@ -871,6 +872,19 @@ impl<'a> AppHost<'a> {
         if let Some(w) = self.worker.as_mut() {
             w.emit(handle, WebOutbound::Windows(ServerMsg::CloneResult(frame)));
             w.post(handle, level, text, at_ms);
+        }
+    }
+
+    /// Apply a new `[worker] disabled_agents` (`worker agents enable|disable`
+    /// rewrote it in the global config) to every open project and to the
+    /// config a project opened later starts from, so the next New Agent form
+    /// offers only the backends left enabled. Running sessions are untouched.
+    pub fn set_disabled_agents(&mut self, agents: &[String]) {
+        for p in self.workspace.projects.iter_mut() {
+            p.state.config.worker.disabled_agents = agents.to_vec();
+        }
+        if let Some(config) = self.web_surface.flavor.fallback_config.as_mut() {
+            config.worker.disabled_agents = agents.to_vec();
         }
     }
 

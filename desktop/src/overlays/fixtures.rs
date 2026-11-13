@@ -22,6 +22,7 @@ fn b(id: &str, label: &str, role: ButtonRole, default: bool) -> DialogButton {
         label: label.to_string(),
         role,
         default,
+        disabled: false,
     }
 }
 

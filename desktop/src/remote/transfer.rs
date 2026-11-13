@@ -394,6 +394,7 @@ pub(super) fn panel_button(
         label: label.to_string(),
         role,
         default,
+        disabled: false,
     };
     dialog_button_with(p, &button, keycap.map(str::to_string), on_click)
 }

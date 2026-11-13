@@ -8,11 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Choose which agent backends a worker offers.** You can now stop a worker offering agents its machine hasn't set up (Codex, Cursor, …). Run `flightdeck worker agents` to list them, `flightdeck worker agents disable codex` to stop offering one, and `flightdeck worker agents enable codex` to offer it again. The choice is saved as `[worker] disabled_agents` in your global `config.toml` (everything is enabled by default) and a running worker applies it immediately. The New Agent form and the **+ agent** picker in a Desktop, a browser or `flightdeck connect` then only list the enabled agents. Sessions already running keep running.
 
 ### Improvements
 
-- None yet.
+- **Create waits for a task name.** In the New Agent Session Tab form, **Create** stays disabled until you've typed a task name for the new branch, in the TUI, FlightDeck Desktop and a browser. Existing-branch and base-branch targets are unchanged.
+- **No more "opened from …" line in a remote window.** A dialog you open in a window connected to a worker (or to another FlightDeck) no longer shows your own address and app version under its title. A dialog someone opened at the host's keyboard still says "opened on the host".
 
 ### Bug fixes
 

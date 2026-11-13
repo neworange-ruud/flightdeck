@@ -254,6 +254,9 @@ export interface WireDialogKey {
    * confirmation, `Esc` in the forms — so the host says which one it is rather
    * than leaving the browser to read the labels. */
   readonly cancels?: boolean;
+  /** Whether this button does nothing while the dialog's text field is blank
+   * (`protocol::DialogKey::needs_input`): the New Agent form's Create. */
+  readonly needs_input?: boolean;
 }
 
 /**

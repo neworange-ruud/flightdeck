@@ -234,11 +234,13 @@ fn the_hosts_dialog_is_drawn_here_and_answered_by_its_key() {
                 key: "y".to_string(),
                 label: "Close".to_string(),
                 cancels: false,
+                needs_input: false,
             },
             DialogKey {
                 key: "n".to_string(),
                 label: "Cancel".to_string(),
                 cancels: true,
+                needs_input: false,
             },
         ],
         confirmable: true,

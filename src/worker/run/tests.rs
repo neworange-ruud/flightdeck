@@ -109,6 +109,7 @@ struct FakeTarget {
     phone_pairs: u32,
     revoked: Vec<String>,
     shutdown_intent: Option<bool>,
+    disabled_agents: Option<Vec<String>>,
 }
 
 fn device(id: &str, label: &str) -> DeviceReport {
@@ -189,6 +190,9 @@ impl ControlTarget for FakeTarget {
             "pair" => Some(Err("'pair' matches several phones".to_string())),
             _ => None,
         }
+    }
+    fn set_disabled_agents(&mut self, agents: &[String]) {
+        self.disabled_agents = Some(agents.to_vec());
     }
 }
 
@@ -368,4 +372,29 @@ fn prepare_shutdown_records_the_intent() {
     );
     assert_eq!(response, ControlResponse::Ok);
     assert_eq!(t.shutdown_intent, Some(true));
+}
+
+#[test]
+fn set_disabled_agents_applies_and_logs_the_list() {
+    let mut t = FakeTarget::default();
+    let agents = vec!["codex".to_string(), "cursor".to_string()];
+    let (response, line) = answer(
+        &mut t,
+        &ControlRequest::SetDisabledAgents {
+            agents: agents.clone(),
+        },
+    );
+    assert_eq!(response, ControlResponse::Ok);
+    assert_eq!(t.disabled_agents, Some(agents));
+    assert_eq!(
+        line.as_deref(),
+        Some("disabled agent backends: codex, cursor")
+    );
+
+    let (_, line) = answer(
+        &mut t,
+        &ControlRequest::SetDisabledAgents { agents: Vec::new() },
+    );
+    assert_eq!(t.disabled_agents, Some(Vec::new()));
+    assert_eq!(line.as_deref(), Some("every agent backend is enabled"));
 }

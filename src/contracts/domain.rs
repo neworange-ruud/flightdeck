@@ -709,6 +709,14 @@ pub struct WorkerConfig {
     /// this is off, the browser app is served over plain HTTP. Needs `web`.
     #[serde(default = "default_true")]
     pub https: bool,
+    /// Agent backends (keys of `[agents]`) this machine has not set up, e.g.
+    /// `["codex", "cursor"]`. A worker leaves them out of the New Agent form
+    /// and the "+ agent" picker, so a Desktop only offers what can start here.
+    /// Empty by default: every configured agent is offered. Sessions already
+    /// running one keep running. Managed with `flightdeck worker agents
+    /// enable|disable <name>`.
+    #[serde(default)]
+    pub disabled_agents: Vec<String>,
 }
 
 impl Default for WorkerConfig {
@@ -721,11 +729,18 @@ impl Default for WorkerConfig {
             phone: false,
             web: true,
             https: true,
+            disabled_agents: Vec::new(),
         }
     }
 }
 
 impl WorkerConfig {
+    /// Whether the agent `key` is offered for new sessions on a worker:
+    /// everything not in [`WorkerConfig::disabled_agents`].
+    pub fn agent_enabled(&self, key: &str) -> bool {
+        !self.disabled_agents.iter().any(|k| k == key)
+    }
+
     /// [`WorkerConfig::projects_root`] as a path: `~` is `home`, `~/x` and a
     /// relative `x` are `home/x`, an absolute path is taken as written. Not
     /// canonicalised: the root may not exist yet (a clone creates it).

@@ -45,6 +45,10 @@ pub enum ControlRequest {
     /// Sent by `worker restart` before stopping, so connections close with
     /// "restarting" rather than "stopped".
     PrepareShutdown { restarting: bool },
+    /// Sent by `worker agents enable|disable` after it rewrote `[worker]
+    /// disabled_agents` in the global config: the full new list, applied at
+    /// once so the next New Agent form offers only what is left enabled.
+    SetDisabledAgents { agents: Vec<String> },
 }
 
 /// The worker's answer.
@@ -73,7 +77,7 @@ pub enum ControlResponse {
         phone: PhoneReport,
     },
     PhonePairing(PhonePairingReport),
-    /// Done, nothing to report (`PrepareShutdown`).
+    /// Done, nothing to report (`PrepareShutdown`, `SetDisabledAgents`).
     Ok,
     /// The request was refused or failed; `message` is for a person.
     Error {
