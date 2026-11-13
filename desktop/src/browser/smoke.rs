@@ -70,6 +70,28 @@ pub fn run() -> i32 {
                 cx.quit();
                 return;
             };
+            // A local session's browser, for the certificate step: this
+            // computer's own network, as a dev server on it is reached.
+            let mut direct = None;
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let browser = cx.new(|cx| {
+                        BrowserView::new_direct(super::profile_id("smoke", "direct"), window, cx)
+                    });
+                    browser.update(cx, |b, _| b.set_shown(true));
+                    direct = Some(browser.clone());
+                    cx.new(|cx| Root::new(browser, window, cx))
+                },
+            );
+            let Some(direct) = direct else {
+                eprintln!("could not open the second window");
+                cx.quit();
+                return;
+            };
             cx.spawn(async move |cx| {
                 let pause = Duration::from_millis(2500);
                 let steps = [
@@ -82,6 +104,23 @@ pub fn run() -> i32 {
                     cx.background_executor().timer(pause).await;
                     let title = view.read_with(cx, |b, _| b.title());
                     println!("{step:<44} title={title:?}");
+                }
+                // B21: a self-signed HTTPS server, its certificate page, and
+                // Continue anyway.
+                if let Some((server, port)) = self_signed_server() {
+                    let step = format!("https://localhost:{port}/");
+                    direct.update(cx, |b, cx| b.go(&step, cx));
+                    cx.background_executor().timer(pause).await;
+                    let failed = direct.read_with(cx, |b, _| b.certificate_failure());
+                    println!("{step:<44} certificate failure={failed:?}");
+                    direct.update(cx, |b, _| b.continue_anyway());
+                    cx.background_executor().timer(pause).await;
+                    let (url, still) =
+                        direct.read_with(cx, |b, _| (b.url(), b.certificate_failure()));
+                    println!("{:<44} url={url:?} failure={still:?}", "continue anyway");
+                    drop(server);
+                    super::trust::TrustStore::at(super::trust::default_path())
+                        .forget(&super::profile_id("smoke", "direct"));
                 }
                 cx.update(|cx| cx.quit());
             })
@@ -157,4 +196,54 @@ fn stand_in_worker(page: u16) -> u16 {
         }
     });
     port
+}
+
+/// `openssl s_server -www` on a free port with a fresh self-signed
+/// certificate for `localhost`, killed when the guard drops.
+fn self_signed_server() -> Option<(ServerGuard, u16)> {
+    let dir = std::env::temp_dir().join(format!("fd-spike-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    let made = std::process::Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        ])
+        .args(["-subj", "/CN=localhost"])
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if !made.success() {
+        return None;
+    }
+    let free = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = free.local_addr().ok()?.port();
+    drop(free);
+    let child = std::process::Command::new("openssl")
+        .args(["s_server", "-www", "-quiet", "-accept"])
+        .arg(port.to_string())
+        .arg("-cert")
+        .arg(&cert)
+        .arg("-key")
+        .arg(&key)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    thread::sleep(Duration::from_millis(500));
+    println!("self-signed https server on localhost:{port}");
+    Some((ServerGuard(child), port))
+}
+
+/// Kills the server it holds.
+struct ServerGuard(std::process::Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
 }

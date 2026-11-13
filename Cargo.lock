@@ -2483,6 +2483,7 @@ name = "flightdeck-desktop"
 version = "0.15.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "crossterm",
  "flightdeck",
  "gpui-component",

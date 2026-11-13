@@ -63,6 +63,8 @@ struct PageState {
     blocked: Option<(String, String)>,
     /// `window.open` asked for these; they open in this tab.
     opened: Vec<String>,
+    /// The certificate page's Continue anyway was chosen (B21).
+    continue_requested: bool,
     /// Something above changed.
     dirty: bool,
 }
@@ -89,6 +91,10 @@ pub struct BrowserView {
     shown: bool,
     /// Why the browser could not start, when it could not.
     failed: Option<String>,
+    /// The profile it browses in (B10), for what it trusts (B21).
+    profile: [u8; 16],
+    /// The certificate failure our page is showing, until Continue anyway.
+    pending_cert: Option<super::tls_macos::CertFailure>,
     _poll: Task<()>,
     _address_events: Subscription,
 }
@@ -159,6 +165,8 @@ impl BrowserView {
             placed: Rc::default(),
             shown: false,
             failed: None,
+            profile: [0; 16],
+            pending_cert: None,
             _poll,
             _address_events,
         }
@@ -166,6 +174,8 @@ impl BrowserView {
 
     fn build(&mut self, profile: [u8; 16], window: &mut Window) {
         use wry::WebViewBuilderExtDarwin;
+        self.profile = profile;
+        let ipc_page = self.page.clone();
         let relay = self.relay.clone();
         let nav_page = self.page.clone();
         let nav_relay = relay.clone();
@@ -205,9 +215,19 @@ impl BrowserView {
                 *path = download_path(&url, path);
                 true
             })
+            .with_ipc_handler(move |request| {
+                if request.body() == error_page::CONTINUE_MESSAGE {
+                    let mut page = ipc_page.borrow_mut();
+                    page.continue_requested = true;
+                    page.dirty = true;
+                }
+            })
             .build_as_child(window);
         match built {
             Ok(webview) => {
+                let trusted =
+                    super::trust::TrustStore::at(super::trust::default_path()).allowed(&profile);
+                super::tls_macos::register(&webview, trusted);
                 if let Some(relay) = &relay {
                     let (user, pass) = relay.credentials();
                     super::proxy_macos::install(&webview, relay.port(), user, pass);
@@ -267,6 +287,24 @@ impl BrowserView {
         }
     }
 
+    /// The `host:port` whose certificate the page on screen failed on, while
+    /// our page offers Continue anyway (B21).
+    pub fn certificate_failure(&self) -> Option<(String, u16)> {
+        self.pending_cert.as_ref().map(|f| (f.host.clone(), f.port))
+    }
+
+    /// Choose Continue anyway, as the page's button does.
+    pub fn continue_anyway(&mut self) {
+        let mut page = self.page.borrow_mut();
+        page.continue_requested = true;
+        page.dirty = true;
+    }
+
+    /// The address of the page last started, for `--spike-browser`.
+    pub fn url(&self) -> String {
+        self.page.borrow().url.clone()
+    }
+
     /// The page's title, for the sidebar row.
     pub fn title(&self) -> String {
         self.page.borrow().title.clone()
@@ -280,16 +318,18 @@ impl BrowserView {
 
     /// What the handlers and the relay reported since the last look.
     fn poll(&mut self, cx: &mut Context<Self>) {
-        let (dirty, blocked, opened, url) = {
+        let (dirty, blocked, opened, url, continue_requested) = {
             let mut page = self.page.borrow_mut();
             (
                 std::mem::take(&mut page.dirty),
                 page.blocked.take(),
                 std::mem::take(&mut page.opened),
                 page.url.clone(),
+                std::mem::take(&mut page.continue_requested),
             )
         };
         let mut changed = dirty;
+        self.poll_certificates(continue_requested);
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
         }
@@ -321,6 +361,42 @@ impl BrowserView {
         }
     }
 
+    /// B21: a page that failed on its certificate shows our page, with
+    /// **Continue anyway**; choosing it trusts that `host:port` in this
+    /// profile from now on, and loads the page again.
+    fn poll_certificates(&mut self, continue_requested: bool) {
+        let webview = self.webview.borrow();
+        let Some(webview) = webview.as_ref() else {
+            return;
+        };
+        if let Some(failure) = super::tls_macos::take_failure(webview) {
+            let detail = format!(
+                "{} The certificate {}:{} presented is not trusted. A development server \
+                 with a self-signed certificate looks like this; anywhere else it can mean \
+                 someone is in the way. Continue only if you expect this certificate.",
+                failure.message, failure.host, failure.port
+            );
+            let _ = webview.load_html(&error_page::page_with_action(
+                &format!("Can't verify {}:{}", failure.host, failure.port),
+                &detail,
+                self.via.as_deref(),
+                "Continue anyway",
+            ));
+            self.pending_cert = Some(failure);
+        }
+        if continue_requested {
+            if let Some(failure) = self.pending_cert.take() {
+                super::tls_macos::allow(webview, &failure.host, failure.port);
+                super::trust::TrustStore::at(super::trust::default_path()).allow(
+                    &self.profile,
+                    &failure.host,
+                    failure.port,
+                );
+                let _ = webview.load_url(&failure.url);
+            }
+        }
+    }
+
     fn back(&self) {
         self.script("history.back()");
     }
@@ -344,6 +420,14 @@ impl BrowserView {
     fn script(&self, js: &str) {
         if let Some(webview) = self.webview.borrow().as_ref() {
             let _ = webview.evaluate_script(js);
+        }
+    }
+}
+
+impl Drop for BrowserView {
+    fn drop(&mut self) {
+        if let Some(webview) = self.webview.borrow().as_ref() {
+            super::tls_macos::unregister(webview);
         }
     }
 }
@@ -469,6 +553,7 @@ impl Render for BrowserView {
 /// a web view still uses, and the views of the session that closed are
 /// dropped at the end of this frame.
 pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
+    super::trust::TrustStore::at(super::trust::default_path()).forget(&profile);
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(1)).await;
         cx.update(|_| {
