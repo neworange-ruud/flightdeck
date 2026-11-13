@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.36.0] - 2026-11-13
+
+### New features
+
 - **Choose which agent backends a worker offers.** You can now stop a worker offering agents its machine hasn't set up (Codex, Cursor, …). Run `flightdeck worker agents` to list them, `flightdeck worker agents disable codex` to stop offering one, and `flightdeck worker agents enable codex` to offer it again. The choice is saved as `[worker] disabled_agents` in your global `config.toml` (everything is enabled by default) and a running worker applies it immediately. The New Agent form and the **+ agent** picker in a Desktop, a browser or `flightdeck connect` then only list the enabled agents. Sessions already running keep running.
 
 ### Improvements
