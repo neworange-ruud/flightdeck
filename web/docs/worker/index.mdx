@@ -100,7 +100,7 @@ minutes; run `flightdeck worker pair` again if it runs out.
 **Or use a browser.** Open the **In a browser** link on any device in your
 tailnet (a laptop without the Desktop, a tablet). The code is in the link, so the
 page signs you in at once and remembers the browser. You get the same things as
-the Desktop's worker window: the Worker shell, your projects and agents, and
+the Desktop's worker window: the worker's shells, your projects and agents, and
 **Open Project**. Pair the Desktop, a browser, or both; each needs its own code.
 
 The link is `https://` when your tailnet has HTTPS certificates turned on (see
@@ -117,8 +117,10 @@ than its hostname.
 ## 3. Log in to your agents on the worker
 
 The agents run on the worker, so they need to be logged in **there**. The
-first tab in the worker's window is the **Worker shell**, a terminal on the
-worker. Use it like any terminal:
+first tab in the worker's window is **Worker**, which holds the worker's
+shells: terminals on the worker, starting with **Shell 1**. Open more with
+**+** (Ctrl-T in the Desktop) and close one with its **✕**. They keep running
+when you disconnect. Use them like any terminal:
 
 1. Run each agent CLI you want to use (`claude`, `codex`, `opencode`,
    `cursor-agent`) and finish its login.
@@ -251,7 +253,7 @@ one shows up in the other. `Ctrl-q` disconnects; the worker keeps running.
 | "The worker stopped." | Run `flightdeck worker start` on the worker, then **Reconnect**. |
 | **version differs** or **update needed** | Update the older side. On the worker: `flightdeck update`, then `flightdeck worker restart`. |
 | **Taken over by …** | Another window opened the worker. **Reconnect** takes it back. |
-| An agent says it isn't logged in | Log in again in the Worker shell (step 3). |
+| An agent says it isn't logged in | Log in again in a worker shell (step 3). |
 
 [Worker in Depth](/worker/operations) covers the security model, logs, crash
 recovery, updating, phone pairing and the `[worker]` settings.

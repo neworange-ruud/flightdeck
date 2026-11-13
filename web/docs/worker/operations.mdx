@@ -131,7 +131,7 @@ agents and open a shell.
 
 1. Add `phone = true` under `[worker]` in the worker's
    `~/.flightdeck/config.toml` and run `flightdeck worker restart`.
-2. In the Worker shell, run `flightdeck worker pair --phone`. It prints a QR
+2. In a worker shell, run `flightdeck worker pair --phone`. It prints a QR
    code and a 4-digit code and waits until the phone has paired.
 
 The phone lists the worker as `<host> (worker)`. `flightdeck worker devices` and
@@ -232,7 +232,7 @@ reconnect on their own. Run `tailscale up` on the worker if it stays that way.
 
 ### Update
 
-On the worker, in the Worker shell or over SSH:
+On the worker, in a worker shell or over SSH:
 
 ```bash
 flightdeck update
