@@ -12,6 +12,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.35.1] - 2026-11-13
+
+### New features
+
+- None yet.
+
+### Improvements
+
 - **New fonts in FlightDeck Web.** Terminals use DejaVu Sans Mono, the open font Apple's Menlo is built on, and the rest of the interface uses Inter, a close open match for SF Pro Text. Both are built into FlightDeck, so every browser shows the same fonts, with or without internet access. (Menlo and SF Pro themselves can't be shipped: Apple's licences don't allow it.)
 
 ### Bug fixes
