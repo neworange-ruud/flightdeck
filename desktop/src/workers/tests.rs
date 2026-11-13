@@ -218,6 +218,7 @@ fn worker_snapshot(version: &str) -> Snapshot {
         worker: Some(WorkerSnapshot {
             home: "/home/u".to_string(),
             shell: None,
+            shells: Vec::new(),
             health: Some(health(version)),
             status: WorkerStatusView {
                 listening: vec!["100.64.0.2:7420".to_string()],

@@ -801,9 +801,11 @@ impl RemoteWindow {
 }
 
 impl RemoteWindow {
-    /// The worker's shell, full width; with Restart shell once it exited.
+    /// The Worker tab: its row of shells (W35) over the shell on screen,
+    /// full width; with Restart shell once that one exited.
     fn worker_shell_area(&self, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
         let model = self.remote.read(cx);
+        let row = worker_shell_row(model, p, &self.remote);
         let restart = || {
             let remote = self.remote.clone();
             div()
@@ -826,20 +828,36 @@ impl RemoteWindow {
                 })
         };
         let Some(shell) = model.worker_shell() else {
+            // Every shell closed (W35): open one. A worker older than v10
+            // has its one shell, which only ever stopped.
+            let body = if model.opens_worker_shells() {
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(notice_card(p, "No shells are open on this worker.", ""))
+                    .child(open_shell_button(p, &self.remote))
+            } else {
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(notice_card(p, "The worker shell is not running.", ""))
+                    .child(restart())
+            };
             return v_flex()
                 .flex_1()
                 .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(notice_card(p, "The worker shell is not running.", ""))
-                .child(restart())
+                .child(row)
+                .child(body)
                 .into_any_element();
         };
         let exited = (!shell.alive).then(|| {
             let why = match shell.exit_code {
-                Some(code) => format!("The worker shell exited ({code})."),
-                None => "The worker shell exited.".to_string(),
+                Some(code) => format!("{} exited ({code}).", shell.title),
+                None => format!("{} exited.", shell.title),
             };
             h_flex()
                 .debug_selector(|| "remote-worker-shell-ended".into())
@@ -859,6 +877,7 @@ impl RemoteWindow {
             .flex_1()
             .min_h_0()
             .size_full()
+            .child(row)
             .child(div().flex_1().min_h_0().child(self.terminal.clone()))
             .children(exited)
             .into_any_element()
@@ -1164,7 +1183,7 @@ fn worker_shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> 
             px(13.),
             if active { p.ink } else { p.muted },
         ))
-        .child("Worker shell")
+        .child("Worker")
         .when_else(
             active,
             |t| {
@@ -1182,6 +1201,148 @@ fn worker_shell_tab(active: bool, p: &Palette, remote: &Entity<RemoteModel>) -> 
         .on_click(move |_, _, cx| {
             remote.update(cx, |model, cx| {
                 model.show_worker_shell();
+                cx.notify();
+            })
+        })
+}
+
+/// The Worker tab's row of shells (W35): one tab per shell, its **×**, and
+/// **+** for another. A worker older than protocol v10 has one shell and
+/// neither button.
+fn worker_shell_row(
+    model: &RemoteModel,
+    p: &Palette,
+    remote: &Entity<RemoteModel>,
+) -> gpui::AnyElement {
+    let manage = model.opens_worker_shells();
+    let on_screen = model.worker_shell().map(|s| s.terminal_id.clone());
+    let tabs = model.worker_shells().iter().enumerate().map(|(i, shell)| {
+        let active = on_screen.as_ref() == Some(&shell.terminal_id);
+        let id = shell.terminal_id.clone();
+        let select = remote.clone();
+        let close = {
+            let remote = remote.clone();
+            let id = shell.terminal_id.clone();
+            div()
+                .id(("remote-worker-shell-close", i))
+                .debug_selector(move || format!("remote-worker-shell-close-{i}"))
+                .flex_none()
+                .rounded(px(4.))
+                .p(px(2.))
+                .cursor_pointer()
+                .hover(|s| s.bg(p.surface_window.hsla()))
+                .child(icons::icon(crate::assets::icon::CLOSE, px(10.), p.muted))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    remote.update(cx, |model, cx| {
+                        model.close_worker_shell(&id);
+                        cx.notify();
+                    })
+                })
+        };
+        h_flex()
+            .id(("remote-worker-shell", i))
+            .debug_selector(move || format!("remote-worker-shell-{i}"))
+            .flex_none()
+            .h(px(24.))
+            .pl(px(9.))
+            .pr(px(if manage { 5. } else { 9. }))
+            .gap(px(6.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .child(icons::icon(
+                crate::assets::icon::TERMINAL,
+                px(11.),
+                if active { p.ink } else { p.muted },
+            ))
+            .child(shell.title.clone())
+            .when(!shell.alive, |t| t.opacity(0.6))
+            .when(manage, |t| t.child(close))
+            .when_else(
+                active,
+                |t| {
+                    t.border_1()
+                        .border_color(p.border.hsla())
+                        .bg(p.surface_raised.hsla())
+                        .text_color(p.ink.hsla())
+                        .font_weight(FontWeight::MEDIUM)
+                },
+                |t| {
+                    t.text_color(p.muted.hsla())
+                        .hover(|s| s.bg(p.surface_raised.hsla()))
+                },
+            )
+            .on_click(move |_, _, cx| {
+                select.update(cx, |model, cx| {
+                    model.select_worker_shell(&id);
+                    cx.notify();
+                })
+            })
+    });
+    let add = manage.then(|| {
+        let remote = remote.clone();
+        let hint = match keycap("NewChildTerminal") {
+            Some(cap) => format!("New shell ({cap})"),
+            None => "New shell".to_string(),
+        };
+        div()
+            .id("remote-worker-shell-new")
+            .debug_selector(|| "remote-worker-shell-new".into())
+            .flex_none()
+            .h(px(24.))
+            .w(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .hover(|s| s.bg(p.surface_raised.hsla()))
+            .child(icons::icon(crate::assets::icon::PLUS, px(12.), p.muted))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(hint.clone()).build(window, cx)
+            })
+            .on_click(move |_, _, cx| {
+                remote.update(cx, |model, cx| {
+                    model.open_worker_shell();
+                    cx.notify();
+                })
+            })
+    });
+    h_flex()
+        .id("remote-worker-shells")
+        .flex_none()
+        .w_full()
+        .px(px(10.))
+        .py(px(5.))
+        .gap(px(4.))
+        .overflow_x_scroll()
+        .border_b_1()
+        .border_color(p.hairline.hsla())
+        .bg(p.surface_window.hsla())
+        .text_size(px(12.))
+        .children(tabs)
+        .children(add)
+        .into_any_element()
+}
+
+/// **Open a shell**, from the Worker tab with every shell closed.
+fn open_shell_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoElement {
+    let remote = remote.clone();
+    div()
+        .id("remote-worker-shell-open")
+        .debug_selector(|| "remote-worker-shell-open".into())
+        .flex_none()
+        .px_3()
+        .py_1()
+        .rounded(px(6.))
+        .bg(p.button_primary_bg.hsla())
+        .text_color(p.button_primary_ink.hsla())
+        .cursor_pointer()
+        .text_size(px(12.))
+        .child("Open a shell")
+        .on_click(move |_, _, cx| {
+            remote.update(cx, |model, cx| {
+                model.open_worker_shell();
                 cx.notify();
             })
         })
