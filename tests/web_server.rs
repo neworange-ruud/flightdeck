@@ -4778,7 +4778,7 @@ mod worker {
             host_kind: HostKind::Worker,
             worker: Some(WorkerHostState {
                 home: "/home/ruud".to_string(),
-                shell: None,
+                shells: Vec::new(),
                 health: None,
                 status: WorkerStatusView::default(),
                 host_messages: Vec::new(),

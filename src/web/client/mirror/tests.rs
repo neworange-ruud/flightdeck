@@ -452,6 +452,7 @@ fn worker_snapshot(messages: Vec<HostMessage>) -> Snapshot {
         worker: Some(WorkerSnapshot {
             home: "/home/u".to_string(),
             shell: Some(shell(10, true)),
+            shells: Vec::new(),
             health: None,
             status: WorkerStatusView {
                 projects_root: "/home/u/projects".to_string(),
@@ -474,7 +475,7 @@ fn a_v6_snapshot_is_not_a_worker_and_worker_deltas_ask_for_a_snapshot() {
     assert_eq!(ws.host_kind, None);
     assert!(!ws.is_worker());
     assert!(ws.worker.is_none());
-    assert!(ws.worker_shell().is_none());
+    assert!(ws.worker_shells().is_empty());
     assert!(ws.take_notifications().is_empty());
     assert_eq!(
         ws.streamed_terminals().len(),
@@ -497,7 +498,7 @@ fn a_worker_snapshot_and_each_worker_delta_are_mirrored() {
     ws.apply_snapshot(worker_snapshot(Vec::new()));
     assert!(ws.is_worker());
     assert_eq!(ws.worker.as_ref().unwrap().home, "/home/u");
-    assert_eq!(ws.worker_shell().map(|s| s.byte_len), Some(10));
+    assert_eq!(ws.worker_shells().first().map(|s| s.byte_len), Some(10));
     let streamed = ws.streamed_terminals();
     let shell_view = streamed.last().unwrap();
     assert_eq!(
@@ -524,7 +525,7 @@ fn a_worker_snapshot_and_each_worker_delta_are_mirrored() {
 
     assert!(ws.apply_delta(Delta::WorkerShell(shell(99, false))).changed);
     assert_eq!(
-        ws.worker_shell().map(|s| (s.byte_len, s.alive)),
+        ws.worker_shells().first().map(|s| (s.byte_len, s.alive)),
         Some((99, false))
     );
 
@@ -612,4 +613,41 @@ fn needs_you_counts_waiting_and_failed_sessions_in_every_project() {
         },
     });
     assert_eq!(ws.needs_you_count(), 1);
+}
+
+/// A v10 worker lists every shell; a delta for one upserts it in place, a
+/// new one is added at the end, and a close removes it (W35).
+#[test]
+fn a_workers_shells_are_upserted_and_closed_by_id() {
+    let mut ws = RemoteWorkspace::new();
+    let mut snapshot = worker_snapshot(Vec::new());
+    let mut second = shell(20, true);
+    second.terminal_id = crate::web::protocol::worker_shell_terminal_id(2);
+    snapshot.worker.as_mut().unwrap().shells = vec![shell(10, true), second.clone()];
+    ws.apply_snapshot(snapshot);
+    let ids = |ws: &RemoteWorkspace| -> Vec<String> {
+        ws.worker_shells()
+            .iter()
+            .map(|s| s.terminal_id.to_string())
+            .collect()
+    };
+    assert_eq!(ids(&ws), ["worker:shell", "worker:shell:2"]);
+    assert_eq!(ws.streamed_terminals().len(), ws.terminals().count() + 2);
+
+    second.alive = false;
+    assert!(ws.apply_delta(Delta::WorkerShell(second)).changed);
+    assert!(!ws.worker_shells()[1].alive, "updated in place");
+
+    let mut third = shell(0, true);
+    third.terminal_id = crate::web::protocol::worker_shell_terminal_id(3);
+    ws.apply_delta(Delta::WorkerShell(third));
+    assert_eq!(
+        ids(&ws),
+        ["worker:shell", "worker:shell:2", "worker:shell:3"]
+    );
+
+    ws.apply_delta(Delta::WorkerShellClosed {
+        terminal_id: "worker:shell".into(),
+    });
+    assert_eq!(ids(&ws), ["worker:shell:2", "worker:shell:3"]);
 }

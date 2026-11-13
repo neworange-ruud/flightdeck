@@ -419,6 +419,12 @@ impl TerminalStreams {
         }
     }
 
+    /// Drop one terminal's stream and its ring: the host closed it for good
+    /// (a worker shell, W35).
+    pub fn remove(&mut self, terminal_id: &TerminalId) {
+        self.streams.remove(terminal_id);
+    }
+
     /// Drop the streams of terminals the host no longer has at all (their tab
     /// was closed), releasing their ring buffers. Terminals that merely exited
     /// stay — use [`TerminalStreams::closed`] for those.

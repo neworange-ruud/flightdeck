@@ -1,9 +1,9 @@
 # Session browser — product requirements
 
 > Status: **requirements agreed, not started** (2026-11-13). Epic
-> `remote-control-cefv`. Decisions B1–B17 were taken with Ruud in a design
-> conversation; open decisions O1–O5 are listed in §7, and the spike
-> (`remote-control-cefv.1`) answers O3 and O4.
+> `remote-control-cefv`. Decisions B1–B21 were taken with Ruud in a design
+> conversation; the one open decision, O3, is answered by the spike
+> (`remote-control-cefv.1`).
 > Scope: a web browser inside an agent session in FlightDeck Desktop on macOS
 > and Windows, whose requests are made by the machine the session runs on.
 
@@ -83,6 +83,10 @@ domains need no changes.
 | B15 | Containers | `localhost` is the worker machine. A session running in a container is reached through its published ports (`forward_ports`, published on `127.0.0.1`). |
 | B16 | Agent use | **Phase 2.** Agents get browser tools over MCP (§6). |
 | B17 | Agent permission | A **per-session switch**, "Let the agent use the browser", **off by default**. `browser_eval` is part of phase 2. |
+| B18 | Restoring tabs | The Desktop does **not** reopen a session's browser tabs after it restarts. |
+| B19 | Profile lifetime | A session's profile is **deleted when its worktree is abandoned** (the close menu's Abandon worktree). |
+| B20 | macOS version | The browser needs **macOS 14 or later** (WKWebView proxy support). Older macOS shows "New browser" disabled with the reason. |
+| B21 | Self-signed HTTPS | A certificate error page offers **Continue anyway**, remembered for that host and port in that session's profile. |
 
 ## 4. Requirements, phase 1
 
@@ -176,11 +180,9 @@ agent (in the worktree, on the worker)
 
 | # | Question |
 | --- | --- |
-| O1 | Does the Desktop reopen a session's browser tabs (their URLs) after it restarts? |
-| O2 | When is a session's profile deleted: when the session closes, when its worktree is removed, or never? |
-| O3 | If WKWebView sends loopback past the proxy: fall back to a local port forward of the requested port (fails visibly when the port is taken on the Desktop)? Decided after the spike. |
-| O4 | Proxy support in WKWebView needs macOS 14. Is that the browser's minimum, with older macOS showing it unavailable? |
-| O5 | A dev server with a self-signed HTTPS certificate: offer "Continue anyway" per session? |
+| O3 | If WKWebView sends loopback past the proxy: fall back to a local port forward of the requested port (fails visibly when the port is taken on the Desktop)? Decided by the spike. |
+
+O1, O2, O4 and O5 were decided as B18, B19, B20 and B21.
 
 ## 8. Issue map
 

@@ -96,6 +96,7 @@ pub(crate) fn snapshot(version: u16, host_kind: Option<HostKind>) -> Snapshot {
         worker: (host_kind == Some(HostKind::Worker)).then(|| WorkerSnapshot {
             home: "/home/u".to_string(),
             shell: None,
+            shells: Vec::new(),
             health: None,
             status: Default::default(),
             connections: Default::default(),
