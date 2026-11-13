@@ -45,7 +45,7 @@ use crate::web::client::messages::{self, Advice};
 use crate::web::client::session::{Dialer, RemoteSession, Tab};
 use crate::web::client::views;
 use crate::web::client::{LinkEnd, RemoteClient};
-use crate::web::protocol::{HostKind, Seat, SessionPhase};
+use crate::web::protocol::{HostKind, Seat, SessionPhase, TerminalId};
 
 /// The terminal UI's side of the update advice: it updates itself with
 /// `flightdeck update`.
@@ -250,18 +250,35 @@ impl ConnectUi {
             // one on screen.
             agents.iter_mut().for_each(|row| row.selected = false);
             git.agent = None;
-            let terminal = self
-                .session
-                .on_screen()
-                .and_then(|id| self.session.terminal(&id));
+            // Its shells are the pane's terminals (W35), the first in the
+            // agent's slot.
+            let shells = self.session.worker_shells();
+            let mut terminals: Vec<TerminalPane> = shells
+                .iter()
+                .enumerate()
+                .map(|(i, shell)| TerminalPane {
+                    target: shell_target(i),
+                    label: shell.title.to_lowercase(),
+                    terminal: self.session.terminal(&shell.terminal_id),
+                })
+                .collect();
+            if terminals.is_empty() {
+                terminals.push(TerminalPane {
+                    target: ChildTarget::Primary,
+                    label: "no shell open".to_string(),
+                    terminal: None,
+                });
+            }
+            let on_screen = self.session.worker_shell().map(|s| &s.terminal_id);
+            let active = shells
+                .iter()
+                .position(|s| Some(&s.terminal_id) == on_screen)
+                .map(shell_target)
+                .unwrap_or(ChildTarget::Primary);
             Some(SessionPane {
                 creating: None,
-                terminals: vec![TerminalPane {
-                    target: ChildTarget::Primary,
-                    label: "worker shell".to_string(),
-                    terminal,
-                }],
-                active: ChildTarget::Primary,
+                terminals,
+                active,
             })
         } else {
             ws.selected_session().map(|s| SessionPane {
@@ -305,7 +322,7 @@ impl ConnectUi {
             tabs.insert(
                 0,
                 ProjectTabView {
-                    name: "worker shell".to_string(),
+                    name: "worker".to_string(),
                     status: ProjectStatus::Idle,
                     agent_count: 0,
                     active: self.on_shell(),
@@ -922,13 +939,18 @@ impl ConnectUi {
                     self.apply(HostEvent::FocusApp);
                 }
             }
-            Some(HitTarget::Child(target)) => {
-                if !self.on_shell() {
-                    self.session.focus_terminal(terminal_ref(target));
+            Some(HitTarget::Child(target)) => match self.worker_shell_at(target) {
+                Some(id) => self.session.select_worker_shell(&id),
+                None if !self.on_shell() => self.session.focus_terminal(terminal_ref(target)),
+                None => {}
+            },
+            Some(HitTarget::CloseChild(target)) => {
+                if let Some(id) = self.worker_shell_at(target) {
+                    self.session.close_worker_shell(Some(id));
                 }
             }
-            Some(HitTarget::CloseChild(_)) => {}
             Some(HitTarget::NewAgentButton) => self.run_palette(PaletteAction::NewAgentTab),
+            Some(HitTarget::NewShellButton) if self.on_shell() => self.session.open_worker_shell(),
             Some(HitTarget::NewShellButton) => {
                 self.run_palette(PaletteAction::Dispatch(Command::OpenShell))
             }
@@ -1032,6 +1054,21 @@ impl ConnectUi {
         } else {
             self.session.select_project(next - offset);
         }
+    }
+
+    /// The worker shell a terminal tab on the Worker tab stands for.
+    fn worker_shell_at(&self, target: ChildTarget) -> Option<TerminalId> {
+        if !self.on_shell() {
+            return None;
+        }
+        let index = match target {
+            ChildTarget::Primary => 0,
+            ChildTarget::Child(i) => i + 1,
+        };
+        self.session
+            .worker_shells()
+            .get(index)
+            .map(|s| s.terminal_id.clone())
     }
 
     /// From the worker's shell back to the project it left.
@@ -1147,6 +1184,14 @@ fn child_target(target: TerminalRef) -> ChildTarget {
     match target {
         TerminalRef::Primary => ChildTarget::Primary,
         TerminalRef::Child(i) => ChildTarget::Child(i),
+    }
+}
+
+/// The pane slot of the worker's `i`th shell: the first in the agent's.
+fn shell_target(i: usize) -> ChildTarget {
+    match i {
+        0 => ChildTarget::Primary,
+        i => ChildTarget::Child(i - 1),
     }
 }
 

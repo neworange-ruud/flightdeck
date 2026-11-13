@@ -274,7 +274,7 @@ fn the_hosts_dialog_is_drawn_here_and_answered_by_its_key() {
 fn a_worker_s_shell_is_the_first_project_tab_and_takes_every_key() {
     let (mut ui, mut script) = open(true);
     let (tabs, active) = ui.project_tabs();
-    assert_eq!(tabs[0].name, "worker shell");
+    assert_eq!(tabs[0].name, "worker");
     assert_eq!(tabs[1].name, "repo");
     assert_eq!(active, 1);
     assert!(drawn(&ui).contains("studio (worker)"));
@@ -295,6 +295,58 @@ fn a_worker_s_shell_is_the_first_project_tab_and_takes_every_key() {
     // The leave-focus key goes back to the project rather than nowhere.
     ui.key(key(KeyCode::F(2)));
     assert_eq!(ui.session().tab(), Tab::Project);
+}
+
+#[test]
+fn the_worker_tab_lists_its_shells_and_the_palette_opens_another() {
+    let (client, mut script) = RemoteClient::scripted();
+    let mut ui = ConnectUi::new(
+        client,
+        "studio",
+        "100.64.0.2:7420",
+        None,
+        UiConfig::default(),
+    );
+    ui.set_notifier(Rc::new(crate::testing::FakeNotifier::new()));
+    let mut snap = snapshot(true, Vec::new());
+    let shell = |n: u32| crate::web::protocol::WorkerShellView {
+        terminal_id: crate::web::protocol::worker_shell_terminal_id(n),
+        title: format!("Shell {n}"),
+        geometry: crate::web::protocol::Geometry { cols: 80, rows: 24 },
+        byte_len: 0,
+        replay_from: 0,
+        alive: true,
+        exit_code: None,
+    };
+    snap.worker.as_mut().unwrap().shells = vec![shell(1), shell(2)];
+    script.snapshot(snap);
+    ui.pump(AREA);
+    ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    assert_eq!(ui.session().tab(), Tab::WorkerShell);
+    let screen = drawn(&ui);
+    assert!(
+        screen.contains("shell 1") && screen.contains("shell 2"),
+        "{screen}"
+    );
+
+    // Alt-Right steps to the next shell.
+    ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(
+        ui.session()
+            .worker_shell()
+            .map(|s| s.terminal_id.to_string()),
+        Some("worker:shell:2".to_string())
+    );
+
+    // The palette's New Child Terminal opens another shell on the worker.
+    script.sent();
+    ui.key(ctrl('g'));
+    for c in "new child".chars() {
+        ui.key(key(KeyCode::Char(c)));
+    }
+    ui.key(key(KeyCode::Enter));
+    let names: Vec<String> = commands(&mut script).into_iter().map(|c| c.0).collect();
+    assert_eq!(names, ["open_worker_shell"]);
 }
 
 #[test]
