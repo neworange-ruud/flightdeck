@@ -153,8 +153,10 @@ client `src/web/client/tunnel_http.rs`).*
   `[::1]:<port>` for each loopback port the session uses, each connection
   sent through the tunnel to that port on the worker. They are bound
   **without `SO_REUSEADDR`** (std's `bind` sets it, and on macOS that lets a
-  forward sit in front of a program listening on `0.0.0.0:<port>`), so a
-  port in use here is refused, never shared.
+  forward sit in front of a program listening on `0.0.0.0:<port>`), and only
+  after the port was found free on the wildcard addresses too (Windows lets
+  `127.0.0.1:P` be bound in front of `0.0.0.0:P` regardless). A port in use
+  here is refused, never shared.
 - *Built:* `src/web/client/relay.rs` (`Relay::start`, `forward`,
   `credentials`, `take_events`). A worker's refusal is the matching SOCKS
   reply code and a `RelayEvent::Refused` with its words, for the error page.

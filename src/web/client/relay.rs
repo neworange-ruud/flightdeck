@@ -146,6 +146,9 @@ impl Relay {
         if forwards.contains_key(&local) {
             return Ok(());
         }
+        if port_in_use(local) {
+            return Err(ForwardError::InUse(local));
+        }
         let runtime = crate::remote::runtime::shared();
         let _enter = runtime.handle().enter();
         let v4 = bind_strict(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local))
@@ -220,6 +223,35 @@ fn bind_strict(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     TcpListener::from_std(socket.into())
+}
+
+/// Whether something on this machine holds `port` on **any** address.
+///
+/// Binding the loopback address alone does not say so everywhere: Windows
+/// lets `127.0.0.1:P` be bound while another program listens on
+/// `0.0.0.0:P`, and the forward would then sit in front of it. So the
+/// wildcard addresses are tried first — bound and closed again, never
+/// listened on, so no firewall is asked anything. Only "in use" counts; a
+/// machine without IPv6 is not a taken port.
+fn port_in_use(port: u16) -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let wildcards = [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+    ];
+    wildcards.iter().any(|addr| {
+        let Ok(socket) = Socket::new(
+            Domain::for_address(*addr),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        ) else {
+            return false;
+        };
+        if addr.is_ipv6() && socket.set_only_v6(true).is_err() {
+            return false;
+        }
+        matches!(socket.bind(&(*addr).into()), Err(e) if e.kind() == io::ErrorKind::AddrInUse)
+    })
 }
 
 fn forward_error(port: u16, e: io::Error) -> ForwardError {
@@ -429,6 +461,14 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secret!"));
         assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn a_port_in_use_on_loopback_only_is_refused() {
+        let relay = relay();
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        assert_eq!(relay.forward(port), Err(ForwardError::InUse(port)));
     }
 
     #[test]
