@@ -7,7 +7,7 @@ import { siteDefinition } from "@/site-definition";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Flightdeck",
+  title: "FlightDeck",
   description: "Orchestrate local AI coding agents in parallel.",
 };
 
