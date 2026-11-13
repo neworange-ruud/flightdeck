@@ -692,16 +692,14 @@ impl<'a> AppHost<'a> {
                 .as_ref()
                 .is_some_and(|h| h.window_count() > 0);
         let active = workspace.active;
-        let n = workspace.projects.len();
         let before = status_fingerprint(workspace, now_ms);
         let mut changed = false;
 
         // --- Service EVERY project each tick so background projects stay live:
         //     drain their PTYs, finalize completed worktrees, poll status files,
         //     and fire notifications regardless of which project is on screen. ---
-        for idx in 0..n {
+        for (idx, p) in workspace.projects.iter_mut().enumerate() {
             let is_active = idx == active;
-            let p = &mut workspace.projects[idx];
 
             let released = drain_pty_output(&mut p.state, now_ms, |sid, which, mint, bytes| {
                 changed = true;

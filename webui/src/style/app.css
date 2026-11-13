@@ -48,7 +48,7 @@ body {
 body {
   background: var(--fd-canvas);
   color: var(--fd-text);
-  font-family: var(--fd-font-mono);
+  font-family: var(--fd-font-ui);
   font-size: var(--fd-t-body);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;

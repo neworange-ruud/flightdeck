@@ -39,6 +39,14 @@ import {
 
 /** The acceptance criterion's words: "verified on a tablet-sized viewport". */
 const TABLET = { width: 768, height: 1024 };
+/**
+ * A small portrait tablet, for the test that needs the host's grid **not** to
+ * fit. The fixture host's pane is 92 columns, about 690px in DejaVu Sans Mono's
+ * 7.5px cells, which fits a 768px stage. It once overflowed there only because
+ * xterm measured its cells before the font loaded and padded every glyph to
+ * 9.4px; the terminal now re-measures (`src/term/terminal.ts`).
+ */
+const SMALL_TABLET = { width: 600, height: 960 };
 /** `playwright.config.ts`'s own viewport, where 1a fits comfortably. */
 const DESKTOP = { width: 1600, height: 1000 };
 
@@ -170,7 +178,7 @@ test.describe("FlightDeck Web below 900px", () => {
     const wideStage = await box(page, ".fd-stage");
     expect(wideMount.width).toBeLessThan(wideStage.width);
 
-    await page.setViewportSize(TABLET);
+    await page.setViewportSize(SMALL_TABLET);
     await expect(page.locator(".fd-frame")).toHaveAttribute(
       "data-width",
       "narrow",
