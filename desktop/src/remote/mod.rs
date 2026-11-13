@@ -988,11 +988,13 @@ impl RemoteModel {
     }
 
     /// Record browser `id`'s page title (the window reads it off the view).
+    #[cfg(target_os = "macos")]
     pub fn set_browser_title(&mut self, id: u64, title: String) -> bool {
         self.browsers.set_title(id, title)
     }
 
     /// The link's HTTP access, which a browser's relay dials the worker with.
+    #[cfg(target_os = "macos")]
     pub fn http_access(&self) -> Option<flightdeck::web::client::http::HttpAccess> {
         self.session.client().http_access().cloned()
     }
