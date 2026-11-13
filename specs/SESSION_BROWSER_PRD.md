@@ -2,8 +2,8 @@
 
 > Status: **requirements agreed, not started** (2026-11-13). Epic
 > `remote-control-cefv`. Decisions B1–B21 were taken with Ruud in a design
-> conversation; the one open decision, O3, is answered by the spike
-> (`remote-control-cefv.1`).
+> conversation. The macOS spike (`remote-control-cefv.1`) decided O3 as B22;
+> the Windows half of the spike is `remote-control-cefv.8`.
 > Scope: a web browser inside an agent session in FlightDeck Desktop on macOS
 > and Windows, whose requests are made by the machine the session runs on.
 
@@ -87,23 +87,37 @@ domains need no changes.
 | B19 | Profile lifetime | A session's profile is **deleted when its worktree is abandoned** (the close menu's Abandon worktree). |
 | B20 | macOS version | The browser needs **macOS 14 or later** (WKWebView proxy support). Older macOS shows "New browser" disabled with the reason. |
 | B21 | Self-signed HTTPS | A certificate error page offers **Continue anyway**, remembered for that host and port in that session's profile. |
+| B22 | Loopback | *From the spike (§4.1).* WKWebView never sends `localhost`, `127.0.0.1` or `[::1]` through a proxy, so on macOS the Desktop **forwards loopback ports itself**: for each loopback port a remote session uses (a port typed in the address field, and every port B11 reports for the session) it listens on `127.0.0.1:<port>` and `[::1]:<port>` and sends each connection through the same tunnel to that port on the worker. The page still asks for `localhost:<port>`. A port already in use on the Mac is shown on our error page by number, never loaded from the Mac. A forward exists only while a browser tab of that session is open. On Windows, WebView2's `<-loopback>` bypass rule may make forwards unnecessary (Windows spike). |
+| B23 | Relay credentials | *From the spike.* `wry`'s proxy setting has no credentials, so on macOS the Desktop installs its own Network.framework proxy configuration on the session's data store, with a username and password the relay checks (RFC 1929). Chromium has no SOCKS5 credentials, so Windows needs another check (Windows spike). |
 
 ## 4. Requirements, phase 1
 
-### 4.1 Spike first (`remote-control-cefv.1`)
+### 4.1 Spike (`remote-control-cefv.1`, `remote-control-cefv.8`)
 
-Before building, prove on macOS and Windows:
+`desktop/examples/browser_spike.rs` opens a GPUI window with a `wry` child web
+view and runs three servers: one standing for the Desktop's own localhost, a
+SOCKS5 relay that logs every target it is asked for, and one standing for the
+worker. Run it with `cargo run -p flightdeck-desktop --example browser_spike
+[-- wry|match|auth|loopback]`.
 
-1. A `wry` child web view placed in a GPUI window at a given rectangle, kept in
-   place on resize, and hidden or replaced by a snapshot while an overlay covers it.
-2. A SOCKS5 proxy with credentials on the web view: `proxyConfigurations` on
-   macOS 14+, `--proxy-server` on WebView2.
-3. **Whether loopback goes through the proxy.** Engines often send `localhost`,
-   `127.0.0.1` and `[::1]` directly, which would load the Desktop's own port.
-   WebView2 can be told not to (`--proxy-bypass-list=<-loopback>`). macOS is
-   the unknown. See O3.
-4. Per-session data stores: `WKWebsiteDataStore(forIdentifier:)` and a
-   WebView2 profile or user data folder.
+**macOS results** (macOS 27, `wry` 0.57.2, 2026-11-13):
+
+| Question | Result |
+| --- | --- |
+| Child web view in a GPUI window | Works: `build_as_child` on GPUI's `Window`, placed with `with_bounds`; `set_visible(false/true)` works for hiding it under an overlay. |
+| Hostnames through the proxy | Yes, **by name**: the relay is asked for `example.com:80` and `only-the-worker-knows.invalid:8080`, so the name is looked up on the far side (B2). |
+| WebSockets through the proxy | Yes, by name (hot reload on a non-loopback host works). |
+| `localhost`, `127.0.0.1`, `[::1]` | **Always direct**, never the proxy. Adding them as Network.framework match domains does not change that (and makes every other host skip the proxy). Hence B22. |
+| Proxy credentials | Work with our own Network.framework configuration (`nw_proxy_config_set_username_and_password`, macOS 14+); the relay saw the username and password on every connection. `wry`'s `with_proxy_config` cannot set them. Hence B23. |
+| Proxy fallback | Network.framework never fails over to a direct connection unless told to, so a dead relay is an error page, not a silent direct load. |
+| Profile per session with a proxy | Works: `with_data_store_identifier` plus the proxy on that store. The store persists across runs (the page cache came back), and `WebViewExtDarwin::remove_data_store` deletes it (B19). |
+
+**Windows** (`remote-control-cefv.8`, to run on a Windows machine): GPUI does not cross-build
+from macOS. To answer: does `--proxy-bypass-list=<-loopback>` send loopback
+through the relay (then Windows needs no forwards), how the relay refuses
+other local programs without SOCKS5 credentials, and a profile per session
+with the proxy. Note that `wry` drops its own proxy flag once browser
+arguments are given, so the whole argument line is ours.
 
 ### 4.2 Worker (`remote-control-cefv.2`)
 
@@ -120,9 +134,14 @@ Before building, prove on macOS and Windows:
 
 ### 4.3 Desktop (`remote-control-cefv.3`, `.4`, `.5`)
 
-- **Relay:** SOCKS5 on `127.0.0.1`, random port, random credentials. Hostnames
-  are passed through and never resolved on the Desktop. Each accepted
-  connection opens one tunnel connection.
+- **Relay:** SOCKS5 on `127.0.0.1`, random port, random credentials (B23).
+  Hostnames are passed through and never resolved on the Desktop. Each
+  accepted connection opens one tunnel connection. On macOS the proxy is our
+  own Network.framework configuration on the session's data store, not
+  `wry`'s `with_proxy_config`.
+- **Loopback forwards (B22):** on macOS, listeners on `127.0.0.1:<port>` and
+  `[::1]:<port>` for each loopback port the session uses, each connection
+  sent through the tunnel to that port on the worker.
 - **Browser tab:** "New browser" in the sidebar footer, the palette and a
   chord. Listed with the session's terminals and shown in the same area. The
   toolbar is B8. The address field accepts a bare `localhost:3000` (adds
@@ -180,9 +199,9 @@ agent (in the worktree, on the worker)
 
 | # | Question |
 | --- | --- |
-| O3 | If WKWebView sends loopback past the proxy: fall back to a local port forward of the requested port (fails visibly when the port is taken on the Desktop)? Decided by the spike. |
+| O6 | Windows: forwards or `<-loopback>`, and how the relay checks its caller (`remote-control-cefv.8`). |
 
-O1, O2, O4 and O5 were decided as B18, B19, B20 and B21.
+O1–O5 were decided as B18–B22.
 
 ## 8. Issue map
 
@@ -190,7 +209,8 @@ Children of epic `remote-control-cefv`. "After" lists blocking dependencies.
 
 | Issue | Work | After |
 | --- | --- | --- |
-| `.1` | Spike: wry in GPUI, SOCKS5 proxy, loopback, profiles | — |
+| `.1` | Spike on macOS: wry in GPUI, SOCKS5 proxy, loopback, profiles (done) | — |
+| `.8` | Spike on Windows: `<-loopback>`, relay access control | — |
 | `.2` | Worker tunnel endpoint | — |
 | `.3` | Desktop SOCKS5 relay | `.2` |
 | `.4` | Browser tabs, toolbar, address field | `.1` |
