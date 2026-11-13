@@ -87,6 +87,19 @@ sha2 = "0.10"
 # against, so no new crate enters the dependency tree.
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# The session browser's macOS proxy with credentials (B23): a Network.framework
+# configuration set on the web view's data store, which wry does not expose.
+objc2 = "0.6"
+
+# The session browser (`specs/SESSION_BROWSER_PRD.md`, `src/browser/`): the
+# system web view (WKWebView, WebView2) as a child of the GPUI window. macOS
+# and Windows only (B7): the session browser skips Linux for now, and on Linux
+# wry would need WebKitGTK on every machine and CI runner. Its default
+# features are Linux's (WebKitGTK, X11), so they are off. `devtools` keeps the
+# toolbar's DevTools button working in release builds; `mac-proxy` is the
+# data-store proxy the spike (`examples/browser_spike.rs`) proved.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+wry = { version = "0.57.2", default-features = false, features = ["mac-proxy", "devtools"] }
 
 [dev-dependencies]
 # The same gpui, plus its headless test platform (`TestAppContext`,
@@ -107,17 +120,6 @@ flightdeck = { path = "..", features = ["testing"] }
 # A folder that is no git repository, for the Open Project refusal test.
 # Already in the lock through the root crate's dev-dependencies.
 tempfile = "3.27.0"
-
-# Spike remote-control-cefv.1 only (`examples/browser_spike.rs`): the system web
-# view in a GPUI window behind a SOCKS5 proxy. Not a dependency of the app yet,
-# and macOS and Windows only: the session browser skips Linux for now, and on
-# Linux wry would need WebKitGTK on every CI runner.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dev-dependencies]
-wry = { version = "0.57.2", features = ["mac-proxy"] }
-# The same spike builds its own Network.framework proxy configuration (match
-# domains, credentials), which wry does not expose.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-objc2 = "0.6"
 
 # --- Packaging metadata (see desktop/PACKAGING.md) ---------------------------
 # Linux .deb: `cargo install cargo-deb && cargo deb -p flightdeck-desktop --no-build`

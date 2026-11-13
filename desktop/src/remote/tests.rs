@@ -2545,3 +2545,117 @@ mod upload;
 
 /// Downloading files from a worker (protocol v9).
 mod download;
+
+/// The session browser in a worker's window (`specs/SESSION_BROWSER_PRD.md`).
+/// The scripted link has no HTTP access, so no web view is built: these pin
+/// the window's rules — the key asked for, the row, what is on screen.
+mod browser {
+    use flightdeck::host::HostEvent;
+    use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
+    #[cfg(target_os = "macos")]
+    use flightdeck::web::client::LinkEvent;
+    #[cfg(target_os = "macos")]
+    use flightdeck::web::protocol::BrowserTunnel;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    #[cfg(target_os = "macos")]
+    use super::click;
+    use super::worker::{sent_commands, worker_snapshot};
+    use super::{open_on, turn};
+    use crate::remote::RemoteModel;
+
+    fn new_browser(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) {
+        model.update(cx, |m, cx| {
+            m.dispatch(
+                HostEvent::RunPaletteAction(PaletteAction::FrontEnd(FrontEndAction::NewBrowser)),
+                cx,
+            )
+        });
+        turn(model, cx);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_screen(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> Option<u64> {
+        model.update(cx, |m, _| m.browser_on_screen())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn new_browser_asks_for_a_key_and_lists_the_tab_with_the_sessions_terminals(
+        app: &mut TestAppContext,
+    ) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        assert!(
+            cx.debug_bounds("new-browser").is_some(),
+            "the footer offers it"
+        );
+        script.sent();
+        new_browser(&model, cx);
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1, "open_browser_tunnel");
+        let seq = sent[0].0;
+        assert!(
+            cx.debug_bounds("browser-row-0").is_some(),
+            "listed under the session"
+        );
+        let id = on_screen(&model, cx).expect("on screen at once");
+
+        // The worker's refusal is kept in its words.
+        script.send(LinkEvent::BrowserTunnel(BrowserTunnel {
+            seq,
+            key: None,
+            refusal: Some("This window has too many browsers open.".to_string()),
+        }));
+        turn(&model, cx);
+        let refusal = model.read_with(cx, |m, _| m.browsers().tab(id).unwrap().refusal.clone());
+        assert_eq!(
+            refusal.as_deref(),
+            Some("This window has too many browsers open.")
+        );
+
+        // Picking a terminal takes it off screen; its row brings it back.
+        click(cx, "terminal-row-0");
+        assert_eq!(on_screen(&model, cx), None);
+        click(cx, "browser-row-0");
+        assert_eq!(on_screen(&model, cx), Some(id));
+
+        // Closing it removes the row.
+        click(cx, "browser-close-0");
+        turn(&model, cx);
+        assert!(cx.debug_bounds("browser-row-0").is_none());
+        assert_eq!(on_screen(&model, cx), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn closing_a_granted_browser_tells_the_worker_its_key_is_done(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        script.sent();
+        new_browser(&model, cx);
+        let seq = sent_commands(&mut script)[0].0;
+        script.send(LinkEvent::BrowserTunnel(BrowserTunnel {
+            seq,
+            key: Some("k-1".to_string()),
+            refusal: None,
+        }));
+        turn(&model, cx);
+        click(cx, "browser-close-0");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1, "close_browser_tunnel");
+        assert_eq!(sent[0].2, Some(serde_json::json!({ "key": "k-1" })));
+    }
+
+    #[gpui::test]
+    fn a_worker_older_than_v11_offers_no_browser(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        snapshot.protocol_version = 10;
+        let (model, mut script, _window, cx) = open_on(app, snapshot);
+        assert!(cx.debug_bounds("new-browser").is_none());
+        script.sent();
+        new_browser(&model, cx);
+        assert!(sent_commands(&mut script).is_empty());
+        assert!(cx.debug_bounds("browser-row-0").is_none());
+    }
+}

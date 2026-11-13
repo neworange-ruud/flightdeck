@@ -321,6 +321,11 @@ pub const UPLOAD_UNAVAILABLE: &str = "Only a FlightDeck worker on a current vers
 pub const DOWNLOAD_UNAVAILABLE: &str =
     "Only a FlightDeck worker on a current version gives downloads.";
 
+/// Why New Browser is not offered: only a worker at protocol v11 or later
+/// makes a browser's requests (`specs/SESSION_BROWSER_PRD.md`).
+pub const BROWSER_UNAVAILABLE: &str =
+    "Only a FlightDeck worker on a current version can run a session's browser.";
+
 /// What `action` does from a remote window.
 pub fn route_palette(action: &PaletteAction) -> RemoteAction {
     if let PaletteAction::Dispatch(command) = action {
@@ -366,6 +371,12 @@ pub fn route_palette_for(ws: &RemoteWorkspace, action: &PaletteAction) -> Remote
         }
         PaletteAction::FrontEnd(FrontEndAction::UploadFiles) if !ws.takes_uploads() => {
             RemoteAction::Unavailable(UPLOAD_UNAVAILABLE)
+        }
+        PaletteAction::FrontEnd(FrontEndAction::NewBrowser)
+            if !(ws.is_worker()
+                && ws.protocol_version >= crate::web::protocol::BROWSER_TUNNEL_MIN_VERSION) =>
+        {
+            RemoteAction::Unavailable(BROWSER_UNAVAILABLE)
         }
         PaletteAction::FrontEnd(FrontEndAction::DownloadFiles) if !ws.takes_downloads() => {
             RemoteAction::Unavailable(DOWNLOAD_UNAVAILABLE)

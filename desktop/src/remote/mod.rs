@@ -98,6 +98,7 @@ use gpui::{App, AppContext, Context, Global, Subscription, Task};
 use crate::host::{HOST_ACTIVE_TURN, HOST_IDLE_TURN};
 use crate::terminal::cadence::Cadence;
 
+pub mod browsers;
 pub mod connect;
 pub mod download;
 pub mod messages;
@@ -164,6 +165,13 @@ pub struct RemoteModel {
     pick_files: bool,
     /// The project picker is open to choose the upload panel's folder.
     choosing_upload_dir: bool,
+    /// The session browsers (`specs/SESSION_BROWSER_PRD.md`): which tabs
+    /// exist and which is on screen. The web views are the window's.
+    browsers: browsers::Browsers,
+    /// The viewer this window attached as when the browsers' keys were
+    /// granted: a reconnect is a new viewer, whose keys the worker must
+    /// grant again (a key ends with its connection).
+    keyed_as: Option<flightdeck::web::protocol::ViewerId>,
 }
 
 impl RemoteModel {
@@ -192,6 +200,8 @@ impl RemoteModel {
             rename_error: None,
             pick_files: false,
             choosing_upload_dir: false,
+            browsers: browsers::Browsers::default(),
+            keyed_as: None,
         }
     }
 
@@ -356,12 +366,14 @@ impl RemoteModel {
     /// Show the SSH shell tab (its tab's click). The window starts the shell
     /// the first time. A worker has none: it has its own shell.
     pub fn show_shell(&mut self) {
+        self.browsers.hide();
         self.session.show_ssh_shell();
     }
 
     /// Show the worker shell's tab (its tab's click). Its keys are the
     /// shell's: there is no APP mode on it.
     pub fn show_worker_shell(&mut self) {
+        self.browsers.hide();
         self.session.show_worker_shell();
     }
 
@@ -382,6 +394,7 @@ impl RemoteModel {
 
     /// Show worker shell `id` (a click on its tab in the shell row).
     pub fn select_worker_shell(&mut self, id: &flightdeck::web::protocol::TerminalId) {
+        self.browsers.hide();
         self.session.select_worker_shell(id);
     }
 
@@ -817,7 +830,8 @@ impl RemoteModel {
 
     /// [`RemoteModel::turn`] without the redraw, for tests and the loop.
     pub fn pump(&mut self) -> bool {
-        let changed = self.session.pump();
+        let mut changed = self.session.pump();
+        changed |= self.pump_browsers();
         // A picker the session closed itself (a reconnect) ends a folder
         // choice with it, so the next picker is the project picker again.
         if self.session.picker().is_none() {
@@ -877,6 +891,7 @@ impl RemoteModel {
                 FrontEndAction::DownloadFiles => {
                     self.session.open_transfer(Some(TransferTab::Download))
                 }
+                FrontEndAction::NewBrowser => self.open_browser(),
                 action => self.front_end.push(action),
             }
         }
@@ -884,17 +899,142 @@ impl RemoteModel {
 
     /// Select agent row `index` and enter APP mode, as a sidebar click does.
     pub fn select_agent(&mut self, index: usize) {
+        self.browsers.hide();
         self.session.select_agent(index);
     }
 
     /// Focus one of the selected session's terminals, as a terminal-row click.
     pub fn focus_terminal(&mut self, target: TerminalRef) {
+        self.browsers.hide();
         self.session.focus_terminal(target);
     }
 
     /// Look at project `index` (a project-tab click).
     pub fn select_project(&mut self, index: usize) {
+        self.browsers.hide();
         self.session.select_project(index);
+    }
+
+    // -- the session browsers (specs/SESSION_BROWSER_PRD.md) -----------------
+
+    /// Open a browser in the selected session (New Browser): ask the worker
+    /// for its tunnel key, and show the tab at once (it says it is waiting).
+    pub fn open_browser(&mut self) {
+        if let Some(why) = crate::browser::unavailable() {
+            self.session.set_notice(why.to_string());
+            return;
+        }
+        if !self.session.client().supports_browser_tunnel() {
+            self.session
+                .set_notice(flightdeck::web::client::views::BROWSER_UNAVAILABLE.to_string());
+            return;
+        }
+        let ws = self.session.workspace();
+        let Some(session) = ws.selected_session().map(|s| s.session_id.clone()) else {
+            self.session
+                .set_notice("Select an agent session to open a browser in.".to_string());
+            return;
+        };
+        if self.session.tab() != Tab::Project {
+            if let Some(index) = ws.selected_project_index() {
+                self.session.select_project(index);
+            }
+        }
+        let terminal = self
+            .session
+            .workspace()
+            .selected_terminal()
+            .map(|t| t.terminal_id.clone());
+        let seq = self.session.client().open_browser_tunnel();
+        if seq.is_some() {
+            self.keyed_as = self.session.workspace().viewer_id.clone();
+        }
+        self.browsers.open(session, seq, terminal);
+    }
+
+    /// Close browser `id`, telling the worker its key is done.
+    pub fn close_browser(&mut self, id: u64) {
+        if let Some(key) = self.browsers.close(id) {
+            self.session.client().close_browser_tunnel(&key);
+        }
+    }
+
+    /// Show browser `id` (its sidebar row), over the terminal on screen.
+    pub fn show_browser(&mut self, id: u64) {
+        let terminal = self
+            .session
+            .workspace()
+            .selected_terminal()
+            .map(|t| t.terminal_id.clone());
+        self.browsers.show(id, terminal);
+    }
+
+    /// The browser on screen, while the window still looks at what it was
+    /// opened over.
+    pub fn browser_on_screen(&mut self) -> Option<u64> {
+        if self.session.tab() != Tab::Project {
+            self.browsers.hide();
+            return None;
+        }
+        let ws = self.session.workspace();
+        let session = ws.selected_session().map(|s| s.session_id.clone());
+        let terminal = ws.selected_terminal().map(|t| t.terminal_id.clone());
+        self.browsers.on_screen(session.as_ref(), terminal.as_ref())
+    }
+
+    /// Every browser tab.
+    pub fn browsers(&self) -> &browsers::Browsers {
+        &self.browsers
+    }
+
+    /// Record browser `id`'s page title (the window reads it off the view).
+    pub fn set_browser_title(&mut self, id: u64, title: String) -> bool {
+        self.browsers.set_title(id, title)
+    }
+
+    /// The link's HTTP access, which a browser's relay dials the worker with.
+    pub fn http_access(&self) -> Option<flightdeck::web::client::http::HttpAccess> {
+        self.session.client().http_access().cloned()
+    }
+
+    /// The browsers' share of a turn: the worker's answers to the keys asked
+    /// for, keys asked again after a reconnect, and the tabs of sessions
+    /// that are gone. Whether anything changed.
+    fn pump_browsers(&mut self) -> bool {
+        let mut changed = false;
+        for (id, seq) in self.browsers.waiting() {
+            if let Some(answer) = self.session.client_mut().take_browser_tunnel(seq) {
+                self.browsers.answered(id, answer.key, answer.refusal);
+                changed = true;
+            }
+        }
+        let ws = self.session.workspace();
+        if !ws.ready || self.browsers.all().is_empty() {
+            return changed;
+        }
+        // A reconnect is a new viewer: the old keys ended with the old
+        // connection, so each tab asks again.
+        if ws.viewer_id.is_some() && ws.viewer_id != self.keyed_as {
+            self.keyed_as = ws.viewer_id.clone();
+            let ids: Vec<u64> = self.browsers.all().iter().map(|t| t.id).collect();
+            for id in ids {
+                let seq = self.session.client().open_browser_tunnel();
+                self.browsers.rekey(id, seq);
+            }
+            changed = true;
+        }
+        let live: Vec<flightdeck::contracts::TabId> = self
+            .session
+            .workspace()
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.session_id.clone()))
+            .collect();
+        for key in self.browsers.retain_sessions(&live) {
+            self.session.client().close_browser_tunnel(&key);
+            changed = true;
+        }
+        changed
     }
 
     /// Ask for a seat: observe, write, or take the input lock.
@@ -958,6 +1098,17 @@ impl RemoteModel {
 impl Drop for RemoteModel {
     fn drop(&mut self) {
         self._ticker = None;
+        // Tell the worker the browsers' keys are done, if the link is still
+        // up; it ends them with the connection anyway.
+        let keys: Vec<String> = self
+            .browsers
+            .all()
+            .iter()
+            .filter_map(|t| t.key.clone())
+            .collect();
+        for key in keys {
+            self.session.client().close_browser_tunnel(&key);
+        }
     }
 }
 
