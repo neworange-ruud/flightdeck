@@ -1711,6 +1711,34 @@ mod worker {
     }
 
     #[gpui::test]
+    fn the_worker_tabs_shells_go_side_by_side_and_a_click_picks_one(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, two_shell_worker());
+        click(cx, "remote-worker-shell-tab");
+        assert!(cx.debug_bounds("remote-worker-shell-pane-0").is_none());
+        script.sent();
+        click(cx, "remote-worker-shell-split");
+        assert!(model.read_with(cx, |m, _| m.worker_split()));
+        turn(&model, cx);
+        let left = cx
+            .debug_bounds("remote-worker-shell-pane-0")
+            .expect("a pane per shell");
+        let right = cx
+            .debug_bounds("remote-worker-shell-pane-1")
+            .expect("a pane per shell");
+        assert!(left.right() <= right.left(), "side by side");
+        assert!(
+            commands(&mut script).is_empty(),
+            "the layout is this window's"
+        );
+
+        click(cx, "remote-worker-shell-pane-1");
+        assert_eq!(on_screen_shell(&model, cx), "worker:shell:2");
+        click(cx, "remote-worker-shell-split");
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-worker-shell-pane-0").is_none());
+    }
+
+    #[gpui::test]
     fn with_every_shell_closed_the_worker_tab_offers_one(app: &mut TestAppContext) {
         let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
         click(cx, "remote-worker-shell-tab");

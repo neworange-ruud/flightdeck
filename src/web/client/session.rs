@@ -88,7 +88,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use crate::app::commands::Selector;
+use crate::app::commands::{Command, Selector};
 use crate::app::keymap::{encode_paste, Action};
 use crate::app::modes::InputMode;
 use crate::contracts::{Clock, Notification, NotificationSound, Notifier, PtySize, TabId};
@@ -96,7 +96,7 @@ use crate::host::{GitStatusView, HostEvent, MessageView, OverlayInput, OverlayKe
 use crate::persistence::workspace::{MainView, MissionScope};
 use crate::terminal::session::{Terminal, TerminalKind, TerminalProfile};
 use crate::tui::clipboard::{check_pasted_image, PastedImage};
-use crate::tui::palette::FrontEndAction;
+use crate::tui::palette::{FrontEndAction, PaletteAction};
 use crate::view::TerminalRef;
 use crate::view::{mission_move, MissionView, PromptReply, SessionKey};
 use crate::web::client::download::{self as downloads, DownloadPanel};
@@ -241,6 +241,10 @@ pub struct RemoteSession {
     /// The worker shell the Worker tab shows (W35), and its place in the row
     /// when it was chosen, so closing it lands on a neighbour.
     worker_shell: Option<(TerminalId, usize)>,
+    /// Whether the Worker tab shows its shells side by side (Ctrl-B there).
+    /// The front-end's own layout: nothing of it reaches the worker but each
+    /// pane's size.
+    worker_split: bool,
     /// The shells there were when this front-end asked for a new one: the
     /// first id not among them, once it appears, is selected.
     opening_shell: Option<Vec<TerminalId>>,
@@ -333,6 +337,7 @@ impl RemoteSession {
             front_end: Vec::new(),
             tab: Tab::Project,
             worker_shell: None,
+            worker_split: false,
             opening_shell: None,
             saved_kind: None,
             dialer: None,
@@ -555,6 +560,31 @@ impl RemoteSession {
             .unwrap_or_else(|| WORKER_SHELL_TERMINAL_ID.into());
         if self.client.restart_worker_shell(&id).is_none() {
             self.local = Local::Message(WORKER_NOT_SENT.to_string());
+        }
+    }
+
+    /// Whether the Worker tab shows its shells side by side.
+    pub fn worker_split(&self) -> bool {
+        self.worker_split
+    }
+
+    /// Show the worker's shells side by side, or one at a time.
+    pub fn set_worker_split(&mut self, split: bool) {
+        self.worker_split = split;
+    }
+
+    /// Size worker terminal `id`'s PTY to its pane (a split pane that is not
+    /// the one on screen; that one follows [`RemoteSession::set_viewport`]).
+    /// Sent once per size, as the viewport's is (W5).
+    pub fn size_pane(&mut self, id: &TerminalId, size: PtySize) {
+        if !self.client.is_worker()
+            || !self.terminals.contains_key(id)
+            || self.sent_sizes.get(id) == Some(&size)
+        {
+            return;
+        }
+        if self.client.resize_terminal(id, size) {
+            self.sent_sizes.insert(id.clone(), size);
         }
     }
 
@@ -1666,6 +1696,21 @@ impl RemoteSession {
     pub fn apply(&mut self, event: HostEvent) {
         if self.tab == Tab::SshShell && Self::hidden_from_shell(&event) {
             return;
+        }
+        // On the Worker tab, split view lays out the worker's shells here:
+        // there is no host screen to arrange (W35).
+        if self.tab == Tab::WorkerShell {
+            let split = matches!(
+                &event,
+                HostEvent::Command(Command::ToggleSplitView)
+                    | HostEvent::RunPaletteAction(PaletteAction::Dispatch(
+                        Command::ToggleSplitView
+                    ))
+            );
+            if split {
+                self.worker_split = !self.worker_split;
+                return;
+            }
         }
         match event {
             HostEvent::TerminalInput(bytes) => self.type_bytes(bytes),

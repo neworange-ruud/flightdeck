@@ -888,3 +888,35 @@ fn a_worker_older_than_v10_has_one_shell_and_says_so() {
     assert!(commands_sent(&mut script).is_empty());
     assert_eq!(session.notice(), Some(WORKER_SHELLS_UNAVAILABLE));
 }
+
+#[test]
+fn ctrl_b_on_the_worker_tab_lays_its_shells_side_by_side_and_sends_nothing() {
+    use crate::app::commands::Command;
+    let (mut session, mut script) = open(two_shells());
+    session.show_worker_shell();
+    let _ = frames(&mut script);
+    session.apply(HostEvent::Command(Command::ToggleSplitView));
+    assert!(session.worker_split());
+    session.apply(HostEvent::RunPaletteAction(
+        crate::tui::palette::PaletteAction::Dispatch(Command::ToggleSplitView),
+    ));
+    assert!(!session.worker_split());
+    assert!(commands_sent(&mut script).is_empty());
+
+    // A pane's own size reaches the worker, once per size.
+    session.size_pane(&"worker:shell:2".into(), PtySize { rows: 30, cols: 50 });
+    session.size_pane(&"worker:shell:2".into(), PtySize { rows: 30, cols: 50 });
+    let resized: Vec<(String, u16, u16)> = frames(&mut script)
+        .into_iter()
+        .filter_map(|f| match f {
+            ClientMsg::ResizeTerminal(r) => Some((r.terminal_id.to_string(), r.cols, r.rows)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resized, [("worker:shell:2".to_string(), 50, 30)]);
+
+    // Off the Worker tab, split view is still the host's and not offered.
+    session.select_project(0);
+    session.apply(HostEvent::Command(Command::ToggleSplitView));
+    assert!(!session.worker_split());
+}
