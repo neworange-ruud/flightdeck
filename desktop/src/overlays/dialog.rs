@@ -48,7 +48,7 @@ fn is_form(view: &DialogView) -> bool {
 pub fn key_events(view: &DialogView, key: &KeyPress) -> Vec<HostEvent> {
     match key {
         KeyPress::Enter => {
-            if view.buttons.iter().any(|b| b.default) {
+            if view.buttons.iter().any(|b| b.default && !b.disabled) {
                 vec![overlay(OverlayInput::Submit)]
             } else {
                 Vec::new()
@@ -116,12 +116,14 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
             label: "Parent folder".to_string(),
             role: ButtonRole::Secondary,
             default: false,
+            disabled: false,
         };
         let native = DialogButton {
             id: "choose-folder".to_string(),
             label: "Choose folder…".to_string(),
             role: ButtonRole::Secondary,
             default: false,
+            disabled: false,
         };
         footer(p)
             .child(dialog_button(

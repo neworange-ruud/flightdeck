@@ -869,6 +869,13 @@ mod overlays {
         assert_eq!(d.origin, crate::web::protocol::DialogOrigin::Desktop);
         assert_eq!(d.origin_label, None);
 
+        // Create waits for a task name; the other buttons do not.
+        assert!(
+            button(&d, "Enter").disabled,
+            "Create is disabled until named"
+        );
+        assert!(!button(&d, "Tab").disabled && !button(&d, "Esc").disabled);
+
         // The TUI keeps prompting on an empty name; so does the host.
         host.handle(HostEvent::Overlay(OverlayInput::Submit))
             .unwrap();
@@ -901,6 +908,10 @@ mod overlays {
 
         host.handle(HostEvent::Overlay(OverlayInput::SetText("feature".into())))
             .unwrap();
+        assert!(
+            !button(&dialog(&host), "Enter").disabled,
+            "a name enables Create"
+        );
         assert_eq!(dialog(&host).input.as_deref(), Some("feature"));
         host.handle(HostEvent::Overlay(OverlayInput::Submit))
             .unwrap();

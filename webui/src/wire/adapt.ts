@@ -810,6 +810,9 @@ export function dialogOf(wire: WireDialogView): DialogState {
        * honest reading of that is that it decides — the browser keeps its own
        * `Esc Cancel` and nothing is dropped from the row. */
       cancels: button.cancels ?? false,
+      /** Absent from an older host: the button is enabled, as it always was.
+       * Only carried when set, so a plain key reads exactly as before. */
+      ...(button.needs_input === true ? { needsInput: true } : {}),
     })),
     /** Absent means "the host did not say", and the honest reading of that is
      * *not* confirmable: a browser that guessed `true` would send a confirm the

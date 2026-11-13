@@ -81,6 +81,7 @@
 //! | [`SeatRequest`], [`Seat`], [`SeatInfo`], [`Delta::Seats`] | D14 as revised — N writers + N observers, the input lock, takeover, read-only watch |
 //! | [`ShutdownReason`], `self_initiated` | Q5 — deliberate quit vs network failure, and "I asked for this" |
 //! | [`Input::seq`], [`Ack`], [`Snapshot::last_input_seq`] | turn 2 §5.1 — input is queued, never dropped, never reordered, never doubled |
+//! | [`DialogKey::needs_input`] | the New Agent form's Create stays disabled on every surface until the task name is typed (additive, rule 4) |
 //! | [`Input::image`], [`ImagePaste`] | a viewer's clipboard image, which the agent on the host cannot read: saved there and typed as a path, as the TUI's paste key does (additive, rule 4) |
 //! | [`Delta::Status`], [`Delta::Git`], [`Delta::Activity`] | D11 activity feed, and the live sidebar/git bar |
 //! | [`Delta::DialogOpened`] + [`DialogOrigin`] | D13 — shared dialogs carry who opened them |
@@ -1448,6 +1449,13 @@ pub struct DialogKey {
     /// with [`command::DIALOG_CANCEL`], which is never gated and never refused.
     #[serde(default)]
     pub cancels: bool,
+    /// Whether this button does nothing while the dialog's `input` is blank
+    /// (the New Agent form's Create, which needs a task name). A surface
+    /// draws it disabled until its own draft of the field holds text. Additive
+    /// (rule 4): an older surface leaves it enabled, and the host still
+    /// ignores the press, as it always has.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_input: bool,
 }
 
 // ===========================================================================

@@ -58,6 +58,18 @@ fn parse_table() {
                 device: "mbp".to_string(),
             }),
         ),
+        (
+            vec!["agents"],
+            Ok(Command::Agents(agents_cli::AgentsCommand::List {
+                json: false,
+            })),
+        ),
+        (
+            vec!["agents", "disable", "codex"],
+            Ok(Command::Agents(agents_cli::AgentsCommand::Disable {
+                name: "codex".to_string(),
+            })),
+        ),
         (vec!["logs"], logs(false, 100)),
         (vec!["logs", "-n", "5"], logs(false, 5)),
         (vec!["logs", "-n5"], logs(false, 5)),
@@ -106,6 +118,8 @@ fn misused_commands_are_usage_errors() {
         &["enable", "--now"],
         &["enable", "--dry-run", "--dry-run"],
         &["disable", "now"],
+        &["agents", "disable"],
+        &["agents", "--yaml"],
     ] {
         assert!(
             matches!(parse(&strings(args)), Err(ParseError::Usage(_))),
@@ -126,6 +140,7 @@ fn no_command_or_help_prints_the_table() {
     assert!(USAGE.contains("logs [-f] [-n N]"));
     assert!(USAGE.contains("enable [--dry-run]"));
     assert!(USAGE.contains("disable [--dry-run]"));
+    assert!(USAGE.contains("agents disable <name>"));
     assert!(
         !USAGE.contains("supervise"),
         "the internal command is not advertised"

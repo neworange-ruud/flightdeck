@@ -454,6 +454,7 @@ trait ControlTarget {
     fn phones(&self) -> Vec<PhoneReport>;
     /// `None` when no phone matches `selector`.
     fn revoke_phone(&mut self, selector: &str) -> Option<Result<PhoneReport, String>>;
+    fn set_disabled_agents(&mut self, agents: &[String]);
 }
 
 #[cfg(unix)]
@@ -484,6 +485,9 @@ impl ControlTarget for AppHost<'_> {
     }
     fn revoke_phone(&mut self, selector: &str) -> Option<Result<PhoneReport, String>> {
         AppHost::revoke_phone(self, selector)
+    }
+    fn set_disabled_agents(&mut self, agents: &[String]) {
+        AppHost::set_disabled_agents(self, agents)
     }
 }
 
@@ -557,6 +561,15 @@ fn answer(
                 "the next stop is a stop"
             };
             (ControlResponse::Ok, Some(line.to_string()))
+        }
+        ControlRequest::SetDisabledAgents { agents } => {
+            target.set_disabled_agents(agents);
+            let line = if agents.is_empty() {
+                "every agent backend is enabled".to_string()
+            } else {
+                format!("disabled agent backends: {}", agents.join(", "))
+            };
+            (ControlResponse::Ok, Some(line))
         }
     }
 }

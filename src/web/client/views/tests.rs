@@ -301,6 +301,7 @@ fn keys(list: &[(&str, &str, bool)]) -> Vec<DialogKey> {
             key: key.to_string(),
             label: label.to_string(),
             cancels: *cancels,
+            needs_input: false,
         })
         .collect()
 }
@@ -634,4 +635,54 @@ fn download_files_is_offered_only_on_a_worker_that_gives_downloads() {
         ws.protocol_version = wire::PROTOCOL_VERSION;
         assert!(!offered(&ws), "{kind:?}");
     }
+}
+
+#[test]
+fn create_stays_disabled_until_the_task_name_is_typed() {
+    let mut buttons = keys(&[
+        ("Enter", "Create", false),
+        ("Tab", "Target: new branch", false),
+        ("Esc", "Cancel", true),
+    ]);
+    buttons[0].needs_input = true;
+    let view = dialog(DialogBody {
+        input: Some(String::new()),
+        buttons,
+        confirmable: true,
+        ..DialogBody::default()
+    });
+    let mut draft = DialogDraft::new(&view);
+    let shown = dialog_overlay(&view, &draft);
+    assert!(shown.buttons[0].disabled, "Create waits for a name");
+    assert!(!shown.buttons[1].disabled && !shown.buttons[2].disabled);
+    assert_eq!(shown.origin_label.as_deref(), Some("opened on the host"));
+    assert!(dialog_input(&view, &mut draft, &OverlayInput::Submit).is_none());
+    assert!(dialog_input(&view, &mut draft, &OverlayInput::Choose("Enter".into())).is_none());
+
+    dialog_input(&view, &mut draft, &OverlayInput::SetText("   ".into()));
+    assert!(dialog_overlay(&view, &draft).buttons[0].disabled, "blank");
+
+    dialog_input(
+        &view,
+        &mut draft,
+        &OverlayInput::SetText("fix login".into()),
+    );
+    assert!(!dialog_overlay(&view, &draft).buttons[0].disabled);
+    let reply = dialog_input(&view, &mut draft, &OverlayInput::Submit).unwrap();
+    assert_eq!(reply.args["text"], "fix login");
+}
+
+#[test]
+fn a_dialog_a_remote_seat_opened_has_no_origin_line() {
+    let mut view = dialog(DialogBody {
+        buttons: keys(&[("y", "Close", false), ("n", "Cancel", true)]),
+        confirmable: true,
+        ..DialogBody::default()
+    });
+    view.origin = DialogOrigin::Browser {
+        viewer_id: None,
+        label: "100.113.110.27 · FlightDeck Desktop/0.14.0".to_string(),
+    };
+    let shown = dialog_overlay(&view, &DialogDraft::new(&view));
+    assert_eq!(shown.origin_label, None);
 }

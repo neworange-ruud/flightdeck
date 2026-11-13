@@ -168,6 +168,9 @@ const WORKER_SECTION_COMMENT: &str = "\
 # (issuing one lists the machine name in public Certificate Transparency logs);
 # otherwise the browser app is plain HTTP. Restart the worker after changing
 # web or https.
+# disabled_agents: agent backends (keys of [agents]) not set up on this machine,
+# e.g. [\"codex\", \"cursor\"]. Left out of the New Agent form a Desktop shows.
+# Empty: every agent is offered. Manage it with `flightdeck worker agents`.
 ";
 
 /// Insert [`REMOTE_SECTION_COMMENT`] above `[remote]`, [`WEB_SECTION_COMMENT`]

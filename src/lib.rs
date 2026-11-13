@@ -1393,6 +1393,11 @@ struct Ui {
     /// ([`crate::host::AppHost::open_worker`]), which has no screen to show
     /// a notification on and forwards them to its window instead (SPECS §33).
     capture_messages: bool,
+    /// Whether new sessions are offered only the agents `[worker]
+    /// disabled_agents` leaves enabled: set only by a worker host
+    /// ([`crate::host::AppHost::open_worker`]), whose machine may not have
+    /// every configured backend set up (SPECS §33). See [`offered_agents`].
+    worker_agents_only: bool,
     /// The status-line sentences since the worker host last drained them,
     /// oldest first, at most [`MESSAGES_OUT_KEPT`]. Always empty unless
     /// `capture_messages`: the TUI and the desktop never read it.
@@ -6400,6 +6405,24 @@ const ISOLATED_REFUSAL: &str =
     "Not available in an isolated run (--isolated): it has one session in this \
      directory and opens nothing else.";
 
+/// Shown instead of the New Agent form (or the "+ agent" picker) when a
+/// worker's `[worker] disabled_agents` leaves no agent to offer.
+const NO_AGENTS_ENABLED: &str = "Every agent backend is disabled on this worker. \
+     Enable one with `flightdeck worker agents enable <name>` on the worker.";
+
+/// `(key, display_name)` of every agent a new session may start, in registry
+/// order: all of them, except on a worker host, which leaves out the backends
+/// `[worker] disabled_agents` says this machine has not set up (SPECS §33).
+fn offered_agents(state: &AppState, ui: &Ui) -> Vec<(String, String)> {
+    state
+        .registry
+        .all()
+        .iter()
+        .filter(|a| !ui.worker_agents_only || state.config.worker.agent_enabled(&a.key))
+        .map(|a| (a.key.clone(), a.display_name.clone()))
+        .collect()
+}
+
 /// Begin the New Agent Tab flow (SPECS §4, §22): open the combined form —
 /// agent radio and new/existing/base target modes — with the configured default
 /// agent preselected.
@@ -6408,12 +6431,11 @@ fn start_new_tab_flow(state: &AppState, services: &Services, ui: &mut Ui) {
         ui.message(ISOLATED_REFUSAL);
         return;
     }
-    let agents: Vec<(String, String)> = state
-        .registry
-        .all()
-        .iter()
-        .map(|a| (a.key.clone(), a.display_name.clone()))
-        .collect();
+    let agents = offered_agents(state, ui);
+    if agents.is_empty() {
+        ui.message(NO_AGENTS_ENABLED);
+        return;
+    }
     // Preselect the configured default agent so Enter alone uses it.
     let selected = agents
         .iter()
@@ -6459,23 +6481,19 @@ fn start_new_child_agent_flow(state: &mut AppState, services: &Services, ui: &mu
         start_new_tab_flow(state, services, ui);
         return;
     }
-    let agents: Vec<(String, String)> = state
-        .registry
-        .all()
-        .iter()
-        .map(|a| (a.key.clone(), a.display_name.clone()))
-        .collect();
-    if agents.len() > 1 {
+    let agents = offered_agents(state, ui);
+    if agents.is_empty() {
+        ui.message(NO_AGENTS_ENABLED);
+    } else if agents.len() > 1 {
         start_prompt(ui, Prompt::SelectChildAgent { agents });
     } else {
-        // Zero or one agent: no meaningful choice — spawn the tab's default.
+        // One agent: no meaningful choice. Named rather than left to the
+        // tab's default, which a worker may have disabled.
+        let agent_key = ui.worker_agents_only.then(|| agents[0].0.clone());
         state.focus_terminal();
-        if let Err(e) = dispatch_command(
-            Command::NewAgentTerminal { agent_key: None },
-            state,
-            services,
-            ui,
-        ) {
+        if let Err(e) =
+            dispatch_command(Command::NewAgentTerminal { agent_key }, state, services, ui)
+        {
             ui.message(format!("Error: {e}"));
         }
     }
@@ -6982,8 +7000,15 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             } else {
                 "Create"
             };
+            // A new branch needs its name before Create does anything.
+            let confirm = DialogButton::new(DialogAccel::Enter, confirm_label);
+            let confirm = if *use_existing_branch || *run_on_base {
+                confirm
+            } else {
+                confirm.needing_input()
+            };
             let buttons = vec![
-                DialogButton::new(DialogAccel::Enter, confirm_label),
+                confirm,
                 DialogButton::new(DialogAccel::Tab, target_label),
                 cancel,
             ];
@@ -8408,6 +8433,8 @@ fn web_dialog_view(
                 // Which button dismisses, said out loud rather than left to the
                 // browser to infer from the label (§6.5 R19).
                 cancels: button.cancels(),
+                // Judged by the surface against its own draft of the field.
+                needs_input: button.needs_input(),
             })
             .collect(),
         confirmable: refusal.is_none(),
@@ -14252,6 +14279,8 @@ mod tests {
             assert!(body.list[0].label.contains("Codex"));
             assert!(body.list[0].selected, "the default agent is preselected");
             assert_eq!(keys(&body), vec!["Enter", "Tab", "Esc"]);
+            assert!(body.buttons[0].needs_input, "Create needs a task name");
+            assert!(!body.buttons[1].needs_input && !body.buttons[2].needs_input);
             assert!(body.confirmable, "the browser may answer this one");
             assert_eq!(body.refusal, None);
         }

@@ -22,6 +22,7 @@ import {
   primaryKey,
   selectedChoice,
   visibleChoices,
+  waitsForInput,
 } from "./dialog";
 import { fixtureSnapshot } from "./fixture";
 import { reduce } from "./reducer";
@@ -50,7 +51,7 @@ function newAgentWire(
         { label: "( ) Codex CLI", selected: false },
       ],
       buttons: [
-        { key: "Enter", label: "Create" },
+        { key: "Enter", label: "Create", needs_input: true },
         { key: "Tab", label: "Target: new branch" },
         { key: "Esc", label: "Cancel", cancels: true },
       ],
@@ -622,5 +623,27 @@ describe("artboard 1g's second step (ll5.4, §6.5 R13)", () => {
     state = opened(unpairWire(), state);
     expect(dialogOf_(state).draft.confirmName).toBe("");
     expect(dialogOf_(state).draft.step).toBe(1);
+  });
+});
+
+describe("a button that needs the text field", () => {
+  it("stays disabled until a task name is typed", () => {
+    const dialog = dialogOf(newAgentWire());
+    const create = dialog.buttons[0]!;
+    const toggle = dialog.buttons[1]!;
+    expect(create.needsInput).toBe(true);
+    expect(waitsForInput(dialog, create)).toBe(true);
+    expect(waitsForInput(dialog, toggle)).toBe(false);
+    const blank = { ...dialog, draft: { ...dialog.draft, text: "   " } };
+    expect(waitsForInput(blank, create)).toBe(true);
+    const named = { ...dialog, draft: { ...dialog.draft, text: "fix login" } };
+    expect(waitsForInput(named, create)).toBe(false);
+  });
+
+  it("reads an older host's key, with no flag, as enabled", () => {
+    const wire = newAgentWire();
+    const body = { ...wire.body!, buttons: [{ key: "Enter", label: "Create" }] };
+    const dialog = dialogOf({ ...wire, body });
+    expect(waitsForInput(dialog, dialog.buttons[0]!)).toBe(false);
   });
 });

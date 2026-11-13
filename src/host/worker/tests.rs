@@ -1544,3 +1544,105 @@ fn a_granted_download_has_a_ticket_and_size_per_file_and_is_logged() {
     );
     host.stop_worker();
 }
+
+use crate::host::{HostEvent, OverlayInput};
+
+/// The worker's project, with `codex` and `cursor` configured beside OpenCode.
+fn three_agent_project(fakes: &Fakes) -> TestProject {
+    let (mut project, _pty) = fakes.project_with_a_tab();
+    let mut config = project.state.config.clone();
+    for (key, name) in [("codex", "Codex CLI"), ("cursor", "Cursor CLI")] {
+        let mut def = config.agents["opencode"].clone();
+        def.key = key.to_string();
+        def.display_name = name.to_string();
+        config.agents.insert(key.to_string(), def);
+    }
+    project.state.reload_config(config);
+    project
+}
+
+fn offered(host: &AppHost) -> Vec<String> {
+    match host.overlay() {
+        Some(crate::host::OverlayView::Dialog(d)) => match d.kind {
+            crate::host::DialogKind::NewAgent(form) => {
+                form.agents.into_iter().map(|a| a.key).collect()
+            }
+            crate::host::DialogKind::NewAgentChild { agents } => {
+                agents.into_iter().map(|a| a.key).collect()
+            }
+            other => panic!("not an agent picker: {other:?}"),
+        },
+        other => panic!("expected a dialog, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_worker_offers_only_the_agents_it_has_not_disabled() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(vec![three_agent_project(&fakes)]);
+    let new_tab = || {
+        HostEvent::Command(Command::NewAgentTab {
+            name: String::new(),
+            agent_key: None,
+        })
+    };
+
+    host.handle(new_tab()).unwrap();
+    assert_eq!(offered(&host), ["codex", "cursor", "opencode"]);
+    host.handle(HostEvent::Overlay(OverlayInput::Cancel))
+        .unwrap();
+
+    // What `worker agents disable codex` hands the running worker.
+    host.set_disabled_agents(&["codex".to_string()]);
+    host.handle(new_tab()).unwrap();
+    assert_eq!(offered(&host), ["cursor", "opencode"]);
+    host.handle(HostEvent::Overlay(OverlayInput::Cancel))
+        .unwrap();
+
+    // The "+ agent" picker too.
+    host.handle(HostEvent::RunPaletteAction(
+        crate::tui::palette::PaletteAction::NewAgentChild,
+    ))
+    .unwrap();
+    assert_eq!(offered(&host), ["cursor", "opencode"]);
+}
+
+#[test]
+fn a_worker_with_every_agent_disabled_says_how_to_enable_one() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(vec![three_agent_project(&fakes)]);
+    host.set_disabled_agents(&[
+        "codex".to_string(),
+        "cursor".to_string(),
+        "opencode".to_string(),
+    ]);
+    host.handle(HostEvent::Command(Command::NewAgentTab {
+        name: String::new(),
+        agent_key: None,
+    }))
+    .unwrap();
+    match host.overlay() {
+        Some(crate::host::OverlayView::Message(m)) => {
+            assert!(
+                m.text.contains("flightdeck worker agents enable"),
+                "{}",
+                m.text
+            )
+        }
+        other => panic!("expected a message, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_tui_host_ignores_the_workers_disabled_agents() {
+    let fakes = Fakes::new();
+    let mut project = three_agent_project(&fakes);
+    project.state.config.worker.disabled_agents = vec!["codex".to_string()];
+    let mut host = testing::host(fakes.env(), &fakes.notifier, vec![project], 0);
+    host.handle(HostEvent::Command(Command::NewAgentTab {
+        name: String::new(),
+        agent_key: None,
+    }))
+    .unwrap();
+    assert_eq!(offered(&host), ["codex", "cursor", "opencode"]);
+}

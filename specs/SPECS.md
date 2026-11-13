@@ -1611,6 +1611,8 @@ the Desktop opens a remote window onto them. Requirements are in
 | `flightdeck worker pair --phone [--json]` | Pairs the FlightDeck iPhone app (needs `[worker] phone = true`): asks the relay for a code, prints the QR and the 4-digit code, and waits until the phone has paired (exit 0), or the code expired or the attempt failed (exit 1). `--json` prints one JSON object per step. See "The phone" below. |
 | `flightdeck worker devices [--json]` | Lists paired devices (Desktops, `flightdeck connect` and browsers, a browser named like `Chrome on macOS (browser)`): label, paired at, last seen, attached / background / offline. The text output then lists paired phones (pairing id, `direct` or `relay`, connected / offline); `--json` stays the Desktops array, and the phones are in `worker status --json`. |
 | `flightdeck worker revoke <device>` | Revokes a Desktop's token (by id, label or unique id prefix) and closes its connections at once. A selector no Desktop matches is tried against the paired phones' pairing ids (exact or unique prefix), and a match is unpaired. |
+| `flightdeck worker agents [--json]` | Lists the agent backends in the global `[agents]` table and whether each is enabled (offered when a Desktop starts a new session) or disabled. `--json` prints `{ config, agents: [{ name, display_name, command, enabled }] }`. |
+| `flightdeck worker agents disable <name>` / `enable <name>` | Adds the agent to (or removes it from) `[worker] disabled_agents` in the global config, keeping the file's comments and layout, then hands the new list to a running worker, which applies it at once; a stopped worker reads it at start, and an older worker that does not know the request is told to restart. An unknown name exits 2 and lists the known ones; disabling the last enabled agent is refused (exit 1). Already in that state is not an error. |
 | `flightdeck worker logs [-f] [-n N]` | Prints (default 100 lines) or follows the worker log. Reads the file directly, so it works while the worker is down. |
 | `flightdeck worker enable [--dry-run]` | Sets up start on boot (see "Start on boot" below): writes the launchd agent (macOS) or systemd user unit (Linux), registers it, and starts the worker through it when none runs. Idempotent: running it again rewrites the unit (refreshing the binary path and `PATH`). `--dry-run` prints the file and the commands without changing anything. |
 | `flightdeck worker disable [--dry-run]` | Takes start on boot down: a worker the service manager runs is stopped first (as `stop` does), then the unit is unregistered and removed. A worker started otherwise keeps running. "Not set up" is not an error. |
@@ -1762,6 +1764,7 @@ default_rows = 50
 phone = false
 web = true
 https = true
+disabled_agents = []
 ```
 
 - **`port`** (integer, default `7420`) — the TCP port served on each Tailscale
@@ -1786,6 +1789,15 @@ https = true
   cert` for this machine's MagicDNS name and answer TLS on the same port. Only
   acted on when the tailnet has HTTPS turned on; `false` never asks Tailscale for
   a certificate and serves plain HTTP only. Read at start.
+- **`disabled_agents`** (array of agent keys, default `[]`) — backends this
+  machine has not set up, e.g. `["codex", "cursor"]`. The worker leaves them
+  out of the New Agent Session Tab form and the "+ agent" picker, so a Desktop,
+  a browser or `flightdeck connect` only offers what can start here; with one
+  left, "+ agent" starts it without asking. Every agent is offered by default.
+  Sessions already running a disabled agent keep running, and a TUI on the
+  same machine ignores the setting. With every agent disabled, New Agent shows
+  a message saying how to enable one. Managed with `flightdeck worker agents`,
+  which applies it to a running worker at once.
 
 An invalid `[worker]` table makes `worker run` exit 78. It is not in the
 configuration manager (numbers and a path, not toggles): edit the file.

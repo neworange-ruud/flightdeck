@@ -150,6 +150,7 @@ fn dialog_view(open: &PromptState) -> DialogView {
                 ButtonRole::Secondary
             },
             default: button.accel == DialogAccel::Enter,
+            disabled: button.disabled_for(dialog.input.as_deref()),
         })
         .collect();
     DialogView {

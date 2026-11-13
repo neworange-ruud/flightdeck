@@ -120,6 +120,9 @@ pub struct DialogButton {
     pub role: ButtonRole,
     /// Whether [`OverlayInput::Submit`] (Enter) presses it.
     pub default: bool,
+    /// Drawn disabled, and not pressed: it would do nothing yet (Create
+    /// before the New Agent form has a task name).
+    pub disabled: bool,
 }
 
 /// What a dialog button does, for a front-end that styles buttons by intent.
