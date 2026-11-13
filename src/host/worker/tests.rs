@@ -156,6 +156,7 @@ fn worker_op(seq: u64, name: &str) -> WebInbound {
         "dir": "~",
         "files": [{ "name": "a.txt", "size": 1 }],
         "names": ["a.txt"],
+        "terminal_id": WORKER_SHELL_TERMINAL_ID,
     });
     let op = WorkerOp::parse(name, Some(&args))
         .expect("a worker command")
@@ -723,6 +724,131 @@ fn input_for_the_worker_shell_goes_to_the_worker_shell() {
         "{:?}",
         ack.detail
     );
+}
+
+/// The ids of the worker's shells, as its published state lists them.
+fn shell_ids(host: &AppHost) -> Vec<String> {
+    host.worker_host_state()
+        .expect("a worker")
+        .shells
+        .iter()
+        .map(|s| s.terminal_id.as_str().to_string())
+        .collect()
+}
+
+#[test]
+fn a_window_opens_closes_and_restarts_worker_shells() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    assert!(shell_ids(&host).is_empty(), "no shell before one is opened");
+
+    let handles: Vec<_> = (0..3).map(|_| fakes.pty.queue_session()).collect();
+    for seq in 1..=3 {
+        let out = host.route_inbound(worker_op(seq, worker_command::OPEN_WORKER_SHELL));
+        assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    }
+    assert_eq!(
+        shell_ids(&host),
+        ["worker:shell", "worker:shell:2", "worker:shell:3"]
+    );
+    let titles: Vec<String> = host
+        .worker_host_state()
+        .unwrap()
+        .shells
+        .into_iter()
+        .map(|s| s.title)
+        .collect();
+    assert_eq!(titles, ["Shell 1", "Shell 2", "Shell 3"]);
+    // Every shell spawned in the worker's home.
+    assert!(fakes
+        .pty
+        .spawns()
+        .iter()
+        .all(|(_, _, dir)| dir == Path::new("/home/me")));
+
+    // Closing ends the process and drops the shell; its number is not reused.
+    let close = |seq, id: &str| {
+        worker_op_with(
+            seq,
+            worker_command::CLOSE_WORKER_SHELL,
+            json!({ "terminal_id": id }),
+        )
+    };
+    let out = host.route_inbound(close(4, "worker:shell:2"));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    assert_eq!(shell_ids(&host), ["worker:shell", "worker:shell:3"]);
+    assert!(handles[1].terminated(), "closing ends the process");
+    assert!(!handles[0].terminated() && !handles[2].terminated());
+    host.route_inbound(worker_op(5, worker_command::OPEN_WORKER_SHELL));
+    assert_eq!(
+        shell_ids(&host),
+        ["worker:shell", "worker:shell:3", "worker:shell:4"]
+    );
+
+    // A shell already closed is refused, and says so.
+    let out = host.route_inbound(close(6, "worker:shell:2"));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .contains("already closed"));
+
+    // Restart names its shell and keeps its id.
+    let spawns = fakes.pty.spawns().len();
+    let out = host.route_inbound(worker_op_with(
+        7,
+        worker_command::RESTART_WORKER_SHELL,
+        json!({ "terminal_id": "worker:shell:3" }),
+    ));
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    assert_eq!(fakes.pty.spawns().len(), spawns + 1);
+    assert_eq!(
+        shell_ids(&host),
+        ["worker:shell", "worker:shell:3", "worker:shell:4"]
+    );
+}
+
+#[test]
+fn a_worker_refuses_more_than_its_cap_of_shells() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    for seq in 0..shell::MAX_WORKER_SHELLS as u64 {
+        let out = host.route_inbound(worker_op(seq, worker_command::OPEN_WORKER_SHELL));
+        assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    }
+    let out = host.route_inbound(worker_op(99, worker_command::OPEN_WORKER_SHELL));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(ack
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .contains("Close one first"));
+    assert_eq!(shell_ids(&host).len(), shell::MAX_WORKER_SHELLS);
+}
+
+#[test]
+fn input_reaches_the_shell_it_names() {
+    let fakes = Fakes::new();
+    let mut host = fakes.worker(Vec::new());
+    let first = fakes.pty.queue_session();
+    let second = fakes.pty.queue_session();
+    host.route_inbound(worker_op(1, worker_command::OPEN_WORKER_SHELL));
+    host.route_inbound(worker_op(2, worker_command::OPEN_WORKER_SHELL));
+    let out = host.route_inbound(WebInbound::Input {
+        viewer_id: viewer(),
+        input: crate::web::protocol::Input {
+            seq: 3,
+            terminal_id: TerminalId::new("worker:shell:2"),
+            data: b"ls\r".to_vec(),
+            image: None,
+        },
+    });
+    assert_eq!(first_ack(&out).outcome, AckOutcome::Applied);
+    assert!(first.input().is_empty(), "not the first shell");
+    assert_eq!(second.input(), b"ls\r");
 }
 
 // ---------------------------------------------------------------------------

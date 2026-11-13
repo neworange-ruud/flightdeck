@@ -490,8 +490,7 @@ function terminalGeometryOf(
       }
     }
   }
-  const shell = wire.worker?.shell;
-  if (shell !== undefined && shell !== null) {
+  for (const shell of wireShells(wire.worker)) {
     grids[shell.terminal_id] = {
       cols: shell.geometry.cols,
       rows: shell.geometry.rows,
@@ -506,10 +505,7 @@ function terminalGeometryOf(
 export function workerOf(wire: WireWorkerSnapshot): WorkerInfo {
   return {
     home: wire.home,
-    shell:
-      wire.shell === undefined || wire.shell === null
-        ? null
-        : workerShellOf(wire.shell),
+    shells: wireShells(wire).map(workerShellOf),
     health:
       wire.health === undefined || wire.health === null
         ? null
@@ -517,6 +513,20 @@ export function workerOf(wire: WireWorkerSnapshot): WorkerInfo {
     status: workerStatusOf(wire.status),
     connections: connectionsOf(wire.connections),
   };
+}
+
+/** A worker's shells: every one from a v10 worker, the one `shell` from an
+ * older one (W35). */
+export function wireShells(
+  wire: WireWorkerSnapshot | null | undefined,
+): readonly WireWorkerShellView[] {
+  if (wire === undefined || wire === null) {
+    return [];
+  }
+  if (wire.shells !== undefined && wire.shells.length > 0) {
+    return wire.shells;
+  }
+  return wire.shell === undefined || wire.shell === null ? [] : [wire.shell];
 }
 
 export function workerShellOf(wire: WireWorkerShellView): WorkerShell {

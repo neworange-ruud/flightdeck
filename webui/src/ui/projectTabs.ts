@@ -6,6 +6,7 @@ import {
   statusTone,
 } from "../state/status";
 import type { Project } from "../state/model";
+import { workerShellOnScreen } from "../state/worker";
 import type { AppState } from "../state/types";
 import { uploadAvailable } from "../state/worker";
 import { clear, el, hostOnlyBadge, separator, spinnerGlyph } from "./dom";
@@ -217,12 +218,12 @@ function projectTab(
  */
 function workerShellTab(state: AppState, store: Store): HTMLElement {
   const selected = state.workerShellTab;
-  const shell = state.worker?.shell ?? null;
+  const shell = workerShellOnScreen(state);
   const select = el(
     "button",
     {
       class: "fd-project__select fd-project__select--shell",
-      title: "the worker's own shell — choosing it moves nothing on the worker",
+      title: "the worker's own shells — choosing them moves nothing on the worker",
       attrs: {
         type: "button",
         role: "tab",
@@ -235,7 +236,7 @@ function workerShellTab(state: AppState, store: Store): HTMLElement {
         text: shell !== null && shell.alive ? "●" : "○",
         attrs: { "aria-hidden": "true" },
       }),
-      el("span", { text: "Worker shell" }),
+      el("span", { text: "Worker" }),
     ],
   );
   select.addEventListener("click", () => {

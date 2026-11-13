@@ -1,23 +1,25 @@
-//! The worker shell (`specs/WORKER_PRD.md` §4.4, W15): a login shell in
-//! `$HOME`, streamed to the attached window as terminal `worker:shell`.
+//! The worker shells (`specs/WORKER_PRD.md` §4.4, W15, W35): login shells in
+//! `$HOME`, each streamed to the attached window as its own terminal —
+//! `worker:shell` for the first, `worker:shell:<n>` for the rest.
 //!
-//! It runs as the worker's account (`$SHELL -l`, falling back to `/bin/sh`),
-//! outlives a detach, and is restarted on demand after it exits. The stream id
-//! is kept across restarts so a window's offsets continue, like a restarted
-//! primary.
+//! Each runs as the worker's account (`$SHELL -l`, falling back to
+//! `/bin/sh`), outlives a detach, and is restarted on demand after it exits.
+//! A shell's stream id is kept across restarts so a window's offsets
+//! continue, like a restarted primary. [`WorkerShells`] holds them; a window
+//! opens and closes them (W35).
 
 use std::path::Path;
 
 use crate::contracts::{ProcessState, PtyBackend, PtySize, Result};
 use crate::terminal::grid::TUI_EMULATOR;
 use crate::terminal::session::{Terminal, MIN_GRID_COLS, MIN_GRID_ROWS};
-use crate::web::protocol::Geometry;
+use crate::web::protocol::{worker_shell_terminal_id, Geometry, TerminalId};
 use crate::web::stream::Written;
 
 /// What the window's shell tab shows about the shell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellFacts {
-    /// Always "Worker shell".
+    /// `Shell <n>`.
     pub title: String,
     pub geometry: Geometry,
     pub alive: bool,
@@ -45,8 +47,10 @@ pub fn login_shell(
     (shell.to_string(), vec!["-l".to_string()])
 }
 
-/// The worker's one login shell.
+/// One of the worker's login shells.
 pub struct WorkerShell {
+    /// The tab title, `Shell <n>`.
+    title: String,
     terminal: Option<Terminal>,
     /// The size the next start spawns at: the last one asked for.
     size: PtySize,
@@ -57,9 +61,15 @@ pub struct WorkerShell {
 }
 
 impl WorkerShell {
-    /// A shell not started yet, to be started at `size`.
+    /// A shell not started yet, to be started at `size`, titled `Shell 1`.
     pub fn new(size: PtySize) -> Self {
+        Self::numbered(1, size)
+    }
+
+    /// Shell number `n`, not started yet, to be started at `size`.
+    pub fn numbered(n: u32, size: PtySize) -> Self {
         WorkerShell {
+            title: format!("Shell {n}"),
             terminal: None,
             size,
             exited: None,
@@ -88,7 +98,7 @@ impl WorkerShell {
         ];
         let mut terminal =
             Terminal::spawn(pty, TUI_EMULATOR, &program, &args, &env, home, self.size)?;
-        terminal.title = "Worker shell".to_string();
+        terminal.title = self.title.clone();
         self.terminal = Some(terminal);
         self.exited = None;
         self.starts += 1;
@@ -192,7 +202,7 @@ impl WorkerShell {
             | ProcessState::Lost => (false, None),
         };
         Some(ShellFacts {
-            title: "Worker shell".to_string(),
+            title: self.title.clone(),
             geometry: Geometry { cols, rows },
             alive,
             exit_code,
@@ -208,6 +218,188 @@ impl WorkerShell {
             ) {
                 let _ = terminal.session_mut().terminate_tree();
             }
+        }
+    }
+}
+
+/// The most shells a worker keeps at once (W35): enough for any workflow, and
+/// a bound on what a runaway client can make the worker spawn.
+pub const MAX_WORKER_SHELLS: usize = 16;
+
+/// Why a shell could not be opened, closed or restarted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellRefusal {
+    /// [`MAX_WORKER_SHELLS`] are open already.
+    TooMany,
+    /// No shell has that id.
+    NoSuchShell,
+    /// The PTY did not spawn.
+    Spawn(String),
+}
+
+impl std::fmt::Display for ShellRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShellRefusal::TooMany => write!(
+                f,
+                "The worker already has {MAX_WORKER_SHELLS} shells open. Close one first."
+            ),
+            ShellRefusal::NoSuchShell => f.write_str("That worker shell is already closed."),
+            ShellRefusal::Spawn(e) => write!(f, "The worker shell did not start: {e}"),
+        }
+    }
+}
+
+/// Every worker shell, in the order they were opened (W35).
+///
+/// Numbers are minted from a counter and never reused while the worker runs,
+/// so a stream id names one shell for the worker's whole life.
+pub struct WorkerShells {
+    shells: Vec<(TerminalId, WorkerShell)>,
+    /// The number the next shell gets.
+    next: u32,
+    /// The size a new shell spawns at: the last one any shell was given.
+    size: PtySize,
+}
+
+impl WorkerShells {
+    /// No shells yet; the first opened is `Shell 1` at `size`.
+    pub fn new(size: PtySize) -> Self {
+        WorkerShells {
+            shells: Vec::new(),
+            next: 1,
+            size,
+        }
+    }
+
+    /// Open the next shell in `home` and return its id.
+    pub fn open(
+        &mut self,
+        pty: &dyn PtyBackend,
+        home: &Path,
+    ) -> std::result::Result<TerminalId, ShellRefusal> {
+        let env_shell = std::env::var("SHELL").ok();
+        self.open_with(pty, home, env_shell.as_deref(), &|p| p.exists())
+    }
+
+    fn open_with(
+        &mut self,
+        pty: &dyn PtyBackend,
+        home: &Path,
+        env_shell: Option<&str>,
+        exists: &dyn Fn(&Path) -> bool,
+    ) -> std::result::Result<TerminalId, ShellRefusal> {
+        if self.shells.len() >= MAX_WORKER_SHELLS {
+            return Err(ShellRefusal::TooMany);
+        }
+        let n = self.next;
+        let mut shell = WorkerShell::numbered(n, self.size);
+        shell
+            .start_with(pty, home, env_shell, exists)
+            .map_err(|e| ShellRefusal::Spawn(e.to_string()))?;
+        // Only a shell that started uses up its number.
+        self.next += 1;
+        let id = worker_shell_terminal_id(n);
+        self.shells.push((id.clone(), shell));
+        Ok(id)
+    }
+
+    /// End shell `id`'s process and forget it.
+    pub fn close(&mut self, id: &TerminalId) -> std::result::Result<(), ShellRefusal> {
+        let at = self
+            .shells
+            .iter()
+            .position(|(have, _)| have == id)
+            .ok_or(ShellRefusal::NoSuchShell)?;
+        let (_, mut shell) = self.shells.remove(at);
+        shell.terminate();
+        Ok(())
+    }
+
+    /// Start shell `id` again in `home` (after it exited, or terminating it).
+    pub fn restart(
+        &mut self,
+        id: &TerminalId,
+        pty: &dyn PtyBackend,
+        home: &Path,
+    ) -> std::result::Result<(), ShellRefusal> {
+        let shell = self.get_mut(id).ok_or(ShellRefusal::NoSuchShell)?;
+        shell
+            .restart(pty, home)
+            .map_err(|e| ShellRefusal::Spawn(e.to_string()))
+    }
+
+    /// The first shell's id, while any shell is open.
+    pub fn first(&self) -> Option<&TerminalId> {
+        self.shells.first().map(|(id, _)| id)
+    }
+
+    /// Whether `id` is an open shell.
+    pub fn contains(&self, id: &TerminalId) -> bool {
+        self.shells.iter().any(|(have, _)| have == id)
+    }
+
+    /// How many shells are open.
+    pub fn len(&self) -> usize {
+        self.shells.len()
+    }
+
+    /// Whether no shell is open.
+    pub fn is_empty(&self) -> bool {
+        self.shells.is_empty()
+    }
+
+    /// Shell `id`, mutably.
+    pub fn get_mut(&mut self, id: &TerminalId) -> Option<&mut WorkerShell> {
+        self.shells
+            .iter_mut()
+            .find(|(have, _)| have == id)
+            .map(|(_, shell)| shell)
+    }
+
+    /// Read every shell's waiting output, handing each chunk to `tee` with
+    /// its shell's id; whether anything was read.
+    pub fn drain(&mut self, tee: &mut dyn FnMut(&TerminalId, &[u8])) -> bool {
+        let mut read = false;
+        for (id, shell) in self.shells.iter_mut() {
+            read |= shell.drain(&mut |bytes| tee(id, bytes));
+        }
+        read
+    }
+
+    /// Every shell seen to have exited on this turn, with its code.
+    pub fn poll_exits(&mut self) -> Vec<(TerminalId, Option<i32>)> {
+        self.shells
+            .iter_mut()
+            .filter_map(|(id, shell)| shell.poll_exit().map(|code| (id.clone(), code)))
+            .collect()
+    }
+
+    /// Type `bytes` into shell `id`; `None` when there is no such shell.
+    pub fn write(&mut self, id: &TerminalId, bytes: &[u8]) -> Option<Written> {
+        self.get_mut(id).map(|shell| shell.write(bytes))
+    }
+
+    /// Resize shell `id`, and spawn later shells at `size`.
+    pub fn resize(&mut self, id: &TerminalId, size: PtySize) {
+        self.size = size;
+        if let Some(shell) = self.get_mut(id) {
+            shell.resize(size);
+        }
+    }
+
+    /// Every started shell's facts, in order.
+    pub fn facts(&self) -> Vec<(TerminalId, ShellFacts)> {
+        self.shells
+            .iter()
+            .filter_map(|(id, shell)| shell.facts().map(|facts| (id.clone(), facts)))
+            .collect()
+    }
+
+    /// Stop every shell (worker stop).
+    pub fn terminate(&mut self) {
+        for (_, shell) in self.shells.iter_mut() {
+            shell.terminate();
         }
     }
 }

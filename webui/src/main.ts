@@ -182,7 +182,17 @@ const app = createApp({
         runPickerIntent(action.intent);
         return;
       case "workerShell/restart":
-        session.sendCommand(WORKER_COMMAND.RESTART_WORKER_SHELL);
+        session.sendCommand(WORKER_COMMAND.RESTART_WORKER_SHELL, {
+          terminal_id: action.terminalId,
+        });
+        return;
+      case "workerShell/open":
+        session.sendCommand(WORKER_COMMAND.OPEN_WORKER_SHELL);
+        return;
+      case "workerShell/close":
+        session.sendCommand(WORKER_COMMAND.CLOSE_WORKER_SHELL, {
+          terminal_id: action.terminalId,
+        });
         return;
       /** Uploading files to a worker (v8, R30): the requests the panel's
        * buttons mean, and Cancel's abort. */

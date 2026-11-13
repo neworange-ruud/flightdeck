@@ -2051,10 +2051,9 @@ struct WorkspaceTerminals<'a> {
     projects: &'a mut [Project],
     /// Where a pasted image is saved ([`crate::web::protocol::Input::image`]).
     fs: &'a dyn FileSystem,
-    /// A worker's login shell, which takes the keystrokes for
-    /// [`crate::web::protocol::WORKER_SHELL_TERMINAL_ID`]. `None` on every
-    /// other host.
-    worker_shell: Option<&'a mut crate::host::worker::shell::WorkerShell>,
+    /// A worker's login shells, which take the keystrokes for their
+    /// `worker:shell…` ids (W35). `None` on every other host.
+    worker_shells: Option<&'a mut crate::host::worker::shell::WorkerShells>,
 }
 
 impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
@@ -2063,9 +2062,9 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
         terminal_id: &crate::web::protocol::TerminalId,
         bytes: &[u8],
     ) -> crate::web::stream::Written {
-        if terminal_id.as_str() == crate::web::protocol::WORKER_SHELL_TERMINAL_ID {
-            if let Some(shell) = self.worker_shell.as_deref_mut() {
-                return shell.write(bytes);
+        if let Some(shells) = self.worker_shells.as_deref_mut() {
+            if let Some(written) = shells.write(terminal_id, bytes) {
+                return written;
             }
         }
         for project in self.projects.iter_mut() {

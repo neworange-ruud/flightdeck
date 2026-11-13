@@ -1,6 +1,8 @@
 import { findSession } from "../state/model";
 import type { TerminalTab } from "../state/model";
+import type { WorkerShell } from "../state/model";
 import type { AppState } from "../state/types";
+import { opensWorkerShells, workerShellOnScreen } from "../state/worker";
 import { clear, el, separator } from "./dom";
 import type { Region } from "./dom";
 import type { Store } from "./store";
@@ -35,6 +37,11 @@ export function createTerminalTabs(store: Store): Region {
 
   function render(state: AppState): void {
     clear(bar);
+    /** The Worker tab: the worker's shells instead of a session's (W35). */
+    if (state.hostKind === "worker" && state.workerShellTab) {
+      renderShells(state);
+      return;
+    }
     const selection = state.selection;
     const session =
       selection === null
@@ -71,7 +78,80 @@ the palette reads Snapshot::commands (remote-control-ll5.1)",
     );
   }
 
+  /** One tab per worker shell, its `✕`, and `+ shell` (v10). A worker older
+   * than v10 has one shell and neither button. */
+  function renderShells(state: AppState): void {
+    const manage = opensWorkerShells(state);
+    const onScreen = workerShellOnScreen(state)?.terminalId ?? null;
+    (state.worker?.shells ?? []).forEach((shell, index) => {
+      if (index > 0) {
+        bar.append(separator());
+      }
+      bar.append(shellTab(shell, shell.terminalId === onScreen, manage, store));
+    });
+    bar.append(el("div", { class: "fd-spacer" }));
+    if (manage) {
+      const add = el("button", {
+        class: "fd-action fd-action--new-shell",
+        text: "+ shell",
+        title: "open another shell on the worker",
+        attrs: { type: "button", "data-action": "new-worker-shell" },
+      });
+      add.addEventListener("click", () => {
+        store.dispatch({ type: "workerShell/open" });
+      });
+      bar.append(add);
+    }
+  }
+
   return { el: bar, update: render };
+}
+
+function shellTab(
+  shell: WorkerShell,
+  selected: boolean,
+  manage: boolean,
+  store: Store,
+): HTMLElement {
+  const label = el("button", {
+    class: "fd-tab__label",
+    text: shell.title.toLowerCase(),
+    title: shell.alive ? "show this shell" : "show this shell (it exited)",
+    attrs: {
+      type: "button",
+      role: "tab",
+      "aria-selected": String(selected),
+    },
+  });
+  label.addEventListener("click", () => {
+    store.dispatch({ type: "workerShell/select", terminalId: shell.terminalId });
+  });
+  const children: HTMLElement[] = [label];
+  if (manage) {
+    const close = el("button", {
+      class: "fd-tab__close",
+      text: "✕",
+      title: "close this shell on the worker",
+      attrs: { type: "button", "aria-label": `Close ${shell.title}` },
+    });
+    close.addEventListener("click", () => {
+      store.dispatch({ type: "workerShell/close", terminalId: shell.terminalId });
+    });
+    children.push(close);
+  }
+  return el(
+    "div",
+    {
+      class: "fd-tab",
+      attrs: {
+        role: "presentation",
+        "data-selected": String(selected),
+        "data-kind": "shell",
+        "data-exited": String(!shell.alive),
+      },
+    },
+    children,
+  );
 }
 
 function terminalTab(

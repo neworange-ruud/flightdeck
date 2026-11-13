@@ -233,6 +233,7 @@ fn worker_snapshot() -> WorkerSnapshot {
     WorkerSnapshot {
         home: "/home/u".into(),
         shell: Some(worker_shell_view()),
+        shells: vec![worker_shell_view()],
         health: Some(health()),
         status: worker_status_view(),
         connections: connections_view(),
@@ -705,9 +706,9 @@ fn protocol_version_is_seven_and_still_serves_six() {
     //
     // **v9 is downloading files from a worker** (`remote-control-pz6d`): one
     // frame kind, `DownloadPlan`, held back below v9 the same way.
-    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(PROTOCOL_VERSION, 10);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 9);
+    assert_eq!(MAX_SUPPORTED_VERSION, 10);
     assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
     assert_eq!(UPLOAD_MIN_VERSION, 8);
     assert_eq!(DOWNLOAD_MIN_VERSION, 9);
@@ -772,9 +773,10 @@ fn the_host_answers_each_peer_at_the_lower_of_the_two_versions() {
     assert_eq!(negotiated(6), 6);
     assert_eq!(negotiated(7), 7);
     assert_eq!(negotiated(8), 8);
+    assert_eq!(negotiated(9), 9);
     // A peer newer than this build never gets past `check_version`, but the
     // arithmetic still never claims a version this build does not speak.
-    assert_eq!(negotiated(9), PROTOCOL_VERSION);
+    assert_eq!(negotiated(11), PROTOCOL_VERSION);
 }
 
 #[test]
@@ -789,15 +791,15 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round. v9 keeps v6 in its range and still refuses v5.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v9 host");
+    // refused both ways round. v10 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v10 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 9,
+            local: 10,
             peer: 5,
             min_supported: 6,
-            max_supported: 9,
+            max_supported: 10,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
@@ -806,7 +808,7 @@ fn mismatched_version_is_representable_and_detectable() {
     }
     // Newer than our ceiling is equally a mismatch. A native client that
     // dialled too new may redial at `max_supported`; a browser reloads.
-    assert!(check_version(10).is_err());
+    assert!(check_version(11).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -814,7 +816,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 9);
+    assert_eq!(value["version"]["max_supported"], 10);
     assert_eq!(round_trip(&frame), frame);
 }
 
@@ -2208,7 +2210,26 @@ fn every_worker_command_parses_into_its_op() {
         (
             worker_command::RESTART_WORKER_SHELL,
             Some(json!({ "ignored": true })),
-            WorkerOp::RestartWorkerShell,
+            WorkerOp::RestartWorkerShell { terminal_id: None },
+        ),
+        (
+            worker_command::RESTART_WORKER_SHELL,
+            Some(json!({ "terminal_id": "worker:shell:3" })),
+            WorkerOp::RestartWorkerShell {
+                terminal_id: Some(TerminalId::new("worker:shell:3")),
+            },
+        ),
+        (
+            worker_command::OPEN_WORKER_SHELL,
+            None,
+            WorkerOp::OpenWorkerShell,
+        ),
+        (
+            worker_command::CLOSE_WORKER_SHELL,
+            Some(json!({ "terminal_id": "worker:shell:2" })),
+            WorkerOp::CloseWorkerShell {
+                terminal_id: TerminalId::new("worker:shell:2"),
+            },
         ),
         (
             worker_command::BEGIN_UPLOAD,

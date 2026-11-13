@@ -365,12 +365,37 @@ impl RemoteModel {
         self.session.show_worker_shell();
     }
 
-    /// The worker's shell, as the worker last described it.
+    /// The worker shell on the Worker tab, as the worker last described it.
     pub fn worker_shell(&self) -> Option<&flightdeck::web::protocol::WorkerShellView> {
         self.session.worker_shell()
     }
 
-    /// Start the worker shell again after it exited (its Restart shell).
+    /// Every worker shell, in the order they were opened (W35).
+    pub fn worker_shells(&self) -> &[flightdeck::web::protocol::WorkerShellView] {
+        self.session.worker_shells()
+    }
+
+    /// Whether the worker opens and closes shells (protocol v10).
+    pub fn opens_worker_shells(&self) -> bool {
+        self.session.opens_worker_shells()
+    }
+
+    /// Show worker shell `id` (a click on its tab in the shell row).
+    pub fn select_worker_shell(&mut self, id: &flightdeck::web::protocol::TerminalId) {
+        self.session.select_worker_shell(id);
+    }
+
+    /// Ask the worker for another shell (the row's **+**, Ctrl-T).
+    pub fn open_worker_shell(&mut self) {
+        self.session.open_worker_shell();
+    }
+
+    /// Close worker shell `id` (its tab's **×**).
+    pub fn close_worker_shell(&mut self, id: &flightdeck::web::protocol::TerminalId) {
+        self.session.close_worker_shell(Some(id.clone()));
+    }
+
+    /// Start the shell on screen again after it exited (its Restart shell).
     pub fn restart_worker_shell(&mut self) {
         self.session.restart_worker_shell();
     }

@@ -1,4 +1,10 @@
-import { shellExitLine, workerCard } from "../state/worker";
+import {
+  noShellLine,
+  opensWorkerShells,
+  shellExitLine,
+  workerCard,
+  workerShellOnScreen,
+} from "../state/worker";
 import type { AppState } from "../state/types";
 import { clear, el } from "./dom";
 import type { Region } from "./dom";
@@ -57,9 +63,13 @@ export function createWorkerCard(store: Store): Region {
           el("div", { class: "fd-workercard__panel" }, [
             el("p", {
               class: "fd-workercard__title",
-              text: shellExitLine(null),
+              text: noShellLine(state),
             }),
-            restart(store),
+            opensWorkerShells(state)
+              ? button("Open a shell", "open-shell", () =>
+                  store.dispatch({ type: "workerShell/open" }),
+                )
+              : restart(store, state),
           ]),
         );
         return;
@@ -68,9 +78,9 @@ export function createWorkerCard(store: Store): Region {
           el("div", { class: "fd-workercard__bar" }, [
             el("span", {
               class: "fd-workercard__line",
-              text: shellExitLine(state.worker?.shell ?? null),
+              text: shellExitLine(workerShellOnScreen(state)),
             }),
-            restart(store),
+            restart(store, state),
           ]),
         );
         return;
@@ -80,9 +90,11 @@ export function createWorkerCard(store: Store): Region {
   return { el: box, update: render };
 }
 
-function restart(store: Store): HTMLElement {
+/** Restart the shell on screen (the first, on a worker with none listed). */
+function restart(store: Store, state: AppState): HTMLElement {
+  const terminalId = workerShellOnScreen(state)?.terminalId ?? "worker:shell";
   return button("Restart shell", "restart-shell", () =>
-    store.dispatch({ type: "workerShell/restart" }),
+    store.dispatch({ type: "workerShell/restart", terminalId }),
   );
 }
 

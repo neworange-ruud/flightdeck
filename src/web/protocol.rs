@@ -260,7 +260,7 @@ mod tests;
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
@@ -270,7 +270,7 @@ pub const PROTOCOL_VERSION: u16 = 9;
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 9;
+pub const MAX_SUPPORTED_VERSION: u16 = 10;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
@@ -280,6 +280,15 @@ pub const UPLOAD_MIN_VERSION: u16 = 8;
 /// that may ask for one with [`worker_command::BEGIN_DOWNLOAD`] (v9). Also the
 /// oldest a worker lists files for ([`DirListing::files`]).
 pub const DOWNLOAD_MIN_VERSION: u16 = 9;
+
+/// The oldest peer that knows a worker has **many shells** (W35, v10): it
+/// reads [`WorkerSnapshot::shells`], takes a [`Delta::WorkerShell`] for any
+/// shell as an upsert and a [`Delta::WorkerShellClosed`], and may send
+/// [`worker_command::OPEN_WORKER_SHELL`] and
+/// [`worker_command::CLOSE_WORKER_SHELL`]. An older peer reads a
+/// [`Delta::WorkerShell`] as "the" shell, so it is only ever sent the first
+/// one's ([`WORKER_SHELL_TERMINAL_ID`]).
+pub const WORKER_SHELLS_MIN_VERSION: u16 = 10;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -1772,6 +1781,27 @@ pub enum ConnectionKind {
 /// client addresses its byte cursor and [`ResizeTerminal`] by this id.
 pub const WORKER_SHELL_TERMINAL_ID: &str = "worker:shell";
 
+/// The [`TerminalId`] of worker shell number `n` (W35): the first keeps
+/// [`WORKER_SHELL_TERMINAL_ID`], so older peers still find it; the rest are
+/// `worker:shell:<n>`. Numbers are never reused while the worker runs, so a
+/// window's byte offsets for a closed shell can never apply to a new one.
+pub fn worker_shell_terminal_id(n: u32) -> TerminalId {
+    if n <= 1 {
+        TerminalId::new(WORKER_SHELL_TERMINAL_ID)
+    } else {
+        TerminalId::new(format!("{WORKER_SHELL_TERMINAL_ID}:{n}"))
+    }
+}
+
+/// Whether `id` names a worker shell (W35).
+pub fn is_worker_shell_terminal_id(id: &str) -> bool {
+    id == WORKER_SHELL_TERMINAL_ID
+        || id
+            .strip_prefix(WORKER_SHELL_TERMINAL_ID)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Everything worker-specific a window paints from, on the
 /// [`Snapshot::worker`]. `Some` only from a [`HostKind::Worker`] host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1779,9 +1809,13 @@ pub struct WorkerSnapshot {
     /// `$HOME` on the worker: the project picker's root and the boundary every
     /// path it browses must stay inside (W16).
     pub home: String,
-    /// The worker shell, when one is running or has run.
+    /// The first worker shell ([`WORKER_SHELL_TERMINAL_ID`]), while it
+    /// exists: what a peer older than [`WORKER_SHELLS_MIN_VERSION`] shows.
     #[serde(default)]
     pub shell: Option<WorkerShellView>,
+    /// Every worker shell, in the order they were opened (W35, v10).
+    #[serde(default)]
+    pub shells: Vec<WorkerShellView>,
     /// The latest health sample, once one has been taken.
     #[serde(default)]
     pub health: Option<Health>,
@@ -2611,9 +2645,16 @@ pub enum Delta {
     },
     /// A fresh health sample (v7, worker hosts only).
     Health(Health),
-    /// The worker shell's title, geometry or liveness changed (v7, worker
-    /// hosts only).
+    /// A worker shell's title, geometry or liveness changed, or it was
+    /// opened (v7, worker hosts only). From v10 an upsert keyed by
+    /// [`WorkerShellView::terminal_id`]; a peer older than
+    /// [`WORKER_SHELLS_MIN_VERSION`] is only sent the first shell's.
     WorkerShell(WorkerShellView),
+    /// A worker shell was closed and is gone (W35, v10, worker hosts only).
+    WorkerShellClosed {
+        /// The closed shell.
+        terminal_id: TerminalId,
+    },
     /// The worker's listen addresses, unread count or projects root changed
     /// (v7, worker hosts only).
     WorkerStatus(WorkerStatusView),
@@ -3272,8 +3313,14 @@ pub mod worker_command {
     /// Clone a URL under the projects root and open it. Args `{url: string,
     /// name?: string}`. Progress arrives as [`super::ServerMsg::CloneProgress`].
     pub const CLONE_PROJECT: &str = "clone_project";
-    /// Restart the worker shell. No args.
+    /// Restart a worker shell. Args `{terminal_id?: string}` (v10); none
+    /// restarts the first shell, as before v10.
     pub const RESTART_WORKER_SHELL: &str = "restart_worker_shell";
+    /// Open another worker shell in `$HOME` (W35, v10). No args.
+    pub const OPEN_WORKER_SHELL: &str = "open_worker_shell";
+    /// Close a worker shell, ending its process (W35, v10). Args
+    /// `{terminal_id: string}`.
+    pub const CLOSE_WORKER_SHELL: &str = "close_worker_shell";
     /// Ask to upload files into one folder under `$HOME` (v8). Args `{dir:
     /// string, files: [{name: string, size: number}], on_conflict?: "ask" |
     /// "replace" | "keep_both"}` (`ask` when absent). Answered with
@@ -3290,6 +3337,8 @@ pub mod worker_command {
         OPEN_PROJECT_PATH,
         CLONE_PROJECT,
         RESTART_WORKER_SHELL,
+        OPEN_WORKER_SHELL,
+        CLOSE_WORKER_SHELL,
         BEGIN_UPLOAD,
         BEGIN_DOWNLOAD,
     ];
@@ -3322,7 +3371,17 @@ pub enum WorkerOp {
         name: Option<String>,
     },
     /// [`worker_command::RESTART_WORKER_SHELL`].
-    RestartWorkerShell,
+    RestartWorkerShell {
+        /// The shell to restart; `None` is the first (a pre-v10 peer).
+        terminal_id: Option<TerminalId>,
+    },
+    /// [`worker_command::OPEN_WORKER_SHELL`] (v10).
+    OpenWorkerShell,
+    /// [`worker_command::CLOSE_WORKER_SHELL`] (v10).
+    CloseWorkerShell {
+        /// The shell to close.
+        terminal_id: TerminalId,
+    },
     /// [`worker_command::BEGIN_UPLOAD`] (v8).
     BeginUpload {
         /// The target folder, as asked (`~`, `~/x`, relative or absolute).
@@ -3379,7 +3438,19 @@ impl WorkerOp {
                     name: args.optional_str("name")?,
                 })
             }
-            worker_command::RESTART_WORKER_SHELL => Ok(WorkerOp::RestartWorkerShell),
+            worker_command::RESTART_WORKER_SHELL => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::RestartWorkerShell {
+                    terminal_id: args.optional_str("terminal_id")?.map(TerminalId::new),
+                })
+            }
+            worker_command::OPEN_WORKER_SHELL => Ok(WorkerOp::OpenWorkerShell),
+            worker_command::CLOSE_WORKER_SHELL => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::CloseWorkerShell {
+                    terminal_id: TerminalId::new(args.required_str("terminal_id")?),
+                })
+            }
             worker_command::BEGIN_UPLOAD => {
                 let args = WorkerArgs::new(name, args)?;
                 Ok(WorkerOp::BeginUpload {

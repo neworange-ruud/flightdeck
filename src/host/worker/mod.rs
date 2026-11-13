@@ -15,7 +15,7 @@
 //!
 //! What a worker adds to a turn:
 //!
-//! * [`AppHost::pump`] drains the shell into its `worker:shell` stream,
+//! * [`AppHost::pump`] drains each shell into its `worker:shell…` stream,
 //!   forwards the agents' notifications ([`WorkerNotifier`]) as
 //!   `Delta::Notification`, turns what the TUI would have shown in its status
 //!   line into [`crate::web::protocol::HostMessage`]s ([`messages`]), reports clones, samples
@@ -40,6 +40,7 @@ use crate::host::AppHost;
 use crate::persistence::workspace::{load_workspace, WorkspaceUi};
 use crate::web::credentials::TokenId;
 use crate::web::credentials::{BrowserToken, BOOTSTRAP_CODE_TTL_MS};
+use crate::web::protocol::is_worker_shell_terminal_id;
 use crate::web::protocol::{
     Ack, AckOutcome, Delta, DirEntryView, DirListing, DownloadPlan, DownloadPlanFile,
     FileEntryView, HostKind, MessageLevel, NotificationSoundView, NotificationView, ProjectId,
@@ -81,7 +82,7 @@ use clone::{CloneEvent, CloneJobs, CloneRunner};
 use health::{AgentCounts, HealthProbe, HealthSampler};
 use messages::{level_of, HostMessageLog};
 use projects::Confinement;
-use shell::WorkerShell;
+use shell::WorkerShells;
 use tls::{CertLifecycle, CertSetup};
 
 /// The answer to every command that needs a project, on a worker that has
@@ -225,7 +226,7 @@ pub(crate) struct WorkerExt {
     update_check: bool,
     probe: Box<dyn HealthProbe + Send>,
     cloner: Arc<dyn CloneRunner>,
-    pub(super) shell: WorkerShell,
+    pub(super) shells: WorkerShells,
     messages: HostMessageLog,
     /// The [`WorkerNotifier`]'s queue: every agent notification the pump fired.
     notifications: Arc<Mutex<Vec<Notification>>>,
@@ -347,10 +348,6 @@ fn level_label(level: MessageLevel) -> &'static str {
         MessageLevel::Warning => "warning",
         MessageLevel::Error => "error",
     }
-}
-
-fn shell_terminal_id() -> TerminalId {
-    TerminalId::new(WORKER_SHELL_TERMINAL_ID)
 }
 
 fn notification_view(note: &Notification, at_ms: i64) -> NotificationView {
@@ -530,7 +527,7 @@ impl<'a> AppHost<'a> {
             config: opts.config,
             probe: opts.health,
             cloner: opts.cloner,
-            shell: WorkerShell::new(size),
+            shells: WorkerShells::new(size),
             messages: HostMessageLog::new(),
             notifications: notifier.queue(),
             health: HealthSampler::new(started_ms),
@@ -604,12 +601,11 @@ impl<'a> AppHost<'a> {
         let pty = self.env.pty;
         if let Some(w) = self.worker.as_mut() {
             let home = w.home.clone();
-            match w.shell.start(pty, &home) {
-                Ok(()) => w.log("worker shell started"),
+            match w.shells.open(pty, &home) {
+                Ok(id) => w.log(format!("worker shell {id} started")),
                 Err(e) => {
                     w.log(format!("worker shell did not start: {e}"));
-                    self.ui
-                        .message(format!("The worker shell did not start: {e}"));
+                    self.ui.message(e.to_string());
                 }
             }
         }
@@ -666,23 +662,22 @@ impl<'a> AppHost<'a> {
         let mut changed = false;
         let at_ms = now_ms as i64;
 
-        // --- The shell: its output into the `worker:shell` stream, its exit
+        // --- The shells: each one's output into its own stream, its exit
         //     onto the stream's facts. ---
         {
             let Some(w) = self.worker.as_mut() else {
                 return false;
             };
             let web_surface = &mut self.web_surface;
-            let id = shell_terminal_id();
             changed |= w
-                .shell
-                .drain(&mut |bytes| web_surface.tee_terminal(&id, bytes));
-            if let Some(code) = w.shell.poll_exit() {
+                .shells
+                .drain(&mut |id, bytes| web_surface.tee_terminal(id, bytes));
+            for (id, code) in w.shells.poll_exits() {
                 changed = true;
                 web_surface.streams.closed(&id, code);
                 w.log(match code {
-                    Some(code) => format!("worker shell exited with status {code}"),
-                    None => "worker shell exited".to_string(),
+                    Some(code) => format!("worker shell {id} exited with status {code}"),
+                    None => format!("worker shell {id} exited"),
                 });
             }
         }
@@ -1002,9 +997,9 @@ impl<'a> AppHost<'a> {
             rows: size.rows.max(MIN_GRID_ROWS),
             cols: size.cols.max(MIN_GRID_COLS),
         };
-        if terminal_id.as_str() == WORKER_SHELL_TERMINAL_ID {
+        if is_worker_shell_terminal_id(terminal_id.as_str()) {
             if let Some(w) = self.worker.as_mut() {
-                w.shell.resize(size);
+                w.shells.resize(terminal_id, size);
             }
         } else if let Some((pi, ti, target)) =
             locate_web_terminal(&self.workspace, terminal_id.as_str())
@@ -1167,18 +1162,40 @@ impl<'a> AppHost<'a> {
                 w.log(format!("cloning {url} into {}", dest.display()));
                 Ok((Some(format!("Cloning into {}…", dest.display())), None))
             }
-            WorkerOp::RestartWorkerShell => {
+            WorkerOp::RestartWorkerShell { terminal_id } => {
                 let home = w.home.clone();
-                match w.shell.restart(self.env.pty, &home) {
+                // A pre-v10 window names no shell: it means the first.
+                let id = terminal_id.unwrap_or_else(|| TerminalId::new(WORKER_SHELL_TERMINAL_ID));
+                match w.shells.restart(&id, self.env.pty, &home) {
                     Ok(()) => {
-                        w.log("worker shell restarted");
+                        self.web_surface.streams.open(id.clone());
+                        w.log(format!("worker shell {id} restarted"));
                         Ok((Some("Restarted the worker shell.".to_string()), None))
                     }
-                    Err(e) => Err(OpRefusal::new(format!(
-                        "The worker shell did not start: {e}"
-                    ))),
+                    Err(e) => Err(OpRefusal::new(e.to_string())),
                 }
             }
+            WorkerOp::OpenWorkerShell => {
+                let home = w.home.clone();
+                match w.shells.open(self.env.pty, &home) {
+                    Ok(id) => {
+                        self.web_surface.streams.open(id.clone());
+                        w.log(format!("worker shell {id} opened"));
+                        Ok((Some("Opened a worker shell.".to_string()), None))
+                    }
+                    Err(e) => Err(OpRefusal::new(e.to_string())),
+                }
+            }
+            WorkerOp::CloseWorkerShell { terminal_id } => match w.shells.close(&terminal_id) {
+                Ok(()) => {
+                    // Its ring goes with it: the number is never reused, so
+                    // nothing can ever resume it.
+                    self.web_surface.streams.remove(&terminal_id);
+                    w.log(format!("worker shell {terminal_id} closed"));
+                    Ok((Some("Closed the worker shell.".to_string()), None))
+                }
+                Err(e) => Err(OpRefusal::new(e.to_string())),
+            },
             WorkerOp::BeginUpload {
                 dir,
                 files,
@@ -1380,20 +1397,24 @@ impl<'a> AppHost<'a> {
     /// host.
     pub(super) fn worker_host_state(&self) -> Option<WorkerHostState> {
         let w = self.worker.as_ref()?;
-        let id = shell_terminal_id();
         let streams = &self.web_surface.streams;
-        let shell = w.shell.facts().map(|facts| WorkerShellView {
-            terminal_id: id.clone(),
-            title: facts.title,
-            geometry: facts.geometry,
-            byte_len: streams.byte_len(&id),
-            replay_from: streams.replay_from(&id),
-            alive: facts.alive,
-            exit_code: facts.exit_code,
-        });
+        let shells = w
+            .shells
+            .facts()
+            .into_iter()
+            .map(|(id, facts)| WorkerShellView {
+                byte_len: streams.byte_len(&id),
+                replay_from: streams.replay_from(&id),
+                terminal_id: id,
+                title: facts.title,
+                geometry: facts.geometry,
+                alive: facts.alive,
+                exit_code: facts.exit_code,
+            })
+            .collect();
         Some(WorkerHostState {
             home: w.confinement.home().display().to_string(),
-            shell,
+            shells,
             health: w.last_health.clone(),
             status: self.worker_status_view(w),
             host_messages: w.messages.unread(),
@@ -1689,7 +1710,7 @@ impl<'a> AppHost<'a> {
                 ..ShutdownNotice::host_quit(None)
             }
         };
-        w.shell.terminate();
+        w.shells.terminate();
         w.log(if w.shutdown_restarting {
             "stopping for a restart"
         } else {

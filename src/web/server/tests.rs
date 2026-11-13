@@ -1225,7 +1225,7 @@ fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_tui_host_serves_v6_to_v9_and_a_worker_v7_to_v9() {
+fn a_tui_host_serves_v6_to_v10_and_a_worker_v7_to_v10() {
     assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Tui, 8), Ok(8));
@@ -1234,8 +1234,10 @@ fn a_tui_host_serves_v6_to_v9_and_a_worker_v7_to_v9() {
     assert_eq!(accept_version(HostKind::Worker, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Worker, 8), Ok(8));
     assert_eq!(accept_version(HostKind::Worker, 9), Ok(9));
+    assert_eq!(accept_version(HostKind::Tui, 10), Ok(10));
+    assert_eq!(accept_version(HostKind::Worker, 10), Ok(10));
 
-    for peer in [5, 6, 10] {
+    for peer in [5, 6, 11] {
         let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
         assert_eq!(refused.peer, peer);
         assert_eq!(refused.min_supported, 7, "the worker's own floor");
@@ -1513,6 +1515,72 @@ fn an_upload_plan_never_reaches_a_peer_below_v8() {
     ));
 }
 
+fn shell_delta(id: &str) -> ServerMsg {
+    ServerMsg::Delta(Delta::WorkerShell(crate::web::protocol::WorkerShellView {
+        terminal_id: id.into(),
+        title: "Shell".to_string(),
+        geometry: crate::web::protocol::Geometry { cols: 80, rows: 24 },
+        byte_len: 0,
+        replay_from: 0,
+        alive: true,
+        exit_code: None,
+    }))
+}
+
+/// A pre-v10 window reads any shell delta as "the" shell (W35): it hears
+/// about the first shell only, and never of a close; a v10 window hears all.
+#[test]
+fn a_peer_below_v10_only_hears_of_the_first_worker_shell() {
+    let mut registry = SeatRegistry::new(0, HostKind::Worker);
+    let (tx9, mut rx9) = mpsc::channel::<ServerMsg>(8);
+    registry.register(
+        viewer("old"),
+        ViewerIdentity {
+            address: IpAddr::V4(Ipv4Addr::new(100, 64, 1, 9)),
+            user_agent_label: Some("FlightDeck Desktop/1.0 (old)".to_string()),
+            token: token(),
+        },
+        5_000,
+        9,
+        ConnectionKind::Window,
+        tx9,
+    );
+    let closed = || {
+        ServerMsg::Delta(Delta::WorkerShellClosed {
+            terminal_id: "worker:shell:2".into(),
+        })
+    };
+    for msg in [
+        shell_delta("worker:shell"),
+        shell_delta("worker:shell:2"),
+        closed(),
+    ] {
+        registry.send_to(&viewer("old"), msg);
+    }
+    match drained(&mut rx9).as_slice() {
+        [ServerMsg::Delta(Delta::WorkerShell(shell))] => {
+            assert_eq!(shell.terminal_id.as_str(), "worker:shell")
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let mut rx10 = register_as(
+        &mut registry,
+        "new",
+        ConnectionKind::Window,
+        &token(),
+        "FlightDeck Desktop/2.0 (new)",
+    );
+    for msg in [
+        shell_delta("worker:shell"),
+        shell_delta("worker:shell:2"),
+        closed(),
+    ] {
+        registry.send_to(&viewer("new"), msg);
+    }
+    assert_eq!(drained(&mut rx10).len(), 3);
+}
+
 /// `same_device` is relative to the recipient's own credential.
 #[test]
 fn the_connections_view_says_whether_the_window_is_the_recipients_device() {
@@ -1722,7 +1790,7 @@ fn worker_state() -> HostState {
         host_kind: HostKind::Worker,
         worker: Some(WorkerHostState {
             home: "/home/ruud".to_string(),
-            shell: None,
+            shells: Vec::new(),
             health: None,
             status: WorkerStatusView::default(),
             host_messages: vec![HostMessage {

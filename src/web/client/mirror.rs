@@ -40,8 +40,9 @@ const NOTIFICATION_CAP: usize = 100;
 pub struct WorkerMirror {
     /// `$HOME` on the worker: the project picker's root.
     pub home: String,
-    /// The worker shell, once one has run.
-    pub shell: Option<WorkerShellView>,
+    /// Every worker shell, in the order they were opened (W35). From a
+    /// pre-v10 worker, its one shell.
+    pub shells: Vec<WorkerShellView>,
     /// The latest health sample.
     pub health: Option<Health>,
     /// Listen addresses, unread count, projects root.
@@ -64,7 +65,12 @@ impl WorkerMirror {
         let previous = previous.unwrap_or_default();
         let mut mirror = WorkerMirror {
             home: snapshot.home,
-            shell: snapshot.shell,
+            // A v10 worker lists them all; an older one has only `shell`.
+            shells: if snapshot.shells.is_empty() {
+                snapshot.shell.into_iter().collect()
+            } else {
+                snapshot.shells
+            },
             health: snapshot.health,
             status: snapshot.status,
             connections: snapshot.connections,
@@ -98,22 +104,36 @@ impl WorkerMirror {
         true
     }
 
-    /// The worker shell as a [`TerminalView`], so it is fed, cursored and
+    /// The worker shells as [`TerminalView`]s, so each is fed, cursored and
     /// rendered by exactly the code every other remote terminal is. Its
     /// session is its own id: it belongs to no project.
-    pub fn shell_terminal(&self) -> Option<TerminalView> {
-        let shell = self.shell.as_ref()?;
-        Some(TerminalView {
-            terminal_id: shell.terminal_id.clone(),
-            session_id: TabId(shell.terminal_id.as_str().to_string()),
-            role: TerminalRole::Shell,
-            title: shell.title.clone(),
-            geometry: shell.geometry,
-            byte_len: shell.byte_len,
-            replay_from: shell.replay_from,
-            alive: shell.alive,
-            exit_code: shell.exit_code,
-        })
+    pub fn shell_terminals(&self) -> Vec<TerminalView> {
+        self.shells
+            .iter()
+            .map(|shell| TerminalView {
+                terminal_id: shell.terminal_id.clone(),
+                session_id: TabId(shell.terminal_id.as_str().to_string()),
+                role: TerminalRole::Shell,
+                title: shell.title.clone(),
+                geometry: shell.geometry,
+                byte_len: shell.byte_len,
+                replay_from: shell.replay_from,
+                alive: shell.alive,
+                exit_code: shell.exit_code,
+            })
+            .collect()
+    }
+
+    /// Insert `shell`, or replace the one with its id in place.
+    fn upsert_shell(&mut self, shell: WorkerShellView) {
+        match self
+            .shells
+            .iter_mut()
+            .find(|s| s.terminal_id == shell.terminal_id)
+        {
+            Some(have) => *have = shell,
+            None => self.shells.push(shell),
+        }
     }
 }
 
@@ -387,7 +407,14 @@ impl RemoteWorkspace {
             },
             Delta::WorkerShell(shell) => match self.worker.as_mut() {
                 Some(worker) => {
-                    worker.shell = Some(shell);
+                    worker.upsert_shell(shell);
+                    changed
+                }
+                None => resync(),
+            },
+            Delta::WorkerShellClosed { terminal_id } => match self.worker.as_mut() {
+                Some(worker) => {
+                    worker.shells.retain(|s| s.terminal_id != terminal_id);
                     changed
                 }
                 None => resync(),
@@ -454,9 +481,19 @@ impl RemoteWorkspace {
         self.is_worker() && self.protocol_version >= crate::web::protocol::DOWNLOAD_MIN_VERSION
     }
 
-    /// The worker's shell, when the host is a worker that has one.
-    pub fn worker_shell(&self) -> Option<&WorkerShellView> {
-        self.worker.as_ref()?.shell.as_ref()
+    /// The worker's shells, in the order they were opened (W35); empty on
+    /// any other host.
+    pub fn worker_shells(&self) -> &[WorkerShellView] {
+        self.worker
+            .as_ref()
+            .map(|w| w.shells.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Whether the worker opens and closes shells on request (W35): a
+    /// worker attached at protocol v10 or later.
+    pub fn opens_worker_shells(&self) -> bool {
+        self.is_worker() && self.protocol_version >= crate::web::protocol::WORKER_SHELLS_MIN_VERSION
     }
 
     /// Notifications the worker raised since the last call, oldest first.
@@ -491,7 +528,9 @@ impl RemoteWorkspace {
     /// the wire.
     pub fn streamed_terminals(&self) -> Vec<TerminalView> {
         let mut out: Vec<TerminalView> = self.terminals().cloned().collect();
-        out.extend(self.worker.as_ref().and_then(WorkerMirror::shell_terminal));
+        if let Some(worker) = self.worker.as_ref() {
+            out.extend(worker.shell_terminals());
+        }
         out
     }
 

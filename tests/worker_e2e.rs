@@ -605,7 +605,8 @@ fn a_cli_minted_code_pairs_and_the_window_attaches_to_a_worker() {
     assert_eq!(ws.host_kind, Some(HostKind::Worker));
     assert!(ws.projects.is_empty(), "a fresh worker has no projects");
     let mirror = ws.worker.as_ref().expect("a worker snapshot");
-    let shell = mirror.shell.as_ref().expect("the worker shell is running");
+    let shell = mirror.shells.first().expect("the worker shell is running");
+    assert_eq!(mirror.shells.len(), 1, "a worker starts with one shell");
     assert_eq!(shell.terminal_id, shell_id());
     assert!(shell.alive, "{shell:?}");
     let home = std::fs::canonicalize(worker.home()).unwrap();
@@ -982,7 +983,8 @@ fn an_agent_spawns_from_the_window_and_the_window_sizes_its_pty() {
         client.pump();
         client
             .workspace()
-            .worker_shell()
+            .worker_shells()
+            .first()
             .is_some_and(|s| s.geometry.cols == 93 && s.geometry.rows == 27)
     });
     shell_round_trip(&worker, &mut client, &mut shell_pty, "stty size", "27 93");
@@ -1132,6 +1134,45 @@ fn a_background_link_gets_status_and_notifications_but_no_bytes() {
 // 8. The worker shell
 // ---------------------------------------------------------------------------
 
+/// A window opens a second shell, which runs on its own PTY next to the
+/// first, and closes it again (W35).
+#[test]
+fn a_window_opens_and_closes_a_second_worker_shell() {
+    let worker = Worker::start();
+    let (_token, mut client) = worker.window("laptop");
+    let seq = client.open_worker_shell();
+    worker.applied(&mut client, seq, "open_worker_shell");
+    let second = TerminalId::new("worker:shell:2");
+    worker.wait("the second shell", || {
+        client.pump();
+        client
+            .workspace()
+            .worker_shells()
+            .iter()
+            .any(|s| s.terminal_id == second && s.alive && s.title == "Shell 2")
+    });
+    let mut pty = client.pty(&second);
+    shell_round_trip(
+        &worker,
+        &mut client,
+        &mut pty,
+        "echo fd-second-$((5*5))",
+        "fd-second-25",
+    );
+
+    let seq = client.close_worker_shell(&second);
+    worker.applied(&mut client, seq, "close_worker_shell");
+    worker.wait("the second shell to close", || {
+        client.pump();
+        client.workspace().worker_shells().len() == 1
+    });
+    assert_eq!(
+        client.workspace().worker_shells()[0].terminal_id,
+        shell_id()
+    );
+    client.stop();
+}
+
 /// The worker shell answers, runs in `$HOME`, and comes back after `exit`.
 #[test]
 fn the_worker_shell_round_trips_and_restarts_after_exit() {
@@ -1159,14 +1200,22 @@ fn the_worker_shell_round_trips_and_restarts_after_exit() {
     pty.write_input(b"exit\r").unwrap();
     worker.wait("the shell to exit", || {
         client.pump();
-        client.workspace().worker_shell().is_some_and(|s| !s.alive)
+        client
+            .workspace()
+            .worker_shells()
+            .first()
+            .is_some_and(|s| !s.alive)
     });
 
-    let seq = client.restart_worker_shell();
+    let seq = client.restart_worker_shell(&shell);
     worker.applied(&mut client, seq, "restart_worker_shell");
     worker.wait("the shell to run again", || {
         client.pump();
-        client.workspace().worker_shell().is_some_and(|s| s.alive)
+        client
+            .workspace()
+            .worker_shells()
+            .first()
+            .is_some_and(|s| s.alive)
     });
     let mut pty = client.pty(&shell);
     shell_round_trip(

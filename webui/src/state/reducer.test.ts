@@ -71,6 +71,8 @@ describe("createInitialState", () => {
       worker: null,
       terminalGeometry: {},
       workerShellTab: false,
+      workerShell: null,
+      openingShell: null,
       picker: null,
       pendingOpen: null,
       notice: null,

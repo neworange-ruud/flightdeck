@@ -1256,15 +1256,15 @@ mod delta {
             host_kind: HostKind::Worker,
             worker: Some(WorkerHostState {
                 home: "/home/ruud".to_string(),
-                shell: Some(WorkerShellView {
+                shells: vec![WorkerShellView {
                     terminal_id: TerminalId::new(WORKER_SHELL_TERMINAL_ID),
-                    title: "zsh".to_string(),
+                    title: "Shell 1".to_string(),
                     geometry: Geometry { cols: 80, rows: 24 },
                     byte_len: 10,
                     replay_from: 0,
                     alive: true,
                     exit_code: None,
-                }),
+                }],
                 health: Some(health(1_000)),
                 status: WorkerStatusView {
                     listening: vec!["100.64.1.2:7420".to_string()],
@@ -1342,7 +1342,7 @@ mod delta {
             let shell = printed
                 .worker
                 .as_mut()
-                .and_then(|w| w.shell.as_mut())
+                .and_then(|w| w.shells.first_mut())
                 .expect("a shell");
             shell.byte_len = 9_999;
             shell.replay_from = 512;
@@ -1353,7 +1353,7 @@ mod delta {
         resized
             .worker
             .as_mut()
-            .and_then(|w| w.shell.as_mut())
+            .and_then(|w| w.shells.first_mut())
             .expect("a shell")
             .geometry = Geometry {
             cols: 200,
@@ -1372,7 +1372,7 @@ mod delta {
             let shell = exited
                 .worker
                 .as_mut()
-                .and_then(|w| w.shell.as_mut())
+                .and_then(|w| w.shells.first_mut())
                 .expect("a shell");
             shell.alive = false;
             shell.exit_code = Some(0);
@@ -1381,6 +1381,36 @@ mod delta {
             [Delta::WorkerShell(shell)] => {
                 assert!(!shell.alive);
                 assert_eq!(shell.exit_code, Some(0));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A shell that appears is one upsert; one that disappears is one close
+    /// (W35).
+    #[test]
+    fn opening_and_closing_a_shell_are_one_delta_each() {
+        let before = worker_state();
+        let mut opened = before.clone();
+        let mut second = opened.worker.as_ref().expect("a worker").shells[0].clone();
+        second.terminal_id = TerminalId::new("worker:shell:2");
+        second.title = "Shell 2".to_string();
+        opened
+            .worker
+            .as_mut()
+            .expect("a worker")
+            .shells
+            .push(second);
+        match deltas(&before, &opened).as_slice() {
+            [Delta::WorkerShell(shell)] => assert_eq!(shell.terminal_id.as_str(), "worker:shell:2"),
+            other => panic!("{other:?}"),
+        }
+
+        let mut closed = opened.clone();
+        closed.worker.as_mut().expect("a worker").shells.remove(0);
+        match deltas(&opened, &closed).as_slice() {
+            [Delta::WorkerShellClosed { terminal_id }] => {
+                assert_eq!(terminal_id.as_str(), WORKER_SHELL_TERMINAL_ID)
             }
             other => panic!("{other:?}"),
         }

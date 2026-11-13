@@ -157,7 +157,7 @@ test("the worker shell is sized to the browser window (W5, W15)", async ({ brows
   /** A fresh worker opens on its empty workspace. */
   await expect(page.locator(".fd-workercard[data-kind='empty']")).toBeVisible();
 
-  await page.getByRole("tab", { name: "Worker shell" }).click();
+  await page.getByRole("tab", { name: "Worker", exact: true }).click();
   await expect(page.locator(".fd-frame")).toHaveAttribute("data-worker-shell", "true");
   await page.locator(".fd-pane .xterm-screen").waitFor();
   await page.locator(".fd-pane .fd-stage").click();
@@ -178,6 +178,34 @@ test("the worker shell is sized to the browser window (W5, W15)", async ({ brows
   expect(resized.rows).toBe(smaller.rows);
   expect(resized.cols).toBeLessThan(size.cols);
   expect(Math.abs(resized.cols - smaller.cols)).toBeLessThanOrEqual(1);
+
+  await page.context().close();
+});
+
+test("a second worker shell opens, runs on its own and closes (W35)", async ({ browser }) => {
+  const page = await openWindow(browser);
+  await page.getByRole("tab", { name: "Worker", exact: true }).click();
+  const shellTabs = page.locator(".fd-tabs .fd-tab");
+  await expect(shellTabs).toHaveCount(1);
+
+  await page.locator('[data-action="new-worker-shell"]').click();
+  await expect(shellTabs).toHaveCount(2);
+  /** The new shell is the one on screen. */
+  await expect(shellTabs.nth(1)).toHaveAttribute("data-selected", "true");
+  await expect(shellTabs.nth(1)).toContainText("shell 2");
+  await page.locator(".fd-pane .xterm-screen").waitFor();
+  await page.locator(".fd-pane .fd-stage").click();
+  await page.keyboard.type("echo fd-second-$((5*5))");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => terminalText(page)).toContain("fd-second-25");
+
+  /** The first shell never saw it. */
+  await shellTabs.nth(0).locator(".fd-tab__label").click();
+  await expect(shellTabs.nth(0)).toHaveAttribute("data-selected", "true");
+  await expect.poll(() => terminalText(page)).not.toContain("fd-second-25");
+
+  await shellTabs.nth(1).locator(".fd-tab__close").click();
+  await expect(shellTabs).toHaveCount(1);
 
   await page.context().close();
 });

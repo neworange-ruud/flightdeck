@@ -7,8 +7,8 @@ use crate::contracts::{AgentTabPosition, InterpretedStatus};
 use crate::testing::FakeNotifier;
 use crate::web::client::{LinkEvent, LinkOut, Script};
 use crate::web::protocol::{
-    ClientMsg, Geometry, GitBar, HostMessage, ProjectView, Seat, Selection, SessionPhase,
-    SessionStatus, SessionView, Snapshot, StatusBucket, TerminalView, WorkerSnapshot,
+    worker_command, ClientMsg, Delta, Geometry, GitBar, HostMessage, ProjectView, Seat, Selection,
+    SessionPhase, SessionStatus, SessionView, Snapshot, StatusBucket, TerminalView, WorkerSnapshot,
     PROTOCOL_VERSION,
 };
 
@@ -94,6 +94,7 @@ pub(crate) fn snapshot(worker: bool, messages: Vec<HostMessage>) -> Snapshot {
         worker: worker.then(|| WorkerSnapshot {
             home: "/home/dev".to_string(),
             shell: None,
+            shells: Vec::new(),
             health: None,
             status: Default::default(),
             connections: Default::default(),
@@ -787,4 +788,103 @@ mod downloads {
         assert!(session.download().is_none());
         assert_eq!(session.transfer_tab(), None);
     }
+}
+
+fn worker_shell(n: u32) -> WorkerShellView {
+    WorkerShellView {
+        terminal_id: crate::web::protocol::worker_shell_terminal_id(n),
+        title: format!("Shell {n}"),
+        geometry: Geometry { cols: 80, rows: 24 },
+        byte_len: 0,
+        replay_from: 0,
+        alive: true,
+        exit_code: None,
+    }
+}
+
+/// A worker with shells 1 and 2 open.
+fn two_shells() -> Snapshot {
+    let mut snapshot = snapshot(true, Vec::new());
+    let worker = snapshot.worker.as_mut().unwrap();
+    worker.shell = Some(worker_shell(1));
+    worker.shells = vec![worker_shell(1), worker_shell(2)];
+    snapshot
+}
+
+fn on_screen_shell(session: &RemoteSession) -> Option<String> {
+    session.worker_shell().map(|s| s.terminal_id.to_string())
+}
+
+#[test]
+fn the_worker_tabs_keys_open_step_and_close_its_shells() {
+    use crate::app::commands::Command;
+    let (mut session, mut script) = open(two_shells());
+    session.show_worker_shell();
+    assert_eq!(session.worker_shells().len(), 2);
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell"));
+    assert_eq!(session.on_screen().unwrap().as_str(), "worker:shell");
+
+    // Alt-Right / Alt-Left step through the shells, wrapping, and stay on the
+    // Worker tab.
+    session.apply(HostEvent::Command(Command::SwitchChildTerminal(
+        Selector::Next,
+    )));
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell:2"));
+    assert_eq!(session.tab(), Tab::WorkerShell);
+    session.apply(HostEvent::Command(Command::SwitchChildTerminal(
+        Selector::Next,
+    )));
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell"));
+    let _ = frames(&mut script);
+
+    // Ctrl-T asks for a shell, and shows it once the worker has it.
+    session.apply(HostEvent::Command(Command::NewChildTerminal));
+    let sent = commands_sent(&mut script);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, worker_command::OPEN_WORKER_SHELL);
+    script.send(LinkEvent::Delta(Delta::WorkerShell(worker_shell(3))));
+    session.pump();
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell:3"));
+
+    // Ctrl-W closes the shell on screen; its neighbour is shown once the
+    // worker confirms.
+    session.apply(HostEvent::Command(Command::CloseChildTerminal));
+    let sent = commands_sent(&mut script);
+    assert_eq!(sent[0].1, worker_command::CLOSE_WORKER_SHELL);
+    assert_eq!(
+        sent[0].2,
+        Some(serde_json::json!({ "terminal_id": "worker:shell:3" }))
+    );
+    script.send(LinkEvent::Delta(Delta::WorkerShellClosed {
+        terminal_id: "worker:shell:3".into(),
+    }));
+    session.pump();
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell:2"));
+    assert_eq!(session.worker_shells().len(), 2);
+
+    // Restart names the shell on screen.
+    session.restart_worker_shell();
+    let sent = commands_sent(&mut script);
+    assert_eq!(sent[0].1, worker_command::RESTART_WORKER_SHELL);
+    assert_eq!(
+        sent[0].2,
+        Some(serde_json::json!({ "terminal_id": "worker:shell:2" }))
+    );
+}
+
+#[test]
+fn a_worker_older_than_v10_has_one_shell_and_says_so() {
+    use crate::app::commands::Command;
+    let mut v9 = snapshot(true, Vec::new());
+    v9.protocol_version = 9;
+    v9.worker.as_mut().unwrap().shell = Some(worker_shell(1));
+    let (mut session, mut script) = open(v9);
+    session.show_worker_shell();
+    assert_eq!(on_screen_shell(&session).as_deref(), Some("worker:shell"));
+    let _ = frames(&mut script);
+
+    session.apply(HostEvent::Command(Command::NewChildTerminal));
+    session.apply(HostEvent::Command(Command::CloseChildTerminal));
+    assert!(commands_sent(&mut script).is_empty());
+    assert_eq!(session.notice(), Some(WORKER_SHELLS_UNAVAILABLE));
 }

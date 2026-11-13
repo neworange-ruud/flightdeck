@@ -436,6 +436,15 @@ export interface AppState {
    * project tab again leaves it.
    */
   readonly workerShellTab: boolean;
+  /**
+   * The worker shell the Worker tab shows (W35), and its place in the row
+   * when it was chosen, so closing it lands on a neighbour. `null` shows the
+   * first. Local, like the tab.
+   */
+  readonly workerShell: { readonly id: string; readonly index: number } | null;
+  /** The shells there were when this window asked for a new one: the first
+   * shell not among them, once it arrives, is shown. */
+  readonly openingShell: readonly string[] | null;
   /** Open Project on a worker: the project picker, or `null` when closed. */
   readonly picker: PickerState | null;
   /** A project the picker had the worker open, until it shows up in a
@@ -654,6 +663,8 @@ export function createInitialState(): AppState {
     worker: null,
     terminalGeometry: {},
     workerShellTab: false,
+    workerShell: null,
+    openingShell: null,
     picker: null,
     pendingOpen: null,
     notice: null,
@@ -1091,12 +1102,15 @@ export type AppAction =
       readonly terminalId: string;
       readonly geometry: TerminalGeometry;
     }
-  /** `Delta::WorkerShell`: the shell's title, grid or liveness changed. */
+  /** `Delta::WorkerShell`: a shell opened, or its title, grid or liveness
+   * changed (an upsert by id since v10). */
   | {
       readonly type: "worker/shell";
       readonly shell: WorkerShell;
       readonly geometry: TerminalGeometry;
     }
+  /** `Delta::WorkerShellClosed` (v10): a shell is gone. */
+  | { readonly type: "worker/shellClosed"; readonly terminalId: string }
   | { readonly type: "worker/health"; readonly health: WorkerHealth }
   | { readonly type: "worker/status"; readonly status: WorkerStatus }
   | { readonly type: "worker/connections"; readonly connections: WorkerConnections }
@@ -1115,8 +1129,15 @@ export type AppAction =
    * the seq comes back as `picker/sent`.
    */
   | { readonly type: "picker/request"; readonly intent: PickerIntent }
-  /** The worker shell's Restart shell. Sent by `main.ts`; nothing local. */
-  | { readonly type: "workerShell/restart" }
+  /** A shell's Restart shell. Sent by `main.ts`; nothing local. */
+  | { readonly type: "workerShell/restart"; readonly terminalId: string }
+  /** Show worker shell `terminalId` on the Worker tab (W35). Local. */
+  | { readonly type: "workerShell/select"; readonly terminalId: string }
+  /** The Worker tab's `+` (v10): `main.ts` sends `open_worker_shell`; the
+   * new shell is shown once it arrives. */
+  | { readonly type: "workerShell/open" }
+  /** A shell's `✕` (v10): `main.ts` sends `close_worker_shell`. */
+  | { readonly type: "workerShell/close"; readonly terminalId: string }
   | { readonly type: "picker/close" }
   /** A picker request went out as `seq`. */
   | { readonly type: "picker/sent"; readonly sent: PickerSent; readonly seq: number }

@@ -29,7 +29,7 @@ use flightdeck::web::credentials::CredentialStore;
 use flightdeck::web::protocol::{
     command as names, ConnectionKind, Geometry, GitBar, HostKind, ProjectView, SeatRequest,
     Selection, ServerMsg, SessionPhase, SessionStatus, SessionView, ShutdownReason, StatusBucket,
-    TerminalId, TerminalRole, TerminalView, WorkerStatusView,
+    TerminalId, TerminalRole, TerminalView, WorkerStatusView, WORKER_SHELL_TERMINAL_ID,
 };
 use flightdeck::web::server::{
     self, HostState, ListenPlan, ServerOptions, ShutdownNotice, WebInbound, WebOutbound,
@@ -306,7 +306,7 @@ impl Host {
             host_kind: self.kind,
             worker: (self.kind == HostKind::Worker).then(|| WorkerHostState {
                 home: "/home/u".to_string(),
-                shell: None,
+                shells: Vec::new(),
                 health: None,
                 status: WorkerStatusView {
                     projects_root: "/home/u/projects".to_string(),
@@ -830,7 +830,11 @@ fn a_tui_host_is_never_sent_a_resize_or_a_worker_command() {
     assert!(!client.resize_terminal(&primary_terminal_id("s1"), size));
     assert_eq!(client.browse_dir(None, false), None);
     assert_eq!(client.scan_projects(), None);
-    assert_eq!(client.restart_worker_shell(), None);
+    assert_eq!(
+        client.restart_worker_shell(&WORKER_SHELL_TERMINAL_ID.into()),
+        None
+    );
+    assert_eq!(client.open_worker_shell(), None);
     for _ in 0..20 {
         host.tick();
         client.pump();

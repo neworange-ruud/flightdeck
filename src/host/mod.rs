@@ -1407,7 +1407,7 @@ impl<'a> AppHost<'a> {
         let mut host = WorkspaceTerminals {
             projects: &mut self.workspace.projects,
             fs: self.env.fs,
-            worker_shell: self.worker.as_mut().map(|w| &mut w.shell),
+            worker_shells: self.worker.as_mut().map(|w| &mut w.shells),
         };
         self.web_surface.streams.apply_inbound(&event, &mut host)
     }

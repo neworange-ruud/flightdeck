@@ -58,7 +58,7 @@ fn start_spawns_the_login_shell_in_home_with_a_terminal_env() {
     assert!(env.contains(&("TERM".to_string(), "xterm-256color".to_string())));
     assert!(env.contains(&("COLORTERM".to_string(), "truecolor".to_string())));
     let facts = shell.facts().unwrap();
-    assert_eq!(facts.title, "Worker shell");
+    assert_eq!(facts.title, "Shell 1");
     assert_eq!(
         facts.geometry,
         Geometry {

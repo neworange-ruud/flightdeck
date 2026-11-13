@@ -170,6 +170,10 @@ pub const WORKER_SHELL_COMMAND_REFUSAL: &str = "Switch to a project tab to run h
                                                 the worker shell is not one of the host's \
                                                 sessions.";
 
+/// Why New shell is refused on a worker older than protocol v10 (W35).
+pub const WORKER_SHELLS_UNAVAILABLE: &str =
+    "This worker has one shell. Update FlightDeck on the worker to open more.";
+
 /// Why a host command is refused on the SSH shell's tab.
 pub const SSH_SHELL_COMMAND_REFUSAL: &str = "Switch to a project tab to run host commands: the \
                                              SSH shell is not one of the host's sessions.";
@@ -234,6 +238,12 @@ pub struct RemoteSession {
     front_end: Vec<FrontEndAction>,
     /// The tab on screen.
     tab: Tab,
+    /// The worker shell the Worker tab shows (W35), and its place in the row
+    /// when it was chosen, so closing it lands on a neighbour.
+    worker_shell: Option<(TerminalId, usize)>,
+    /// The shells there were when this front-end asked for a new one: the
+    /// first id not among them, once it appears, is selected.
+    opening_shell: Option<Vec<TerminalId>>,
     /// The host kind saved for this remote by an earlier attach, so a worker
     /// looks like one before this attach answers.
     saved_kind: Option<HostKind>,
@@ -322,6 +332,8 @@ impl RemoteSession {
             close_requested: false,
             front_end: Vec::new(),
             tab: Tab::Project,
+            worker_shell: None,
+            opening_shell: None,
             saved_kind: None,
             dialer: None,
             viewport: None,
@@ -462,15 +474,123 @@ impl RemoteSession {
         self.local = Local::None;
     }
 
-    /// The worker's shell, as the worker last described it.
-    pub fn worker_shell(&self) -> Option<&WorkerShellView> {
-        self.workspace().worker_shell()
+    /// Every worker shell, in the order they were opened (W35).
+    pub fn worker_shells(&self) -> &[WorkerShellView] {
+        self.workspace().worker_shells()
     }
 
-    /// Start the worker shell again after it exited (its Restart shell).
-    pub fn restart_worker_shell(&mut self) {
-        if self.client.restart_worker_shell().is_none() {
+    /// The worker shell the Worker tab shows: the chosen one, else the
+    /// first.
+    pub fn worker_shell(&self) -> Option<&WorkerShellView> {
+        let shells = self.worker_shells();
+        self.worker_shell
+            .as_ref()
+            .and_then(|(id, _)| shells.iter().find(|s| &s.terminal_id == id))
+            .or_else(|| shells.first())
+    }
+
+    /// Whether this worker opens and closes shells (protocol v10, W35).
+    pub fn opens_worker_shells(&self) -> bool {
+        self.workspace().opens_worker_shells()
+    }
+
+    /// Show worker shell `id` on the Worker tab.
+    pub fn select_worker_shell(&mut self, id: &TerminalId) {
+        let Some(at) = self
+            .worker_shells()
+            .iter()
+            .position(|s| &s.terminal_id == id)
+        else {
+            return;
+        };
+        self.worker_shell = Some((id.clone(), at));
+        self.show_worker_shell();
+    }
+
+    /// Ask the worker for another shell; it is shown once it arrives.
+    pub fn open_worker_shell(&mut self) {
+        if !self.opens_worker_shells() {
+            self.notice = Some(WORKER_SHELLS_UNAVAILABLE.to_string());
+            return;
+        }
+        let known = self
+            .worker_shells()
+            .iter()
+            .map(|s| s.terminal_id.clone())
+            .collect();
+        if self.client.open_worker_shell().is_none() {
             self.local = Local::Message(WORKER_NOT_SENT.to_string());
+            return;
+        }
+        self.opening_shell = Some(known);
+        self.show_worker_shell();
+    }
+
+    /// Close worker shell `id`, or the one on screen; its neighbour is shown
+    /// once the worker confirms.
+    pub fn close_worker_shell(&mut self, id: Option<TerminalId>) {
+        if !self.opens_worker_shells() {
+            self.notice = Some(WORKER_SHELLS_UNAVAILABLE.to_string());
+            return;
+        }
+        let Some(id) = id.or_else(|| self.worker_shell().map(|s| s.terminal_id.clone())) else {
+            return;
+        };
+        if self.client.close_worker_shell(&id).is_none() {
+            self.local = Local::Message(WORKER_NOT_SENT.to_string());
+        }
+    }
+
+    /// Start the shell on screen again after it exited (its Restart).
+    pub fn restart_worker_shell(&mut self) {
+        let id = self
+            .worker_shell()
+            .map(|s| s.terminal_id.clone())
+            .unwrap_or_else(|| WORKER_SHELL_TERMINAL_ID.into());
+        if self.client.restart_worker_shell(&id).is_none() {
+            self.local = Local::Message(WORKER_NOT_SENT.to_string());
+        }
+    }
+
+    /// Step through the worker's shells, as Alt-Left/Right steps through a
+    /// session's terminals.
+    fn step_worker_shell(&mut self, selector: Selector) {
+        let ids: Vec<TerminalId> = self
+            .worker_shells()
+            .iter()
+            .map(|s| s.terminal_id.clone())
+            .collect();
+        let current = self
+            .worker_shell()
+            .and_then(|s| ids.iter().position(|id| id == &s.terminal_id));
+        if let Some(next) = step(selector, current, ids.len()) {
+            self.worker_shell = Some((ids[next].clone(), next));
+        }
+    }
+
+    /// Keep the Worker tab's choice on a shell that exists: a shell this
+    /// front-end opened once it arrives, a neighbour of one that closed.
+    fn follow_worker_shells(&mut self) -> bool {
+        let ids: Vec<TerminalId> = self
+            .worker_shells()
+            .iter()
+            .map(|s| s.terminal_id.clone())
+            .collect();
+        if let Some(known) = &self.opening_shell {
+            if let Some((at, id)) = ids.iter().enumerate().find(|(_, id)| !known.contains(id)) {
+                self.worker_shell = Some((id.clone(), at));
+                self.opening_shell = None;
+                return true;
+            }
+        }
+        match &self.worker_shell {
+            Some((id, _)) if ids.contains(id) => false,
+            Some((_, at)) if !ids.is_empty() => {
+                let at = (*at).min(ids.len() - 1);
+                self.worker_shell = Some((ids[at].clone(), at));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1144,6 +1264,7 @@ impl RemoteSession {
         changed |= self.take_worker_news();
         changed |= self.follow_host_kind();
         changed |= self.select_opened();
+        changed |= self.follow_worker_shells();
         changed |= self.sync_terminals();
         self.sync_geometry();
         self.watch
@@ -1840,6 +1961,25 @@ impl RemoteSession {
     }
 
     fn run(&mut self, action: RemoteAction) {
+        // On the Worker tab, a session's terminal keys work its shells
+        // instead (W35): Ctrl-T opens one, Ctrl-W closes the one on screen,
+        // Alt-Left/Right step through them.
+        if self.tab == Tab::WorkerShell {
+            match action {
+                RemoteAction::Local(LocalAction::Terminal(selector)) => {
+                    return self.step_worker_shell(selector);
+                }
+                RemoteAction::Send {
+                    name: names::NEW_CHILD_TERMINAL,
+                    ..
+                } => return self.open_worker_shell(),
+                RemoteAction::Send {
+                    name: names::CLOSE_CHILD_TERMINAL,
+                    ..
+                } => return self.close_worker_shell(None),
+                _ => {}
+            }
+        }
         // Stepping through sessions, terminals or projects from a shell tab
         // first goes back to the project.
         if let RemoteAction::Local(

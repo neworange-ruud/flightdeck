@@ -57,6 +57,7 @@ import {
   snapshotFromWire,
   statusFromLabel,
   uploadPlanOf,
+  wireShells,
   workerShellOf,
   workerStatusOf,
 } from "./adapt";
@@ -554,9 +555,11 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
     if (cursor === undefined) {
       return null;
     }
-    const shell = frame.worker?.shell ?? null;
+    const shell = wireShells(frame.worker).find(
+      (candidate) => candidate.terminal_id === terminalId,
+    );
     const view =
-      shell !== null && shell.terminal_id === terminalId
+      shell !== undefined
         ? shell
         : frame.projects
             .flatMap((project) => project.sessions)
@@ -818,6 +821,12 @@ export function openSession(options: SessionSocketOptions): SessionSocket {
         });
         return;
       }
+      case "worker_shell_closed":
+        store.dispatch({
+          type: "worker/shellClosed",
+          terminalId: (frame as unknown as { terminal_id: string }).terminal_id,
+        });
+        return;
       case "worker_status":
         store.dispatch({
           type: "worker/status",

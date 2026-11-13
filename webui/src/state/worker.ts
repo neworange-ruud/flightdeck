@@ -28,6 +28,10 @@ export const WORKER_COMMAND = {
   OPEN_PROJECT_PATH: "open_project_path",
   CLONE_PROJECT: "clone_project",
   RESTART_WORKER_SHELL: "restart_worker_shell",
+  /** v10: open another worker shell (W35). */
+  OPEN_WORKER_SHELL: "open_worker_shell",
+  /** v10: close one, by `terminal_id` (W35). */
+  CLOSE_WORKER_SHELL: "close_worker_shell",
   /** v8: ask to upload files into one folder (`state/upload.ts`). */
   BEGIN_UPLOAD: "begin_upload",
   /** v9: ask to download files from one folder (`state/download.ts`). */
@@ -54,6 +58,28 @@ export const UPLOAD_MIN_VERSION = 8;
  * Transfer files panel on its Download tab (`ui/downloadView.ts`).
  */
 export const DOWNLOAD_FILES_COMMAND = "download_files";
+
+/** The protocol version whose worker opens and closes shells
+ * (`protocol::WORKER_SHELLS_MIN_VERSION`, W35). */
+export const WORKER_SHELLS_MIN_VERSION = 10;
+
+/** Whether this worker opens and closes shells on request (W35). */
+export function opensWorkerShells(state: AppState): boolean {
+  return (
+    isWorker(state) && (state.protocolVersion ?? 0) >= WORKER_SHELLS_MIN_VERSION
+  );
+}
+
+/** The shell the Worker tab shows: the chosen one, else the first. */
+export function workerShellOnScreen(state: AppState): WorkerShell | null {
+  const shells = state.worker?.shells ?? [];
+  const chosen = state.workerShell;
+  return (
+    (chosen === null ? undefined : shells.find((s) => s.terminalId === chosen.id)) ??
+    shells[0] ??
+    null
+  );
+}
 
 /** The protocol version that can download (`protocol::DOWNLOAD_MIN_VERSION`):
  * `begin_download`, `download_plan`, and files in a `dir_listing`. */
@@ -151,7 +177,7 @@ export function onScreenTerminalId(state: AppState): string | null {
     return state.selection?.terminalId ?? null;
   }
   if (state.workerShellTab) {
-    return state.worker?.shell?.terminalId ?? null;
+    return workerShellOnScreen(state)?.terminalId ?? null;
   }
   const id = state.selection?.terminalId ?? "";
   return id === "" ? null : id;
@@ -218,7 +244,7 @@ export function workerCard(state: AppState): WorkerCard | null {
     return null;
   }
   if (state.workerShellTab) {
-    const shell = state.worker?.shell ?? null;
+    const shell = workerShellOnScreen(state);
     if (shell === null) {
       return "shell_missing";
     }
@@ -233,8 +259,16 @@ export function shellExitLine(shell: WorkerShell | null): string {
     return "The worker shell is not running.";
   }
   return shell.exitCode === null
-    ? "The worker shell exited."
-    : `The worker shell exited (${shell.exitCode}).`;
+    ? `${shell.title} exited.`
+    : `${shell.title} exited (${shell.exitCode}).`;
+}
+
+/** What the Worker tab says with no shell to show: every shell closed on a
+ * worker that opens them (W35), else its one shell stopped. */
+export function noShellLine(state: AppState): string {
+  return opensWorkerShells(state)
+    ? "No shells are open on this worker."
+    : shellExitLine(null);
 }
 
 // ---------------------------------------------------------------------------

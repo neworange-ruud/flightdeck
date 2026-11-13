@@ -1500,6 +1500,7 @@ mod worker {
         snapshot.worker = Some(WorkerSnapshot {
             home: "/home/dev".to_string(),
             shell: Some(shell(true)),
+            shells: vec![shell(true)],
             health: None,
             status: WorkerStatusView {
                 projects_root: "/home/dev/flightdeck".to_string(),
@@ -1645,6 +1646,95 @@ mod worker {
         click(cx, "remote-worker-shell-restart");
         let names: Vec<String> = commands(&mut script).into_iter().map(|c| c.0).collect();
         assert_eq!(names, ["restart_worker_shell"]);
+    }
+
+    fn numbered_shell(n: u32) -> WorkerShellView {
+        WorkerShellView {
+            terminal_id: flightdeck::web::protocol::worker_shell_terminal_id(n),
+            title: format!("Shell {n}"),
+            ..shell(true)
+        }
+    }
+
+    /// A worker with shells 1 and 2 open.
+    fn two_shell_worker() -> Snapshot {
+        let mut snapshot = worker_snapshot();
+        snapshot.worker.as_mut().unwrap().shells = vec![numbered_shell(1), numbered_shell(2)];
+        snapshot
+    }
+
+    fn on_screen_shell(model: &Entity<RemoteModel>, cx: &mut VisualTestContext) -> String {
+        model.read_with(cx, |m, _| {
+            m.worker_shell()
+                .map(|s| s.terminal_id.to_string())
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn the_worker_tab_has_a_row_of_shells_to_pick_open_and_close(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, two_shell_worker());
+        click(cx, "remote-worker-shell-tab");
+        assert!(cx.debug_bounds("remote-worker-shell-0").is_some());
+        assert!(cx.debug_bounds("remote-worker-shell-1").is_some());
+        assert_eq!(on_screen_shell(&model, cx), "worker:shell");
+
+        click(cx, "remote-worker-shell-1");
+        assert_eq!(on_screen_shell(&model, cx), "worker:shell:2");
+
+        script.sent();
+        click(cx, "remote-worker-shell-new");
+        let sent = commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "open_worker_shell");
+        script.send(LinkEvent::Delta(Delta::WorkerShell(numbered_shell(3))));
+        turn(&model, cx);
+        assert_eq!(
+            on_screen_shell(&model, cx),
+            "worker:shell:3",
+            "the new shell is shown"
+        );
+        assert!(cx.debug_bounds("remote-worker-shell-2").is_some());
+
+        click(cx, "remote-worker-shell-close-0");
+        let sent = commands(&mut script);
+        assert_eq!(sent[0].0, "close_worker_shell");
+        assert_eq!(
+            sent[0].1,
+            Some(serde_json::json!({ "terminal_id": "worker:shell" }))
+        );
+        assert_eq!(
+            on_screen_shell(&model, cx),
+            "worker:shell:3",
+            "closing another shell keeps this one on screen"
+        );
+    }
+
+    #[gpui::test]
+    fn with_every_shell_closed_the_worker_tab_offers_one(app: &mut TestAppContext) {
+        let (model, mut script, _window, cx) = open_on(app, worker_snapshot());
+        click(cx, "remote-worker-shell-tab");
+        script.send(LinkEvent::Delta(Delta::WorkerShellClosed {
+            terminal_id: "worker:shell".into(),
+        }));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-worker-shell-0").is_none());
+        script.sent();
+        click(cx, "remote-worker-shell-open");
+        let names: Vec<String> = commands(&mut script).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["open_worker_shell"]);
+    }
+
+    #[gpui::test]
+    fn a_worker_older_than_v10_shows_its_one_shell_without_new_or_close(app: &mut TestAppContext) {
+        let mut snapshot = worker_snapshot();
+        snapshot.protocol_version = 9;
+        snapshot.worker.as_mut().unwrap().shells.clear();
+        let (_model, _script, _window, cx) = open_on(app, snapshot);
+        click(cx, "remote-worker-shell-tab");
+        assert!(cx.debug_bounds("remote-worker-shell-0").is_some());
+        assert!(cx.debug_bounds("remote-worker-shell-new").is_none());
+        assert!(cx.debug_bounds("remote-worker-shell-close-0").is_none());
     }
 
     // --- geometry (W5) ----------------------------------------------------

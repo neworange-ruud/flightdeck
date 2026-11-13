@@ -464,11 +464,11 @@ pub fn deltas(previous: &HostState, next: &HostState) -> Vec<Delta> {
 ///
 /// Only what changed, and only what a [`Delta`] can describe:
 ///
-/// * **The shell** when a field its tab renders moved — title, geometry,
-///   liveness, exit code. Its byte counters move on every tick it prints, and
-///   for the same reason as a terminal's (see [`deltas`]) they produce nothing.
-///   A shell that disappears from the state produces nothing either: there is
-///   no frame for "no shell", and the worker always has one once started.
+/// * **Each shell** when it is new, or a field its tab renders moved — title,
+///   geometry, liveness, exit code. Its byte counters move on every tick it
+///   prints, and for the same reason as a terminal's (see [`deltas`]) they
+///   produce nothing. A shell that disappears from the state was closed, and
+///   produces a [`Delta::WorkerShellClosed`] (W35).
 /// * **Health** whenever the sample differs, which is every sample, since
 ///   `sampled_at_ms` moves.
 /// * **Status** whenever any of it differs.
@@ -481,12 +481,16 @@ fn worker_deltas(
     now: &crate::web::server::WorkerHostState,
     out: &mut Vec<Delta>,
 ) {
-    if let Some(shell) = &now.shell {
-        let changed = match previous.and_then(|p| p.shell.as_ref()) {
+    let was_shells: &[crate::web::protocol::WorkerShellView] =
+        previous.map(|p| p.shells.as_slice()).unwrap_or(&[]);
+    for shell in &now.shells {
+        let changed = match was_shells
+            .iter()
+            .find(|w| w.terminal_id == shell.terminal_id)
+        {
             None => true,
             Some(was) => {
-                was.terminal_id != shell.terminal_id
-                    || was.title != shell.title
+                was.title != shell.title
                     || was.geometry != shell.geometry
                     || was.alive != shell.alive
                     || was.exit_code != shell.exit_code
@@ -494,6 +498,13 @@ fn worker_deltas(
         };
         if changed {
             out.push(Delta::WorkerShell(shell.clone()));
+        }
+    }
+    for was in was_shells {
+        if !now.shells.iter().any(|s| s.terminal_id == was.terminal_id) {
+            out.push(Delta::WorkerShellClosed {
+                terminal_id: was.terminal_id.clone(),
+            });
         }
     }
     if let Some(health) = &now.health {

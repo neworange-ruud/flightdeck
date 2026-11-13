@@ -199,12 +199,14 @@ describe("a worker's deltas land in the store", () => {
     });
     const worker = h.store.getState().worker;
     expect(worker?.health?.agentsTotal).toBe(7);
-    expect(worker?.shell).toEqual({
-      terminalId: "worker:shell",
-      title: "Worker shell",
-      alive: false,
-      exitCode: 0,
-    });
+    expect(worker?.shells).toEqual([
+      {
+        terminalId: "worker:shell",
+        title: "Worker shell",
+        alive: false,
+        exitCode: 0,
+      },
+    ]);
     expect(h.store.getState().terminalGeometry["worker:shell"]).toEqual({ cols: 99, rows: 33 });
     expect(worker?.status.projectsRoot).toBe("/home/me/src");
     expect(worker?.connections.backgroundLinks).toBe(2);

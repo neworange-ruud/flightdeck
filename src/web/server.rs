@@ -119,7 +119,8 @@ use crate::web::protocol::{
     ProjectView, Seat, SeatInfo, SeatRequest, Selection, ServerMsg, ShutdownReason, Snapshot,
     TermCursor, TerminalId, VersionMismatch, ViewerId, Viewport, WindowInfo, WireError, WorkerOp,
     WorkerShellView, WorkerSnapshot, WorkerStatusView, DOWNLOAD_MIN_VERSION, MAX_SUPPORTED_VERSION,
-    PROTOCOL_VERSION, UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION,
+    PROTOCOL_VERSION, UPLOAD_MIN_VERSION, WORKER_MIN_CLIENT_VERSION, WORKER_SHELLS_MIN_VERSION,
+    WORKER_SHELL_TERMINAL_ID,
 };
 use crate::web::upload::UploadGrants;
 pub use crate::web::upload::{
@@ -288,8 +289,8 @@ pub struct HostState {
 pub struct WorkerHostState {
     /// `$HOME` on the worker.
     pub home: String,
-    /// The worker shell, when one is running or has run.
-    pub shell: Option<WorkerShellView>,
+    /// Every worker shell, in the order they were opened (W35).
+    pub shells: Vec<WorkerShellView>,
     /// The latest health sample.
     pub health: Option<Health>,
     /// Listen addresses, unread count, projects root.
@@ -1938,7 +1939,16 @@ impl Shared {
                 let background = recipient.is_some_and(|v| v.kind == ConnectionKind::Background);
                 WorkerSnapshot {
                     home: w.home.clone(),
-                    shell: w.shell.clone(),
+                    shell: w
+                        .shells
+                        .iter()
+                        .find(|s| s.terminal_id.as_str() == WORKER_SHELL_TERMINAL_ID)
+                        .cloned(),
+                    shells: if protocol_version >= WORKER_SHELLS_MIN_VERSION {
+                        w.shells.clone()
+                    } else {
+                        Vec::new()
+                    },
                     health: w.health.clone(),
                     status: w.status.clone(),
                     connections: registry.connections_view(recipient.map(|v| &v.identity.token)),
@@ -2612,6 +2622,14 @@ fn min_version_for(msg: &ServerMsg) -> u16 {
     match msg {
         ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
         ServerMsg::DownloadPlan(_) => DOWNLOAD_MIN_VERSION,
+        // A pre-v10 peer reads any shell delta as "the" shell: it only hears
+        // about the first (W35).
+        ServerMsg::Delta(Delta::WorkerShell(shell))
+            if shell.terminal_id.as_str() != WORKER_SHELL_TERMINAL_ID =>
+        {
+            WORKER_SHELLS_MIN_VERSION
+        }
+        ServerMsg::Delta(Delta::WorkerShellClosed { .. }) => WORKER_SHELLS_MIN_VERSION,
         _ => 0,
     }
 }

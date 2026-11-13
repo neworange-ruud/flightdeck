@@ -589,9 +589,26 @@ impl RemoteClient {
         self.worker_command(worker_command::CLONE_PROJECT, Some(args))
     }
 
-    /// Restart the worker's shell after it exited.
-    pub fn restart_worker_shell(&self) -> Option<u64> {
-        self.worker_command(worker_command::RESTART_WORKER_SHELL, None)
+    /// Restart worker shell `terminal_id` after it exited. A pre-v10 worker
+    /// ignores the argument and restarts its one shell.
+    pub fn restart_worker_shell(&self, terminal_id: &TerminalId) -> Option<u64> {
+        self.worker_command(
+            worker_command::RESTART_WORKER_SHELL,
+            Some(serde_json::json!({ "terminal_id": terminal_id.as_str() })),
+        )
+    }
+
+    /// Open another worker shell (W35, v10).
+    pub fn open_worker_shell(&self) -> Option<u64> {
+        self.worker_command(worker_command::OPEN_WORKER_SHELL, None)
+    }
+
+    /// Close worker shell `terminal_id` (W35, v10).
+    pub fn close_worker_shell(&self, terminal_id: &TerminalId) -> Option<u64> {
+        self.worker_command(
+            worker_command::CLOSE_WORKER_SHELL,
+            Some(serde_json::json!({ "terminal_id": terminal_id.as_str() })),
+        )
     }
 
     /// Size `terminal_id`'s PTY to this window's pane (PRD W5). Worker hosts
@@ -802,7 +819,15 @@ mod tests {
             assert_eq!(client.scan_projects(), None);
             assert_eq!(client.open_project_path("/x"), None);
             assert_eq!(client.clone_project("u", None), None);
-            assert_eq!(client.restart_worker_shell(), None);
+            assert_eq!(
+                client.restart_worker_shell(&WORKER_SHELL_TERMINAL_ID.into()),
+                None
+            );
+            assert_eq!(client.open_worker_shell(), None);
+            assert_eq!(
+                client.close_worker_shell(&WORKER_SHELL_TERMINAL_ID.into()),
+                None
+            );
             assert!(!client.resize_terminal(
                 &"t1:primary".into(),
                 PtySize {
@@ -830,7 +855,11 @@ mod tests {
         let clone = client
             .clone_project("git@host:me/app.git", Some(" "))
             .unwrap();
-        client.restart_worker_shell().unwrap();
+        client
+            .restart_worker_shell(&WORKER_SHELL_TERMINAL_ID.into())
+            .unwrap();
+        client.open_worker_shell().unwrap();
+        client.close_worker_shell(&"worker:shell:2".into()).unwrap();
         assert!(client.resize_terminal(
             &WORKER_SHELL_TERMINAL_ID.into(),
             PtySize {
@@ -847,6 +876,8 @@ mod tests {
                 worker_command::OPEN_PROJECT_PATH,
                 worker_command::CLONE_PROJECT,
                 worker_command::RESTART_WORKER_SHELL,
+                worker_command::OPEN_WORKER_SHELL,
+                worker_command::CLOSE_WORKER_SHELL,
             ]
         );
         let args: Vec<Option<serde_json::Value>> = frames
@@ -864,6 +895,15 @@ mod tests {
             args[3],
             Some(serde_json::json!({ "url": "git@host:me/app.git" })),
             "a blank name is left to the worker"
+        );
+        assert_eq!(
+            args[4],
+            Some(serde_json::json!({ "terminal_id": WORKER_SHELL_TERMINAL_ID }))
+        );
+        assert_eq!(args[5], None);
+        assert_eq!(
+            args[6],
+            Some(serde_json::json!({ "terminal_id": "worker:shell:2" }))
         );
         assert!(browse < clone);
         assert_eq!(

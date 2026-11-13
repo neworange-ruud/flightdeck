@@ -86,7 +86,7 @@
  * `GET /download/{ticket}`, or a refusal. A worker never sends
  * `download_plan` to a peer below v9, and refuses `begin_download` from one.
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
@@ -540,7 +540,10 @@ export type WireHostKind = "tui" | "desktop" | "worker";
 export interface WireWorkerSnapshot {
   /** `$HOME` on the worker: the picker's root and its boundary (W16). */
   readonly home: string;
+  /** The first shell, for a pre-v10 window. */
   readonly shell?: WireWorkerShellView | null;
+  /** Every shell, in the order they were opened (W35, v10). */
+  readonly shells?: readonly WireWorkerShellView[];
   readonly health?: WireHealth | null;
   readonly status: WireWorkerStatusView;
   readonly connections: WireConnectionsView;
