@@ -2362,8 +2362,12 @@ mod tests {
                 "/tmp/iso/.flightdeck/runtime/status/opencode/plugins/flightdeck.js",
             ))
             .unwrap();
-        assert!(plugin
-            .contains(r#"const FLIGHTDECK_STATUS_FILE = "/tmp/iso/.flightdeck/agent-status";"#));
+        // Built the way the launch builds it: `\` separators on Windows.
+        let status_file = Path::new("/tmp/iso")
+            .join(".flightdeck")
+            .join("agent-status");
+        let status_file_js = serde_json::to_string(&status_file.to_string_lossy()).unwrap();
+        assert!(plugin.contains(&format!("const FLIGHTDECK_STATUS_FILE = {status_file_js};")));
         assert!(plugin.contains(r#"const FLIGHTDECK_WORKTREE = "/repo";"#));
     }
 
