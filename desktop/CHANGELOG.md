@@ -27,7 +27,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode 2 sessions are reported under their own project again.** OpenCode 2 runs one background service for every folder, and that service used the FlightDeck status plugin of whichever session started it. So agents in other projects and worktrees reported their status as that first project's main session: the wrong tab changed state, and phone notifications came in under the wrong project. Each folder's sessions now report to that folder's own status. Agents already running keep the old plugin until the OpenCode background service (`opencode serve --service`) is restarted.
 
 ## [0.15.0] - 2026-11-13
 
