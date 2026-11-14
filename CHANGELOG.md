@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [1.37.0] - 2026-11-14
+
+### New features
+
 - **More than one worker shell.** A worker now keeps any number of shells instead of one. The first tab is now called **Worker** and lists its shells (`Shell 1`, `Shell 2`, …). In `flightdeck connect`, open one with the palette's **New Child Terminal** or the **+** button, switch with Alt-Left/Right or a click, and close one with its **✕**. In a browser, use **+ shell** and the **✕** on each shell. The shells live on the worker, so every window sees the same ones, and they keep running when you disconnect. When every shell is closed, the tab offers **Open a shell**. A worker keeps at most 16. Update both the worker and the machine you connect from: an older worker keeps its one shell, and an older client only sees the first.
 
 ### Improvements
