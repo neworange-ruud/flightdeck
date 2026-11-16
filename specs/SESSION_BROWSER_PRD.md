@@ -297,6 +297,11 @@ Children of epic `remote-control-cefv`. "After" lists blocking dependencies.
 | `.8` | Spike on Windows: `<-loopback>`, relay access control (done) | — |
 | `.11` | Spike on Windows: per-profile proxy credentials behind one HTTP proxy (done) | `.8` |
 | `.12` | Session browser on Windows (WebView2) | `.11` |
+| `.12.1` | Proxy hub: one HTTP proxy, a login per session (`src/web/client/proxy_hub.rs`) | — |
+| `.12.2` | Windows browser view (WebView2) | `.12.1` |
+| `.12.3` | Windows: Continue anyway for a self-signed certificate (B21) | `.12.2` |
+| `.12.4` | Windows: delete a session's profile with its worktree (B19) | `.12.2` |
+| `.12.5` | Port suggestions on a Windows worker (B11) | — |
 | `.2` | Worker tunnel endpoint | — |
 | `.3` | Desktop SOCKS5 relay | `.2` |
 | `.4` | Browser tabs, toolbar, address field | `.1` |
