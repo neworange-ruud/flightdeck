@@ -2,7 +2,8 @@
 //! `remote-control-cefv.12.4`), as plain file handling so it is tested on
 //! any platform.
 //!
-//! WebView2 keeps a profile in `<data folder>\EBWebView\<profile name>`. Its
+//! WebView2 keeps a profile in `<data folder>\EBWebView\WV2Profile_<name>`
+//! (seen, not documented; a bare `<name>` is matched too). Its
 //! own delete call needs a live web view of that profile, and when a
 //! worktree is abandoned its browsers are already closed. So [`forget`]
 //! renames the folder aside first, which Windows refuses while the browser
@@ -21,7 +22,12 @@ pub fn forget(data_dir: &Path, pending: &Path, name: &str) {
     let Some(dir) = profile_dir(data_dir, name) else {
         return;
     };
-    let aside = dir.with_file_name(format!("{name}{DELETED}-{}", std::process::id()));
+    let folder = dir.file_name().map(|f| f.to_string_lossy().into_owned());
+    let aside = dir.with_file_name(format!(
+        "{}{DELETED}-{}",
+        folder.as_deref().unwrap_or(name),
+        std::process::id()
+    ));
     if std::fs::rename(&dir, &aside).is_ok() {
         // Renamed whole: what cannot go now, the next sweep takes.
         let _ = std::fs::remove_dir_all(&aside);
@@ -58,8 +64,13 @@ pub fn sweep(data_dir: &Path, pending: &Path) {
     }
 }
 
-/// Profile `name`'s folder, matched without regard to case (Windows paths).
+/// The prefix WebView2 gives a named profile's folder.
+const PROFILE_PREFIX: &str = "WV2Profile_";
+
+/// Profile `name`'s folder, `WV2Profile_<name>` or `<name>`, matched without
+/// regard to case (Windows paths).
 fn profile_dir(data_dir: &Path, name: &str) -> Option<PathBuf> {
+    let prefixed = format!("{PROFILE_PREFIX}{name}");
     std::fs::read_dir(data_dir.join("EBWebView"))
         .ok()?
         .flatten()
@@ -67,7 +78,7 @@ fn profile_dir(data_dir: &Path, name: &str) -> Option<PathBuf> {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                .is_some_and(|n| n.eq_ignore_ascii_case(&prefixed) || n.eq_ignore_ascii_case(name))
                 && entry.path().is_dir()
         })
         .map(|entry| entry.path())
@@ -111,6 +122,25 @@ mod tests {
 
     #[test]
     fn a_forgotten_profile_goes_and_the_others_stay() {
+        // WebView2's own layout.
+        let root = data_folder(&["WV2Profile_fdaaa", "WV2Profile_fdbbb", "Default"]);
+        let pending = root.path().join("forget.txt");
+        forget(root.path(), &pending, "fdaaa");
+        let mut left: Vec<String> = std::fs::read_dir(root.path().join("EBWebView"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["Default".to_string(), "WV2Profile_fdbbb".to_string()]
+        );
+        assert!(!pending.exists(), "nothing left for the sweep");
+    }
+
+    #[test]
+    fn a_bare_profile_folder_is_found_too() {
         let root = data_folder(&["fdaaa", "fdbbb"]);
         let pending = root.path().join("forget.txt");
         forget(root.path(), &pending, "fdaaa");
@@ -135,7 +165,12 @@ mod tests {
 
     #[test]
     fn the_sweep_deletes_what_was_pending_and_what_was_left_aside() {
-        let root = data_folder(&["fdaaa", "FDCCC", "fdbbb", "fdddd.deleted-42"]);
+        let root = data_folder(&[
+            "WV2Profile_fdaaa",
+            "wv2profile_FDCCC",
+            "WV2Profile_fdbbb",
+            "WV2Profile_fdddd.deleted-42",
+        ]);
         let pending = root.path().join("forget.txt");
         // As forget leaves it when the browser process held a file.
         std::fs::write(&pending, "fdaaa\nfdccc\nfdgone\n").unwrap();
@@ -146,7 +181,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["fdbbb".to_string()], "case-insensitive too");
+        assert_eq!(
+            left,
+            vec!["WV2Profile_fdbbb".to_string()],
+            "case-insensitive too"
+        );
         assert!(!pending.exists(), "all done");
     }
 
