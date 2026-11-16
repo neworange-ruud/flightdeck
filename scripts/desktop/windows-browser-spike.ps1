@@ -61,45 +61,6 @@ function Get-WebView2Version {
     return 'not found'
 }
 
-$os = Get-CimInstance Win32_OperatingSystem
-$header = @(
-    "FlightDeck session browser - Windows spike (remote-control-cefv.8)",
-    "date:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
-    "commit:   $(git rev-parse --short HEAD 2>$null)",
-    "windows:  $($os.Caption) $($os.Version) (build $($os.BuildNumber)) $($env:PROCESSOR_ARCHITECTURE)",
-    "webview2: $(Get-WebView2Version)",
-    "rustc:    $(rustc --version 2>$null)",
-    "modes:    $($Modes -join ', ')",
-    ''
-)
-$header | ForEach-Object { Write-Host $_ }
-
-if (-not $SkipBuild) {
-    Write-Host 'Building the spike (the first build takes a while)...'
-    cargo build -p flightdeck-desktop --example browser_spike --locked
-    if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
-}
-if (-not (Test-Path $exe)) { throw "No spike at $exe; build it first (drop -SkipBuild)." }
-
-# The spike's imports that are not part of every Windows (API sets such as
-# api-ms-win-* are, and are left out). Read from the cross-built .exe.
-$imports = @(
-    'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'd3d11.dll', 'd3dcompiler_47.dll',
-    'dcomp.dll', 'dwrite.dll', 'dxgi.dll', 'icuuc.dll', 'uiautomationcore.dll',
-    'comctl32.dll', 'dwmapi.dll', 'iphlpapi.dll', 'bcryptprimitives.dll'
-)
-$system32 = Join-Path $env:windir 'System32'
-$missing = @($imports | Where-Object { -not (Test-Path (Join-Path $system32 $_)) })
-if ($missing.Count -gt 0) {
-    $header += "missing:  $($missing -join ', ') (not in $system32)"
-    Write-Host "Missing DLLs: $($missing -join ', ')" -ForegroundColor Yellow
-    if ($missing | Where-Object { $_ -like 'VCRUNTIME*' }) {
-        Write-Host 'Install the Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe' -ForegroundColor Yellow
-    }
-} else {
-    $header += 'missing:  none of the DLLs the spike imports'
-}
-
 # The DLL names a PE file imports, read from its import and delay-import
 # tables (no dumpbin needed).
 function Get-PeImports([string] $path) {
@@ -194,6 +155,66 @@ function Read-Lines([string] $path, [int] $last = 0) {
     }
     return , $list
 }
+
+$os = Get-CimInstance Win32_OperatingSystem
+$header = @(
+    "FlightDeck session browser - Windows spike (remote-control-cefv.8)",
+    "date:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
+    "commit:   $(git rev-parse --short HEAD 2>$null)",
+    "windows:  $($os.Caption) $($os.Version) (build $($os.BuildNumber)) $($env:PROCESSOR_ARCHITECTURE)",
+    "webview2: $(Get-WebView2Version)",
+    "rustc:    $(rustc --version 2>$null) ($((rustc -vV 2>$null | Select-String '^host:').ToString().Substring(6)))",
+    "modes:    $($Modes -join ', ')",
+    ''
+)
+$header | ForEach-Object { Write-Host $_ }
+
+if (-not $SkipBuild) {
+    Write-Host 'Building the spike (the first build takes a while)...'
+    cargo build -p flightdeck-desktop --example browser_spike --locked
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+}
+if (-not (Test-Path $exe)) { throw "No spike at $exe; build it first (drop -SkipBuild)." }
+
+# With the GNU toolchain (x86_64-pc-windows-gnu), webview2-com-sys links
+# WebView2's loader as WebView2Loader.dll instead of statically, and the .exe
+# needs it beside it; the crate's build only copies it into its own output.
+if ((Get-PeImports $exe) -contains 'WebView2Loader.dll') {
+    $beside = Join-Path (Split-Path -Parent $exe) 'WebView2Loader.dll'
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+    $loader = Get-ChildItem -Path (Join-Path $repo 'target\debug\build') -Directory -Filter 'webview2-com-sys-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName "out\$arch\WebView2Loader.dll" } |
+        Where-Object { Test-Path $_ } |
+        Sort-Object { (Get-Item $_).LastWriteTime } -Descending |
+        Select-Object -First 1
+    if ($loader) {
+        Copy-Item -Force $loader $beside
+        $header += "loader:   WebView2Loader.dll copied beside the spike (GNU toolchain)"
+        Write-Host "Copied WebView2Loader.dll beside the spike (GNU toolchain links it as a DLL)."
+    } else {
+        Write-Host 'The spike needs WebView2Loader.dll and no build of webview2-com-sys has one.' -ForegroundColor Yellow
+    }
+}
+
+# The spike's imports that are not part of every Windows (API sets such as
+# api-ms-win-* are, and are left out). Read from the cross-built .exe.
+$imports = @(
+    'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'd3d11.dll', 'd3dcompiler_47.dll',
+    'dcomp.dll', 'dwrite.dll', 'dxgi.dll', 'icuuc.dll', 'uiautomationcore.dll',
+    'comctl32.dll', 'dwmapi.dll', 'iphlpapi.dll', 'bcryptprimitives.dll'
+)
+$system32 = Join-Path $env:windir 'System32'
+$missing = @($imports | Where-Object { -not (Test-Path (Join-Path $system32 $_)) })
+if ($missing.Count -gt 0) {
+    $header += "missing:  $($missing -join ', ') (not in $system32)"
+    Write-Host "Missing DLLs: $($missing -join ', ')" -ForegroundColor Yellow
+    if ($missing | Where-Object { $_ -like 'VCRUNTIME*' }) {
+        Write-Host 'Install the Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe' -ForegroundColor Yellow
+    }
+} else {
+    $header += 'missing:  none of the DLLs the spike imports'
+}
+
 
 $results = New-Object System.Collections.Generic.List[string]
 foreach ($line in $header) { $results.Add([string] $line) }
