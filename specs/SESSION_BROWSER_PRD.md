@@ -133,6 +133,7 @@ powershell -ExecutionPolicy Bypass -File scripts\desktop\windows-browser-spike.p
 | `http-auth` | Chromium has no SOCKS5 credentials. Does WebView2's `BasicAuthenticationRequested` fire for an HTTP proxy's 407, and does the proxy then get the password? That would keep other programs out as B23 does. | `notes` (the event), `HTTP-PROXY … auth=ok` lines |
 | `pid` | Can the relay tell WebView2's connections from another program's? Each connection's owning process and its parents (`GetExtendedTcpTable`, a process snapshot), then one from `curl.exe`. | `SOCKS connection from … OURS/FOREIGN` lines; curl's must be `FOREIGN` |
 | `profiles` | A profile per session (B10) behind one proxy: are cookies and `localStorage` kept apart? A second proxy port in the same data folder (each session has its own relay): refused? In a folder of its own: works? | titles (`cookie=`, `storage=`) per web view, `notes` for a web view that could not be built, `SOCKS2` lines |
+| `profile-auth` | (`remote-control-cefv.11`) One HTTP proxy, two profiles in one data folder, each answering its login as its own user. Are proxy credentials cached per profile, so the proxy can tell sessions apart by user? | the `VERDICT` line: `PER PROFILE` or `SHARED` (with the requests that crossed); `notes` show which profiles were asked to log in |
 
 **Windows results** (Windows 11 Pro 26200, WebView2 157.0.4341.60, `wry` 0.57.2,
 `x86_64-pc-windows-gnu`, 2026-11-16):

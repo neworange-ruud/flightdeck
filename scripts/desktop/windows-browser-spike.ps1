@@ -15,6 +15,9 @@
                connection from outside, which must come out FOREIGN
     profiles   two profiles behind one proxy (cookies kept apart?), and a
                second proxy port in the same data folder vs. its own folder
+    profile-auth  one HTTP proxy, two profiles answering its login as
+               different users: are proxy credentials cached per profile?
+               (remote-control-cefv.11; ends with a VERDICT line)
 
   Needs what any FlightDeck desktop build on Windows needs: Rust (MSVC
   toolchain), Visual Studio Build Tools with "Desktop development with C++"
@@ -31,10 +34,12 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\desktop\windows-browser-spike.ps1
 .EXAMPLE
+  scripts\desktop\windows-browser-spike.ps1 -Modes profile-auth
+.EXAMPLE
   scripts\desktop\windows-browser-spike.ps1 -Modes pid,profiles -SkipBuild
 #>
 param(
-    [string[]] $Modes = @('wry', 'loopback', 'http-auth', 'pid', 'profiles'),
+    [string[]] $Modes = @('wry', 'loopback', 'http-auth', 'pid', 'profiles', 'profile-auth'),
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120
 )
@@ -158,7 +163,7 @@ function Read-Lines([string] $path, [int] $last = 0) {
 
 $os = Get-CimInstance Win32_OperatingSystem
 $header = @(
-    "FlightDeck session browser - Windows spike (remote-control-cefv.8)",
+    "FlightDeck session browser - Windows spike (remote-control-cefv.8, .11)",
     "date:     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')",
     "commit:   $(git rev-parse --short HEAD 2>$null)",
     "windows:  $($os.Caption) $($os.Version) (build $($os.BuildNumber)) $($env:PROCESSOR_ARCHITECTURE)",

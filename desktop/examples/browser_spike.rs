@@ -57,6 +57,13 @@
 //!   other. A third asks for the same data folder with a **different** proxy
 //!   port (each session has its own relay, so its own port): does WebView2
 //!   refuse? A fourth uses a data folder of its own with that port.
+//! - `profile-auth` (`remote-control-cefv.11`): one HTTP proxy for two
+//!   profiles in one data folder, each answering the proxy's login with its
+//!   own user (`user-a`, `user-b`). Chromium caches proxy credentials: if
+//!   that cache is per profile, the proxy can tell sessions apart by user;
+//!   if it is shared, B's requests arrive as `user-a`. Every page URL says
+//!   which profile loaded it (`/from-a`, `/from-b`), and the run ends with a
+//!   `VERDICT` line.
 
 // The session browser is macOS and Windows only (B7); wry is not built on Linux.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -85,6 +92,10 @@ mod spike {
         /// Everything else worth reporting: the proxy-login event, web views
         /// that could not be built.
         notes: Vec<String>,
+        /// Each request the HTTP proxy saw, and the user it was authorised
+        /// as ("none" without a login, "WRONG" for an unknown one).
+        #[allow(dead_code)]
+        proxy_users: Vec<(String, String)>,
     }
 
     type Shared = Arc<Mutex<Log>>;
@@ -358,8 +369,13 @@ mod spike {
 
     #[cfg(target_os = "windows")]
     fn serve_http_proxy(client: TcpStream, worker_port: u16, log: &Shared) -> std::io::Result<()> {
-        // base64("fd-user:fd-secret")
-        const EXPECTED: &str = "Basic ZmQtdXNlcjpmZC1zZWNyZXQ=";
+        // (user, `Proxy-Authorization` for user:password), password being
+        // fd-secret, pass-a and pass-b.
+        const USERS: [(&str, &str); 3] = [
+            ("fd-user", "Basic ZmQtdXNlcjpmZC1zZWNyZXQ="),
+            ("user-a", "Basic dXNlci1hOnBhc3MtYQ=="),
+            ("user-b", "Basic dXNlci1iOnBhc3MtYg=="),
+        ];
         let mut reader = BufReader::new(client.try_clone()?);
         let mut first = String::new();
         reader.read_line(&mut first)?;
@@ -377,17 +393,22 @@ mod spike {
                 _ => head.push(line),
             }
         }
-        let verdict = match &auth {
+        let user = match &auth {
             None => "none",
-            Some(a) if a == EXPECTED => "ok",
-            Some(_) => "WRONG",
+            Some(a) => USERS
+                .iter()
+                .find(|(_, header)| header == a)
+                .map_or("WRONG", |(user, _)| user),
         };
-        log.lock()
-            .unwrap()
-            .socks
-            .push(format!("HTTP-PROXY {} auth={verdict}", first.trim()));
+        {
+            let mut log = log.lock().unwrap();
+            log.socks
+                .push(format!("HTTP-PROXY {} auth={user}", first.trim()));
+            log.proxy_users
+                .push((first.trim().to_string(), user.to_string()));
+        }
         let mut client = client;
-        if verdict != "ok" {
+        if user == "none" || user == "WRONG" {
             client.write_all(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n\
                   Proxy-Authenticate: Basic realm=\"flightdeck\"\r\n\
@@ -440,8 +461,13 @@ mod spike {
         use super::Shared;
 
         /// Answer every authentication request — a page's or a proxy's —
-        /// with `fd-user` / `fd-secret`, and note each one.
-        pub fn answer_proxy_login(webview: &wry::WebView, log: Shared) {
+        /// with `user` / `password`, and note each one under `label`.
+        pub fn answer_proxy_login(
+            webview: &wry::WebView,
+            log: Shared,
+            label: &'static str,
+            (user, password): (&'static str, &'static str),
+        ) {
             use wry::WebViewExtWindows;
             let core: ICoreWebView2 = webview.webview();
             let core: ICoreWebView2_10 = match core.cast() {
@@ -466,13 +492,14 @@ mod spike {
                         let mut challenge = PWSTR::null();
                         args.Challenge(&mut challenge)?;
                         events.lock().unwrap().notes.push(format!(
-                            "BasicAuthenticationRequested uri={} challenge={}",
+                            "{label}: BasicAuthenticationRequested uri={} challenge={} \
+                             -> answered as {user}",
                             take_pwstr(uri),
                             take_pwstr(challenge)
                         ));
                         let response = args.Response()?;
-                        response.SetUserName(&HSTRING::from("fd-user"))?;
-                        response.SetPassword(&HSTRING::from("fd-secret"))?;
+                        response.SetUserName(&HSTRING::from(user))?;
+                        response.SetPassword(&HSTRING::from(password))?;
                     }
                     Ok(())
                 }));
@@ -602,6 +629,47 @@ mod spike {
         }
     }
 
+    /// `profile-auth`'s answer: did each profile's requests carry its own
+    /// login? A request's profile is in its path (`/from-a`, `/from-b`);
+    /// favicons and WebSockets, which carry no path of ours, are left out.
+    #[allow(dead_code)]
+    fn login_verdict(requests: &[(String, String)]) -> String {
+        let (mut own, mut other, mut none) = (0, 0, 0);
+        let mut crossed = Vec::new();
+        for (line, user) in requests {
+            let expected = if line.contains("/from-a") {
+                "user-a"
+            } else if line.contains("/from-b") {
+                "user-b"
+            } else {
+                continue;
+            };
+            match user.as_str() {
+                "none" => none += 1,
+                u if u == expected => own += 1,
+                _ => {
+                    other += 1;
+                    crossed.push(format!("  {line} carried {user}"));
+                }
+            }
+        }
+        let summary = format!(
+            "{own} with their own profile's login, {other} with the other's, {none} without one"
+        );
+        if other > 0 {
+            format!(
+                "VERDICT: SHARED: proxy credentials cross profiles ({summary}):\n{}",
+                crossed.join("\n")
+            )
+        } else if own >= 4 {
+            format!(
+                "VERDICT: PER PROFILE: every request carried its own profile's login ({summary})"
+            )
+        } else {
+            format!("VERDICT: INCONCLUSIVE: too few authorised requests ({summary})")
+        }
+    }
+
     /// Where a web view goes in the window, and how it is set up.
     struct Plan {
         label: &'static str,
@@ -617,6 +685,10 @@ mod spike {
         /// WebView2 user data folder (Windows); `None` is wry's default.
         #[allow(dead_code)]
         data_dir: Option<std::path::PathBuf>,
+        /// The user and password this web view answers a proxy's login with
+        /// (Windows).
+        #[allow(dead_code)]
+        login: Option<(&'static str, &'static str)>,
     }
 
     /// WebView2's arguments for a proxy at `proxy` that loopback goes
@@ -648,6 +720,7 @@ mod spike {
             browser_args: None,
             profile: None,
             data_dir: None,
+            login: None,
         }];
         #[cfg(target_os = "windows")]
         match mode.as_str() {
@@ -658,6 +731,35 @@ mod spike {
                 let proxy = http_proxy_server(worker, log.clone());
                 println!("HTTP-PROXY 127.0.0.1:{proxy} (wants fd-user / fd-secret)");
                 plans[0].browser_args = Some(chromium_args(&format!("http://127.0.0.1:{proxy}")));
+                plans[0].login = Some(("fd-user", "fd-secret"));
+            }
+            "profile-auth" => {
+                let proxy = http_proxy_server(worker, log.clone());
+                println!("HTTP-PROXY 127.0.0.1:{proxy} (wants user-a / pass-a or user-b / pass-b)");
+                let shared = std::env::temp_dir()
+                    .join(format!("flightdeck-browser-spike-{}", std::process::id()))
+                    .join("shared");
+                let args = chromium_args(&format!("http://127.0.0.1:{proxy}"));
+                plans = vec![
+                    Plan {
+                        label: "A session-a",
+                        bounds: (0, 40, 450, 600),
+                        wry_proxy: None,
+                        browser_args: Some(args.clone()),
+                        profile: Some("session-a"),
+                        data_dir: Some(shared.clone()),
+                        login: Some(("user-a", "pass-a")),
+                    },
+                    Plan {
+                        label: "B session-b",
+                        bounds: (450, 40, 450, 600),
+                        wry_proxy: None,
+                        browser_args: Some(args),
+                        profile: Some("session-b"),
+                        data_dir: Some(shared),
+                        login: Some(("user-b", "pass-b")),
+                    },
+                ];
             }
             "profiles" => {
                 let second = socks_server("SOCKS2", worker, log.clone(), false);
@@ -677,6 +779,7 @@ mod spike {
                         browser_args: Some(args1.clone()),
                         profile: Some("session-a"),
                         data_dir: Some(shared.clone()),
+                        login: None,
                     },
                     Plan {
                         label: "B shared/session-b",
@@ -685,6 +788,7 @@ mod spike {
                         browser_args: Some(args1),
                         profile: Some("session-b"),
                         data_dir: Some(shared.clone()),
+                        login: None,
                     },
                     Plan {
                         label: "C shared/other-port",
@@ -693,6 +797,7 @@ mod spike {
                         browser_args: Some(args2.clone()),
                         profile: Some("session-c"),
                         data_dir: Some(shared),
+                        login: None,
                     },
                     Plan {
                         label: "D own/other-port",
@@ -701,6 +806,7 @@ mod spike {
                         browser_args: Some(args2),
                         profile: Some("session-d"),
                         data_dir: Some(own),
+                        login: None,
                     },
                 ];
             }
@@ -709,7 +815,20 @@ mod spike {
 
         // (web view label, URL), in order.
         let worker_page = "http://only-the-worker-knows.invalid:8080/".to_string();
-        let steps: Vec<(&'static str, String)> = if mode == "profiles" {
+        let a = |path: &str| format!("http://a-host.invalid:8080/{path}");
+        let b = |path: &str| format!("http://b-host.invalid:8080/{path}");
+        let steps: Vec<(&'static str, String)> = if mode == "profile-auth" {
+            // A first, so its login is cached before B asks; then both
+            // again, and each on the other's host.
+            vec![
+                ("A session-a", a("from-a/1")),
+                ("B session-b", b("from-b/1")),
+                ("A session-a", a("from-a/2")),
+                ("B session-b", b("from-b/2")),
+                ("B session-b", a("from-b/3")),
+                ("A session-a", b("from-a/3")),
+            ]
+        } else if mode == "profiles" {
             vec![
                 ("A shared/session-a", worker_page.clone()),
                 ("A shared/session-a", worker_page.clone()),
@@ -760,6 +879,7 @@ mod spike {
 
             let port_file = std::env::temp_dir().join("flightdeck-browser-spike-socks-port");
             let wait_for_foreign = mode == "pid";
+            let judge_logins = mode == "profile-auth";
             cx.spawn(async move |cx| {
                 let pause = Duration::from_millis(2500);
                 for (label, url) in &steps {
@@ -813,6 +933,9 @@ mod spike {
                 println!("PROXY saw:   {:#?}", log.socks);
                 println!("pages loaded: {:#?}", log.loaded);
                 println!("notes:       {:#?}", log.notes);
+                if judge_logins {
+                    println!("\n{}", login_verdict(&log.proxy_users));
+                }
                 cx.update(|cx| cx.quit());
             })
             .detach();
@@ -898,8 +1021,8 @@ mod spike {
             _ => {}
         }
         #[cfg(target_os = "windows")]
-        if mode == "http-auth" {
-            windows_only::answer_proxy_login(&webview, log.clone());
+        if let Some(login) = plan.login {
+            windows_only::answer_proxy_login(&webview, log.clone(), label, login);
         }
         let _ = mode;
         Ok(webview)
