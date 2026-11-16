@@ -43,6 +43,8 @@ mod proxy_macos;
 #[cfg(target_os = "macos")]
 mod tls_macos;
 
+#[cfg(any(test, target_os = "windows"))]
+mod profile_dirs;
 #[cfg(target_os = "windows")]
 mod tls_windows;
 #[cfg(target_os = "windows")]

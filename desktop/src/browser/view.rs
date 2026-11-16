@@ -865,11 +865,18 @@ fn create_webview(
 
 /// Delete browser profile `profile` (B19: its worktree was abandoned). Done
 /// a moment later on the main thread: WebKit refuses to remove a data store
-/// a web view still uses, and the views of the session that closed are
-/// dropped at the end of this frame.
+/// a web view still uses (WebView2 a folder, until its browser process lets
+/// go), and the views of the session that closed are dropped at the end of
+/// this frame.
 pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
     super::trust::TrustStore::at(super::trust::default_path()).forget(&profile);
-    // WebView2's profile is deleted in `remote-control-cefv.12.4`.
+    // WebView2 keeps the profile in a folder; see `profile_dirs`.
+    #[cfg(target_os = "windows")]
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(Duration::from_secs(1)).await;
+        cx.update(|_| super::windows::forget_profile(&profile));
+    })
+    .detach();
     #[cfg(target_os = "macos")]
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -883,8 +890,6 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
         });
     })
     .detach();
-    #[cfg(not(target_os = "macos"))]
-    let _ = cx;
 }
 
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
