@@ -9,6 +9,8 @@
 //! - `view` (macOS): the [`view::BrowserView`] — toolbar, web view and the
 //!   relay it sends through.
 //! - `proxy_macos`: the data-store proxy with credentials (B23).
+//! - `host_macos`: the native view the web view lives in, so DevTools docks
+//!   inside the browser, and the keyboard's way back to GPUI.
 //!
 //! Which tabs exist is the window's model's ([`tabs`]).
 
@@ -20,6 +22,8 @@ pub mod address;
 #[cfg(target_os = "macos")]
 pub mod error_page;
 
+#[cfg(target_os = "macos")]
+mod host_macos;
 #[cfg(target_os = "macos")]
 mod proxy_macos;
 #[cfg(target_os = "macos")]

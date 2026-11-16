@@ -22,7 +22,11 @@
 //! - **Placed every frame.** The web view is native and sits above GPUI, so
 //!   the canvas under the toolbar places it each frame, and the window hides
 //!   it whenever anything covers it or it is not on screen
-//!   ([`BrowserView::set_shown`], B13).
+//!   ([`BrowserView::set_shown`], B13). It lives in a container of its own
+//!   ([`Host`]), so a docked DevTools stays inside the browser's area.
+//! - **The keyboard comes back.** A click anywhere in GPUI, hiding the
+//!   browser or closing it takes the keyboard back from the page or its
+//!   DevTools.
 //! - **Downloads** go to this computer's Downloads folder, under a free
 //!   name; `window.open` opens in this tab.
 
@@ -35,9 +39,9 @@ use std::time::Duration;
 use flightdeck::web::client::http::HttpAccess;
 use flightdeck::web::client::relay::{Relay, RelayEvent};
 use gpui::{
-    canvas, div, px, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window,
+    canvas, div, px, AppContext, Bounds, Context, DispatchPhase, Entity, Focusable,
+    InteractiveElement, IntoElement, MouseDownEvent, ParentElement, Pixels, Render,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
@@ -46,6 +50,7 @@ use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use super::address::{self, Address, FILE_REFUSED};
 use super::error_page;
+use super::host_macos::Host;
 use crate::theme::Palette;
 
 /// How often the view looks at what the web view and the relay reported.
@@ -75,6 +80,9 @@ type Shared = Rc<RefCell<Option<WebView>>>;
 /// See the module docs.
 pub struct BrowserView {
     webview: Shared,
+    /// The native view the web view lives in; `None` until built, or if the
+    /// web view could not be moved into it (then it is placed directly).
+    host: Option<Rc<Host>>,
     relay: Option<Arc<Relay>>,
     /// The worker's name, for the badge and the error pages; `None` for a
     /// local session's browser, which connects directly (B9).
@@ -159,6 +167,7 @@ impl BrowserView {
         });
         BrowserView {
             webview: Rc::default(),
+            host: None,
             relay: None,
             via,
             address,
@@ -237,6 +246,7 @@ impl BrowserView {
                     super::proxy_macos::install(&webview, relay.port(), user, pass);
                 }
                 let _ = webview.load_html(&start_page(self.via.as_deref()));
+                self.host = Host::adopt(&webview).map(Rc::new);
                 *self.webview.borrow_mut() = Some(webview);
             }
             Err(e) => self.failed = Some(format!("The browser could not start: {e}")),
@@ -284,6 +294,10 @@ impl BrowserView {
         self.shown = shown;
         if let Some(webview) = self.webview.borrow().as_ref() {
             let _ = webview.set_visible(shown);
+        }
+        if let Some(host) = &self.host {
+            // Hiding gives the keyboard back to whatever covers it.
+            host.set_hidden(!shown);
         }
         if shown {
             // Placed again on the next frame.
@@ -456,6 +470,11 @@ impl BrowserView {
 
 impl Drop for BrowserView {
     fn drop(&mut self) {
+        // Before the web view leaves the window: a first responder taken out
+        // of it leaves no view with the keyboard.
+        if let Some(host) = &self.host {
+            host.release_keyboard();
+        }
         if let Some(webview) = self.webview.borrow().as_ref() {
             super::tls_macos::unregister(webview);
         }
@@ -595,10 +614,22 @@ impl Render for BrowserView {
                 .into_any_element(),
             None => {
                 let webview = self.webview.clone();
+                let host = self.host.clone();
+                let keyboard = self.host.clone();
                 let placed = self.placed.clone();
                 canvas(
-                    move |bounds, _, _| place(&webview, &placed, bounds),
-                    |_, _, _, _| {},
+                    move |bounds, _, _| place(&webview, host.as_deref(), &placed, bounds),
+                    move |_, _, window, _| {
+                        // A click in GPUI is outside the page (the page takes
+                        // its own clicks): the keyboard comes back to GPUI.
+                        if let Some(host) = keyboard {
+                            window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
+                                if phase == DispatchPhase::Capture {
+                                    host.release_keyboard();
+                                }
+                            });
+                        }
+                    },
                 )
                 .flex_1()
                 .size_full()
@@ -636,13 +667,25 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
 }
 
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
-/// lays out and wry places a child view).
-fn place(webview: &Shared, placed: &Cell<Option<Bounds<Pixels>>>, bounds: Bounds<Pixels>) {
+/// lays out and wry places a child view): its container when it has one.
+fn place(
+    webview: &Shared,
+    host: Option<&Host>,
+    placed: &Cell<Option<Bounds<Pixels>>>,
+    bounds: Bounds<Pixels>,
+) {
     if placed.get() == Some(bounds) {
         return;
     }
     placed.set(Some(bounds));
-    if let Some(webview) = webview.borrow().as_ref() {
+    if let Some(host) = host {
+        host.place(
+            f64::from(f32::from(bounds.origin.x)),
+            f64::from(f32::from(bounds.origin.y)),
+            f64::from(f32::from(bounds.size.width)),
+            f64::from(f32::from(bounds.size.height)),
+        );
+    } else if let Some(webview) = webview.borrow().as_ref() {
         let _ = webview.set_bounds(Rect {
             position: LogicalPosition::new(f32::from(bounds.origin.x), f32::from(bounds.origin.y))
                 .into(),

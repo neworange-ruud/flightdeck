@@ -27,6 +27,8 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **The keyboard works again after using the session browser.** After clicking in a page or opening **DevTools**, no key reached FlightDeck any more until it was restarted. Clicking anywhere outside the page now gives FlightDeck the keyboard back, as does switching away from the browser or closing it.
+- **DevTools stays inside the browser.** Opening **DevTools** made the page and its developer tools spread over the whole window, covering the agents list, until the window was resized. They now share the browser's own area, and hide with it.
 - **OpenCode 2 sessions are reported under their own project again.** OpenCode 2 runs one background service for every folder, and that service used the FlightDeck status plugin of whichever session started it. So agents in other projects and worktrees reported their status as that first project's main session: the wrong tab changed state, and phone notifications came in under the wrong project. Each folder's sessions now report to that folder's own status. Agents already running keep the old plugin until the OpenCode background service (`opencode serve --service`) is restarted.
 
 ## [0.15.0] - 2026-11-13
