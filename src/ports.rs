@@ -19,8 +19,9 @@
 //!   for the directories.
 //! - **Linux**: `ss -ltnpH` for the sockets and their processes,
 //!   `/proc/<pid>/cwd` for the directories.
-//! - **Windows**: none yet (an empty list): the session browser does not run
-//!   there.
+//! - **Windows**: `GetExtendedTcpTable` for the sockets and their
+//!   processes, each process's own memory for its directory
+//!   (`probe_windows`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -198,12 +199,19 @@ impl ListenProbe for SystemProbe {
                 })
                 .collect()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            probe_windows::listening()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             Vec::new()
         }
     }
 }
+
+#[cfg(windows)]
+mod probe_windows;
 
 /// Run `program` with `args` and return its stdout, when it ran.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -387,22 +395,38 @@ mod tests {
     }
 
     /// The real probe, against a real server: a port is found under the
-    /// folder its process runs in. macOS (`lsof`) and Linux (`ss`).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// folder its process runs in. macOS (`lsof`), Linux (`ss`) and Windows
+    /// (the TCP table and the process's own memory).
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn the_system_probe_finds_a_server_by_its_folder() {
         let dir = tempfile::tempdir().unwrap();
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
-        let Ok(mut server) = std::process::Command::new("python3")
-            .args([
-                "-m",
-                "http.server",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-            ])
+        #[cfg(not(windows))]
+        let mut command = std::process::Command::new("python3");
+        #[cfg(not(windows))]
+        command.args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ]);
+        // Every Windows has PowerShell; a listener that waits.
+        #[cfg(windows)]
+        let mut command = std::process::Command::new("powershell");
+        #[cfg(windows)]
+        command.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {port}); \
+                 $l.Start(); Start-Sleep -Seconds 30"
+            ),
+        ]);
+        let Ok(mut server) = command
             .current_dir(dir.path())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -412,7 +436,7 @@ mod tests {
             return;
         };
         let mut found = Vec::new();
-        for _ in 0..50 {
+        for _ in 0..100 {
             found = ports_under(&SystemProbe.listening(), dir.path());
             if found.contains(&port) {
                 break;

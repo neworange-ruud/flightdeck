@@ -12,7 +12,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **A Windows worker offers its sessions' ports to the session browser.** When the worker runs on Windows, a session browser in FlightDeck Desktop now lists the ports the session's processes listen on (**Listening:** under its toolbar), as it already did for macOS and Linux workers. A port is matched to the session whose worktree its process runs in.
 
 ### Bug fixes
 

@@ -2476,6 +2476,7 @@ dependencies = [
  "tungstenite 0.30.0",
  "vt100",
  "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

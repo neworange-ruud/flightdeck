@@ -19,12 +19,16 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2
 use webview2_com::{take_pwstr, BasicAuthenticationRequestedEventHandler};
 use windows::core::{Interface, HSTRING, PWSTR};
 
-/// The app's one proxy hub, started on first use.
+/// The app's one proxy hub, started on first use, which is also before
+/// any web view starts: profiles left to delete go first (B19).
 pub fn hub() -> Result<&'static ProxyHub, String> {
     static HUB: OnceLock<Result<ProxyHub, String>> = OnceLock::new();
-    HUB.get_or_init(|| ProxyHub::start().map_err(|e| e.to_string()))
-        .as_ref()
-        .map_err(|e| format!("The browser could not start its proxy: {e}"))
+    HUB.get_or_init(|| {
+        sweep_forgotten();
+        ProxyHub::start().map_err(|e| e.to_string())
+    })
+    .as_ref()
+    .map_err(|e| format!("The browser could not start its proxy: {e}"))
 }
 
 /// The GPUI window a web view is built in, by its handle alone, so it can
@@ -55,6 +59,27 @@ impl wry::raw_window_handle::HasWindowHandle for ParentWindow {
 /// The data folder every session browser shares.
 pub fn data_dir() -> Option<PathBuf> {
     super::flightdeck_dir().map(|dir| dir.join("browser").join("webview2"))
+}
+
+/// Where profiles that could not be deleted yet are listed.
+fn forget_list() -> Option<PathBuf> {
+    super::flightdeck_dir().map(|dir| dir.join("browser").join("webview2-forget.txt"))
+}
+
+/// Delete the profiles WebView2 still held when their worktree was
+/// abandoned. At app start, before any web view: then nothing holds them.
+pub fn sweep_forgotten() {
+    if let (Some(data), Some(pending)) = (data_dir(), forget_list()) {
+        super::profile_dirs::sweep(&data, &pending);
+    }
+}
+
+/// Delete `profile`'s WebView2 data now if WebView2 has let go of it, else
+/// when the app next starts (B19, `super::profile_dirs`).
+pub fn forget_profile(profile: &[u8; 16]) {
+    if let (Some(data), Some(pending)) = (data_dir(), forget_list()) {
+        super::profile_dirs::forget(&data, &pending, &profile_name(profile));
+    }
 }
 
 /// WebView2's argument line: the hub as proxy, loopback through it too.

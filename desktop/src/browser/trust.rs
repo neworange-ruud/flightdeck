@@ -32,8 +32,6 @@ impl TrustStore {
         TrustStore { path }
     }
 
-    // Windows uses it from `remote-control-cefv.12.3` (Continue anyway).
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
     /// The `host:port`s profile `profile` trusts.
     pub fn allowed(&self, profile: &[u8; 16]) -> HashSet<(String, u16)> {
         read(self.path.as_deref())
@@ -44,8 +42,6 @@ impl TrustStore {
             .collect()
     }
 
-    // Windows uses it from `remote-control-cefv.12.3` (Continue anyway).
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
     /// Trust `host:port` in profile `profile` from now on.
     pub fn allow(&self, profile: &[u8; 16], host: &str, port: u16) {
         let Some(path) = self.path.as_deref() else {
@@ -94,8 +90,6 @@ fn write(path: &Path, all: &Entries) {
     }
 }
 
-// Windows uses it from `remote-control-cefv.12.3` (Continue anyway).
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 /// `host:port` (IPv6 bracketed) into its parts.
 fn split(entry: &str) -> Option<(String, u16)> {
     let (host, port) = entry.rsplit_once(':')?;

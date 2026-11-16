@@ -33,8 +33,6 @@ pub fn page(title: &str, detail: &str, via: Option<&str>) -> String {
 /// (`window.ipc.postMessage`, `wry`'s channel back to the view).
 pub const CONTINUE_MESSAGE: &str = "flightdeck:continue";
 
-// Windows uses it from `remote-control-cefv.12.3` (Continue anyway).
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 /// [`page`], with one button that posts [`CONTINUE_MESSAGE`]: the
 /// certificate page's **Continue anyway** (B21).
 pub fn page_with_action(title: &str, detail: &str, via: Option<&str>, action: &str) -> String {
