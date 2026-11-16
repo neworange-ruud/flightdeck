@@ -21,6 +21,10 @@
   and a Windows SDK, and the WebView2 runtime (part of Windows 10/11).
   curl.exe ships with Windows 10 1803 and later.
 
+  Before running, it checks that the DLLs the spike imports are on this
+  machine (VCRUNTIME140*.dll come with the Visual C++ Redistributable:
+  https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
   Results: target\browser-spike\results.txt (also one file per mode). Send
   results.txt back; it goes into specs/SESSION_BROWSER_PRD.md section 4.1.
 
@@ -77,6 +81,108 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "No spike at $exe; build it first (drop -SkipBuild)." }
 
+# The spike's imports that are not part of every Windows (API sets such as
+# api-ms-win-* are, and are left out). Read from the cross-built .exe.
+$imports = @(
+    'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll', 'd3d11.dll', 'd3dcompiler_47.dll',
+    'dcomp.dll', 'dwrite.dll', 'dxgi.dll', 'icuuc.dll', 'uiautomationcore.dll',
+    'comctl32.dll', 'dwmapi.dll', 'iphlpapi.dll', 'bcryptprimitives.dll'
+)
+$system32 = Join-Path $env:windir 'System32'
+$missing = @($imports | Where-Object { -not (Test-Path (Join-Path $system32 $_)) })
+if ($missing.Count -gt 0) {
+    $header += "missing:  $($missing -join ', ') (not in $system32)"
+    Write-Host "Missing DLLs: $($missing -join ', ')" -ForegroundColor Yellow
+    if ($missing | Where-Object { $_ -like 'VCRUNTIME*' }) {
+        Write-Host 'Install the Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe' -ForegroundColor Yellow
+    }
+} else {
+    $header += 'missing:  none of the DLLs the spike imports'
+}
+
+# The DLL names a PE file imports, read from its import and delay-import
+# tables (no dumpbin needed).
+function Get-PeImports([string] $path) {
+    $b = [System.IO.File]::ReadAllBytes($path)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    if ([BitConverter]::ToUInt32($b, $pe) -ne 0x4550) { throw "$path is not a PE file" }
+    $coff = $pe + 4
+    $sections = [BitConverter]::ToUInt16($b, $coff + 2)
+    $optional = $coff + 20
+    $optionalSize = [BitConverter]::ToUInt16($b, $coff + 16)
+    $directories = if ([BitConverter]::ToUInt16($b, $optional) -eq 0x20B) { $optional + 112 } else { $optional + 96 }
+    $table = $optional + $optionalSize
+    $toOffset = {
+        param([uint32] $rva)
+        for ($i = 0; $i -lt $sections; $i++) {
+            $s = $table + 40 * $i
+            $va = [BitConverter]::ToUInt32($b, $s + 12)
+            $size = [Math]::Max([BitConverter]::ToUInt32($b, $s + 8), [BitConverter]::ToUInt32($b, $s + 16))
+            if ($rva -ge $va -and $rva -lt $va + $size) {
+                return [int]($rva - $va + [BitConverter]::ToUInt32($b, $s + 20))
+            }
+        }
+        return -1
+    }
+    $names = New-Object System.Collections.Generic.List[string]
+    # (data directory, descriptor size, offset of the DLL name in it):
+    # imports, then delay-load imports.
+    foreach ($kind in @(@(1, 20, 12), @(13, 32, 4))) {
+        $rva = [BitConverter]::ToUInt32($b, $directories + 8 * $kind[0])
+        if ($rva -eq 0) { continue }
+        $at = & $toOffset $rva
+        while ($at -ge 0) {
+            $nameRva = [BitConverter]::ToUInt32($b, $at + $kind[2])
+            if ($nameRva -eq 0) { break }
+            $start = & $toOffset $nameRva
+            $end = $start
+            while ($b[$end] -ne 0) { $end++ }
+            $names.Add([System.Text.Encoding]::ASCII.GetString($b, $start, $end - $start))
+            $at += $kind[1]
+        }
+    }
+    return , $names
+}
+
+# Load each DLL `$path` imports, as the loader would; for one that fails,
+# say why, and follow its own imports (a DLL that is there can still miss
+# one of its dependencies). Windows only.
+function Find-MissingDlls([string] $path, [int] $depth = 0, $seen = $null) {
+    if ($null -eq $seen) { $seen = New-Object System.Collections.Generic.HashSet[string] }
+    if (-not ('FlightDeck.Native' -as [type])) {
+        Add-Type -Namespace FlightDeck -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern IntPtr LoadLibraryExW(string name, IntPtr file, uint flags);
+[DllImport("kernel32.dll")]
+public static extern bool FreeLibrary(IntPtr module);
+'@
+    }
+    $found = New-Object System.Collections.Generic.List[string]
+    $indent = '  ' * ($depth + 1)
+    $dir = Split-Path -Parent $path
+    foreach ($name in (Get-PeImports $path)) {
+        if (-not $seen.Add($name.ToLowerInvariant())) { continue }
+        $local = Join-Path $dir $name
+        $target = if (Test-Path $local) { $local } else { $name }
+        $module = [FlightDeck.Native]::LoadLibraryExW($target, [IntPtr]::Zero, 0)
+        if ($module -ne [IntPtr]::Zero) {
+            [void] [FlightDeck.Native]::FreeLibrary($module)
+            continue
+        }
+        $code = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $file = @($local, (Join-Path $env:windir "System32\$name")) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($file) {
+            $found.Add("$indent$name cannot load (error $code), though it is at $file; its imports:")
+            if ($depth -lt 3) {
+                foreach ($line in (Find-MissingDlls $file ($depth + 1) $seen)) { $found.Add($line) }
+            }
+        } else {
+            $found.Add("$indent$name NOT FOUND (error $code)")
+        }
+    }
+    return , $found
+}
+
 # A file's lines, as a list (empty for a missing or empty file). A list,
 # because PowerShell turns an empty array returned from a function into $null.
 function Read-Lines([string] $path, [int] $last = 0) {
@@ -132,7 +238,21 @@ foreach ($mode in $Modes) {
     $lines = Read-Lines $stdout
     $errors = Read-Lines $stderr 40
 
+    $diagnosis = New-Object System.Collections.Generic.List[string]
+    if ($code -eq -1073741515) {
+        # 0xC0000135: a DLL it needs could not be found. Which one?
+        $diagnosis.Add('DLLs the spike could not load (0xC0000135):')
+        try {
+            $missingDlls = Find-MissingDlls $exe
+            if ($missingDlls.Count -eq 0) { $diagnosis.Add('  (every import loads from here; see the stderr)') }
+            foreach ($line in $missingDlls) { $diagnosis.Add($line) }
+        } catch {
+            $diagnosis.Add("  could not check: $_")
+        }
+    }
+
     $results.Add("===== mode: $mode (exit $shown) =====")
+    foreach ($line in $diagnosis) { $results.Add($line) }
     foreach ($line in $lines) { $results.Add($line) }
     if ($lines.Count -eq 0) { $results.Add('(the spike printed nothing)') }
     if ($curl) { $results.Add("curl.exe (a program that is not the spike) got: $curl") }
@@ -144,6 +264,7 @@ foreach ($mode in $Modes) {
 
     $lines | Write-Host
     Write-Host "exit: $shown"
+    $diagnosis | Write-Host
     if ($lines.Count -eq 0) { Write-Host '(the spike printed nothing)' }
     if ($errors.Count -gt 0) {
         Write-Host '--- stderr ---'
