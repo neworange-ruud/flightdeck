@@ -77,8 +77,20 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "No spike at $exe; build it first (drop -SkipBuild)." }
 
+# A file's lines, as a list (empty for a missing or empty file). A list,
+# because PowerShell turns an empty array returned from a function into $null.
+function Read-Lines([string] $path, [int] $last = 0) {
+    $list = New-Object System.Collections.Generic.List[string]
+    if (Test-Path $path) {
+        $content = @(Get-Content $path)
+        if ($last -gt 0) { $content = @($content | Select-Object -Last $last) }
+        foreach ($line in $content) { $list.Add([string] $line) }
+    }
+    return , $list
+}
+
 $results = New-Object System.Collections.Generic.List[string]
-$results.AddRange([string[]]$header)
+foreach ($line in $header) { $results.Add([string] $line) }
 
 foreach ($mode in $Modes) {
     Write-Host ''
@@ -113,15 +125,30 @@ foreach ($mode in $Modes) {
         Add-Content -Path $stdout -Value "(killed after $TimeoutSeconds s)"
     }
 
-    $results.Add("===== mode: $mode (exit $($proc.ExitCode)) =====")
-    if (Test-Path $stdout) { $results.AddRange([string[]](Get-Content $stdout)) }
+    # Hex too: a crash before main is an NTSTATUS such as 0xC0000135
+    # (a DLL not found).
+    $code = $proc.ExitCode
+    $shown = if ($null -eq $code) { 'unknown' } else { '{0} (0x{1:X8})' -f $code, $code }
+    $lines = Read-Lines $stdout
+    $errors = Read-Lines $stderr 40
+
+    $results.Add("===== mode: $mode (exit $shown) =====")
+    foreach ($line in $lines) { $results.Add($line) }
+    if ($lines.Count -eq 0) { $results.Add('(the spike printed nothing)') }
     if ($curl) { $results.Add("curl.exe (a program that is not the spike) got: $curl") }
-    if ((Test-Path $stderr) -and (Get-Item $stderr).Length -gt 0) {
+    if ($errors.Count -gt 0) {
         $results.Add('--- stderr ---')
-        $results.AddRange([string[]](Get-Content $stderr | Select-Object -Last 40))
+        foreach ($line in $errors) { $results.Add($line) }
     }
     $results.Add('')
-    if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
+
+    $lines | Write-Host
+    Write-Host "exit: $shown"
+    if ($lines.Count -eq 0) { Write-Host '(the spike printed nothing)' }
+    if ($errors.Count -gt 0) {
+        Write-Host '--- stderr ---'
+        $errors | Write-Host
+    }
 }
 
 # The profiles mode's data folders.
