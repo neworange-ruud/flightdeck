@@ -62,6 +62,10 @@ const POLL: Duration = Duration::from_millis(100);
 struct PageState {
     /// The page's address, as last started.
     url: String,
+    /// The address last asked for (typed, a port, `window.open`) until a
+    /// page starts. A page the worker refused never starts, so its refusal
+    /// is matched against this to show our error page instead of nothing.
+    requested: String,
     /// The page's title.
     title: String,
     /// Our own page to show instead: a title and its detail.
@@ -208,8 +212,11 @@ impl BrowserView {
             })
             .with_on_page_load_handler(move |event, url| {
                 let mut page = load_page.borrow_mut();
-                if matches!(event, PageLoadEvent::Started) && is_web(&url) {
-                    page.url = url;
+                if matches!(event, PageLoadEvent::Started) {
+                    page.requested.clear();
+                    if is_web(&url) {
+                        page.url = url;
+                    }
                 }
                 page.dirty = true;
             })
@@ -269,6 +276,7 @@ impl BrowserView {
                         return;
                     }
                 }
+                self.page.borrow_mut().requested = url.clone();
                 if let Some(webview) = self.webview.borrow().as_ref() {
                     let _ = webview.load_url(&url);
                 }
@@ -379,6 +387,7 @@ impl BrowserView {
         }
         for url in opened {
             if allow_navigation(&url, self.relay.as_deref(), &self.page) {
+                self.page.borrow_mut().requested = url.clone();
                 if let Some(webview) = self.webview.borrow().as_ref() {
                     let _ = webview.load_url(&url);
                 }
@@ -387,12 +396,20 @@ impl BrowserView {
         if let Some(relay) = self.relay.clone() {
             // A tunnel the worker refused for the page itself is our error
             // page; one for a script or an image is the page's own business.
+            // The page is the one asked for while it has not started yet.
+            let requested = self.page.borrow().requested.clone();
+            let page = if requested.is_empty() {
+                url.clone()
+            } else {
+                requested
+            };
             for event in relay.take_events() {
                 let RelayEvent::Refused {
                     target, message, ..
                 } = event;
-                if targets_page(&url, &target) {
-                    self.show_error(&format!("Can't reach {}", shown_address(&url)), &message);
+                if targets_page(&page, &target) {
+                    self.page.borrow_mut().requested.clear();
+                    self.show_error(&format!("Can't reach {}", shown_address(&page)), &message);
                     changed = true;
                 }
             }

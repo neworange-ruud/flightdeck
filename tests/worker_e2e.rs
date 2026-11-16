@@ -2409,6 +2409,16 @@ fn the_desktop_relay_sends_socks_and_loopback_through_the_worker() {
         .unwrap();
     let page = get_over(stream, &format!("localhost:{local}"));
     assert!(page.contains("served-on-the-worker"), "{page}");
+    // The page server listens on 127.0.0.1 only. A browser tries `localhost`
+    // over ::1 first; the forward then reaches the worker's IPv4 loopback
+    // instead of loading nothing. (Skipped where this machine has no ::1.)
+    if let Ok(stream) = std::net::TcpStream::connect(("::1", local)) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let page = get_over(stream, &format!("localhost:{local}"));
+        assert!(page.contains("served-on-the-worker"), "over ::1: {page}");
+    }
 
     // Nothing listening on the worker: SOCKS "connection refused", and the
     // worker's sentence for the browser's error page.
