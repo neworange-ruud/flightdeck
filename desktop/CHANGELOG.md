@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [0.16.0] - 2026-11-16
+
+### New features
+
 - **The session browser on Windows.** **New Browser** now works on Windows too, in worker and local sessions alike, with the same toolbar, error pages, port suggestions, downloads and **DevTools** (in a window of its own). As on macOS, a worker session's requests, `localhost` included, are made by the worker, and each session keeps its own cookies and storage. Needs the WebView2 runtime, which Windows 10 and 11 include. **Continue anyway** for a self-signed certificate works there too, and a session's browser data is deleted when its worktree is abandoned (at the latest the next time FlightDeck starts).
 - **A browser in your worker sessions (macOS 14 or later).** In a worker window, choose **New Browser** from the palette, or click the globe button at the bottom of the sidebar, to open a browser in the selected agent session. It shows in the same area as the agent and its shells, and is listed under the session's terminals with a **✕** to close it. Whatever address you type, the worker makes the request: `localhost:3000` is the dev server on the worker, and any other site is fetched from the worker's network. The page itself is drawn on your Mac. The toolbar has back, forward, reload, the address field with **Go**, a "via ‹worker›" badge and **DevTools**. Each session keeps its own cookies and storage. If a `localhost` port is already in use on your Mac, or the worker can't reach an address, the browser says so in its own words instead of showing your Mac's page. `file://` addresses are not opened. Downloads go to your Downloads folder. Needs a worker on the current version. Not yet available on Windows or Linux.
 - **More than one worker shell.** In a worker window, the first tab is now called **Worker** and holds a row of the worker's shells. Click one to show it, press **+** or Ctrl-T to open another, and close one with its **✕** or Ctrl-W. Alt-Left/Right switch between them. The shells live on the worker, so every window sees the same ones, and they keep running when you disconnect. When every shell is closed, the tab offers **Open a shell**. A worker keeps at most 16. Update the worker too: an older worker keeps its one shell, without **+** or **✕**.
