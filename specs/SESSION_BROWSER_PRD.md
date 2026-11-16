@@ -150,17 +150,29 @@ powershell -ExecutionPolicy Bypass -File scripts\desktop\windows-browser-spike.p
 | A different proxy per session | **Not in one data folder**: a second web view asking for the same folder with another proxy port fails with `0x8007139F` (`ERROR_INVALID_STATE`, reported as "Class not registered"); the browser process's arguments are fixed by the first. In a folder of its own it works (its own browser process). |
 | WebView2's own traffic | WebView2 itself fetches `config.edge.skype.com:443` through the proxy; without credentials an HTTP proxy refuses it (`auth=none`, 407), which does no harm. |
 | GNU toolchain | `webview2-com-sys` links `WebView2Loader.dll` dynamically there (statically with MSVC), so a GNU build must ship the DLL beside the `.exe`. Release builds use MSVC. |
+| Proxy logins per profile (`profile-auth`, `cefv.11`) | **Per profile.** Two profiles in one data folder behind one HTTP proxy were each asked to log in once, A answered `user-a`, B `user-b`, and every later request, WebSockets and favicons included, carried its own profile's user, also when each loaded the other's host (`VERDICT: PER PROFILE`, 6 of 6). Each profile's first request costs one 407 round trip. |
 
-**What this means for Windows** (`remote-control-cefv.12`): one HTTP proxy in the
-app for every session, with `<-loopback>` so loopback reaches the worker too
-(no forwards), each session's web views in their own profile in one data
-folder, and each session answering `BasicAuthenticationRequested` with
-**its own** username and password, by which the proxy knows the session and
-its worker. One question is open before that design holds
-(`remote-control-cefv.11`): Chromium caches proxy credentials, and if that
-cache is shared across profiles, session B would reuse session A's and go to
-A's worker. The alternative, a data folder (and browser process) per
-session, is proven but costs a browser process per session.
+**The Windows design** (`remote-control-cefv.12`), which the results above
+support end to end:
+
+- **One HTTP proxy in the app** for every session's browser, started with
+  `--proxy-bypass-list=<-loopback>`, so loopback reaches the worker too and
+  there are no local forwards (B22's forwards are macOS only).
+- **One data folder, a profile per session** (`with_profile_name`), so one
+  WebView2 browser process for every browser (B10).
+- **A login per session.** Each session's web views answer
+  `BasicAuthenticationRequested` with that session's own username and
+  password (random, like B23's). The proxy refuses anything else, which
+  keeps other programs out, and the username tells it the session, and so
+  the worker and tunnel key, a connection belongs to. Proxy logins are
+  cached per profile (`cefv.11`), so they never cross sessions.
+- The proxy takes `CONNECT` and absolute-form `GET http://…` (plain HTTP
+  comes that way), and brackets IPv6 loopback names (`::1` → `[::1]:P`)
+  before the worker's `parse_target`.
+
+A data folder per session also works (it is how a per-session proxy port
+could be kept), at the cost of a browser process per session; it is the
+fallback should the login per profile ever stop holding.
 
 ### 4.2 Worker (`remote-control-cefv.2`)
 
@@ -283,7 +295,7 @@ Children of epic `remote-control-cefv`. "After" lists blocking dependencies.
 | --- | --- | --- |
 | `.1` | Spike on macOS: wry in GPUI, SOCKS5 proxy, loopback, profiles (done) | — |
 | `.8` | Spike on Windows: `<-loopback>`, relay access control (done) | — |
-| `.11` | Spike on Windows: per-profile proxy credentials behind one HTTP proxy | `.8` |
+| `.11` | Spike on Windows: per-profile proxy credentials behind one HTTP proxy (done) | `.8` |
 | `.12` | Session browser on Windows (WebView2) | `.11` |
 | `.2` | Worker tunnel endpoint | — |
 | `.3` | Desktop SOCKS5 relay | `.2` |
