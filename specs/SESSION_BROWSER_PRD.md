@@ -120,6 +120,34 @@ other local programs without SOCKS5 credentials, and a profile per session
 with the proxy. Note that `wry` drops its own proxy flag once browser
 arguments are given, so the whole argument line is ours.
 
+Run every mode and collect the results in `target\browser-spike\results.txt`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\desktop\windows-browser-spike.ps1
+```
+
+| Mode | Question | Read the answer in |
+| --- | --- | --- |
+| `wry` | With `wry`'s own SOCKS5 setting, does loopback go direct (Chromium's implicit bypass)? | `DESKTOP saw` vs `WORKER saw` for the `localhost`, `127.0.0.1` and `[::1]` pages |
+| `loopback` | Does `--proxy-bypass-list=<-loopback>` send loopback through the relay? If so, Windows needs no forwards (B22). | the same: loopback pages served by `WORKER`, `SOCKS CONNECT` lines for them |
+| `http-auth` | Chromium has no SOCKS5 credentials. Does WebView2's `BasicAuthenticationRequested` fire for an HTTP proxy's 407, and does the proxy then get the password? That would keep other programs out as B23 does. | `notes` (the event), `HTTP-PROXY … auth=ok` lines |
+| `pid` | Can the relay tell WebView2's connections from another program's? Each connection's owning process and its parents (`GetExtendedTcpTable`, a process snapshot), then one from `curl.exe`. | `SOCKS connection from … OURS/FOREIGN` lines; curl's must be `FOREIGN` |
+| `profiles` | A profile per session (B10) behind one proxy: are cookies and `localStorage` kept apart? A second proxy port in the same data folder (each session has its own relay): refused? In a folder of its own: works? | titles (`cookie=`, `storage=`) per web view, `notes` for a web view that could not be built, `SOCKS2` lines |
+
+Fill in the table below from the results.
+
+**Windows results** (to fill in):
+
+| Question | Result |
+| --- | --- |
+| Child web view in a GPUI window | |
+| Loopback with `wry`'s proxy setting | |
+| Loopback with `<-loopback>` | |
+| Proxy credentials (HTTP proxy, `BasicAuthenticationRequested`) | |
+| Telling WebView2's connections from other programs' | |
+| Profile per session with a proxy | |
+| A different proxy per session | |
+
 ### 4.2 Worker (`remote-control-cefv.2`)
 
 *Built (protocol v11; `src/web/tunnel.rs`, `src/web/server/tunnel_route.rs`,

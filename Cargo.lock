@@ -2497,6 +2497,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
+ "webview2-com",
+ "windows 0.62.2",
  "wry",
 ]
 
