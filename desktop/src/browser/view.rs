@@ -59,6 +59,10 @@ use super::error_page;
 #[cfg(target_os = "macos")]
 use super::host_macos::Host;
 use super::net::{direct_net, worker_net, Net};
+#[cfg(target_os = "macos")]
+use super::tls_macos as tls;
+#[cfg(target_os = "windows")]
+use super::tls_windows as tls;
 use crate::theme::Palette;
 
 /// Windows has no container view (WebView2 places and hides itself, and its
@@ -97,6 +101,11 @@ struct PageState {
     opened: Vec<String>,
     /// The certificate page's Continue anyway was chosen (B21).
     continue_requested: bool,
+    /// The main frame's latest navigation (Windows, where wry's navigation
+    /// handler sees only the main frame): a certificate failure there is
+    /// the page's own.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    navigating: String,
     /// Something above changed.
     dirty: bool,
 }
@@ -134,8 +143,7 @@ pub struct BrowserView {
     /// The profile it browses in (B10), for what it trusts (B21).
     profile: [u8; 16],
     /// The certificate failure our page is showing, until Continue anyway.
-    #[cfg(target_os = "macos")]
-    pending_cert: Option<super::tls_macos::CertFailure>,
+    pending_cert: Option<super::cert::CertFailure>,
     /// The ports the session listens on (B11), each with whether this
     /// computer has it in use (a worker session's forward was refused).
     ports: Vec<(u16, bool)>,
@@ -219,7 +227,6 @@ impl BrowserView {
             failed: None,
             pending_load: None,
             profile: [0; 16],
-            #[cfg(target_os = "macos")]
             pending_cert: None,
             ports: Vec::new(),
             _poll,
@@ -383,13 +390,11 @@ impl BrowserView {
 
     /// The `host:port` whose certificate the page on screen failed on, while
     /// our page offers Continue anyway (B21).
-    #[cfg(target_os = "macos")]
     pub fn certificate_failure(&self) -> Option<(String, u16)> {
         self.pending_cert.as_ref().map(|f| (f.host.clone(), f.port))
     }
 
     /// Choose Continue anyway, as the page's button does.
-    #[cfg(target_os = "macos")]
     pub fn continue_anyway(&mut self) {
         let mut page = self.page.borrow_mut();
         page.continue_requested = true;
@@ -397,7 +402,6 @@ impl BrowserView {
     }
 
     /// The address of the page last started, for `--spike-browser`.
-    #[cfg(target_os = "macos")]
     pub fn url(&self) -> String {
         self.page.borrow().url.clone()
     }
@@ -444,10 +448,7 @@ impl BrowserView {
         if let Some(host) = &self.host {
             host.enforce(self.shown);
         }
-        #[cfg(target_os = "macos")]
         self.poll_certificates(continue_requested);
-        #[cfg(not(target_os = "macos"))]
-        let _ = continue_requested;
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
         }
@@ -486,15 +487,22 @@ impl BrowserView {
 
     /// B21: a page that failed on its certificate shows our page, with
     /// **Continue anyway**; choosing it trusts that `host:port` in this
-    /// profile from now on, and loads the page again. macOS for now
-    /// (Windows: `remote-control-cefv.12.3`).
-    #[cfg(target_os = "macos")]
+    /// profile from now on, and loads the page again. On Windows only a
+    /// failure of the page itself counts; one of a script or an image on it
+    /// was simply cancelled.
     fn poll_certificates(&mut self, continue_requested: bool) {
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
             return;
         };
-        if let Some(failure) = super::tls_macos::take_failure(webview) {
+        let failure = tls::take_failure(webview);
+        #[cfg(target_os = "windows")]
+        let failure = failure.filter(|failure| {
+            let page = self.page.borrow();
+            super::cert::is_page_failure(failure, &page.navigating)
+                || super::cert::is_page_failure(failure, &page.requested)
+        });
+        if let Some(failure) = failure {
             let detail = format!(
                 "{} The certificate {}:{} presented is not trusted. A development server \
                  with a self-signed certificate looks like this; anywhere else it can mean \
@@ -511,7 +519,7 @@ impl BrowserView {
         }
         if continue_requested {
             if let Some(failure) = self.pending_cert.take() {
-                super::tls_macos::allow(webview, &failure.host, failure.port);
+                tls::allow(webview, &failure.host, failure.port);
                 super::trust::TrustStore::at(super::trust::default_path()).allow(
                     &self.profile,
                     &failure.host,
@@ -557,8 +565,7 @@ impl Drop for BrowserView {
             host.release_keyboard();
         }
         if let Some(webview) = self.webview.borrow().as_ref() {
-            #[cfg(target_os = "macos")]
-            super::tls_macos::unregister(webview);
+            tls::unregister(webview);
             #[cfg(target_os = "windows")]
             let _ = webview.focus_parent();
         }
@@ -779,7 +786,13 @@ fn create_webview(
         })
         .with_visible(false)
         .with_devtools(true)
-        .with_navigation_handler(move |url| allow_navigation(&url, &nav_net, &nav_page))
+        .with_navigation_handler(move |url| {
+            #[cfg(target_os = "windows")]
+            {
+                nav_page.borrow_mut().navigating = url.clone();
+            }
+            allow_navigation(&url, &nav_net, &nav_page)
+        })
         .with_on_page_load_handler(move |event, url| {
             let mut page = load_page.borrow_mut();
             if matches!(event, PageLoadEvent::Started) {
@@ -831,10 +844,11 @@ fn create_webview(
     let webview = builder
         .build_as_child(parent)
         .map_err(|e| format!("The browser could not start: {e}"))?;
+    // B21: the certificates this profile trusts.
+    let trusted = super::trust::TrustStore::at(super::trust::default_path()).allowed(&profile);
+    tls::register(&webview, trusted);
     #[cfg(target_os = "macos")]
     {
-        let trusted = super::trust::TrustStore::at(super::trust::default_path()).allowed(&profile);
-        super::tls_macos::register(&webview, trusted);
         if let Net::Relay(relay) = &*net {
             let (user, pass) = relay.credentials();
             super::proxy_macos::install(&webview, relay.port(), user, pass);

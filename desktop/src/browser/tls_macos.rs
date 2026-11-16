@@ -28,16 +28,8 @@ use objc2::encode::{Encoding, RefEncode};
 use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
 use objc2::{class, msg_send, sel};
 
-/// A page that failed on its certificate.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CertFailure {
-    /// The address that failed.
-    pub url: String,
-    pub host: String,
-    pub port: u16,
-    /// WebKit's own words for what was wrong.
-    pub message: String,
-}
+use super::cert::host_port;
+pub use super::cert::CertFailure;
 
 #[derive(Default)]
 struct ViewTrust {
@@ -260,53 +252,5 @@ unsafe fn text(object: *mut AnyObject) -> String {
         } else {
             CStr::from_ptr(utf8).to_string_lossy().into_owned()
         }
-    }
-}
-
-/// An `https://` address's host (lowercase, IPv6 unbracketed) and port.
-pub fn host_port(url: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("wss") {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
-    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
-        let (host, tail) = after.split_once(']')?;
-        (host, tail.strip_prefix(':'))
-    } else {
-        match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        }
-    };
-    let port = match port {
-        Some(port) => port.parse().ok()?,
-        None => 443,
-    };
-    Some((host.to_ascii_lowercase(), port))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_https_address_names_its_host_and_port() {
-        assert_eq!(
-            host_port("https://localhost:8443/a"),
-            Some(("localhost".into(), 8443))
-        );
-        assert_eq!(
-            host_port("https://Dev.Test/"),
-            Some(("dev.test".into(), 443))
-        );
-        assert_eq!(host_port("https://[::1]:9443/"), Some(("::1".into(), 9443)));
-        assert_eq!(
-            host_port("wss://localhost:24678/hmr"),
-            Some(("localhost".into(), 24678))
-        );
-        assert_eq!(host_port("http://localhost:3000"), None, "not TLS");
-        assert_eq!(host_port(""), None);
     }
 }

@@ -24,6 +24,8 @@ pub mod tabs;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod address;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod cert;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod error_page;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod net;
@@ -41,6 +43,8 @@ mod proxy_macos;
 #[cfg(target_os = "macos")]
 mod tls_macos;
 
+#[cfg(target_os = "windows")]
+mod tls_windows;
 #[cfg(target_os = "windows")]
 mod windows;
 

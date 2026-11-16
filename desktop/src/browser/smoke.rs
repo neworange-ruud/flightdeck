@@ -106,9 +106,12 @@ pub fn run() -> i32 {
                     println!("{step:<44} title={title:?}");
                 }
                 // B21: a self-signed HTTPS server, its certificate page, and
-                // Continue anyway (macOS; Windows is cefv.12.3).
-                #[cfg(target_os = "macos")]
-                if let Some((server, port)) = self_signed_server() {
+                // Continue anyway. Needs openssl to make the server.
+                let tls = self_signed_server();
+                if tls.is_none() {
+                    println!("{:<44} skipped: no openssl", "self-signed certificate");
+                }
+                if let Some((server, port)) = tls {
                     let step = format!("https://localhost:{port}/");
                     direct.update(cx, |b, cx| b.go(&step, cx));
                     cx.background_executor().timer(pause).await;
@@ -248,14 +251,14 @@ fn stand_in_worker(page: u16) -> u16 {
     port
 }
 
-#[cfg(target_os = "macos")]
 /// `openssl s_server -www` on a free port with a fresh self-signed
 /// certificate for `localhost`, killed when the guard drops.
 fn self_signed_server() -> Option<(ServerGuard, u16)> {
     let dir = std::env::temp_dir().join(format!("fd-spike-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
-    let made = std::process::Command::new("openssl")
+    let openssl = openssl()?;
+    let made = std::process::Command::new(&openssl)
         .args([
             "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
         ])
@@ -274,7 +277,7 @@ fn self_signed_server() -> Option<(ServerGuard, u16)> {
     let free = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = free.local_addr().ok()?.port();
     drop(free);
-    let child = std::process::Command::new("openssl")
+    let child = std::process::Command::new(&openssl)
         .args(["s_server", "-www", "-quiet", "-accept"])
         .arg(port.to_string())
         .arg("-cert")
@@ -290,11 +293,30 @@ fn self_signed_server() -> Option<(ServerGuard, u16)> {
     Some((ServerGuard(child), port))
 }
 
-#[cfg(target_os = "macos")]
 /// Kills the server it holds.
 struct ServerGuard(std::process::Child);
 
-#[cfg(target_os = "macos")]
+/// An `openssl` to run: on the path, else (Windows) Git for Windows' own.
+fn openssl() -> Option<std::path::PathBuf> {
+    let on_path = std::process::Command::new("openssl")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if on_path {
+        return Some("openssl".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let git = std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\openssl.exe");
+        if git.exists() {
+            return Some(git);
+        }
+    }
+    None
+}
+
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
