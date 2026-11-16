@@ -128,6 +128,19 @@ flightdeck = { path = "..", features = ["testing"] }
 # Already in the lock through the root crate's dev-dependencies.
 tempfile = "3.27.0"
 
+# The Windows browser spike (`examples/browser_spike.rs`, `remote-control-cefv.8`):
+# WebView2's proxy-login event, and which process opened a connection to the
+# relay. The versions wry already builds against, so nothing new is downloaded.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
 # --- Packaging metadata (see desktop/PACKAGING.md) ---------------------------
 # Linux .deb: `cargo install cargo-deb && cargo deb -p flightdeck-desktop --no-build`
 # after a release build. Asset sources are relative to this crate (desktop/), except

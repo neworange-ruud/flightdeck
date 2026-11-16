@@ -36,6 +36,34 @@
 //!   `--proxy-bypass-list=<-loopback>`, Chromium's way of sending loopback
 //!   through the proxy too. `wry` ignores its own proxy setting once browser
 //!   arguments are given, so this passes the whole argument line itself.
+//!
+//! Windows only, for `remote-control-cefv.8` (run them all with
+//! `scripts/desktop/windows-browser-spike.ps1`):
+//!
+//! - `http-auth`: an **HTTP** proxy that demands `Proxy-Authorization`
+//!   (Chromium cannot send SOCKS5 credentials). WebView2's
+//!   `BasicAuthenticationRequested` event answers with a username and
+//!   password: does it fire for a proxy's 407, and does the proxy then see
+//!   them? If yes, the relay can keep other programs out the way it does on
+//!   macOS (B23).
+//! - `pid`: the SOCKS relay looks up which process opened each connection
+//!   (`GetExtendedTcpTable`) and whether that process descends from this one.
+//!   It then waits for a connection from outside (the script sends one with
+//!   `curl.exe`), which must come out as foreign. If WebView2's network
+//!   process is ours and curl's is not, the relay can refuse by process.
+//! - `profiles`: a profile per session (B10) with a proxy. Two web views
+//!   share one data folder and one proxy, in profiles `session-a` and
+//!   `session-b`: a cookie and `localStorage` set in one must not show in the
+//!   other. A third asks for the same data folder with a **different** proxy
+//!   port (each session has its own relay, so its own port): does WebView2
+//!   refuse? A fourth uses a data folder of its own with that port.
+//! - `profile-auth` (`remote-control-cefv.11`): one HTTP proxy for two
+//!   profiles in one data folder, each answering the proxy's login with its
+//!   own user (`user-a`, `user-b`). Chromium caches proxy credentials: if
+//!   that cache is per profile, the proxy can tell sessions apart by user;
+//!   if it is shared, B's requests arrive as `user-a`. Every page URL says
+//!   which profile loaded it (`/from-a`, `/from-b`), and the run ends with a
+//!   `VERDICT` line.
 
 // The session browser is macOS and Windows only (B7); wry is not built on Linux.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -61,6 +89,13 @@ mod spike {
         socks: Vec<String>,
         loaded: Vec<String>,
         titles: Vec<String>,
+        /// Everything else worth reporting: the proxy-login event, web views
+        /// that could not be built.
+        notes: Vec<String>,
+        /// Each request the HTTP proxy saw, and the user it was authorised
+        /// as ("none" without a login, "WRONG" for an unknown one).
+        #[allow(dead_code)]
+        proxy_users: Vec<(String, String)>,
     }
 
     type Shared = Arc<Mutex<Log>>;
@@ -106,7 +141,10 @@ mod spike {
         let body = format!(
             "<html><head><title>{who} {host}</title></head>\
              <body style='font:24px system-ui;padding:24px'>served by <b>{who}</b> for Host {host}\
-             <script>try {{ new WebSocket('ws://websocket-only.invalid:8081/hmr'); }} catch (e) {{}}</script>\
+             <script>try {{ new WebSocket('ws://websocket-only.invalid:8081/hmr'); }} catch (e) {{}}\
+             try {{ document.title += ' cookie=' + (document.cookie || '-') + ' storage=' + \
+             (localStorage.getItem('seen') || '-'); document.cookie = 'seen=1; path=/'; \
+             localStorage.setItem('seen', '1'); }} catch (e) {{ document.title += ' ' + e; }}</script>\
              </body></html>"
         );
         let _ = write!(
@@ -120,15 +158,18 @@ mod spike {
     /// A minimal SOCKS5 relay (no auth, CONNECT only). It logs the target it is
     /// asked for — the name as the browser gave it, not resolved — and connects
     /// every request to the stand-in worker on `worker_port`.
-    fn socks_server(worker_port: u16, log: Shared, auth: bool) -> u16 {
+    fn socks_server(label: &'static str, worker_port: u16, log: Shared, auth: bool) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind socks");
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let log = log.clone();
                 thread::spawn(move || {
-                    if let Err(e) = serve_socks(stream, worker_port, &log, auth) {
-                        log.lock().unwrap().socks.push(format!("error: {e}"));
+                    if let Err(e) = serve_socks(label, stream, worker_port, &log, auth) {
+                        log.lock()
+                            .unwrap()
+                            .socks
+                            .push(format!("{label} error: {e}"));
                     }
                 });
             }
@@ -137,11 +178,20 @@ mod spike {
     }
 
     fn serve_socks(
+        label: &'static str,
         mut client: TcpStream,
         worker_port: u16,
         log: &Shared,
         auth: bool,
     ) -> std::io::Result<()> {
+        #[cfg(target_os = "windows")]
+        if let Ok(peer) = client.peer_addr() {
+            let who = windows_only::describe_client(peer);
+            log.lock()
+                .unwrap()
+                .socks
+                .push(format!("{label} connection from {who}"));
+        }
         let mut head = [0u8; 2];
         client.read_exact(&mut head)?;
         let mut methods = vec![0u8; head[1] as usize];
@@ -203,7 +253,7 @@ mod spike {
         log.lock()
             .unwrap()
             .socks
-            .push(format!("CONNECT {target}:{target_port}"));
+            .push(format!("{label} CONNECT {target}:{target_port}"));
         let upstream = TcpStream::connect(("127.0.0.1", worker_port))?;
         client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])?;
         let (mut c2, mut u2) = (client.try_clone()?, upstream.try_clone()?);
@@ -219,7 +269,8 @@ mod spike {
     }
 
     struct Spike {
-        webview: WebView,
+        /// The first is the one the URLs load in; `profiles` adds more.
+        webviews: Vec<(&'static str, WebView)>,
     }
 
     impl Render for Spike {
@@ -292,26 +343,517 @@ mod spike {
         }
     }
 
+    /// An HTTP proxy that demands `Proxy-Authorization: Basic` for
+    /// `fd-user` / `fd-secret`, logs what it was asked and with which
+    /// credentials, and sends everything to the stand-in worker. `CONNECT`
+    /// for HTTPS and WebSockets, absolute-form requests for plain HTTP.
+    #[cfg(target_os = "windows")]
+    fn http_proxy_server(worker_port: u16, log: Shared) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind http proxy");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let log = log.clone();
+                thread::spawn(move || {
+                    if let Err(e) = serve_http_proxy(stream, worker_port, &log) {
+                        log.lock()
+                            .unwrap()
+                            .socks
+                            .push(format!("HTTP-PROXY error: {e}"));
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[cfg(target_os = "windows")]
+    fn serve_http_proxy(client: TcpStream, worker_port: u16, log: &Shared) -> std::io::Result<()> {
+        // (user, `Proxy-Authorization` for user:password), password being
+        // fd-secret, pass-a and pass-b.
+        const USERS: [(&str, &str); 3] = [
+            ("fd-user", "Basic ZmQtdXNlcjpmZC1zZWNyZXQ="),
+            ("user-a", "Basic dXNlci1hOnBhc3MtYQ=="),
+            ("user-b", "Basic dXNlci1iOnBhc3MtYg=="),
+        ];
+        let mut reader = BufReader::new(client.try_clone()?);
+        let mut first = String::new();
+        reader.read_line(&mut first)?;
+        let mut head = Vec::new();
+        let mut auth = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 || line == "\r\n" {
+                break;
+            }
+            match line.split_once(':') {
+                Some((name, value)) if name.eq_ignore_ascii_case("proxy-authorization") => {
+                    auth = Some(value.trim().to_string());
+                }
+                _ => head.push(line),
+            }
+        }
+        let user = match &auth {
+            None => "none",
+            Some(a) => USERS
+                .iter()
+                .find(|(_, header)| header == a)
+                .map_or("WRONG", |(user, _)| user),
+        };
+        {
+            let mut log = log.lock().unwrap();
+            log.socks
+                .push(format!("HTTP-PROXY {} auth={user}", first.trim()));
+            log.proxy_users
+                .push((first.trim().to_string(), user.to_string()));
+        }
+        let mut client = client;
+        if user == "none" || user == "WRONG" {
+            client.write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"flightdeck\"\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            return Ok(());
+        }
+        let mut upstream = TcpStream::connect(("127.0.0.1", worker_port))?;
+        if first.starts_with("CONNECT ") {
+            client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+        } else {
+            upstream.write_all(first.as_bytes())?;
+            for line in &head {
+                upstream.write_all(line.as_bytes())?;
+            }
+            upstream.write_all(b"\r\n")?;
+        }
+        let (mut c2, mut u2) = (client.try_clone()?, upstream.try_clone()?);
+        let up = thread::spawn(move || {
+            let _ = std::io::copy(&mut c2, &mut u2);
+            let _ = u2.shutdown(Shutdown::Write);
+        });
+        let _ = std::io::copy(&mut upstream, &mut client);
+        let _ = client.shutdown(Shutdown::Write);
+        let _ = up.join();
+        Ok(())
+    }
+
+    /// Windows-only probes: WebView2's proxy-login event, and which process
+    /// opened a connection.
+    #[cfg(target_os = "windows")]
+    mod windows_only {
+        use std::collections::HashMap;
+        use std::net::{IpAddr, SocketAddr};
+
+        use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2_10};
+        use webview2_com::{take_pwstr, BasicAuthenticationRequestedEventHandler};
+        use windows::core::{Interface, HSTRING, PWSTR};
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+        };
+        use windows::Win32::Networking::WinSock::AF_INET;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+
+        use super::Shared;
+
+        /// Answer every authentication request — a page's or a proxy's —
+        /// with `user` / `password`, and note each one under `label`.
+        pub fn answer_proxy_login(
+            webview: &wry::WebView,
+            log: Shared,
+            label: &'static str,
+            (user, password): (&'static str, &'static str),
+        ) {
+            use wry::WebViewExtWindows;
+            let core: ICoreWebView2 = webview.webview();
+            let core: ICoreWebView2_10 = match core.cast() {
+                Ok(core) => core,
+                Err(e) => {
+                    log.lock()
+                        .unwrap()
+                        .notes
+                        .push(format!("no ICoreWebView2_10 (runtime too old?): {e}"));
+                    return;
+                }
+            };
+            let events = log.clone();
+            let handler =
+                BasicAuthenticationRequestedEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    // SAFETY: WebView2 COM calls on its own callback's
+                    // arguments, on the UI thread it calls us on.
+                    unsafe {
+                        let mut uri = PWSTR::null();
+                        args.Uri(&mut uri)?;
+                        let mut challenge = PWSTR::null();
+                        args.Challenge(&mut challenge)?;
+                        events.lock().unwrap().notes.push(format!(
+                            "{label}: BasicAuthenticationRequested uri={} challenge={} \
+                             -> answered as {user}",
+                            take_pwstr(uri),
+                            take_pwstr(challenge)
+                        ));
+                        let response = args.Response()?;
+                        response.SetUserName(&HSTRING::from(user))?;
+                        response.SetPassword(&HSTRING::from(password))?;
+                    }
+                    Ok(())
+                }));
+            let mut token = 0i64;
+            // SAFETY: registering a handler WebView2 keeps alive itself.
+            if let Err(e) = unsafe { core.add_BasicAuthenticationRequested(&handler, &mut token) } {
+                log.lock()
+                    .unwrap()
+                    .notes
+                    .push(format!("add_BasicAuthenticationRequested failed: {e}"));
+            }
+        }
+
+        /// The process at the other end of a connection the relay accepted
+        /// from `peer`, its parents, and whether it descends from this
+        /// process.
+        pub fn describe_client(peer: SocketAddr) -> String {
+            let Some(pid) = owning_pid(peer) else {
+                return format!("{peer}: owning process not found");
+            };
+            let processes = processes();
+            let me = unsafe { GetCurrentProcessId() };
+            let mut chain = Vec::new();
+            let mut ours = false;
+            let mut at = pid;
+            for _ in 0..16 {
+                if at == me {
+                    ours = true;
+                }
+                match processes.get(&at) {
+                    Some((parent, name)) => {
+                        chain.push(format!("{name}({at})"));
+                        if *parent == 0 || *parent == at {
+                            break;
+                        }
+                        at = *parent;
+                    }
+                    None => {
+                        chain.push(format!("?({at})"));
+                        break;
+                    }
+                }
+            }
+            format!(
+                "{peer}: {} — {}",
+                chain.join(" <- "),
+                if ours {
+                    "OURS (descends from this process)"
+                } else {
+                    "FOREIGN (not a descendant of this process)"
+                }
+            )
+        }
+
+        /// The process owning the IPv4 TCP connection whose local end is
+        /// `peer`.
+        fn owning_pid(peer: SocketAddr) -> Option<u32> {
+            let IpAddr::V4(ip) = peer.ip() else {
+                return None;
+            };
+            let mut size = 0u32;
+            // SAFETY: the first call only reports the size needed; the
+            // second fills a buffer of that size, read as the documented
+            // MIB_TCPTABLE_OWNER_PID (a count, then the rows).
+            unsafe {
+                GetExtendedTcpTable(
+                    None,
+                    &mut size,
+                    false,
+                    AF_INET.0 as u32,
+                    TCP_TABLE_OWNER_PID_CONNECTIONS,
+                    0,
+                );
+                let mut buffer = vec![0u32; (size as usize).div_ceil(4) + 1];
+                let status = GetExtendedTcpTable(
+                    Some(buffer.as_mut_ptr().cast()),
+                    &mut size,
+                    false,
+                    AF_INET.0 as u32,
+                    TCP_TABLE_OWNER_PID_CONNECTIONS,
+                    0,
+                );
+                if status != 0 {
+                    return None;
+                }
+                let count = buffer[0] as usize;
+                let rows = std::slice::from_raw_parts(
+                    buffer.as_ptr().add(1).cast::<MIB_TCPROW_OWNER_PID>(),
+                    count,
+                );
+                rows.iter()
+                    .find(|row| {
+                        std::net::Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()) == ip
+                            && u16::from_be(row.dwLocalPort as u16) == peer.port()
+                    })
+                    .map(|row| row.dwOwningPid)
+            }
+        }
+
+        /// Every process: its parent and its executable's name.
+        fn processes() -> HashMap<u32, (u32, String)> {
+            let mut out = HashMap::new();
+            // SAFETY: a process snapshot walked with a correctly sized
+            // PROCESSENTRY32W, closed afterwards.
+            unsafe {
+                let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                    return out;
+                };
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+                while more {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                    out.insert(entry.th32ProcessID, (entry.th32ParentProcessID, name));
+                    more = Process32NextW(snapshot, &mut entry).is_ok();
+                }
+                let _ = CloseHandle(snapshot);
+            }
+            out
+        }
+    }
+
+    /// `profile-auth`'s answer: did each profile's requests carry its own
+    /// login? A request's profile is in its path (`/from-a`, `/from-b`);
+    /// favicons and WebSockets, which carry no path of ours, are left out.
+    #[allow(dead_code)]
+    fn login_verdict(requests: &[(String, String)]) -> String {
+        let (mut own, mut other, mut none) = (0, 0, 0);
+        let mut crossed = Vec::new();
+        for (line, user) in requests {
+            let expected = if line.contains("/from-a") {
+                "user-a"
+            } else if line.contains("/from-b") {
+                "user-b"
+            } else {
+                continue;
+            };
+            match user.as_str() {
+                "none" => none += 1,
+                u if u == expected => own += 1,
+                _ => {
+                    other += 1;
+                    crossed.push(format!("  {line} carried {user}"));
+                }
+            }
+        }
+        let summary = format!(
+            "{own} with their own profile's login, {other} with the other's, {none} without one"
+        );
+        if other > 0 {
+            format!(
+                "VERDICT: SHARED: proxy credentials cross profiles ({summary}):\n{}",
+                crossed.join("\n")
+            )
+        } else if own >= 4 {
+            format!(
+                "VERDICT: PER PROFILE: every request carried its own profile's login ({summary})"
+            )
+        } else {
+            format!("VERDICT: INCONCLUSIVE: too few authorised requests ({summary})")
+        }
+    }
+
+    /// Where a web view goes in the window, and how it is set up.
+    struct Plan {
+        label: &'static str,
+        bounds: (i32, i32, u32, u32),
+        /// The `wry` mode's own proxy setting, on this SOCKS port.
+        wry_proxy: Option<u16>,
+        /// WebView2's whole browser-argument line (Windows).
+        #[allow(dead_code)]
+        browser_args: Option<String>,
+        /// WebView2 profile name (Windows).
+        #[allow(dead_code)]
+        profile: Option<&'static str>,
+        /// WebView2 user data folder (Windows); `None` is wry's default.
+        #[allow(dead_code)]
+        data_dir: Option<std::path::PathBuf>,
+        /// The user and password this web view answers a proxy's login with
+        /// (Windows).
+        #[allow(dead_code)]
+        login: Option<(&'static str, &'static str)>,
+    }
+
+    /// WebView2's arguments for a proxy at `proxy` that loopback goes
+    /// through too.
+    #[allow(dead_code)]
+    fn chromium_args(proxy: &str) -> String {
+        format!(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+             --proxy-server={proxy} --proxy-bypass-list=<-loopback>"
+        )
+    }
+
     pub fn main() {
         let mode = std::env::args().nth(1).unwrap_or_else(|| "wry".to_string());
         println!("mode: {mode}");
         let log: Shared = Arc::default();
         let desktop = http_server("DESKTOP", log.clone());
         let worker = http_server("WORKER", log.clone());
-        let socks = socks_server(worker, log.clone(), mode == "auth");
+        let socks = socks_server("SOCKS", worker, log.clone(), mode == "auth");
         println!("DESKTOP 127.0.0.1:{desktop}  WORKER 127.0.0.1:{worker}  SOCKS 127.0.0.1:{socks}");
 
-        let urls = vec![
-            format!("http://localhost:{desktop}/"),
-            format!("http://127.0.0.1:{desktop}/"),
-            format!("http://[::1]:{desktop}/"),
-            "http://only-the-worker-knows.invalid:8080/".to_string(),
-            "http://example.com/".to_string(),
-        ];
+        let full = (0, 40, 900, 600);
+        // Only Windows' modes change the plan.
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut plans = vec![Plan {
+            label: "main",
+            bounds: full,
+            wry_proxy: (mode == "wry").then_some(socks),
+            browser_args: None,
+            profile: None,
+            data_dir: None,
+            login: None,
+        }];
+        #[cfg(target_os = "windows")]
+        match mode.as_str() {
+            "loopback" | "pid" => {
+                plans[0].browser_args = Some(chromium_args(&format!("socks5://127.0.0.1:{socks}")));
+            }
+            "http-auth" => {
+                let proxy = http_proxy_server(worker, log.clone());
+                println!("HTTP-PROXY 127.0.0.1:{proxy} (wants fd-user / fd-secret)");
+                plans[0].browser_args = Some(chromium_args(&format!("http://127.0.0.1:{proxy}")));
+                plans[0].login = Some(("fd-user", "fd-secret"));
+            }
+            "profile-auth" => {
+                let proxy = http_proxy_server(worker, log.clone());
+                println!("HTTP-PROXY 127.0.0.1:{proxy} (wants user-a / pass-a or user-b / pass-b)");
+                let shared = std::env::temp_dir()
+                    .join(format!("flightdeck-browser-spike-{}", std::process::id()))
+                    .join("shared");
+                let args = chromium_args(&format!("http://127.0.0.1:{proxy}"));
+                plans = vec![
+                    Plan {
+                        label: "A session-a",
+                        bounds: (0, 40, 450, 600),
+                        wry_proxy: None,
+                        browser_args: Some(args.clone()),
+                        profile: Some("session-a"),
+                        data_dir: Some(shared.clone()),
+                        login: Some(("user-a", "pass-a")),
+                    },
+                    Plan {
+                        label: "B session-b",
+                        bounds: (450, 40, 450, 600),
+                        wry_proxy: None,
+                        browser_args: Some(args),
+                        profile: Some("session-b"),
+                        data_dir: Some(shared),
+                        login: Some(("user-b", "pass-b")),
+                    },
+                ];
+            }
+            "profiles" => {
+                let second = socks_server("SOCKS2", worker, log.clone(), false);
+                println!("SOCKS2 127.0.0.1:{second}");
+                let base = std::env::temp_dir()
+                    .join(format!("flightdeck-browser-spike-{}", std::process::id()));
+                let shared = base.join("shared");
+                let own = base.join("own");
+                let args1 = chromium_args(&format!("socks5://127.0.0.1:{socks}"));
+                let args2 = chromium_args(&format!("socks5://127.0.0.1:{second}"));
+                let half = |x, y| (x, y, 450, 300);
+                plans = vec![
+                    Plan {
+                        label: "A shared/session-a",
+                        bounds: half(0, 40),
+                        wry_proxy: None,
+                        browser_args: Some(args1.clone()),
+                        profile: Some("session-a"),
+                        data_dir: Some(shared.clone()),
+                        login: None,
+                    },
+                    Plan {
+                        label: "B shared/session-b",
+                        bounds: half(450, 40),
+                        wry_proxy: None,
+                        browser_args: Some(args1),
+                        profile: Some("session-b"),
+                        data_dir: Some(shared.clone()),
+                        login: None,
+                    },
+                    Plan {
+                        label: "C shared/other-port",
+                        bounds: half(0, 340),
+                        wry_proxy: None,
+                        browser_args: Some(args2.clone()),
+                        profile: Some("session-c"),
+                        data_dir: Some(shared),
+                        login: None,
+                    },
+                    Plan {
+                        label: "D own/other-port",
+                        bounds: half(450, 340),
+                        wry_proxy: None,
+                        browser_args: Some(args2),
+                        profile: Some("session-d"),
+                        data_dir: Some(own),
+                        login: None,
+                    },
+                ];
+            }
+            _ => {}
+        }
+
+        // (web view label, URL), in order.
+        let worker_page = "http://only-the-worker-knows.invalid:8080/".to_string();
+        let a = |path: &str| format!("http://a-host.invalid:8080/{path}");
+        let b = |path: &str| format!("http://b-host.invalid:8080/{path}");
+        let steps: Vec<(&'static str, String)> = if mode == "profile-auth" {
+            // A first, so its login is cached before B asks; then both
+            // again, and each on the other's host.
+            vec![
+                ("A session-a", a("from-a/1")),
+                ("B session-b", b("from-b/1")),
+                ("A session-a", a("from-a/2")),
+                ("B session-b", b("from-b/2")),
+                ("B session-b", a("from-b/3")),
+                ("A session-a", b("from-a/3")),
+            ]
+        } else if mode == "profiles" {
+            vec![
+                ("A shared/session-a", worker_page.clone()),
+                ("A shared/session-a", worker_page.clone()),
+                ("B shared/session-b", worker_page.clone()),
+                ("C shared/other-port", worker_page.clone()),
+                ("D own/other-port", worker_page.clone()),
+                ("D own/other-port", format!("http://localhost:{desktop}/")),
+            ]
+        } else {
+            [
+                format!("http://localhost:{desktop}/"),
+                format!("http://127.0.0.1:{desktop}/"),
+                format!("http://[::1]:{desktop}/"),
+                worker_page,
+                "http://example.com/".to_string(),
+            ]
+            .into_iter()
+            .map(|url| ("main", url))
+            .collect()
+        };
 
         gpui_platform::application().run(move |cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
             let log_for_view = log.clone();
+            let mode_for_view = mode.clone();
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -319,95 +861,171 @@ mod spike {
                         ..Default::default()
                     },
                     move |window, cx| {
-                        let load_log = log_for_view.clone();
-                        let title_log = log_for_view.clone();
-                        let mut builder = WebViewBuilder::new().with_bounds(Rect {
-                            position: LogicalPosition::new(0, 40).into(),
-                            size: LogicalSize::new(900, 600).into(),
-                        });
-                        if mode == "wry" {
-                            builder =
-                                builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
-                                    host: "127.0.0.1".to_string(),
-                                    port: socks.to_string(),
-                                }));
+                        let mut webviews = Vec::new();
+                        for plan in plans {
+                            match build(&plan, &mode_for_view, socks, &log_for_view, window) {
+                                Ok(webview) => webviews.push((plan.label, webview)),
+                                Err(e) => log_for_view
+                                    .lock()
+                                    .unwrap()
+                                    .notes
+                                    .push(format!("{}: could not build: {e}", plan.label)),
+                            }
                         }
-                        let builder = builder
-                            .with_on_page_load_handler(move |event, url| {
-                                if matches!(event, PageLoadEvent::Finished) {
-                                    load_log.lock().unwrap().loaded.push(url);
-                                }
-                            })
-                            .with_document_title_changed_handler(move |title| {
-                                title_log.lock().unwrap().titles.push(title);
-                            });
-                        #[cfg(target_os = "windows")]
-                        let builder = if mode == "loopback" {
-                            use wry::WebViewBuilderExtWindows;
-                            builder.with_additional_browser_args(format!(
-                                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
-                                 --proxy-server=socks5://127.0.0.1:{socks} \
-                                 --proxy-bypass-list=<-loopback>"
-                            ))
-                        } else {
-                            builder
-                        };
-                        #[cfg(target_os = "macos")]
-                        let builder = {
-                            use wry::WebViewBuilderExtDarwin;
-                            builder.with_data_store_identifier(*b"flightdeck-spike")
-                        };
-                        let webview = builder.build_as_child(window).expect("build the web view");
-                        #[cfg(target_os = "macos")]
-                        match mode.as_str() {
-                            "match" => own_proxy::install(
-                                &webview,
-                                socks,
-                                &["localhost", "127.0.0.1", "::1"],
-                                None,
-                            ),
-                            "auth" => own_proxy::install(
-                                &webview,
-                                socks,
-                                &[],
-                                Some(("fd-user", "fd-secret")),
-                            ),
-                            _ => {}
-                        }
-                        cx.new(|_| Spike { webview })
+                        cx.new(|_| Spike { webviews })
                     },
                 )
                 .expect("open the window");
 
+            let port_file = std::env::temp_dir().join("flightdeck-browser-spike-socks-port");
+            let wait_for_foreign = mode == "pid";
+            let judge_logins = mode == "profile-auth";
             cx.spawn(async move |cx| {
                 let pause = Duration::from_millis(2500);
-                for url in &urls {
-                    let _ = window.update(cx, |spike, _, _| spike.webview.load_url(url));
+                for (label, url) in &steps {
+                    let loaded = window.update(cx, |spike, _, _| {
+                        spike
+                            .webviews
+                            .iter()
+                            .find(|(l, _)| l == label)
+                            .map(|(_, webview)| webview.load_url(url))
+                    });
+                    if !matches!(loaded, Ok(Some(_))) {
+                        println!("{label:<22} {url:<44} (no such web view)");
+                        continue;
+                    }
                     cx.background_executor().timer(pause).await;
                     let log = log.lock().unwrap();
-                    println!(
-                        "{url:<48} title={:?}",
-                        log.titles.last().cloned().unwrap_or_default()
-                    );
+                    let prefix = format!("{label}: ");
+                    let title = log
+                        .titles
+                        .iter()
+                        .rev()
+                        .find_map(|t| t.strip_prefix(&prefix))
+                        .unwrap_or_default()
+                        .to_string();
+                    println!("{label:<22} {url:<44} title={title:?}");
                 }
                 // Hiding (for a GPUI overlay) and showing again.
                 let hidden = window.update(cx, |spike, _, _| {
-                    (
-                        spike.webview.set_visible(false),
-                        spike.webview.set_visible(true),
-                    )
+                    spike.webviews.first().map(|(_, webview)| {
+                        (webview.set_visible(false), webview.set_visible(true))
+                    })
                 });
                 println!("set_visible(false/true): {hidden:?}");
+
+                if wait_for_foreign {
+                    // The script connects with curl.exe now: a program that
+                    // is not this one.
+                    let _ = std::fs::write(&port_file, socks.to_string());
+                    println!(
+                        "waiting 20s for a connection from another program on SOCKS 127.0.0.1:{socks}"
+                    );
+                    cx.background_executor()
+                        .timer(Duration::from_secs(20))
+                        .await;
+                    let _ = std::fs::remove_file(&port_file);
+                }
 
                 let log = log.lock().unwrap();
                 println!("\nDESKTOP saw: {:#?}", log.desktop);
                 println!("WORKER saw:  {:#?}", log.worker);
-                println!("SOCKS saw:   {:#?}", log.socks);
+                println!("PROXY saw:   {:#?}", log.socks);
                 println!("pages loaded: {:#?}", log.loaded);
+                println!("notes:       {:#?}", log.notes);
+                if judge_logins {
+                    println!("\n{}", login_verdict(&log.proxy_users));
+                }
                 cx.update(|cx| cx.quit());
             })
             .detach();
         });
+    }
+
+    /// Build one web view as `plan` says, its titles logged under its label.
+    fn build(
+        plan: &Plan,
+        mode: &str,
+        socks: u16,
+        log: &Shared,
+        window: &mut Window,
+    ) -> wry::Result<WebView> {
+        let _ = socks;
+        let load_log = log.clone();
+        let title_log = log.clone();
+        let label = plan.label;
+        let (x, y, w, h) = plan.bounds;
+        #[cfg(target_os = "windows")]
+        let mut context = plan
+            .data_dir
+            .clone()
+            .map(|dir| wry::WebContext::new(Some(dir)));
+        #[cfg(target_os = "windows")]
+        let builder = match context.as_mut() {
+            Some(context) => WebViewBuilder::new_with_web_context(context),
+            None => WebViewBuilder::new(),
+        };
+        #[cfg(not(target_os = "windows"))]
+        let builder = WebViewBuilder::new();
+        let mut builder = builder.with_bounds(Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(w, h).into(),
+        });
+        if let Some(port) = plan.wry_proxy {
+            builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: port.to_string(),
+            }));
+        }
+        let builder = builder
+            .with_on_page_load_handler(move |event, url| {
+                if matches!(event, PageLoadEvent::Finished) {
+                    load_log
+                        .lock()
+                        .unwrap()
+                        .loaded
+                        .push(format!("{label}: {url}"));
+                }
+            })
+            .with_document_title_changed_handler(move |title| {
+                title_log
+                    .lock()
+                    .unwrap()
+                    .titles
+                    .push(format!("{label}: {title}"));
+            });
+        #[cfg(target_os = "windows")]
+        let builder = {
+            use wry::WebViewBuilderExtWindows;
+            let mut builder = builder;
+            if let Some(args) = &plan.browser_args {
+                builder = builder.with_additional_browser_args(args.clone());
+            }
+            if let Some(profile) = plan.profile {
+                builder = builder.with_profile_name(profile);
+            }
+            builder
+        };
+        #[cfg(target_os = "macos")]
+        let builder = {
+            use wry::WebViewBuilderExtDarwin;
+            builder.with_data_store_identifier(*b"flightdeck-spike")
+        };
+        let webview = builder.build_as_child(window)?;
+        #[cfg(target_os = "macos")]
+        match mode {
+            "match" => {
+                own_proxy::install(&webview, socks, &["localhost", "127.0.0.1", "::1"], None)
+            }
+            "auth" => own_proxy::install(&webview, socks, &[], Some(("fd-user", "fd-secret"))),
+            _ => {}
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(login) = plan.login {
+            windows_only::answer_proxy_login(&webview, log.clone(), label, login);
+        }
+        let _ = mode;
+        Ok(webview)
     }
 }
 
