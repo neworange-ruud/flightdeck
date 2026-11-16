@@ -106,7 +106,8 @@ pub fn run() -> i32 {
                     println!("{step:<44} title={title:?}");
                 }
                 // B21: a self-signed HTTPS server, its certificate page, and
-                // Continue anyway.
+                // Continue anyway (macOS; Windows is cefv.12.3).
+                #[cfg(target_os = "macos")]
                 if let Some((server, port)) = self_signed_server() {
                     let step = format!("https://localhost:{port}/");
                     direct.update(cx, |b, cx| b.go(&step, cx));
@@ -125,16 +126,31 @@ pub fn run() -> i32 {
                 // The keyboard stays GPUI's: a page that focuses a field as
                 // it loads, and DevTools opening, both take the window's
                 // first responder; nobody clicked them, so it comes back.
-                let (server, port) = autofocus_server();
-                direct.update(cx, |b, cx| b.go(&format!("localhost:{port}"), cx));
-                cx.background_executor().timer(pause).await;
-                let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
-                println!("{:<44} page has the keyboard={page}", "autofocus page");
-                direct.update(cx, |b, _| b.open_devtools());
-                cx.background_executor().timer(pause).await;
-                let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
-                println!("{:<44} page has the keyboard={page}", "devtools opened");
-                drop(server);
+                #[cfg(target_os = "macos")]
+                {
+                    let (server, port) = autofocus_server();
+                    direct.update(cx, |b, cx| b.go(&format!("localhost:{port}"), cx));
+                    cx.background_executor().timer(pause).await;
+                    let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
+                    println!("{:<44} page has the keyboard={page}", "autofocus page");
+                    direct.update(cx, |b, _| b.open_devtools());
+                    cx.background_executor().timer(pause).await;
+                    let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
+                    println!("{:<44} page has the keyboard={page}", "devtools opened");
+                    drop(server);
+                }
+                // A local session on Windows goes through the hub's direct
+                // route: this computer's localhost, by way of the proxy.
+                #[cfg(target_os = "windows")]
+                {
+                    let (server, port) = autofocus_server();
+                    let step = format!("localhost:{port}");
+                    direct.update(cx, |b, cx| b.go(&step, cx));
+                    cx.background_executor().timer(pause).await;
+                    let title = direct.read_with(cx, |b, _| b.title());
+                    println!("{:<44} title={title:?}", format!("{step} (local session)"));
+                    drop(server);
+                }
                 cx.update(|cx| cx.quit());
             })
             .detach();
@@ -232,6 +248,7 @@ fn stand_in_worker(page: u16) -> u16 {
     port
 }
 
+#[cfg(target_os = "macos")]
 /// `openssl s_server -www` on a free port with a fresh self-signed
 /// certificate for `localhost`, killed when the guard drops.
 fn self_signed_server() -> Option<(ServerGuard, u16)> {
@@ -273,9 +290,11 @@ fn self_signed_server() -> Option<(ServerGuard, u16)> {
     Some((ServerGuard(child), port))
 }
 
+#[cfg(target_os = "macos")]
 /// Kills the server it holds.
 struct ServerGuard(std::process::Child);
 
+#[cfg(target_os = "macos")]
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();

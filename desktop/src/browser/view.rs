@@ -1,33 +1,38 @@
 //! One session browser (`specs/SESSION_BROWSER_PRD.md` B1–B24): our toolbar
-//! over the system web view, and the relay its requests go through.
+//! over the system web view (WKWebView on macOS, WebView2 on Windows), and
+//! where its requests go ([`Net`]).
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
 //! │ ‹  ›  ⟳  [ localhost:3000                     ] Go  via studio  ⚙ │  GPUI
 //! ├──────────────────────────────────────────────────────────────────┤
 //! │                                                                  │
-//! │      WKWebView, a native child view placed over this area        │  wry
+//! │   the web view, a native child placed over this area             │  wry
 //! │                                                                  │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! - **The network is the worker's.** The web view's data store sends
-//!   everything through the session's [`Relay`] (SOCKS5 with a password,
+//! - **The network is the worker's.** On macOS the web view's data store
+//!   sends everything through the session's relay (SOCKS5 with a password,
 //!   B23); loopback, which WKWebView never proxies, gets a forward first
 //!   (B22): from the address field when typed (B24), from the navigation
-//!   handler for links and redirects. A port in use here, `file://` (B12) and
-//!   a page the worker could not reach are our own [`error_page`]s.
-//! - **One profile per session** (B10): the data store identifier is
-//!   [`super::profile_id`] of the worker and the session.
+//!   handler for links and redirects. On Windows every browser's proxy is the
+//!   app's hub, loopback included, and the session answers its login (§4.1).
+//!   A port in use here, `file://` (B12) and a page the worker could not
+//!   reach are our own [`error_page`]s.
+//! - **One profile per session** (B10): [`super::profile_id`] of the worker
+//!   and the session, as the data store identifier (macOS) or the WebView2
+//!   profile's name (Windows).
 //! - **Placed every frame.** The web view is native and sits above GPUI, so
 //!   the canvas under the toolbar places it each frame, and the window hides
 //!   it whenever anything covers it or it is not on screen
-//!   ([`BrowserView::set_shown`], B13). It lives in a container of its own
-//!   ([`Host`]), so a docked DevTools stays inside the browser's area.
+//!   ([`BrowserView::set_shown`], B13). On macOS it lives in a container of
+//!   its own (`Host`), so a docked DevTools stays inside the browser's area;
+//!   WebView2's DevTools is a window of its own.
 //! - **The keyboard is the page's only while you last clicked it** (the
 //!   page, or a docked DevTools). A click anywhere else, hiding the browser
-//!   or closing it gives it back to GPUI, and the poll takes it back from a
-//!   page or DevTools that grabbed it on its own ([`Host::enforce`]).
+//!   or closing it gives it back to GPUI; on macOS the poll also takes it
+//!   back from a page or DevTools that grabbed it on its own.
 //! - **Downloads** go to this computer's Downloads folder, under a free
 //!   name; `window.open` opens in this tab.
 
@@ -38,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use flightdeck::web::client::http::HttpAccess;
-use flightdeck::web::client::relay::{Relay, RelayEvent};
+use flightdeck::web::client::relay::RelayEvent;
 use gpui::{
     canvas, div, px, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
@@ -51,8 +56,25 @@ use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use super::address::{self, Address, FILE_REFUSED};
 use super::error_page;
+#[cfg(target_os = "macos")]
 use super::host_macos::Host;
+use super::net::{direct_net, worker_net, Net};
 use crate::theme::Palette;
+
+/// Windows has no container view (WebView2 places and hides itself, and its
+/// DevTools is a window of its own): the field stays `None`.
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+struct Host;
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+impl Host {
+    fn place(&self, _x: f64, _y: f64, _width: f64, _height: f64) {}
+    fn set_hidden(&self, _hidden: bool) {}
+    fn enforce(&self, _shown: bool) {}
+    fn release_keyboard(&self) {}
+}
 
 /// How often the view looks at what the web view and the relay reported.
 const POLL: Duration = Duration::from_millis(100);
@@ -86,9 +108,11 @@ type Shared = Rc<RefCell<Option<WebView>>>;
 pub struct BrowserView {
     webview: Shared,
     /// The native view the web view lives in; `None` until built, or if the
-    /// web view could not be moved into it (then it is placed directly).
+    /// web view could not be moved into it (then it is placed directly), and
+    /// always on Windows.
     host: Option<Rc<Host>>,
-    relay: Option<Arc<Relay>>,
+    /// Where the web view's requests go.
+    net: Arc<Net>,
     /// The worker's name, for the badge and the error pages; `None` for a
     /// local session's browser, which connects directly (B9).
     via: Option<String>,
@@ -104,9 +128,13 @@ pub struct BrowserView {
     shown: bool,
     /// Why the browser could not start, when it could not.
     failed: Option<String>,
+    /// An address asked for before the web view was built (Windows builds
+    /// it a moment later), loaded once it is.
+    pending_load: Option<String>,
     /// The profile it browses in (B10), for what it trusts (B21).
     profile: [u8; 16],
     /// The certificate failure our page is showing, until Continue anyway.
+    #[cfg(target_os = "macos")]
     pending_cert: Option<super::tls_macos::CertFailure>,
     /// The ports the session listens on (B11), each with whether this
     /// computer has it in use (a worker session's forward was refused).
@@ -128,25 +156,32 @@ impl BrowserView {
         cx: &mut Context<Self>,
     ) -> BrowserView {
         let mut view = Self::empty(Some(via), window, cx);
-        match Relay::start(access, key) {
-            Ok(relay) => {
-                view.relay = Some(Arc::new(relay));
-                view.build(profile, window);
+        match worker_net(access, key) {
+            Ok(net) => {
+                view.net = Arc::new(net);
+                view.build(profile, window, cx);
             }
-            Err(e) => view.failed = Some(format!("The browser could not start its relay: {e}")),
+            Err(e) => view.failed = Some(e),
         }
         view
     }
 
-    /// A local session's browser: this computer's own network, no relay and
-    /// no proxy (B9), in the profile `profile`.
+    /// A local session's browser: this computer's own network (B9), in the
+    /// profile `profile`. No relay on macOS; on Windows the hub's direct
+    /// route, since every WebView2 browser shares the hub as its proxy.
     pub fn new_direct(
         profile: [u8; 16],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> BrowserView {
         let mut view = Self::empty(None, window, cx);
-        view.build(profile, window);
+        match direct_net() {
+            Ok(net) => {
+                view.net = Arc::new(net);
+                view.build(profile, window, cx);
+            }
+            Err(e) => view.failed = Some(e),
+        }
         view
     }
 
@@ -173,7 +208,7 @@ impl BrowserView {
         BrowserView {
             webview: Rc::default(),
             host: None,
-            relay: None,
+            net: Arc::new(Net::Direct),
             via,
             address,
             pending_address: None,
@@ -182,7 +217,9 @@ impl BrowserView {
             placed: Rc::default(),
             shown: false,
             failed: None,
+            pending_load: None,
             profile: [0; 16],
+            #[cfg(target_os = "macos")]
             pending_cert: None,
             ports: Vec::new(),
             _poll,
@@ -190,74 +227,83 @@ impl BrowserView {
         }
     }
 
-    fn build(&mut self, profile: [u8; 16], window: &mut Window) {
-        use wry::WebViewBuilderExtDarwin;
+    /// Build the web view for `profile` as a child of `window`.
+    ///
+    /// On Windows not now but from a task: WebView2's creation runs the
+    /// thread's message loop while it waits, and so GPUI's own tasks, which
+    /// must not find the app borrowed, as it is inside any update. The task
+    /// keeps only the parent window's handle and installs the web view when
+    /// it is there; until then an address asked for waits in
+    /// `pending_load`.
+    fn build(&mut self, profile: [u8; 16], window: &mut Window, cx: &mut Context<Self>) {
         self.profile = profile;
-        let ipc_page = self.page.clone();
-        let relay = self.relay.clone();
-        let nav_page = self.page.clone();
-        let nav_relay = relay.clone();
-        let load_page = self.page.clone();
-        let title_page = self.page.clone();
-        let open_page = self.page.clone();
-        let built = WebViewBuilder::new()
-            .with_bounds(Rect {
-                position: LogicalPosition::new(0, 0).into(),
-                size: LogicalSize::new(1, 1).into(),
-            })
-            .with_visible(false)
-            .with_devtools(true)
-            .with_data_store_identifier(profile)
-            .with_navigation_handler(move |url| {
-                allow_navigation(&url, nav_relay.as_deref(), &nav_page)
-            })
-            .with_on_page_load_handler(move |event, url| {
-                let mut page = load_page.borrow_mut();
-                if matches!(event, PageLoadEvent::Started) {
-                    page.requested.clear();
-                    if is_web(&url) {
-                        page.url = url;
-                    }
+        let plan = Plan {
+            page: self.page.clone(),
+            net: self.net.clone(),
+            profile,
+            via: self.via.clone(),
+        };
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = &cx;
+            let built = create_webview(plan, window);
+            self.install(built);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let parent = match super::windows::ParentWindow::of(window) {
+                Ok(parent) => parent,
+                Err(e) => {
+                    self.failed = Some(e);
+                    return;
                 }
-                page.dirty = true;
+            };
+            cx.spawn(async move |this, cx| {
+                let built = create_webview(plan, &parent);
+                let _ = this.update(cx, |view, cx| {
+                    view.install(built);
+                    cx.notify();
+                });
             })
-            .with_document_title_changed_handler(move |title| {
-                let mut page = title_page.borrow_mut();
-                page.title = title;
-                page.dirty = true;
-            })
-            .with_new_window_req_handler(move |url, _| {
-                let mut page = open_page.borrow_mut();
-                page.opened.push(url);
-                page.dirty = true;
-                NewWindowResponse::Deny
-            })
-            .with_download_started_handler(|url, path| {
-                *path = download_path(&url, path);
-                true
-            })
-            .with_ipc_handler(move |request| {
-                if request.body() == error_page::CONTINUE_MESSAGE {
-                    let mut page = ipc_page.borrow_mut();
-                    page.continue_requested = true;
-                    page.dirty = true;
-                }
-            })
-            .build_as_child(window);
-        match built {
-            Ok(webview) => {
-                let trusted =
-                    super::trust::TrustStore::at(super::trust::default_path()).allowed(&profile);
-                super::tls_macos::register(&webview, trusted);
-                if let Some(relay) = &relay {
-                    let (user, pass) = relay.credentials();
-                    super::proxy_macos::install(&webview, relay.port(), user, pass);
-                }
-                let _ = webview.load_html(&start_page(self.via.as_deref()));
-                self.host = Host::adopt(&webview).map(Rc::new);
-                *self.webview.borrow_mut() = Some(webview);
+            .detach();
+        }
+    }
+
+    /// Take the built web view: shown and placed if the browser is already
+    /// on screen, and loading what was asked for while it was being built.
+    fn install(&mut self, built: Result<WebView, String>) {
+        let webview = match built {
+            Ok(webview) => webview,
+            Err(e) => {
+                self.failed = Some(e);
+                return;
             }
-            Err(e) => self.failed = Some(format!("The browser could not start: {e}")),
+        };
+        #[cfg(target_os = "macos")]
+        {
+            self.host = Host::adopt(&webview).map(Rc::new);
+            if let Some(host) = &self.host {
+                host.set_hidden(!self.shown);
+            }
+        }
+        if self.shown {
+            let _ = webview.set_visible(true);
+        }
+        if let Some(url) = self.pending_load.take() {
+            let _ = webview.load_url(&url);
+        }
+        *self.webview.borrow_mut() = Some(webview);
+        // Placed on the next frame, whatever was placed before.
+        self.placed.set(None);
+    }
+
+    /// Load `url` now, or once the web view is built.
+    fn load(&mut self, url: &str) {
+        match self.webview.borrow().as_ref() {
+            Some(webview) => {
+                let _ = webview.load_url(url);
+            }
+            None => self.pending_load = Some(url.to_string()),
         }
     }
 
@@ -267,8 +313,8 @@ impl BrowserView {
         match address::parse(text) {
             Address::Refused(why) => self.note = Some(why),
             Address::Load(url) => {
-                if let (Some(port), Some(relay)) = (address::loopback_port(&url), &self.relay) {
-                    if let Err(e) = relay.forward(port) {
+                if let Some(port) = address::loopback_port(&url) {
+                    if let Err(e) = self.net.forward(port) {
                         self.show_error(
                             &format!("Can't show {}", shown_address(&url)),
                             &e.to_string(),
@@ -278,9 +324,7 @@ impl BrowserView {
                     }
                 }
                 self.page.borrow_mut().requested = url.clone();
-                if let Some(webview) = self.webview.borrow().as_ref() {
-                    let _ = webview.load_url(&url);
-                }
+                self.load(&url);
             }
         }
         cx.notify();
@@ -289,9 +333,7 @@ impl BrowserView {
     /// Send new tunnels with `key`: the window reconnected and the worker
     /// granted a new one.
     pub fn set_key(&self, key: String) {
-        if let Some(relay) = &self.relay {
-            relay.set_key(key);
-        }
+        self.net.set_key(key);
     }
 
     /// Whether the window has the browser on screen and uncovered. A hidden
@@ -307,6 +349,10 @@ impl BrowserView {
             host.set_hidden(!shown);
         }
         if let Some(webview) = self.webview.borrow().as_ref() {
+            #[cfg(target_os = "windows")]
+            if !shown {
+                let _ = webview.focus_parent();
+            }
             let _ = webview.set_visible(shown);
         }
         if shown {
@@ -330,24 +376,20 @@ impl BrowserView {
         }
         self.ports = ports
             .iter()
-            .map(|port| {
-                let in_use = self
-                    .relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.forward(*port).is_err());
-                (*port, in_use)
-            })
+            .map(|port| (*port, self.net.forward(*port).is_err()))
             .collect();
         cx.notify();
     }
 
     /// The `host:port` whose certificate the page on screen failed on, while
     /// our page offers Continue anyway (B21).
+    #[cfg(target_os = "macos")]
     pub fn certificate_failure(&self) -> Option<(String, u16)> {
         self.pending_cert.as_ref().map(|f| (f.host.clone(), f.port))
     }
 
     /// Choose Continue anyway, as the page's button does.
+    #[cfg(target_os = "macos")]
     pub fn continue_anyway(&mut self) {
         let mut page = self.page.borrow_mut();
         page.continue_requested = true;
@@ -355,12 +397,14 @@ impl BrowserView {
     }
 
     /// The address of the page last started, for `--spike-browser`.
+    #[cfg(target_os = "macos")]
     pub fn url(&self) -> String {
         self.page.borrow().url.clone()
     }
 
     /// Whether the page or its DevTools holds the keyboard, for
     /// `--spike-browser`.
+    #[cfg(target_os = "macos")]
     pub fn page_has_keyboard(&self) -> bool {
         self.host
             .as_ref()
@@ -368,6 +412,7 @@ impl BrowserView {
     }
 
     /// Open DevTools, as the toolbar button does, for `--spike-browser`.
+    #[cfg(target_os = "macos")]
     pub fn open_devtools(&self) {
         self.devtools();
     }
@@ -399,37 +444,36 @@ impl BrowserView {
         if let Some(host) = &self.host {
             host.enforce(self.shown);
         }
+        #[cfg(target_os = "macos")]
         self.poll_certificates(continue_requested);
+        #[cfg(not(target_os = "macos"))]
+        let _ = continue_requested;
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
         }
         for url in opened {
-            if allow_navigation(&url, self.relay.as_deref(), &self.page) {
+            if allow_navigation(&url, &self.net, &self.page) {
                 self.page.borrow_mut().requested = url.clone();
-                if let Some(webview) = self.webview.borrow().as_ref() {
-                    let _ = webview.load_url(&url);
-                }
+                self.load(&url);
             }
         }
-        if let Some(relay) = self.relay.clone() {
-            // A tunnel the worker refused for the page itself is our error
-            // page; one for a script or an image is the page's own business.
-            // The page is the one asked for while it has not started yet.
-            let requested = self.page.borrow().requested.clone();
-            let page = if requested.is_empty() {
-                url.clone()
-            } else {
-                requested
-            };
-            for event in relay.take_events() {
-                let RelayEvent::Refused {
-                    target, message, ..
-                } = event;
-                if targets_page(&page, &target) {
-                    self.page.borrow_mut().requested.clear();
-                    self.show_error(&format!("Can't reach {}", shown_address(&page)), &message);
-                    changed = true;
-                }
+        // A tunnel the worker refused for the page itself is our error
+        // page; one for a script or an image is the page's own business.
+        // The page is the one asked for while it has not started yet.
+        let requested = self.page.borrow().requested.clone();
+        let page = if requested.is_empty() {
+            url.clone()
+        } else {
+            requested
+        };
+        for event in self.net.take_events() {
+            let RelayEvent::Refused {
+                target, message, ..
+            } = event;
+            if targets_page(&page, &target) {
+                self.page.borrow_mut().requested.clear();
+                self.show_error(&format!("Can't reach {}", shown_address(&page)), &message);
+                changed = true;
             }
         }
         if dirty && !url.is_empty() {
@@ -442,7 +486,9 @@ impl BrowserView {
 
     /// B21: a page that failed on its certificate shows our page, with
     /// **Continue anyway**; choosing it trusts that `host:port` in this
-    /// profile from now on, and loads the page again.
+    /// profile from now on, and loads the page again. macOS for now
+    /// (Windows: `remote-control-cefv.12.3`).
+    #[cfg(target_os = "macos")]
     fn poll_certificates(&mut self, continue_requested: bool) {
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
@@ -511,7 +557,10 @@ impl Drop for BrowserView {
             host.release_keyboard();
         }
         if let Some(webview) = self.webview.borrow().as_ref() {
+            #[cfg(target_os = "macos")]
             super::tls_macos::unregister(webview);
+            #[cfg(target_os = "windows")]
+            let _ = webview.focus_parent();
         }
     }
 }
@@ -651,9 +700,25 @@ impl Render for BrowserView {
                 let webview = self.webview.clone();
                 let host = self.host.clone();
                 let placed = self.placed.clone();
+                #[cfg(target_os = "windows")]
+                let focus = self.webview.clone();
                 canvas(
                     move |bounds, _, _| place(&webview, host.as_deref(), &placed, bounds),
-                    |_, _, _, _| {},
+                    move |_, _, _window, _| {
+                        // WebView2 keeps the keyboard once clicked: a click
+                        // in GPUI (the page takes its own) hands it back.
+                        #[cfg(target_os = "windows")]
+                        {
+                            let focus = focus.clone();
+                            _window.on_mouse_event(move |_: &gpui::MouseDownEvent, phase, _, _| {
+                                if phase == gpui::DispatchPhase::Capture {
+                                    if let Some(webview) = focus.borrow().as_ref() {
+                                        let _ = webview.focus_parent();
+                                    }
+                                }
+                            });
+                        }
+                    },
                 )
                 .flex_1()
                 .size_full()
@@ -670,12 +735,128 @@ impl Render for BrowserView {
     }
 }
 
+/// What [`create_webview`] needs, taken from the view so the build holds
+/// no borrow of it.
+struct Plan {
+    page: Rc<RefCell<PageState>>,
+    net: Arc<Net>,
+    profile: [u8; 16],
+    via: Option<String>,
+}
+
+/// The web view for `plan`, a child of `parent`, hidden, on its start page,
+/// its requests going where `plan.net` says.
+fn create_webview(
+    plan: Plan,
+    parent: &impl wry::raw_window_handle::HasWindowHandle,
+) -> Result<WebView, String> {
+    let Plan {
+        page,
+        net,
+        profile,
+        via,
+    } = plan;
+    let ipc_page = page.clone();
+    let nav_page = page.clone();
+    let nav_net = net.clone();
+    let load_page = page.clone();
+    let title_page = page.clone();
+    let open_page = page;
+    // Every WebView2 browser shares one data folder (§4.1).
+    #[cfg(target_os = "windows")]
+    let mut context = super::windows::data_dir().map(|dir| wry::WebContext::new(Some(dir)));
+    #[cfg(target_os = "windows")]
+    let builder = match context.as_mut() {
+        Some(context) => WebViewBuilder::new_with_web_context(context),
+        None => WebViewBuilder::new(),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let builder = WebViewBuilder::new();
+    let builder = builder
+        .with_bounds(Rect {
+            position: LogicalPosition::new(0, 0).into(),
+            size: LogicalSize::new(1, 1).into(),
+        })
+        .with_visible(false)
+        .with_devtools(true)
+        .with_navigation_handler(move |url| allow_navigation(&url, &nav_net, &nav_page))
+        .with_on_page_load_handler(move |event, url| {
+            let mut page = load_page.borrow_mut();
+            if matches!(event, PageLoadEvent::Started) {
+                page.requested.clear();
+                if is_web(&url) {
+                    page.url = url;
+                }
+            }
+            page.dirty = true;
+        })
+        .with_document_title_changed_handler(move |title| {
+            let mut page = title_page.borrow_mut();
+            page.title = title;
+            page.dirty = true;
+        })
+        .with_new_window_req_handler(move |url, _| {
+            let mut page = open_page.borrow_mut();
+            page.opened.push(url);
+            page.dirty = true;
+            NewWindowResponse::Deny
+        })
+        .with_download_started_handler(|url, path| {
+            *path = download_path(&url, path);
+            true
+        })
+        .with_ipc_handler(move |request| {
+            if request.body() == error_page::CONTINUE_MESSAGE {
+                let mut page = ipc_page.borrow_mut();
+                page.continue_requested = true;
+                page.dirty = true;
+            }
+        });
+    // B10: the profile; on Windows also the hub as proxy, the same
+    // arguments for every browser.
+    #[cfg(target_os = "macos")]
+    let builder = {
+        use wry::WebViewBuilderExtDarwin;
+        builder.with_data_store_identifier(profile)
+    };
+    #[cfg(target_os = "windows")]
+    let (builder, hub_port) = {
+        use wry::WebViewBuilderExtWindows;
+        let hub = super::windows::hub()?;
+        let builder = builder
+            .with_additional_browser_args(super::windows::browser_args(hub.port()))
+            .with_profile_name(super::windows::profile_name(&profile));
+        (builder, hub.port())
+    };
+    let webview = builder
+        .build_as_child(parent)
+        .map_err(|e| format!("The browser could not start: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let trusted = super::trust::TrustStore::at(super::trust::default_path()).allowed(&profile);
+        super::tls_macos::register(&webview, trusted);
+        if let Net::Relay(relay) = &*net {
+            let (user, pass) = relay.credentials();
+            super::proxy_macos::install(&webview, relay.port(), user, pass);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Net::Hub(session) = &*net {
+        let (user, pass) = session.credentials();
+        super::windows::answer_hub_login(&webview, hub_port, user.to_string(), pass.to_string())?;
+    }
+    let _ = webview.load_html(&start_page(via.as_deref()));
+    Ok(webview)
+}
+
 /// Delete browser profile `profile` (B19: its worktree was abandoned). Done
 /// a moment later on the main thread: WebKit refuses to remove a data store
 /// a web view still uses, and the views of the session that closed are
 /// dropped at the end of this frame.
 pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
     super::trust::TrustStore::at(super::trust::default_path()).forget(&profile);
+    // WebView2's profile is deleted in `remote-control-cefv.12.4`.
+    #[cfg(target_os = "macos")]
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(1)).await;
         cx.update(|_| {
@@ -688,6 +869,8 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
         });
     })
     .detach();
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
 }
 
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
@@ -722,7 +905,7 @@ fn place(
 /// The navigation rule: our own pages and the web load; `file:` is refused
 /// (B12); a loopback address gets its forward first (B22, B24), and a port in
 /// use here is refused with our page instead.
-fn allow_navigation(url: &str, relay: Option<&Relay>, page: &RefCell<PageState>) -> bool {
+fn allow_navigation(url: &str, net: &Net, page: &RefCell<PageState>) -> bool {
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("about:") || lower.starts_with("data:") || lower.starts_with("blob:") {
         return true;
@@ -731,9 +914,10 @@ fn allow_navigation(url: &str, relay: Option<&Relay>, page: &RefCell<PageState>)
         block(page, "This page is not shown here", FILE_REFUSED);
         return false;
     }
-    // A local browser's loopback is this computer's own (B9).
-    if let (Some(port), Some(relay)) = (address::loopback_port(url), relay) {
-        if let Err(e) = relay.forward(port) {
+    // A local browser's loopback is this computer's own (B9); on Windows
+    // loopback goes through the hub, and `forward` has nothing to do.
+    if let Some(port) = address::loopback_port(url) {
+        if let Err(e) = net.forward(port) {
             block(
                 page,
                 &format!("Can't show {}", shown_address(url)),

@@ -22,7 +22,7 @@ categories = ["command-line-utilities", "development-tools"]
 [workspace]
 members = [".", "desktop"]
 default-members = ["."]
-exclude = ["remote"]
+exclude = ["remote", "vendor/gpui-pre-windows"]
 resolver = "2"
 
 # Not used by any member of THIS workspace. It exists because of a cargo quirk
@@ -311,3 +311,10 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# GPUI's Windows platform with one line changed: its DirectComposition target
+# is not topmost, so child windows, the session browser's WebView2, draw over
+# GPUI as the web view does on macOS. See vendor/gpui-pre-windows/README.md
+# for the diff, and drop this when GPUI offers it (remote-control-cefv.12.2).
+[patch.crates-io]
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

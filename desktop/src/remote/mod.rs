@@ -1024,7 +1024,7 @@ impl RemoteModel {
 
     /// The ports browser `id`'s session listens on, as the worker last said
     /// (B11).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn browser_ports(&self, id: u64) -> Vec<u16> {
         let Some(tab) = self.browsers.tab(id) else {
             return Vec::new();
@@ -1043,13 +1043,13 @@ impl RemoteModel {
     }
 
     /// Record browser `id`'s page title (the window reads it off the view).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_browser_title(&mut self, id: u64, title: String) -> bool {
         self.browsers.set_title(id, title)
     }
 
     /// The link's HTTP access, which a browser's relay dials the worker with.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn http_access(&self) -> Option<flightdeck::web::client::http::HttpAccess> {
         self.session.client().http_access().cloned()
     }

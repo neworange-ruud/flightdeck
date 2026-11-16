@@ -86,7 +86,7 @@ pub const NOMINAL_PTY_SIZE: PtySize = PtySize {
 };
 
 /// The "worker" a local browser's profile is named for (B10).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const LOCAL_PROFILES: &str = "this computer";
 
 pub struct FlightDeckWindow {
@@ -107,7 +107,7 @@ pub struct FlightDeckWindow {
     /// clock; set up on the first frame (the constructor has no window).
     window_watch: Vec<Subscription>,
     /// The local sessions' browser views, by tab id (B9); macOS only for now.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     browser_views: std::collections::HashMap<u64, Entity<crate::browser::view::BrowserView>>,
     /// The browser the main area shows this frame.
     shown_browser: Option<u64>,
@@ -138,7 +138,7 @@ impl FlightDeckWindow {
             update_dismissed: false,
             panes: Panes::default(),
             window_watch: Vec::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             browser_views: std::collections::HashMap::new(),
             shown_browser: None,
         }
@@ -152,7 +152,7 @@ impl FlightDeckWindow {
         let abandoned = self
             .host
             .update(cx, |model, _| model.take_abandoned_worktrees());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let tabs: Vec<(u64, String)> = self
                 .host
@@ -203,25 +203,25 @@ impl FlightDeckWindow {
                 );
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = (window, abandoned);
         shown
     }
 
     /// Show browser `shown`'s web view, hiding every other.
     fn set_browsers_shown(&mut self, shown: Option<u64>, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         for (id, view) in &self.browser_views {
             let on = shown == Some(*id);
             view.update(cx, |view, _| view.set_shown(on));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = (shown, cx);
     }
 
     /// The browser on screen, full size.
     fn browser_main(&self, id: u64) -> Option<AnyElement> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(view) = self.browser_views.get(&id) {
             return Some(
                 div()
