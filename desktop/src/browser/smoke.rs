@@ -122,11 +122,45 @@ pub fn run() -> i32 {
                     super::trust::TrustStore::at(super::trust::default_path())
                         .forget(&super::profile_id("smoke", "direct"));
                 }
+                // The keyboard stays GPUI's: a page that focuses a field as
+                // it loads, and DevTools opening, both take the window's
+                // first responder; nobody clicked them, so it comes back.
+                let (server, port) = autofocus_server();
+                direct.update(cx, |b, cx| b.go(&format!("localhost:{port}"), cx));
+                cx.background_executor().timer(pause).await;
+                let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
+                println!("{:<44} page has the keyboard={page}", "autofocus page");
+                direct.update(cx, |b, _| b.open_devtools());
+                cx.background_executor().timer(pause).await;
+                let page = direct.read_with(cx, |b, _| b.page_has_keyboard());
+                println!("{:<44} page has the keyboard={page}", "devtools opened");
+                drop(server);
                 cx.update(|cx| cx.quit());
             })
             .detach();
         });
     0
+}
+
+/// A page whose text field takes the focus as it loads.
+fn autofocus_server() -> (thread::JoinHandle<()>, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        for mut stream in listener.incoming().flatten().take(4) {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "<!doctype html><title>autofocus</title><input autofocus>\
+                        <script>document.querySelector('input').focus()</script>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (handle, port)
 }
 
 /// A page server naming the `Host` it was asked for in its title.

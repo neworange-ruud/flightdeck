@@ -19,6 +19,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- **New Agent, New Terminal and New Browser on an agent's right-click menu.** Right-click an agent in the sidebar to open a new agent, a new terminal in that agent's session, or a new browser in it, from the top of the menu. New Browser appears only where the sidebar offers it.
 - **Worker shells side by side.** On a worker window's **Worker** tab, press Ctrl-B, or click **Side by side** in the row of shells, to see every shell at once in its own column. The one you are typing in is live; the others are dimmed, and a click on one switches to it. Each shell is sized to its own column. Press Ctrl-B again, or click **One at a time**, to go back.
 - **The session browser in local sessions too.** **New Browser** (palette, or the globe button at the bottom of the sidebar) now also works in a local window, on this computer's own network.
 - **Browser data is cleaned up with its worktree.** A session browser's cookies and storage belong to its worktree: closing a session but keeping the worktree keeps them for when you open it again, and abandoning the worktree deletes them.
@@ -27,6 +28,9 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **The keyboard works again after using the session browser.** After clicking in a page or opening **DevTools**, letters no longer reached FlightDeck until it was restarted (only arrows and ⌘-shortcuts did). The page and its DevTools now have the keyboard only while you last clicked in them. Clicking anywhere else, switching away from the browser or closing it gives FlightDeck the keyboard back, and so does a page or DevTools taking it on its own.
+- **`localhost` pages load in a worker session's browser.** A dev server on the worker that listens on only one of `127.0.0.1` and `::1` loaded nothing: the browser tried the other one, and gave up without a word. The browser now reaches whichever the server listens on. If neither answers, or anything else stops an address you typed from loading, the browser shows why instead of staying on the old page.
+- **DevTools stays inside the browser.** Opening **DevTools** made the page and its developer tools spread over the whole window, covering the agents list, until the window was resized. They now share the browser's own area, and hide with it.
 - **OpenCode 2 sessions are reported under their own project again.** OpenCode 2 runs one background service for every folder, and that service used the FlightDeck status plugin of whichever session started it. So agents in other projects and worktrees reported their status as that first project's main session: the wrong tab changed state, and phone notifications came in under the wrong project. Each folder's sessions now report to that folder's own status. Agents already running keep the old plugin until the OpenCode background service (`opencode serve --service`) is restarted.
 
 ## [0.15.0] - 2026-11-13

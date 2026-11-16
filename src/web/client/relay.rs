@@ -164,16 +164,24 @@ impl Relay {
             Err(_) => None,
         };
         let handle = runtime.handle();
+        let ipv4 = format!("127.0.0.1:{remote}");
+        let ipv6 = format!("[::1]:{remote}");
         handle.spawn(accept_loop(
             v4,
             self.inner.clone(),
-            Door::Loopback(format!("127.0.0.1:{remote}")),
+            Door::Loopback {
+                first: ipv4.clone(),
+                then: ipv6.clone(),
+            },
         ));
         if let Some(v6) = v6 {
             handle.spawn(accept_loop(
                 v6,
                 self.inner.clone(),
-                Door::Loopback(format!("[::1]:{remote}")),
+                Door::Loopback {
+                    first: ipv6,
+                    then: ipv4,
+                },
             ));
         }
         forwards.insert(local, remote);
@@ -213,8 +221,15 @@ impl Drop for Relay {
 #[derive(Clone)]
 enum Door {
     Socks,
-    /// A loopback forward, and the worker target it stands for.
-    Loopback(String),
+    /// A loopback forward: the worker's loopback on the same IP version as
+    /// the connection came in on, then the other one if nothing listens
+    /// there. A browser connects to `localhost` over `::1` first, and a dev
+    /// server often listens on `127.0.0.1` only (or the other way round);
+    /// one family alone would leave the page loading nothing.
+    Loopback {
+        first: String,
+        then: String,
+    },
 }
 
 /// A listener bound **without** `SO_REUSEADDR`, so it fails while anything
@@ -294,15 +309,24 @@ async fn accept_loop(listener: TcpListener, inner: Arc<Inner>, door: Door) {
 
 async fn serve(mut stream: TcpStream, inner: &Inner, door: Door) {
     let socks = matches!(door, Door::Socks);
-    let target = match door {
-        Door::Loopback(target) => target,
+    let (target, fallback) = match door {
+        Door::Loopback { first, then } => (first, Some(then)),
         Door::Socks => match socks_handshake(&mut stream, inner).await {
-            Ok(target) => target,
+            Ok(target) => (target, None),
             Err(_) => return,
         },
     };
     let key = lock(&inner.key).clone();
-    match tunnel_http::open(&inner.access, &key, &target).await {
+    let mut opened = tunnel_http::open(&inner.access, &key, &target).await;
+    let mut target = target;
+    if let (Err(refusal), Some(then)) = (&opened, fallback) {
+        // Nothing on that loopback: try the worker's other one.
+        if refusal.reason == "refused" {
+            opened = tunnel_http::open(&inner.access, &key, &then).await;
+            target = then;
+        }
+    }
+    match opened {
         Ok(tunnel) => {
             // SOCKS: tell the web view it is connected. A forward is already
             // a plain connection.

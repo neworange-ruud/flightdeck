@@ -85,8 +85,11 @@ sha2 = "0.10"
 # The Dock tile's badge (the "needs you" count): `NSApp.dockTile.badgeLabel`,
 # which GPUI does not expose. The versions its macOS platform already builds
 # against, so no new crate enters the dependency tree.
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+# The session browser's own container view and keyboard hand-back
+# (`src/browser/host_macos.rs`): `NSView`, `NSWindow`'s first responder, their
+# geometry, and a click monitor (`NSEvent`, whose handler is a block).
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "NSApplication", "NSDockTile", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSGeometry", "NSString"] }
 # The session browser's macOS proxy with credentials (B23): a Network.framework
 # configuration set on the web view's data store, which wry does not expose.
 objc2 = "0.6"

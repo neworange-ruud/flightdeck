@@ -22,7 +22,12 @@
 //! - **Placed every frame.** The web view is native and sits above GPUI, so
 //!   the canvas under the toolbar places it each frame, and the window hides
 //!   it whenever anything covers it or it is not on screen
-//!   ([`BrowserView::set_shown`], B13).
+//!   ([`BrowserView::set_shown`], B13). It lives in a container of its own
+//!   ([`Host`]), so a docked DevTools stays inside the browser's area.
+//! - **The keyboard is the page's only while you last clicked it** (the
+//!   page, or a docked DevTools). A click anywhere else, hiding the browser
+//!   or closing it gives it back to GPUI, and the poll takes it back from a
+//!   page or DevTools that grabbed it on its own ([`Host::enforce`]).
 //! - **Downloads** go to this computer's Downloads folder, under a free
 //!   name; `window.open` opens in this tab.
 
@@ -46,6 +51,7 @@ use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use super::address::{self, Address, FILE_REFUSED};
 use super::error_page;
+use super::host_macos::Host;
 use crate::theme::Palette;
 
 /// How often the view looks at what the web view and the relay reported.
@@ -57,6 +63,10 @@ const POLL: Duration = Duration::from_millis(100);
 struct PageState {
     /// The page's address, as last started.
     url: String,
+    /// The address last asked for (typed, a port, `window.open`) until a
+    /// page starts. A page the worker refused never starts, so its refusal
+    /// is matched against this to show our error page instead of nothing.
+    requested: String,
     /// The page's title.
     title: String,
     /// Our own page to show instead: a title and its detail.
@@ -75,6 +85,9 @@ type Shared = Rc<RefCell<Option<WebView>>>;
 /// See the module docs.
 pub struct BrowserView {
     webview: Shared,
+    /// The native view the web view lives in; `None` until built, or if the
+    /// web view could not be moved into it (then it is placed directly).
+    host: Option<Rc<Host>>,
     relay: Option<Arc<Relay>>,
     /// The worker's name, for the badge and the error pages; `None` for a
     /// local session's browser, which connects directly (B9).
@@ -159,6 +172,7 @@ impl BrowserView {
         });
         BrowserView {
             webview: Rc::default(),
+            host: None,
             relay: None,
             via,
             address,
@@ -199,8 +213,11 @@ impl BrowserView {
             })
             .with_on_page_load_handler(move |event, url| {
                 let mut page = load_page.borrow_mut();
-                if matches!(event, PageLoadEvent::Started) && is_web(&url) {
-                    page.url = url;
+                if matches!(event, PageLoadEvent::Started) {
+                    page.requested.clear();
+                    if is_web(&url) {
+                        page.url = url;
+                    }
                 }
                 page.dirty = true;
             })
@@ -237,6 +254,7 @@ impl BrowserView {
                     super::proxy_macos::install(&webview, relay.port(), user, pass);
                 }
                 let _ = webview.load_html(&start_page(self.via.as_deref()));
+                self.host = Host::adopt(&webview).map(Rc::new);
                 *self.webview.borrow_mut() = Some(webview);
             }
             Err(e) => self.failed = Some(format!("The browser could not start: {e}")),
@@ -259,6 +277,7 @@ impl BrowserView {
                         return;
                     }
                 }
+                self.page.borrow_mut().requested = url.clone();
                 if let Some(webview) = self.webview.borrow().as_ref() {
                     let _ = webview.load_url(&url);
                 }
@@ -282,6 +301,11 @@ impl BrowserView {
             return;
         }
         self.shown = shown;
+        if let Some(host) = &self.host {
+            // Hiding gives the keyboard back to whatever covers it, before
+            // the web view hides.
+            host.set_hidden(!shown);
+        }
         if let Some(webview) = self.webview.borrow().as_ref() {
             let _ = webview.set_visible(shown);
         }
@@ -335,6 +359,19 @@ impl BrowserView {
         self.page.borrow().url.clone()
     }
 
+    /// Whether the page or its DevTools holds the keyboard, for
+    /// `--spike-browser`.
+    pub fn page_has_keyboard(&self) -> bool {
+        self.host
+            .as_ref()
+            .is_some_and(|host| host.page_has_keyboard())
+    }
+
+    /// Open DevTools, as the toolbar button does, for `--spike-browser`.
+    pub fn open_devtools(&self) {
+        self.devtools();
+    }
+
     /// The page's title, for the sidebar row.
     pub fn title(&self) -> String {
         self.page.borrow().title.clone()
@@ -359,12 +396,16 @@ impl BrowserView {
             )
         };
         let mut changed = dirty;
+        if let Some(host) = &self.host {
+            host.enforce(self.shown);
+        }
         self.poll_certificates(continue_requested);
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
         }
         for url in opened {
             if allow_navigation(&url, self.relay.as_deref(), &self.page) {
+                self.page.borrow_mut().requested = url.clone();
                 if let Some(webview) = self.webview.borrow().as_ref() {
                     let _ = webview.load_url(&url);
                 }
@@ -373,12 +414,20 @@ impl BrowserView {
         if let Some(relay) = self.relay.clone() {
             // A tunnel the worker refused for the page itself is our error
             // page; one for a script or an image is the page's own business.
+            // The page is the one asked for while it has not started yet.
+            let requested = self.page.borrow().requested.clone();
+            let page = if requested.is_empty() {
+                url.clone()
+            } else {
+                requested
+            };
             for event in relay.take_events() {
                 let RelayEvent::Refused {
                     target, message, ..
                 } = event;
-                if targets_page(&url, &target) {
-                    self.show_error(&format!("Can't reach {}", shown_address(&url)), &message);
+                if targets_page(&page, &target) {
+                    self.page.borrow_mut().requested.clear();
+                    self.show_error(&format!("Can't reach {}", shown_address(&page)), &message);
                     changed = true;
                 }
             }
@@ -456,6 +505,11 @@ impl BrowserView {
 
 impl Drop for BrowserView {
     fn drop(&mut self) {
+        // Before the web view leaves the window: a first responder taken out
+        // of it leaves no view with the keyboard.
+        if let Some(host) = &self.host {
+            host.release_keyboard();
+        }
         if let Some(webview) = self.webview.borrow().as_ref() {
             super::tls_macos::unregister(webview);
         }
@@ -595,9 +649,10 @@ impl Render for BrowserView {
                 .into_any_element(),
             None => {
                 let webview = self.webview.clone();
+                let host = self.host.clone();
                 let placed = self.placed.clone();
                 canvas(
-                    move |bounds, _, _| place(&webview, &placed, bounds),
+                    move |bounds, _, _| place(&webview, host.as_deref(), &placed, bounds),
                     |_, _, _, _| {},
                 )
                 .flex_1()
@@ -636,13 +691,25 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
 }
 
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
-/// lays out and wry places a child view).
-fn place(webview: &Shared, placed: &Cell<Option<Bounds<Pixels>>>, bounds: Bounds<Pixels>) {
+/// lays out and wry places a child view): its container when it has one.
+fn place(
+    webview: &Shared,
+    host: Option<&Host>,
+    placed: &Cell<Option<Bounds<Pixels>>>,
+    bounds: Bounds<Pixels>,
+) {
     if placed.get() == Some(bounds) {
         return;
     }
     placed.set(Some(bounds));
-    if let Some(webview) = webview.borrow().as_ref() {
+    if let Some(host) = host {
+        host.place(
+            f64::from(f32::from(bounds.origin.x)),
+            f64::from(f32::from(bounds.origin.y)),
+            f64::from(f32::from(bounds.size.width)),
+            f64::from(f32::from(bounds.size.height)),
+        );
+    } else if let Some(webview) = webview.borrow().as_ref() {
         let _ = webview.set_bounds(Rect {
             position: LogicalPosition::new(f32::from(bounds.origin.x), f32::from(bounds.origin.y))
                 .into(),
