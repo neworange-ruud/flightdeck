@@ -27,6 +27,31 @@ pub fn hub() -> Result<&'static ProxyHub, String> {
         .map_err(|e| format!("The browser could not start its proxy: {e}"))
 }
 
+/// The GPUI window a web view is built in, by its handle alone, so it can
+/// be built outside GPUI's borrow of the app (see `BrowserView::build`).
+pub struct ParentWindow(wry::raw_window_handle::RawWindowHandle);
+
+impl ParentWindow {
+    /// `window`'s handle.
+    pub fn of(window: &gpui::Window) -> Result<ParentWindow, String> {
+        // `Window` has a `window_handle` of its own (GPUI's handle).
+        wry::raw_window_handle::HasWindowHandle::window_handle(window)
+            .map(|handle| ParentWindow(handle.as_raw()))
+            .map_err(|e| format!("The browser could not find its window: {e}"))
+    }
+}
+
+impl wry::raw_window_handle::HasWindowHandle for ParentWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<wry::raw_window_handle::WindowHandle<'_>, wry::raw_window_handle::HandleError> {
+        // SAFETY: the handle is of a GPUI window, which outlives the task
+        // that builds in it; a window closed meanwhile makes the build fail,
+        // and the view that would own the web view is gone with it.
+        Ok(unsafe { wry::raw_window_handle::WindowHandle::borrow_raw(self.0) })
+    }
+}
+
 /// The data folder every session browser shares.
 pub fn data_dir() -> Option<PathBuf> {
     super::flightdeck_dir().map(|dir| dir.join("browser").join("webview2"))
