@@ -412,7 +412,14 @@ async fn socks_handshake(stream: &mut TcpStream, inner: &Inner) -> io::Result<St
         }
         3 => {
             let name = read_counted(stream).await?;
-            String::from_utf8(name).map_err(|_| bad("name is not UTF-8"))?
+            let name = String::from_utf8(name).map_err(|_| bad("name is not UTF-8"))?;
+            // Chromium names an IPv6 address as a name (`::1`); the worker
+            // wants it bracketed.
+            if name.contains(':') && !name.starts_with('[') {
+                format!("[{name}]")
+            } else {
+                name
+            }
         }
         4 => {
             let mut a = [0u8; 16];
@@ -445,7 +452,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Compare without stopping at the first difference.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 

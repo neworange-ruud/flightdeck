@@ -2335,6 +2335,87 @@ fn a_browser_tunnel_ends_with_its_key_and_with_its_window() {
     assert_eq!(after.reason, "invalid_tunnel");
 }
 
+/// The Windows session browser's proxy hub (`remote-control-cefv.12.1`):
+/// one HTTP proxy, a login per session; a worker session's CONNECT and
+/// plain HTTP reach the worker's page, an unknown login gets a 407, and a
+/// dead port is a 502 with the worker's words and an event.
+#[test]
+fn the_proxy_hub_sends_a_worker_sessions_requests_through_the_worker() {
+    use base64::Engine;
+    use flightdeck::web::client::proxy_hub::ProxyHub;
+    use flightdeck::web::client::relay::RelayEvent;
+    use std::io::{Read, Write};
+
+    let worker = Worker::start();
+    let (_token, mut client) = worker.window("laptop");
+    let port = page_server("served-on-the-worker");
+    let key = tunnel_key(&worker, &mut client);
+    let access = client.http_access().expect("a dialled client").clone();
+    let hub = ProxyHub::start().expect("the hub starts");
+    let session = hub.worker_session(access, key);
+    let (user, pass) = session.credentials();
+    let login = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    );
+    let dial = || {
+        let s = std::net::TcpStream::connect(("127.0.0.1", hub.port())).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s
+    };
+    let ask = |request: String| {
+        let mut s = dial();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+
+    // CONNECT: the worker's localhost, by name.
+    let mut s = dial();
+    write!(
+        s,
+        "CONNECT localhost:{port} HTTP/1.1\r\nProxy-Authorization: {login}\r\n\r\n"
+    )
+    .unwrap();
+    let established = b"HTTP/1.1 200 Connection established\r\n\r\n";
+    let mut head = vec![0u8; established.len()];
+    s.read_exact(&mut head).unwrap();
+    assert_eq!(head, established);
+    let page = get_over(s, &format!("localhost:{port}"));
+    assert!(page.contains("served-on-the-worker"), "{page}");
+
+    // Plain HTTP in absolute form.
+    let page = ask(format!(
+        "GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost:{port}\r\n\
+         Proxy-Authorization: {login}\r\n\r\n"
+    ));
+    assert!(page.contains("served-on-the-worker"), "{page}");
+
+    // Another program, without the login.
+    let refused = ask(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n"));
+    assert!(refused.starts_with("HTTP/1.1 407 "), "{refused}");
+
+    // Nothing listening on the worker.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = closed.local_addr().unwrap().port();
+    drop(closed);
+    let answer = ask(format!(
+        "CONNECT 127.0.0.1:{dead} HTTP/1.1\r\nProxy-Authorization: {login}\r\n\r\n"
+    ));
+    assert!(answer.starts_with("HTTP/1.1 502 "), "{answer}");
+    assert!(answer.contains("on the worker"), "{answer}");
+    let events = session.take_events();
+    assert!(
+        events.iter().any(|e| matches!(e,
+            RelayEvent::Refused { target, reason, .. }
+                if target == &format!("127.0.0.1:{dead}") && reason == "refused")),
+        "{events:?}"
+    );
+    drop(session);
+    client.stop();
+}
+
 /// A SOCKS5 `CONNECT` to `host:port` through the relay at `relay_port`, as
 /// the web view's proxy makes it: the reply code, and the stream.
 fn socks_connect(
@@ -2419,6 +2500,14 @@ fn the_desktop_relay_sends_socks_and_loopback_through_the_worker() {
         let page = get_over(stream, &format!("localhost:{local}"));
         assert!(page.contains("served-on-the-worker"), "over ::1: {page}");
     }
+
+    // An IPv6 address named as a name (Chromium's `::1`) reaches the
+    // worker bracketed: nothing listens on its [::1] here, so "connection
+    // refused" (0x05), not the general failure (0x01) an unbracketed,
+    // unparseable target would be.
+    let (code, _) = socks_connect(relay.port(), credentials, "::1", port);
+    assert_eq!(code, 5, "::1 arrives as [::1]:{port}");
+    relay.take_events();
 
     // Nothing listening on the worker: SOCKS "connection refused", and the
     // worker's sentence for the browser's error page.
