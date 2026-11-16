@@ -120,6 +120,60 @@ other local programs without SOCKS5 credentials, and a profile per session
 with the proxy. Note that `wry` drops its own proxy flag once browser
 arguments are given, so the whole argument line is ours.
 
+Run every mode and collect the results in `target\browser-spike\results.txt`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\desktop\windows-browser-spike.ps1
+```
+
+| Mode | Question | Read the answer in |
+| --- | --- | --- |
+| `wry` | With `wry`'s own SOCKS5 setting, does loopback go direct (Chromium's implicit bypass)? | `DESKTOP saw` vs `WORKER saw` for the `localhost`, `127.0.0.1` and `[::1]` pages |
+| `loopback` | Does `--proxy-bypass-list=<-loopback>` send loopback through the relay? If so, Windows needs no forwards (B22). | the same: loopback pages served by `WORKER`, `SOCKS CONNECT` lines for them |
+| `http-auth` | Chromium has no SOCKS5 credentials. Does WebView2's `BasicAuthenticationRequested` fire for an HTTP proxy's 407, and does the proxy then get the password? That would keep other programs out as B23 does. | `notes` (the event), `HTTP-PROXY … auth=ok` lines |
+| `pid` | Can the relay tell WebView2's connections from another program's? Each connection's owning process and its parents (`GetExtendedTcpTable`, a process snapshot), then one from `curl.exe`. | `SOCKS connection from … OURS/FOREIGN` lines; curl's must be `FOREIGN` |
+| `profiles` | A profile per session (B10) behind one proxy: are cookies and `localStorage` kept apart? A second proxy port in the same data folder (each session has its own relay): refused? In a folder of its own: works? | titles (`cookie=`, `storage=`) per web view, `notes` for a web view that could not be built, `SOCKS2` lines |
+| `profile-auth` | (`remote-control-cefv.11`) One HTTP proxy, two profiles in one data folder, each answering its login as its own user. Are proxy credentials cached per profile, so the proxy can tell sessions apart by user? | the `VERDICT` line: `PER PROFILE` or `SHARED` (with the requests that crossed); `notes` show which profiles were asked to log in |
+
+**Windows results** (Windows 11 Pro 26200, WebView2 157.0.4341.60, `wry` 0.57.2,
+`x86_64-pc-windows-gnu`, 2026-11-16):
+
+| Question | Result |
+| --- | --- |
+| Child web view in a GPUI window | Works, as on macOS: `build_as_child`, `with_bounds`, `set_visible(false/true)`. |
+| Hostnames through the proxy | Yes, **by name**, WebSockets too (`example.com:80`, `only-the-worker-knows.invalid:8080`, `websocket-only.invalid:8081`). |
+| Loopback with `wry`'s proxy setting | **Direct**: `localhost` and `127.0.0.1` were served by this machine, never the relay (Chromium's implicit bypass). |
+| Loopback with `--proxy-bypass-list=<-loopback>` | **Through the relay**: `localhost`, `127.0.0.1` and `[::1]` all reached the stand-in worker; this machine saw nothing. So **Windows needs no local forwards** (B22), and a port in use here is no obstacle. The relay is asked for them **as names**, including `::1`, which it must bracket (`[::1]:P`) before the worker's `parse_target`, which refuses an unbracketed IPv6 address. |
+| Proxy credentials | Chromium has no SOCKS5 credentials, but an **HTTP proxy with `Basic` auth works**: the 407 raised `BasicAuthenticationRequested` once (`uri` = the proxy, `challenge` = its realm), the answer was used for every later request (`auth=ok`), and nothing loaded without it. Plain `http://` comes to an HTTP proxy as an absolute-form `GET http://host/…`, everything else as `CONNECT`, so the relay must handle both. |
+| Telling WebView2's connections from other programs' | Works: every web view connection's owner was `msedgewebview2.exe` ← `msedgewebview2.exe` ← the app; `curl.exe` started from PowerShell came out foreign. But an agent or shell started by FlightDeck descends from the app too, so "descends from us" alone admits them; only a chain of `msedgewebview2.exe` up to the app would not. Credentials are the simpler and stronger guard. |
+| Profile per session with a proxy | Works: two profiles (`with_profile_name`) in one data folder behind one proxy keep cookies and `localStorage` apart, and both use the proxy. |
+| A different proxy per session | **Not in one data folder**: a second web view asking for the same folder with another proxy port fails with `0x8007139F` (`ERROR_INVALID_STATE`, reported as "Class not registered"); the browser process's arguments are fixed by the first. In a folder of its own it works (its own browser process). |
+| WebView2's own traffic | WebView2 itself fetches `config.edge.skype.com:443` through the proxy; without credentials an HTTP proxy refuses it (`auth=none`, 407), which does no harm. |
+| GNU toolchain | `webview2-com-sys` links `WebView2Loader.dll` dynamically there (statically with MSVC), so a GNU build must ship the DLL beside the `.exe`. Release builds use MSVC. |
+| Proxy logins per profile (`profile-auth`, `cefv.11`) | **Per profile.** Two profiles in one data folder behind one HTTP proxy were each asked to log in once, A answered `user-a`, B `user-b`, and every later request, WebSockets and favicons included, carried its own profile's user, also when each loaded the other's host (`VERDICT: PER PROFILE`, 6 of 6). Each profile's first request costs one 407 round trip. |
+
+**The Windows design** (`remote-control-cefv.12`), which the results above
+support end to end:
+
+- **One HTTP proxy in the app** for every session's browser, started with
+  `--proxy-bypass-list=<-loopback>`, so loopback reaches the worker too and
+  there are no local forwards (B22's forwards are macOS only).
+- **One data folder, a profile per session** (`with_profile_name`), so one
+  WebView2 browser process for every browser (B10).
+- **A login per session.** Each session's web views answer
+  `BasicAuthenticationRequested` with that session's own username and
+  password (random, like B23's). The proxy refuses anything else, which
+  keeps other programs out, and the username tells it the session, and so
+  the worker and tunnel key, a connection belongs to. Proxy logins are
+  cached per profile (`cefv.11`), so they never cross sessions.
+- The proxy takes `CONNECT` and absolute-form `GET http://…` (plain HTTP
+  comes that way), and brackets IPv6 loopback names (`::1` → `[::1]:P`)
+  before the worker's `parse_target`.
+
+A data folder per session also works (it is how a per-session proxy port
+could be kept), at the cost of a browser process per session; it is the
+fallback should the login per profile ever stop holding.
+
 ### 4.2 Worker (`remote-control-cefv.2`)
 
 *Built (protocol v11; `src/web/tunnel.rs`, `src/web/server/tunnel_route.rs`,
@@ -240,7 +294,9 @@ Children of epic `remote-control-cefv`. "After" lists blocking dependencies.
 | Issue | Work | After |
 | --- | --- | --- |
 | `.1` | Spike on macOS: wry in GPUI, SOCKS5 proxy, loopback, profiles (done) | — |
-| `.8` | Spike on Windows: `<-loopback>`, relay access control | — |
+| `.8` | Spike on Windows: `<-loopback>`, relay access control (done) | — |
+| `.11` | Spike on Windows: per-profile proxy credentials behind one HTTP proxy (done) | `.8` |
+| `.12` | Session browser on Windows (WebView2) | `.11` |
 | `.2` | Worker tunnel endpoint | — |
 | `.3` | Desktop SOCKS5 relay | `.2` |
 | `.4` | Browser tabs, toolbar, address field | `.1` |
