@@ -24,9 +24,7 @@ use windows::core::{Interface, HSTRING, PWSTR};
 pub fn hub() -> Result<&'static ProxyHub, String> {
     static HUB: OnceLock<Result<ProxyHub, String>> = OnceLock::new();
     HUB.get_or_init(|| {
-        if let (Some(data), Some(pending)) = (data_dir(), forget_list()) {
-            super::profile_dirs::sweep(&data, &pending);
-        }
+        sweep_forgotten();
         ProxyHub::start().map_err(|e| e.to_string())
     })
     .as_ref()
@@ -66,6 +64,14 @@ pub fn data_dir() -> Option<PathBuf> {
 /// Where profiles that could not be deleted yet are listed.
 fn forget_list() -> Option<PathBuf> {
     super::flightdeck_dir().map(|dir| dir.join("browser").join("webview2-forget.txt"))
+}
+
+/// Delete the profiles WebView2 still held when their worktree was
+/// abandoned. At app start, before any web view: then nothing holds them.
+pub fn sweep_forgotten() {
+    if let (Some(data), Some(pending)) = (data_dir(), forget_list()) {
+        super::profile_dirs::sweep(&data, &pending);
+    }
 }
 
 /// Delete `profile`'s WebView2 data now if WebView2 has let go of it, else

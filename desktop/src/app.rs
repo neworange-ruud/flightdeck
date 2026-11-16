@@ -203,6 +203,10 @@ pub fn run(args: Vec<String>) {
     // Windows only: an update staged by the previous run replaces this
     // installation before anything opens (and relaunches into it).
     flightdeck_desktop::selfupdate::finish_staged_update_at_launch();
+    // Windows only: the browser profiles of abandoned worktrees that WebView2
+    // still held last time go now, before any web view holds a profile (B19).
+    #[cfg(target_os = "windows")]
+    crate::browser::sweep_forgotten_profiles();
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(e) => {

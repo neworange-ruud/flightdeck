@@ -50,6 +50,14 @@ mod tls_windows;
 #[cfg(target_os = "windows")]
 mod windows;
 
+/// Delete the browser profiles of abandoned worktrees that WebView2 still
+/// held last time (B19). Windows only; call at app start, before any
+/// window opens.
+#[cfg(target_os = "windows")]
+pub fn sweep_forgotten_profiles() {
+    windows::sweep_forgotten();
+}
+
 /// Why this computer cannot run a session browser, or `None` when it can.
 ///
 /// - macOS needs 14 or later (B20): the proxy is set on the web view's data
