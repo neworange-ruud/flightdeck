@@ -282,6 +282,18 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # no-connector path is unambiguous and `MaybeTlsStream` has exactly one TLS arm.
 [target.'cfg(windows)'.dependencies]
 tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+# The session browser's port suggestions on a Windows worker (src/ports/
+# probe_windows.rs): listening sockets with their processes, and each
+# process's working directory. Already in the lock through tokio and others.
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+] }
 # The HTTPS push fallback's TLS on Windows (src/remote/push.rs): the same
 # SChannel-backed tokio-native-tls tokio-tungstenite uses for `wss://` here.
 tokio-native-tls = "0.3"
