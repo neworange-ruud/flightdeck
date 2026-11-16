@@ -495,58 +495,125 @@ fn agent_row(row: &AgentRowView, data: &SidebarData, host: &Surface, p: &Palette
         .when(selected, |b| {
             b.child(terminal_rows(&row.terminals, data, host, p))
         })
-        .context_menu(move |menu, _, _| agent_menu(menu, index, &menu_host));
+        .context_menu({
+            let (isolated, offers_browser) = (data.isolated, data.offers_browser);
+            move |menu, _, _| agent_menu(menu, index, &menu_host, isolated, offers_browser)
+        });
     block.into_any_element()
 }
 
-/// The row's context menu. Each item selects the row, then performs the
-/// keymap entry its chord performs (Rename has no chord; it is the palette's
-/// Rename, which opens the same prompt).
+/// One entry of an agent row's context menu, in [`agent_menu_entries`]'s
+/// order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentMenuEntry {
+    /// Greyed out when `disabled` (an isolated run).
+    NewAgent {
+        disabled: bool,
+    },
+    NewTerminal,
+    NewBrowser,
+    Separator,
+    Rename,
+    SetStatus,
+    Restart,
+    OpenInFileManager,
+    OpenInVsCode,
+    Close,
+}
+
+/// The row's context menu, top to bottom: first what the footer's buttons
+/// open (New Browser only where the footer offers it), then what acts on the
+/// agent, then Close.
+fn agent_menu_entries(isolated: bool, offers_browser: bool) -> Vec<AgentMenuEntry> {
+    use AgentMenuEntry::*;
+    let new_agent_disabled = keymap()
+        .entry("NewAgentTab")
+        .is_some_and(|entry| disabled_in(entry, isolated));
+    let mut entries = vec![
+        NewAgent {
+            disabled: new_agent_disabled,
+        },
+        NewTerminal,
+    ];
+    if offers_browser {
+        entries.push(NewBrowser);
+    }
+    entries.extend([
+        Separator,
+        Rename,
+        SetStatus,
+        Restart,
+        OpenInFileManager,
+        OpenInVsCode,
+        Separator,
+        Close,
+    ]);
+    entries
+}
+
+/// The row's context menu ([`agent_menu_entries`]). Each item selects the
+/// row, then performs the keymap entry its chord performs: Rename has no
+/// chord (it is the palette's Rename, which opens the same prompt), New
+/// Browser is the footer's globe button, Open in VS Code the palette's.
 fn agent_menu(
     menu: gpui_component::menu::PopupMenu,
     index: usize,
     host: &Surface,
+    isolated: bool,
+    offers_browser: bool,
 ) -> gpui_component::menu::PopupMenu {
-    let item = |label: &'static str, id: Option<&'static str>| {
+    let keyed = |label: &'static str, id: &'static str| {
         let host = host.clone();
-        let text = match id.and_then(keycap) {
+        let text = match keycap(id) {
             Some(cap) => format!("{label}    {cap}"),
             None => label.to_string(),
         };
         PopupMenuItem::new(text).on_click(move |_, _, cx| {
             host.select_agent(index, cx);
-            match id {
-                Some(id) => host.perform_id(id, cx),
-                None => host.dispatch(
+            host.perform_id(id, cx);
+        })
+    };
+    let then = |label: &'static str, act: fn(&Surface, &mut App)| {
+        let host = host.clone();
+        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            host.select_agent(index, cx);
+            act(&host, cx);
+        })
+    };
+    agent_menu_entries(isolated, offers_browser)
+        .into_iter()
+        .fold(menu, |menu, entry| match entry {
+            AgentMenuEntry::NewAgent { disabled } => {
+                menu.item(keyed("New Agent", "NewAgentTab").disabled(disabled))
+            }
+            AgentMenuEntry::NewTerminal => menu.item(keyed("New Terminal", "NewChildTerminal")),
+            AgentMenuEntry::NewBrowser => {
+                menu.item(then("New Browser", |host, cx| host.open_browser(cx)))
+            }
+            AgentMenuEntry::Separator => menu.separator(),
+            AgentMenuEntry::Rename => menu.item(then("Rename…", |host, cx| {
+                host.dispatch(
                     HostEvent::Command(Command::RenameAgentTab {
                         new_name: String::new(),
                     }),
                     cx,
-                ),
+                )
+            })),
+            AgentMenuEntry::SetStatus => menu.item(keyed("Set status…", "SetManualStatus")),
+            AgentMenuEntry::Restart => menu.item(keyed("Restart agent", "RestartAgent")),
+            AgentMenuEntry::OpenInFileManager => {
+                menu.item(keyed("Open in file manager", "OpenWorktreeInFileManager"))
             }
-        })
-    };
-    menu.item(item("Rename…", None))
-        .item(item("Set status…", Some("SetManualStatus")))
-        .item(item("Restart agent", Some("RestartAgent")))
-        .item(item(
-            "Open in file manager",
-            Some("OpenWorktreeInFileManager"),
-        ))
-        .item({
-            let host = host.clone();
-            PopupMenuItem::new("Open in VS Code").on_click(move |_, _, cx| {
-                host.select_agent(index, cx);
+            AgentMenuEntry::OpenInVsCode => menu.item(then("Open in VS Code", |host, cx| {
                 host.dispatch(
                     HostEvent::RunPaletteAction(PaletteAction::FrontEnd(
                         FrontEndAction::OpenInVsCode,
                     )),
                     cx,
-                );
-            })
+                )
+            })),
+            AgentMenuEntry::Close => menu.item(keyed("Close agent…", "CloseAgentTab")),
         })
-        .separator()
-        .item(item("Close agent…", Some("CloseAgentTab")))
 }
 
 /// The selected agent's terminals, indented under it.
@@ -768,6 +835,44 @@ mod tests {
         assert_eq!(monogram("Codex"), "CX");
         assert_eq!(monogram("x"), "X");
         assert_eq!(monogram(""), "?");
+    }
+
+    #[test]
+    fn the_agent_menu_opens_new_things_first_then_a_divider() {
+        use AgentMenuEntry::*;
+        let entries = agent_menu_entries(false, true);
+        assert_eq!(
+            entries[..4],
+            [
+                NewAgent { disabled: false },
+                NewTerminal,
+                NewBrowser,
+                Separator
+            ]
+        );
+        assert_eq!(
+            entries[4..],
+            [
+                Rename,
+                SetStatus,
+                Restart,
+                OpenInFileManager,
+                OpenInVsCode,
+                Separator,
+                Close
+            ]
+        );
+    }
+
+    #[test]
+    fn new_browser_only_where_offered_and_new_agent_greyed_when_isolated() {
+        use AgentMenuEntry::*;
+        let entries = agent_menu_entries(true, false);
+        assert_eq!(
+            entries[..3],
+            [NewAgent { disabled: true }, NewTerminal, Separator]
+        );
+        assert!(!entries.contains(&NewBrowser));
     }
 
     #[test]

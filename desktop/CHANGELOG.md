@@ -19,6 +19,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- **New Agent, New Terminal and New Browser on an agent's right-click menu.** Right-click an agent in the sidebar to open a new agent, a new terminal in that agent's session, or a new browser in it, from the top of the menu. New Browser appears only where the sidebar offers it.
 - **Worker shells side by side.** On a worker window's **Worker** tab, press Ctrl-B, or click **Side by side** in the row of shells, to see every shell at once in its own column. The one you are typing in is live; the others are dimmed, and a click on one switches to it. Each shell is sized to its own column. Press Ctrl-B again, or click **One at a time**, to go back.
 - **The session browser in local sessions too.** **New Browser** (palette, or the globe button at the bottom of the sidebar) now also works in a local window, on this computer's own network.
 - **Browser data is cleaned up with its worktree.** A session browser's cookies and storage belong to its worktree: closing a session but keeping the worktree keeps them for when you open it again, and abandoning the worktree deletes them.
