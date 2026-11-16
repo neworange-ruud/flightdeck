@@ -24,9 +24,10 @@
 //!   it whenever anything covers it or it is not on screen
 //!   ([`BrowserView::set_shown`], B13). It lives in a container of its own
 //!   ([`Host`]), so a docked DevTools stays inside the browser's area.
-//! - **The keyboard comes back.** A click anywhere in GPUI, hiding the
-//!   browser or closing it takes the keyboard back from the page or its
-//!   DevTools.
+//! - **The keyboard is the page's only while you last clicked it** (the
+//!   page, or a docked DevTools). A click anywhere else, hiding the browser
+//!   or closing it gives it back to GPUI, and the poll takes it back from a
+//!   page or DevTools that grabbed it on its own ([`Host::enforce`]).
 //! - **Downloads** go to this computer's Downloads folder, under a free
 //!   name; `window.open` opens in this tab.
 
@@ -39,9 +40,9 @@ use std::time::Duration;
 use flightdeck::web::client::http::HttpAccess;
 use flightdeck::web::client::relay::{Relay, RelayEvent};
 use gpui::{
-    canvas, div, px, AppContext, Bounds, Context, DispatchPhase, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseDownEvent, ParentElement, Pixels, Render,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    canvas, div, px, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
+    Task, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
@@ -300,12 +301,13 @@ impl BrowserView {
             return;
         }
         self.shown = shown;
+        if let Some(host) = &self.host {
+            // Hiding gives the keyboard back to whatever covers it, before
+            // the web view hides.
+            host.set_hidden(!shown);
+        }
         if let Some(webview) = self.webview.borrow().as_ref() {
             let _ = webview.set_visible(shown);
-        }
-        if let Some(host) = &self.host {
-            // Hiding gives the keyboard back to whatever covers it.
-            host.set_hidden(!shown);
         }
         if shown {
             // Placed again on the next frame.
@@ -357,6 +359,19 @@ impl BrowserView {
         self.page.borrow().url.clone()
     }
 
+    /// Whether the page or its DevTools holds the keyboard, for
+    /// `--spike-browser`.
+    pub fn page_has_keyboard(&self) -> bool {
+        self.host
+            .as_ref()
+            .is_some_and(|host| host.page_has_keyboard())
+    }
+
+    /// Open DevTools, as the toolbar button does, for `--spike-browser`.
+    pub fn open_devtools(&self) {
+        self.devtools();
+    }
+
     /// The page's title, for the sidebar row.
     pub fn title(&self) -> String {
         self.page.borrow().title.clone()
@@ -381,6 +396,9 @@ impl BrowserView {
             )
         };
         let mut changed = dirty;
+        if let Some(host) = &self.host {
+            host.enforce(self.shown);
+        }
         self.poll_certificates(continue_requested);
         if let Some((title, detail)) = blocked {
             self.show_error(&title, &detail);
@@ -632,21 +650,10 @@ impl Render for BrowserView {
             None => {
                 let webview = self.webview.clone();
                 let host = self.host.clone();
-                let keyboard = self.host.clone();
                 let placed = self.placed.clone();
                 canvas(
                     move |bounds, _, _| place(&webview, host.as_deref(), &placed, bounds),
-                    move |_, _, window, _| {
-                        // A click in GPUI is outside the page (the page takes
-                        // its own clicks): the keyboard comes back to GPUI.
-                        if let Some(host) = keyboard {
-                            window.on_mouse_event(move |_: &MouseDownEvent, phase, _, _| {
-                                if phase == DispatchPhase::Capture {
-                                    host.release_keyboard();
-                                }
-                            });
-                        }
-                    },
+                    |_, _, _, _| {},
                 )
                 .flex_1()
                 .size_full()
