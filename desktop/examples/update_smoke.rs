@@ -4,14 +4,15 @@
 //! checked end to end before users click the button.
 //!
 //! ```text
-//! cargo run -p flightdeck-desktop --example update_smoke -- <installed copy> <its version>
+//! cargo run -p flightdeck-desktop --example update_smoke -- <installed copy> <its version> [--run-installer]
 //! ```
 //!
 //! The installed copy is the `.app` bundle (macOS), the `.AppImage` (Linux) or
 //! `flightdeck-desktop.exe` (Windows). Use a throwaway copy: it is replaced
 //! (macOS, Linux) or gets an update staged beside it (Windows portable). For a
-//! copy the MSI installed it only downloads and verifies the new MSI and says
-//! where it is; installing that is what the app's "Restart" does.
+//! copy the MSI installed it downloads and verifies the new MSI; with
+//! `--run-installer` it then starts the same helper the app's "Restart" does
+//! (wait for this process, `msiexec`, start the app) and exits.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,12 +20,16 @@ use std::process::ExitCode;
 use flightdeck::contracts::real::RealFs;
 use flightdeck_desktop::selfupdate::kind::{detect, Arch, DirectKind, InstallKind, Os, Probe};
 use flightdeck_desktop::selfupdate::release::Version;
-use flightdeck_desktop::selfupdate::source::{GithubReleases, SystemUnzip};
+use flightdeck_desktop::selfupdate::source::{
+    msi_handoff, spawn_handoff, GithubReleases, SystemUnzip,
+};
 use flightdeck_desktop::selfupdate::state::update_to_latest;
 use flightdeck_desktop::selfupdate::Outcome;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let run_installer = args.iter().any(|a| a == "--run-installer");
+    args.retain(|a| a != "--run-installer");
     let (Some(target), Some(version)) = (args.first(), args.get(1)) else {
         eprintln!("usage: update_smoke <installed copy> <its version>");
         return ExitCode::from(2);
@@ -76,8 +81,23 @@ fn main() -> ExitCode {
                 (DirectKind::WindowsPortable { .. }, _) => {
                     println!("start {} once to apply it", exe.display());
                 }
+                (_, Outcome::RunInstaller { msi }) if run_installer => {
+                    let root = std::env::var_os("SystemRoot").map(PathBuf::from);
+                    let handoff = msi_handoff(std::process::id(), msi, &exe, root.as_deref());
+                    if let Err(e) = spawn_handoff(&handoff) {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!(
+                        "the installer starts once this exits, then {}",
+                        exe.display()
+                    );
+                }
                 (_, Outcome::RunInstaller { msi }) => {
-                    println!("verified; install with: msiexec /i \"{}\"", msi.display());
+                    println!(
+                        "verified: {} (add --run-installer to install it)",
+                        msi.display()
+                    );
                 }
                 _ => {}
             }
