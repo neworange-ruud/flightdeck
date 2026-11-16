@@ -197,7 +197,7 @@ impl Browsers {
     }
 
     /// Record tab `id`'s page title.
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub fn set_title(&mut self, id: u64, title: String) -> bool {
         match self.tab_mut(id) {
             Some(tab) if tab.title != title => {

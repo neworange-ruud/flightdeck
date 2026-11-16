@@ -119,7 +119,7 @@ pub struct RemoteWindow {
     /// The session browsers' views, by tab id, with the key each relay was
     /// last given (`specs/SESSION_BROWSER_PRD.md`). Built from the model's
     /// list and dropped with it; macOS only for now.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     browser_views:
         std::collections::HashMap<u64, (Entity<crate::browser::view::BrowserView>, String)>,
     /// The browser the main area shows this frame.
@@ -163,7 +163,7 @@ impl RemoteWindow {
             upload: None,
             #[cfg(target_os = "macos")]
             drag_pending: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             browser_views: std::collections::HashMap::new(),
             shown_browser: None,
             shell_panes: std::collections::HashMap::new(),
@@ -828,7 +828,7 @@ impl RemoteWindow {
     /// screen.
     fn sync_browsers(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
         let shown = self.remote.update(cx, |model, _| model.browser_on_screen());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let model = self.remote.read(cx);
             let tabs: Vec<(u64, String, Option<String>)> = model
@@ -894,7 +894,7 @@ impl RemoteWindow {
         let abandoned = self
             .remote
             .update(cx, |model, _| model.take_abandoned_worktrees());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let worker = self.remote.read(cx).address().to_string();
             for worktree in abandoned {
@@ -904,26 +904,26 @@ impl RemoteWindow {
                 );
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = (window, abandoned);
         shown
     }
 
     /// Show browser `shown`'s web view, hiding every other.
     fn set_browsers_shown(&mut self, shown: Option<u64>, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         for (id, (view, _)) in &self.browser_views {
             let on = shown == Some(*id);
             view.update(cx, |view, _| view.set_shown(on));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = (shown, cx);
     }
 
     /// Browser `id`'s area: its view once the worker granted its key, else
     /// what it is waiting for or why it cannot open.
     fn browser_area(&self, id: u64, p: &Palette, cx: &Context<Self>) -> gpui::AnyElement {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some((view, _)) = self.browser_views.get(&id) {
             return div()
                 .flex_1()

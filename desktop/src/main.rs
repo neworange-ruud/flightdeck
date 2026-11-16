@@ -35,7 +35,7 @@ fn main() {
         // M0 spike S4: latency / throughput / idle / scroll measurements.
         Some(flag) if flag == "--bench" => std::process::exit(terminal::bench::run(args.collect())),
         // The session browser against a stand-in worker (browser::smoke).
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(flag) if flag == "--spike-browser" => std::process::exit(browser::smoke::run()),
         Some(flag) if flag == "--dump-grid" => {
             std::process::exit(terminal::spike::dump(args.collect()))

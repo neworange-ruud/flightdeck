@@ -278,13 +278,13 @@ impl HostModel {
     }
 
     /// Record browser `id`'s page title.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_browser_title(&mut self, id: u64, title: String) -> bool {
         self.browsers.set_title(id, title)
     }
 
     /// The ports browser `id`'s session listens on (B11), as last seen.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn browser_ports(&self, id: u64) -> Vec<u16> {
         let Some(tab) = self.browsers.tab(id) else {
             return Vec::new();

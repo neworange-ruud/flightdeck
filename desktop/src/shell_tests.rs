@@ -846,7 +846,7 @@ fn the_spinner_clock_holds_still_while_the_window_is_inactive_or_hidden(app: &mu
 /// The session browser in a local session (`specs/SESSION_BROWSER_PRD.md`
 /// B9): the window's rules. No web view is built here (the test platform has
 /// no native window); `--spike-browser` drives the real one.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod local_browser {
     use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
 
