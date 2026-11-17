@@ -1,0 +1,131 @@
+---
+label: Video Tutorials
+section: Start Here
+order: 5
+icon: play
+---
+
+# Video Tutorials
+
+Short narrated videos of FlightDeck in real use: FlightDeck Desktop on a Mac,
+driving a worker called `devbox`, with real Claude Code agents building a small
+notes app called Pinboard. Each video takes one task from start to finish, in
+one to two minutes. Agent work is sped up (the corner says by how much), and
+every video has captions.
+
+<Video src="/videos/tutorials/intro.mp4" poster="/videos/tutorials/intro.jpg"
+  captions="/videos/tutorials/intro.vtt" title="FlightDeck in 100 seconds"
+  caption="FlightDeck in 100 seconds: parallel agents, Mission control, the session browser and Finish." />
+
+## Get started
+
+### Connect FlightDeck Desktop to a worker
+
+<Video src="/videos/tutorials/connect-worker.mp4" poster="/videos/tutorials/connect-worker.jpg"
+  captions="/videos/tutorials/connect-worker.vtt" title="Connect FlightDeck Desktop to a worker" />
+
+Check the worker over SSH, ask it for a pairing code with `flightdeck worker pair`,
+and connect from **Connect to remote…**. Includes the one-time warning for a
+link outside Tailscale. More in [Quickstart: Worker](/worker).
+
+### Your first agent on a worker
+
+<Video src="/videos/tutorials/first-agent.mp4" poster="/videos/tutorials/first-agent.jpg"
+  captions="/videos/tutorials/first-agent.vtt" title="Your first agent on a worker" />
+
+The whole loop: open a project, start an agent, tell it what to build, run the
+app in a terminal, try it in the session's browser, have the agent commit, and
+**Finish** to merge into main. More in [Agents](/desktop/agents) and
+[Git Workflow](/desktop/git).
+
+### Start a new project
+
+<Video src="/videos/tutorials/new-project.mp4" poster="/videos/tutorials/new-project.jpg"
+  captions="/videos/tutorials/new-project.vtt" title="Start a new project" />
+
+**Open a project…** on a worker: the projects it already has, browsing to any
+folder, cloning a git URL, or creating a new project, which FlightDeck sets up
+as a git repository with a first commit. Then the first agent builds the
+first version. More in [Projects](/desktop/projects).
+
+## Work with agents
+
+### Run agents in parallel
+
+<Video src="/videos/tutorials/parallel-agents.mp4" poster="/videos/tutorials/parallel-agents.jpg"
+  captions="/videos/tutorials/parallel-agents.vtt" title="Run agents in parallel" />
+
+Three agents on one project at once, each on its own branch and worktree,
+switched with **Option-1**, **Option-2** and **Option-3**, then merged one
+after another. More in [Core Concepts](/concepts).
+
+### Mission control
+
+<Video src="/videos/tutorials/mission-control.mp4" poster="/videos/tutorials/mission-control.jpg"
+  captions="/videos/tutorials/mission-control.vtt" title="Mission control" />
+
+Every agent as a live tile, the ones that need you first. Answer an agent's
+question from its tile, and find finished sessions under **Earlier today**.
+
+### When an agent needs you
+
+<Video src="/videos/tutorials/agent-needs-you.mp4" poster="/videos/tutorials/agent-needs-you.jpg"
+  captions="/videos/tutorials/agent-needs-you.vtt" title="When an agent needs you" />
+
+An agent stops to ask a question: how the sidebar, the Mission control badge
+and the project tab tell you, and how to answer in its terminal. More in
+[Notifications](/desktop/notifications).
+
+### Review before you merge
+
+<Video src="/videos/tutorials/review-changes.mp4" poster="/videos/tutorials/review-changes.jpg"
+  captions="/videos/tutorials/review-changes.vtt" title="Review before you merge" />
+
+Check an agent's work before it reaches main: the change count, `git diff` and
+the tests in a terminal in its worktree, a revision request, then **Finish**.
+
+### Keep an agent's branch up to date
+
+<Video src="/videos/tutorials/keep-up-to-date.mp4" poster="/videos/tutorials/keep-up-to-date.jpg"
+  captions="/videos/tutorials/keep-up-to-date.vtt" title="Keep an agent's branch up to date" />
+
+A teammate pushed to main while the agent worked: pull main in a worker shell,
+spot **target +1** in the agent's header, and **Rebase Worktree** to put the
+agent's commits on top. More in [Git Workflow](/desktop/git#rebase-a-worktree).
+
+## The worker
+
+### Shells on the worker and in an agent's worktree
+
+<Video src="/videos/tutorials/shells.mp4" poster="/videos/tutorials/shells.jpg"
+  captions="/videos/tutorials/shells.vtt" title="Shells on the worker and in an agent's worktree" />
+
+SSH into the worker and into an agent's worktree, or skip SSH: the **Worker**
+tab's shells (side by side), a terminal in an agent's worktree, and **Open
+Worktree in VS Code**. More in [The Desktop App: remote windows](/desktop-app/remote).
+
+### Files and images
+
+<Video src="/videos/tutorials/files-and-images.mp4" poster="/videos/tutorials/files-and-images.jpg"
+  captions="/videos/tutorials/files-and-images.vtt" title="Files and images" />
+
+Upload a logo with **Transfer files…**, and paste a mockup straight into the
+agent's terminal with **Cmd-V**: FlightDeck copies the image to the worker and
+types its path for the agent. More in [Quickstart: Worker](/worker).
+
+### FlightDeck Web: your worker in a browser
+
+<Video src="/videos/tutorials/web-client.mp4" poster="/videos/tutorials/web-client.jpg"
+  captions="/videos/tutorials/web-client.vtt" title="FlightDeck Web: your worker in a browser" />
+
+Pair a browser with the link `flightdeck worker pair` prints, then use the
+worker's projects, agents, terminals and command palette from any browser. A
+worker serves one window at a time; **Reconnect** in the Desktop takes it back.
+More in [FlightDeck Web](/web).
+
+## How these videos are made
+
+The videos are recorded without anyone at the controls: scripts in the
+repository's `tutorials/` folder drive the real FlightDeck Desktop in a macOS
+virtual machine against a real worker and real agents, then cut, caption and
+narrate the recording. Each one can be recorded again for a new release.

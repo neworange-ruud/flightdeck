@@ -19,8 +19,29 @@ host (Apple Silicon Mac)
 ## Run a tutorial
 
 ```sh
-tutorials/scenes/first-agent.sh          # -> target/tutorials/videos/first-agent.mp4
+tutorials/scenes/first-agent.sh          # -> target/tutorials/videos/first-agent.mp4 (+ .vtt)
+tutorials/vm/sheet.sh first-agent        # contact sheets, to check a take without watching it
+tutorials/publish.sh first-agent         # -> web/public/videos/tutorials/ (web-sized mp4, poster, captions)
 ```
+
+The scenes (all published on the docs site's Video Tutorials page):
+
+| Scene | Shows |
+| --- | --- |
+| `intro` | The homepage video: parallel agents, Mission control, session browser, Finish |
+| `connect-worker` | `ssh devbox`, `worker status`, `worker pair`, Connect to remote… |
+| `first-agent` | The whole loop: project, agent, terminal, session browser, commit, Finish |
+| `new-project` | Open a project…: projects, browse, clone, New project; the first agent |
+| `parallel-agents` | Three agents at once, Option-1/2/3, three merges |
+| `mission-control` | Live tiles, answer from a tile, Earlier today |
+| `agent-needs-you` | A waiting agent: sidebar, badges, answering in its terminal |
+| `review-changes` | Change count, `git diff`, tests, a revision, Finish |
+| `keep-up-to-date` | A teammate's push, `git pull` in a worker shell, target +1, Rebase Worktree |
+| `shells` | SSH into a worktree, the Worker tab's shells side by side, Open Worktree in VS Code |
+| `files-and-images` | Transfer files…, pasting a mockup into the agent, the result in the browser |
+| `web-client` | `worker pair`'s browser link, FlightDeck Web, taken over / Reconnect |
+
+A take uses real agents (your Claude subscription) and takes 3 to 8 minutes.
 
 A scene script stages everything (`tutorials/prepare.sh`: fresh VM clone,
 fresh worker, FlightDeck paired and full screen, about 45 s), records, and
@@ -40,11 +61,22 @@ frame rate) and `NAME.timeline`.
 | `tutorials/vm/vm run file\|-` | Run scene commands (see `vnc_drive.py`): glide, click, type, key, pause, waitfor |
 | `tutorials/vm/vm record start` / `record stop NAME` | Record; stop cuts the video with `edit.py` |
 | `tutorials/vm/vm mark cut\|uncut\|fast N\|normal\|caption TEXT` | Editing marks between scene runs |
+| `tutorials/vm/terminal.sh` | The Mac's Terminal, filling the screen, font two steps up (rows 18 pt apart) |
+| `tutorials/worker/agent-state.sh "task" [state]` | An agent's state; `waitfor` it rather than pausing |
 | `tutorials/vm/voice.py "Text"` | Fetch (or reuse) a voiceover clip; `say` in a scene does this itself |
 
 Scene coordinates are screen points (1440x810). Editing marks go into the
 timeline with host timestamps; the timeline is plain text, so a take can be
 re-cut by editing it and running `edit.py RAW TIMELINE OUT` again.
+
+## Finding things that move
+
+Most positions are fixed screen points, measured from `vm shot` previews. When
+a target depends on the take (an agent's answer buttons, a layout that changes
+with timing), use `clicktext "Label"` / `highlighttext "Label"`: Vision OCR in
+the guest (`vm/guest/find-text.swift`, compiled at boot) finds the text on
+screen, the lowest match by default. Or split the scene and decide in bash
+from `agent-state.sh`.
 
 ## Voiceover and highlights
 
@@ -93,6 +125,16 @@ re-cut by editing it and running `edit.py RAW TIMELINE OUT` again.
 - `tart set --display` alone does not change the guest's resolution: macOS
   keeps the mode it saved. `up.sh` switches it (`vm/guest/display-mode.swift`)
   before the VNC daemon connects, as the VNC framebuffer takes its size then.
+- After a failed scene the guest may still be recording: stop it with
+  `vm ssh 'pkill -INT screencapture'` and let the next scene boot a fresh VM;
+  don't `vnc-restart` into a guest that was recording (Tart crashes).
+- The worker: `ssh devbox` from the Mac (port 2222, user `dev`); each project has
+  an `origin` in `/srv/git`; FlightDeck Web's files sit at `/src/webui/dist`
+  because a debug build reads them from disk; `flightdeck` is wrapped to show
+  `devbox:7420` instead of the debug worker's `0.0.0.0`.
+- Claude Code in the worker: `settings.json` in the volume also has
+  `permissions.additionalDirectories: ["/tmp/flightdeck-paste"]`, so a pasted
+  image is read without a permission prompt.
 - The Desktop shows a version banner unless the worker's FlightDeck version
   equals the core the app was built with, so build both from the same tree
   (`scripts/desktop/macos-bundle.sh`, `tutorials/worker/build-binary.sh`).

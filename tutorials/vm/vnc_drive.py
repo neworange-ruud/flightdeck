@@ -19,6 +19,10 @@ framebuffer is Retina, so they are doubled on the wire.
     paste TEXT           type as fast as the guest accepts (setup steps)
     key CHORD...         e.g. `key cmd-a bsp`, `key ctrl-g`, `key opt-2`, `key enter`
     scroll up|down [N]   wheel clicks
+    clicktext TEXT [N]   find TEXT on screen (OCR, vm/guest/find-text.swift), glide
+                         there and click; N picks the match, top to bottom
+                         (default -1: the lowest), for targets that move between takes
+    glidetext TEXT [N]   the same without the click
     pause SECS           wait
     waitfor SECS CMD...  run CMD on the host until it succeeds (or fail after SECS)
     sh CMD...            run CMD on the host once
@@ -31,6 +35,8 @@ Editing marks, written with host timestamps to $TUT_TIMELINE (set by
     fast FACTOR          play what follows FACTOR times faster (an agent working)
     normal               back to normal speed
     caption TEXT         show TEXT from here until the next caption (or `caption`)
+    highlighttext TEXT [N] [PAD]   highlight TEXT found on screen (see clicktext),
+                         PAD points around it (default 8)
     highlight X Y W H [spot]   draw attention to a screen area (points) until
                          `unhighlight`; `spot` also dims everything around it
     unhighlight          remove all highlights
@@ -144,6 +150,35 @@ class Driver:
         for _ in range(int(n)):
             self.c.mousePress(button)
             time.sleep(0.03)
+
+    def _find(self, text, n="-1"):
+        """TEXT's box on screen (x, y, w, h points), via OCR in the guest.
+        Retries for a few seconds: what a scene looks for may still be drawing."""
+        vm = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vm")
+        for _ in range(6):
+            out = subprocess.run(
+                [vm, "ssh", f"/tmp/find-text {shlex.quote(text)} 2>/dev/null"],
+                capture_output=True, text=True,
+            ).stdout.split("\n")
+            boxes = [tuple(map(int, line.split())) for line in out if line.strip()]
+            if boxes:
+                return boxes[int(n)]
+            time.sleep(1)
+        raise ValueError(f"text not on screen: {text!r}")
+
+    def glidetext(self, text, n="-1", secs="0.9"):
+        x, y, w, h = self._find(text, n)
+        self.glide(x + w / 2, y + h / 2, secs)
+
+    def clicktext(self, text, n="-1", secs="0.9"):
+        self.glidetext(text, n, secs)
+        time.sleep(0.3)
+        self.click()
+
+    def highlighttext(self, text, n="-1", pad="8"):
+        x, y, w, h = self._find(text, n)
+        p = float(pad)
+        self.highlight(*(f"{v:g}" for v in (x - p, y - p, w + 2 * p, h + 2 * p)))
 
     def pause(self, secs):
         time.sleep(float(secs))

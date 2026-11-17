@@ -42,6 +42,11 @@ ditto "$APP" "$VM_SHARE/FlightDeck.app"
 vm_ssh "rm -rf /Applications/FlightDeck.app && ditto '$VM_GUEST_SHARE/FlightDeck.app' /Applications/FlightDeck.app"
 rm -rf "$VM_SHARE/FlightDeck.app"
 
+# find-text (OCR on the guest's screen) for clicktext/highlighttext: compiled
+# once per boot, about half a minute.
+vm_ssh 'cat > /tmp/find-text.swift' < "$TUT_ROOT/tutorials/vm/guest/find-text.swift"
+vm_ssh 'swiftc -O /tmp/find-text.swift -o /tmp/find-text 2>/dev/null'
+
 # No OS notifications from FlightDeck: they cover the toolbar's right end.
 vm_ssh "mkdir -p ~/.flightdeck && printf '[notifications]\nenabled = false\n' > ~/.flightdeck/config.toml"
 
