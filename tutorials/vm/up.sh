@@ -21,7 +21,7 @@ else
 fi
 
 if ! tart list | grep -E "^local +$VM +" | grep -q running; then
-  nohup tart run "$VM" --no-graphics --no-audio --vnc-experimental \
+  nohup "$DETACH" tart run "$VM" --no-graphics --no-audio --vnc-experimental \
     --dir "share:$VM_SHARE" < /dev/null > "$VM_RUN_LOG" 2>&1 &
   disown
 fi

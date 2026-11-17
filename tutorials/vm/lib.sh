@@ -48,6 +48,10 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
 vm_ip() { tart ip "$VM" --wait "${1:-120}"; }
 
+# Long-lived processes start through `detach` (a session of their own), so
+# stopping whatever started them does not stop them too.
+DETACH="$TUT_ROOT/tutorials/vm/detach"
+
 # ssh into the guest with the tutorial key.
 vm_ssh() { ssh "${SSH_OPTS[@]}" -i "$VM_KEY" "$VM_USER@$(vm_ip)" "$@"; }
 
@@ -92,7 +96,7 @@ vm_vnc_daemon() {
   read -r addr pass < <(vm_vnc)
   pkill -f "vnc_drive.py serve" 2>/dev/null || true
   rm -f "$VNC_SOCK"
-  VM_DISPLAY="$VM_DISPLAY" nohup "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" serve "$addr" "$pass" "$VNC_SOCK" \
+  VM_DISPLAY="$VM_DISPLAY" nohup "$DETACH" "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" serve "$addr" "$pass" "$VNC_SOCK" \
     < /dev/null > "$VNC_LOG" 2>&1 &
   disown
   for _ in $(seq 1 100); do grep -q "daemon ready" "$VNC_LOG" 2>/dev/null && return 0; sleep 0.2; done

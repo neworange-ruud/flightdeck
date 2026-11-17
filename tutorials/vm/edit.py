@@ -94,6 +94,13 @@ def parse(timeline: Path, video_len: float) -> Timeline:
     else:
         t0 = next(t for t, w in marks if w[0] == "start") + START_LATENCY
 
+    # A static screen records no frames, so a take that ends on one has a
+    # file shorter than the take: the timeline runs to the stop mark, and the
+    # constant-rate copy repeats the last frame (see main).
+    stops = [t for t, w in marks if w[0] == "stop"]
+    if stops:
+        video_len = max(video_len, stops[-1] - t0)
+
     segs, voices = [], []
     # `cut`/`uncut` are the scene's; `hold`/`release` the driver's own (while
     # it fetches voice clips), so the two never undo each other.
@@ -295,7 +302,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         cfr = tmp / "cfr.mp4"
-        ffmpeg("-i", str(raw), "-vf", f"fps={FPS},scale={W}:{H}:flags=lanczos,{indicator}",
+        ffmpeg("-i", str(raw), "-vf",
+               f"fps={FPS},scale={W}:{H}:flags=lanczos,{indicator},tpad=stop_mode=clone:stop_duration=60",
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "8", "-g", str(FPS),
                "-pix_fmt", "yuv420p", "-an", str(cfr))
         jobs = []

@@ -17,7 +17,7 @@ framebuffer is Retina, so they are doubled on the wire.
     dclick               double click
     type TEXT [CPS]      type at CPS characters per second (default 14)
     paste TEXT           type as fast as the guest accepts (setup steps)
-    key CHORD...         e.g. `key cmd-a backspace`, `key ctrl-g`, `key enter`
+    key CHORD...         e.g. `key cmd-a bsp`, `key ctrl-g`, `key opt-2`, `key enter`
     scroll up|down [N]   wheel clicks
     pause SECS           wait
     waitfor SECS CMD...  run CMD on the host until it succeeds (or fail after SECS)
@@ -47,7 +47,8 @@ lets the driver know how long each line runs.
 
 Virtualization.framework's VNC server maps keys to a US layout and ignores a
 keysym's shift level, so capitals and shifted symbols are sent with Shift
-held, and it maps X11 Alt to Command, so `cmd-` becomes `alt-`.
+held, and it maps X11 Alt to Command and Meta to Option, so `cmd-` becomes
+`alt-` and `opt-` becomes `meta-`.
 """
 
 import math
@@ -124,7 +125,7 @@ class Driver:
 
         for chord in chords:
             parts = chord.split("-")
-            parts = ["alt" if p == "cmd" else p for p in parts]
+            parts = [{"cmd": "alt", "opt": "meta"}.get(p, p) for p in parts]
             # An unknown name would fail inside vncdotool's client and leave it
             # failing every later call: check first.
             for p in parts:
