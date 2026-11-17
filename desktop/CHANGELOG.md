@@ -25,6 +25,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- **FlightDeck Desktop and the FlightDeck CLI now share one version number.** Both are 2.0.0 and are released together from now on, so the app and the worker or CLI it connects to carry the same version. The jump from 0.16 is only the alignment; nothing breaks on update.
 - **Much less CPU while a phone is paired.** FlightDeck used to rebuild every session's transcript for the phone on every loop tick (a worker ticks every 5–25 ms). Each rebuild walked `~/.codex/sessions`, listed Claude's project folder, and opened OpenCode's database afresh, which can be tens of gigabytes. A worker with a few sessions spent about half a core on this. Transcripts now sync every half second. A session whose status changes syncs at once, so a finished turn or a new question still reaches the phone straight away. Where each session's file lives is looked up again only every few seconds, and the OpenCode database stays open between reads.
 - The Windows MSI is published as `FlightDeck-<version>-windows-x86_64.msi`,
   with a `.sha256` checksum.
