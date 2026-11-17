@@ -18,7 +18,11 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- About FlightDeck is now a small window of its own. It shows the product
+  name, the app's version, "Created and maintained by Ruud van Falier" (the
+  name opens a mail to him) and a link to www.flightdeckai.app. From the app
+  menu it now works everywhere: before, it did nothing on the launcher or in a
+  worker window. The palette's About shows the same card.
 
 ### Bug fixes
 

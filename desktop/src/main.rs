@@ -4,6 +4,7 @@
 //! starts the app. See `desktop/NOTES-M0.md` for how GPUI is consumed and
 //! `desktop/NOTES-M2.md` for the shell.
 
+mod about_window;
 mod app;
 mod assets;
 mod browser;

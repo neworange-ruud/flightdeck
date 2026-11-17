@@ -14,9 +14,10 @@
 //! New window, Open project…, New project…, Connect to remote… and the
 //! GitHub link ([`AppCommand`]). Each is a small
 //! action whose handler asks the host for the same thing the palette row
-//! does (`Command::ShowAbout`, `PaletteAction::OpenConfig`, the native folder
-//! picker answering `HostEvent::OpenProject`, the native save dialog
-//! answering `HostEvent::CreateProject`).
+//! does (`PaletteAction::OpenConfig`, the native folder picker answering
+//! `HostEvent::OpenProject`, the native save dialog answering
+//! `HostEvent::CreateProject`), or acts on its own: About opens its own
+//! window (`crate::about_window`), with or without a project open.
 //!
 //! ## Layout
 //!
@@ -53,7 +54,6 @@
 //! session by muscle memory (that is Ctrl-k), and the window has its own
 //! close button.
 
-use flightdeck::app::commands::Command;
 use flightdeck::app::keymap::{Keymap, KeymapEntry};
 use flightdeck::host::HostEvent;
 use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
@@ -111,9 +111,11 @@ impl AppCommand {
     /// The host input this item stands for, when it is one.
     pub fn host_event(self) -> Option<HostEvent> {
         match self {
-            AppCommand::About => Some(HostEvent::Command(Command::ShowAbout)),
             AppCommand::Settings => Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig)),
-            AppCommand::OpenProject
+            // A window of its own (`about_window`): it works with no project
+            // open and from a worker window, where no local host is running.
+            AppCommand::About
+            | AppCommand::OpenProject
             | AppCommand::NewProject
             | AppCommand::NewWindow
             | AppCommand::ConnectRemote
@@ -178,6 +180,7 @@ impl AppCommand {
             }
             AppCommand::ConnectRemote => crate::remote::connect::open_connect_window(None, cx),
             AppCommand::GitHub => cx.open_url(GITHUB_URL),
+            AppCommand::About => crate::about_window::open(cx),
             other => {
                 if let Some(event) = other.host_event() {
                     crate::root::dispatch(event, cx);
@@ -634,9 +637,9 @@ mod tests {
 
     #[test]
     fn the_desktops_own_items_map_to_the_palettes_rows() {
-        assert_eq!(
-            AppCommand::About.host_event(),
-            Some(HostEvent::Command(Command::ShowAbout))
+        assert!(
+            AppCommand::About.host_event().is_none(),
+            "About opens its own window, host or no host"
         );
         assert_eq!(
             AppCommand::Settings.host_event(),

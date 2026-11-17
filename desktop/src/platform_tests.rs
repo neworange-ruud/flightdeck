@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use flightdeck::app::commands::Command;
 use flightdeck::app::keymap::{Context, Keymap};
 use flightdeck::host::testing::{self, TestProject};
 use flightdeck::host::{AppHost, HostEvent, OverlayInput, OverlayView};
@@ -199,23 +198,11 @@ fn every_menu_item_dispatches_what_its_chord_dispatches(app: &mut TestAppContext
 }
 
 #[gpui::test]
-fn about_and_settings_ask_the_host_for_the_palettes_rows(app: &mut TestAppContext) {
+fn settings_asks_the_host_for_the_palettes_row(app: &mut TestAppContext) {
     let f = fakes();
     let host = testing::host(env(f), &f.notifier, two_projects(), 0);
     let (root, cx) = open_root(app, Some(host), no_opener(), Vec::new());
     let model = model_of(&root, cx);
-
-    reset(&model, cx);
-    cx.dispatch_action(menus::About);
-    cx.run_until_parked();
-    assert_eq!(
-        take_dispatched(&model, cx),
-        [HostEvent::Command(Command::ShowAbout)]
-    );
-    assert!(matches!(
-        model.read_with(cx, |m, _| m.host().overlay()),
-        Some(OverlayView::About(_))
-    ));
 
     reset(&model, cx);
     cx.dispatch_action(menus::OpenSettings);
@@ -230,6 +217,38 @@ fn about_and_settings_ask_the_host_for_the_palettes_rows(app: &mut TestAppContex
         model.read_with(cx, |m, _| m.host().overlay().is_some()),
         "the configuration manager opened"
     );
+}
+
+/// The app menu's About opens a window of its own: the host is not asked, and
+/// a second About brings the same window forward instead of another.
+#[gpui::test]
+fn about_opens_one_window_of_its_own_and_leaves_the_host_alone(app: &mut TestAppContext) {
+    let f = fakes();
+    let host = testing::host(env(f), &f.notifier, two_projects(), 0);
+    let (root, cx) = open_root(app, Some(host), no_opener(), Vec::new());
+    let model = model_of(&root, cx);
+    let before = cx.windows().len();
+
+    reset(&model, cx);
+    cx.dispatch_action(menus::About);
+    cx.run_until_parked();
+    assert_eq!(take_dispatched(&model, cx), []);
+    assert!(model.read_with(cx, |m, _| m.host().overlay().is_none()));
+    assert_eq!(cx.windows().len(), before + 1, "the About window opened");
+
+    cx.dispatch_action(menus::About);
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), before + 1, "still the one About window");
+}
+
+/// About works on the launcher too, where no host is running to ask.
+#[gpui::test]
+fn about_opens_its_window_from_the_launcher(app: &mut TestAppContext) {
+    let (_root, cx) = open_root(app, None, no_opener(), Vec::new());
+    let before = cx.windows().len();
+    cx.dispatch_action(menus::About);
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), before + 1);
 }
 
 /// The palette offers Connect to Remote and New Window once the host knows it

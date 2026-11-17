@@ -473,7 +473,8 @@ pub fn render_overlay(view: &OverlayView, cx: &OverlayCx, app: &App) -> AnyEleme
         },
         OverlayView::Message(m) => message(&m.text, cx),
         OverlayView::Help(doc) => help::help_view(doc, emit(), app).into_any_element(),
-        OverlayView::About(doc) => about::about_view(doc, emit(), app).into_any_element(),
+        // The desktop's own content, not the TUI's `AboutDoc` (see `about`).
+        OverlayView::About(_) => about::about_view(emit(), app).into_any_element(),
         OverlayView::Config(v) => {
             config::config_view(v, emit(), cx.config_focus, cx.field, app).into_any_element()
         }
