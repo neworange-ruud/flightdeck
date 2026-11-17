@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [2.0.0] - 2026-11-17
+
+### New features
+
 - **Create a new project from FlightDeck.** **File → New project…** (and **New Project** in the palette) asks where to create it and what to call it, and FlightDeck makes the folder, runs `git init`, makes one empty first commit (so agents have a base branch to branch from), and opens it. Adding a remote stays up to you (`git remote add`). It works on a worker too: the worker's project picker has a new-project field that creates in the folder you are browsing, inside your home folder. The folder must not exist yet and its name may use letters, digits, dots, dashes and underscores. If git has no `user.name`/`user.email` the first commit can't be made, so FlightDeck removes the folder again and tells you what to set. This is the only commit FlightDeck ever makes, and only in a folder it has just created (SPECS §5.3).
 - **New project… in the launcher and on cmd-shift-n.** The launcher has a New project… button next to Open project…, so you can start from nothing on Windows and Linux too. In the palette's New Project browser, **Choose location…** opens the system save dialog.
 - **The remote worker picker can create projects.** Below Clone, type a folder name and press Create. The new project goes in the folder you are browsing on the worker. Needs a worker running this version.
