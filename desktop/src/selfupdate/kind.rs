@@ -5,7 +5,9 @@
 //! version is installed, and the next `brew upgrade` or `apt upgrade` would
 //! fight the swap), so it only gets a "update with <manager>" line. A copy the
 //! user unpacked or dragged somewhere (an app bundle, an AppImage, a portable
-//! zip) is ours to replace, so it gets "Update now".
+//! zip) is ours to replace, so it gets "Update now". So is a copy our own MSI
+//! installed: the update runs the next MSI, which Windows Installer upgrades
+//! in place, so its records stay true.
 //!
 //! [`detect`] is a pure function of a [`Probe`] (the running executable, the
 //! `$APPIMAGE` variable, the Windows Program Files roots) plus the
@@ -86,8 +88,6 @@ pub enum PackageManager {
     Apt,
     /// An `.rpm` installed with rpm/dnf/zypper.
     Rpm,
-    /// The MSI (or winget, which installs the same MSI).
-    WindowsInstaller,
 }
 
 impl PackageManager {
@@ -95,12 +95,15 @@ impl PackageManager {
     pub fn update_hint(self) -> &'static str {
         match self {
             PackageManager::Homebrew => "brew update && brew upgrade --cask flightdeck-desktop",
+            // No apt or dnf repository publishes the app: the package comes
+            // from the release page, and installing a newer one upgrades it.
             PackageManager::Apt => {
-                "sudo apt update && sudo apt install --only-upgrade flightdeck-desktop"
+                "download the new .deb from the release page, then \
+                 sudo apt install ./flightdeck-desktop_*.deb"
             }
-            PackageManager::Rpm => "sudo dnf upgrade flightdeck-desktop",
-            PackageManager::WindowsInstaller => {
-                "winget upgrade FlightDeck (or run the new .msi from the release page)"
+            PackageManager::Rpm => {
+                "download the new .rpm from the release page, then \
+                 sudo dnf install ./flightdeck-desktop-*.rpm"
             }
         }
     }
@@ -115,6 +118,11 @@ pub enum DirectKind {
     AppImage { file: PathBuf },
     /// A Windows portable unzip; `exe` is the running `.exe`.
     WindowsPortable { exe: PathBuf },
+    /// A Windows copy installed by our MSI (under Program Files). It is not
+    /// replaced file by file: the next MSI is downloaded to `staging` (in the
+    /// user's local app data, as Program Files needs elevation) and run when
+    /// the app restarts.
+    WindowsMsi { exe: PathBuf, staging: PathBuf },
 }
 
 /// How this copy was installed.
@@ -139,6 +147,8 @@ pub struct Probe {
     pub appimage: Option<PathBuf>,
     /// Windows: `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%`.
     pub program_dirs: Vec<PathBuf>,
+    /// Windows: `%LOCALAPPDATA%`, where an MSI update is downloaded.
+    pub local_data: Option<PathBuf>,
 }
 
 impl Probe {
@@ -156,6 +166,7 @@ impl Probe {
             exe,
             appimage: std::env::var_os("APPIMAGE").map(PathBuf::from),
             program_dirs,
+            local_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
         })
     }
 }
@@ -240,7 +251,15 @@ fn detect_windows(probe: &Probe) -> InstallKind {
         !root.is_empty() && (exe == root || exe.starts_with(&format!("{root}/")))
     });
     if under_program_files {
-        InstallKind::Managed(PackageManager::WindowsInstaller)
+        // Our MSI installs per machine under Program Files; with nowhere to
+        // download the next one, the notice is all that is left.
+        match &probe.local_data {
+            Some(data) => InstallKind::Direct(DirectKind::WindowsMsi {
+                exe: probe.exe.clone(),
+                staging: data.join("flightdeck").join("update"),
+            }),
+            None => InstallKind::Unsupported,
+        }
     } else {
         InstallKind::Direct(DirectKind::WindowsPortable {
             exe: probe.exe.clone(),
@@ -272,6 +291,7 @@ mod tests {
                 PathBuf::from("C:\\Program Files"),
                 PathBuf::from("C:\\Program Files (x86)"),
             ],
+            local_data: Some(PathBuf::from("C:\\Users\\u\\AppData\\Local")),
         }
     }
 
@@ -380,18 +400,18 @@ mod tests {
     #[test]
     fn windows_installed_and_portable() {
         let fs = FakeFs::new();
+        let installed = "C:\\Program Files\\FlightDeck\\flightdeck-desktop.exe";
         assert_eq!(
-            detect(
-                &fs,
-                &probe(
-                    Os::Windows,
-                    "C:\\Program Files\\FlightDeck\\flightdeck-desktop.exe"
-                )
-            ),
-            InstallKind::Managed(PackageManager::WindowsInstaller)
+            detect(&fs, &probe(Os::Windows, installed)),
+            InstallKind::Direct(DirectKind::WindowsMsi {
+                exe: PathBuf::from(installed),
+                staging: PathBuf::from("C:\\Users\\u\\AppData\\Local")
+                    .join("flightdeck")
+                    .join("update"),
+            })
         );
         // Case and separators do not matter on Windows.
-        assert_eq!(
+        assert!(matches!(
             detect(
                 &fs,
                 &probe(
@@ -399,8 +419,12 @@ mod tests {
                     "c:/program files (x86)/FlightDeck/flightdeck-desktop.exe"
                 )
             ),
-            InstallKind::Managed(PackageManager::WindowsInstaller)
-        );
+            InstallKind::Direct(DirectKind::WindowsMsi { .. })
+        ));
+        // Without a local app data folder there is nowhere to download to.
+        let mut no_data = probe(Os::Windows, installed);
+        no_data.local_data = None;
+        assert_eq!(detect(&fs, &no_data), InstallKind::Unsupported);
         // "Program Files Extra" is not "Program Files".
         assert!(matches!(
             detect(
@@ -429,10 +453,13 @@ mod tests {
             PackageManager::Homebrew,
             PackageManager::Apt,
             PackageManager::Rpm,
-            PackageManager::WindowsInstaller,
         ] {
             assert!(!manager.update_hint().is_empty());
         }
         assert!(PackageManager::Homebrew.update_hint().contains("brew"));
+        // No repository carries the Linux packages, so the hint must not send
+        // anyone to `apt upgrade` / `dnf upgrade`, which would find nothing.
+        assert!(PackageManager::Apt.update_hint().contains("release page"));
+        assert!(PackageManager::Rpm.update_hint().contains("release page"));
     }
 }

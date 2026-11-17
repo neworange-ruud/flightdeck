@@ -10,11 +10,12 @@
 //! macOS     FlightDeck-<version>-macos-<arch>.zip    (FlightDeck.app at the zip root)
 //! Linux     FlightDeck-<version>-linux-<arch>.AppImage
 //! Windows   FlightDeck-<version>-windows-<arch>-portable.zip   (flightdeck-desktop.exe at the root)
+//!           FlightDeck-<version>-windows-<arch>.msi            (for a copy the MSI installed)
 //! checksum  <asset name>.sha256                      `<64 hex>  <asset name>`
 //! ```
 //!
-//! `<arch>` is `x86_64` or `aarch64`. The `.msi`, `.deb`, `.rpm` and the cask
-//! are for package managers and are never downloaded by the app.
+//! `<arch>` is `x86_64` or `aarch64`. The `.deb`, `.rpm` and the cask are for
+//! package managers and are never downloaded by the app.
 
 use std::fmt;
 use std::io::Read;
@@ -76,6 +77,7 @@ pub enum PackageFormat {
     MacZip,
     AppImage,
     WindowsZip,
+    WindowsMsi,
 }
 
 impl PackageFormat {
@@ -85,6 +87,7 @@ impl PackageFormat {
             DirectKind::MacBundle { .. } => PackageFormat::MacZip,
             DirectKind::AppImage { .. } => PackageFormat::AppImage,
             DirectKind::WindowsPortable { .. } => PackageFormat::WindowsZip,
+            DirectKind::WindowsMsi { .. } => PackageFormat::WindowsMsi,
         }
     }
 
@@ -93,7 +96,7 @@ impl PackageFormat {
         match self {
             PackageFormat::MacZip => Os::MacOs,
             PackageFormat::AppImage => Os::Linux,
-            PackageFormat::WindowsZip => Os::Windows,
+            PackageFormat::WindowsZip | PackageFormat::WindowsMsi => Os::Windows,
         }
     }
 }
@@ -106,6 +109,7 @@ pub fn asset_name(version: Version, format: PackageFormat, arch: Arch) -> String
         PackageFormat::MacZip => format!("FlightDeck-{version}-{os}-{arch}.zip"),
         PackageFormat::AppImage => format!("FlightDeck-{version}-{os}-{arch}.AppImage"),
         PackageFormat::WindowsZip => format!("FlightDeck-{version}-{os}-{arch}-portable.zip"),
+        PackageFormat::WindowsMsi => format!("FlightDeck-{version}-{os}-{arch}.msi"),
     }
 }
 
@@ -273,6 +277,10 @@ mod tests {
         assert_eq!(
             asset_name(version, PackageFormat::WindowsZip, Arch::X86_64),
             "FlightDeck-1.4.0-windows-x86_64-portable.zip"
+        );
+        assert_eq!(
+            asset_name(version, PackageFormat::WindowsMsi, Arch::X86_64),
+            "FlightDeck-1.4.0-windows-x86_64.msi"
         );
         assert_eq!(
             checksum_name("FlightDeck-1.4.0-macos-aarch64.zip"),

@@ -16,7 +16,9 @@ use super::apply::{Installer, Outcome};
 use super::check::{cache_path, newer_version};
 use super::kind::{detect, Arch, DirectKind, InstallKind, Os, Probe};
 use super::release::Version;
-use super::source::{GithubReleases, ReleaseSource, SystemUnzip, Unzip, UpdateError};
+use super::source::{
+    msi_handoff, spawn_handoff, GithubReleases, ReleaseSource, SystemUnzip, Unzip, UpdateError,
+};
 
 /// The desktop app's own version.
 fn current_version() -> Option<Version> {
@@ -151,6 +153,54 @@ pub fn begin_install(cx: &mut App) {
                     },
                 },
             )
+        });
+    })
+    .detach();
+}
+
+/// The banner's "Restart". Usually GPUI's own restart; for an MSI install the
+/// downloaded installer must run while the app is gone, so a small helper
+/// waits for this process to exit, runs `msiexec` and starts the app again.
+pub fn restart(cx: &mut App) {
+    let Some(UpdateStatus::Installed {
+        version,
+        outcome: Outcome::RunInstaller { msi },
+    }) = status(cx)
+    else {
+        cx.restart();
+        return;
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            set_status(
+                cx,
+                UpdateStatus::Failed {
+                    version,
+                    message: format!("could not find the running app ({e})"),
+                },
+            );
+            return;
+        }
+    };
+    let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
+    let handoff = msi_handoff(std::process::id(), &msi, &exe, system_root.as_deref());
+    // Off the UI thread: on Windows starting a process can pump the message
+    // loop, which must not happen inside a GPUI update.
+    cx.spawn(async move |cx| {
+        let spawned = cx
+            .background_executor()
+            .spawn(async move { spawn_handoff(&handoff) })
+            .await;
+        cx.update(|cx| match spawned {
+            Ok(()) => cx.quit(),
+            Err(e) => set_status(
+                cx,
+                UpdateStatus::Failed {
+                    version,
+                    message: e.to_string(),
+                },
+            ),
         });
     })
     .detach();

@@ -20,6 +20,14 @@
 //! | macOS bundle | `<parent>/.FlightDeck-update-<v>/` | bundle to `previous.app`, new `.app` to the bundle path (two renames, rolled back on failure) | restart |
 //! | AppImage | `<dir>/.<name>.update-<v>/` | one rename over the file (atomic; the running image keeps its old inode) | restart |
 //! | Windows portable | `<dir>/.flightdeck-update/` | at next launch | staged, applied on start |
+//! | Windows MSI | `%LOCALAPPDATA%\flightdeck\update\` | none: the downloaded MSI upgrades the install | restart runs it |
+//!
+//! An MSI install lives under Program Files, which the app cannot write to
+//! without elevation, and Windows Installer keeps a record of what it
+//! installed. So the app never touches those files: it downloads and verifies
+//! the next MSI, and on restart hands it to `msiexec` (which asks for
+//! elevation and does the major upgrade) once the app has exited
+//! ([`super::source::msi_handoff`]).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -138,6 +146,14 @@ impl Layout {
                     staging,
                 }
             }
+            DirectKind::WindowsMsi { exe, staging } => Layout {
+                download: staging.join(asset_name),
+                checksum: staging.join(CHECKSUM_FILE),
+                extracted: staging.join("unused"),
+                aside: staging.join("unused"),
+                target: exe.clone(),
+                staging: staging.clone(),
+            },
             DirectKind::WindowsPortable { exe } => {
                 let dir = parent_of(exe);
                 let staging = dir.join(WINDOWS_STAGING);
@@ -161,12 +177,14 @@ fn parent_of(path: &Path) -> PathBuf {
 }
 
 /// How an install ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The new version is in place; restart to run it.
     Replaced,
     /// The new version is staged and replaces this one at the next launch.
     StagedForNextLaunch,
+    /// The verified installer is at `msi`; restarting runs it, then the app.
+    RunInstaller { msi: PathBuf },
 }
 
 /// Everything an install needs from the outside.
@@ -192,7 +210,10 @@ impl Installer<'_> {
         // the next attempt to trip on. A staged Windows update is the one
         // thing that stays, and only once it is complete.
         let result = self.stage_and_swap(kind, &selected, &layout);
-        let keep = matches!(result, Ok(Outcome::StagedForNextLaunch));
+        let keep = matches!(
+            result,
+            Ok(Outcome::StagedForNextLaunch | Outcome::RunInstaller { .. })
+        );
         if !keep {
             let _ = self.fs.remove_dir_all(&layout.staging);
         }
@@ -231,6 +252,10 @@ impl Installer<'_> {
                 swap_one(self.fs, &new_bundle, bundle, &layout.aside)?;
                 Ok(Outcome::Replaced)
             }
+            // Verified is as far as the app goes; `msiexec` does the rest.
+            DirectKind::WindowsMsi { .. } => Ok(Outcome::RunInstaller {
+                msi: layout.download.clone(),
+            }),
             DirectKind::WindowsPortable { .. } => {
                 self.fs.create_dir_all(&layout.extracted)?;
                 self.unzip.unzip(&layout.download, &layout.extracted)?;

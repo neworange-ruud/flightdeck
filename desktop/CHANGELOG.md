@@ -14,15 +14,25 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **A copy installed with the Windows MSI now updates itself.** The update
+  banner's **Update now** downloads and verifies the new MSI. **Restart** then
+  installs it, after Windows asks for permission, and starts the app again.
+  Installs from this release on can update to the next one.
 
 ### Improvements
 
-- None yet.
+- The Windows MSI is published as `FlightDeck-<version>-windows-x86_64.msi`,
+  with a `.sha256` checksum.
+- `cargo run -p flightdeck-desktop --example update_smoke -- <copy> <version>`
+  runs the self-update against the live releases without opening a window, so
+  a release can be checked before anyone clicks **Update now**.
 
 ### Bug fixes
 
-- None yet.
+- The update banner no longer tells `.deb` and `.rpm` installs to run
+  `apt upgrade` or `dnf upgrade`. No repository publishes the app, so those
+  commands found nothing. It now says to install the new package from the
+  release page.
 
 ## [0.16.0] - 2026-11-16
 

@@ -10,10 +10,12 @@
 #   macOS    FlightDeck-{version}-macos-{arch}.zip
 #   Linux    FlightDeck-{version}-linux-{arch}.AppImage
 #   Windows  FlightDeck-{version}-windows-{arch}-portable.zip
+#            FlightDeck-{version}-windows-{arch}.msi      (updates an MSI install)
 #   checksum {asset}.sha256      containing `<64 hex>  <asset>`
 #   {arch} in { x86_64, aarch64 }; {version} = plain major.minor.patch
 # The same contract as a regex (keep in sync with release.rs):
-#   ^FlightDeck-[0-9]+\.[0-9]+\.[0-9]+-(macos-(x86_64|aarch64)\.zip|linux-(x86_64|aarch64)\.AppImage|windows-(x86_64|aarch64)-portable\.zip)$
+#   ^FlightDeck-[0-9]+\.[0-9]+\.[0-9]+-(macos-(x86_64|aarch64)\.zip|linux-(x86_64|aarch64)\.AppImage|windows-(x86_64|aarch64)(-portable\.zip|\.msi))$
+# For --os windows both Windows assets must be there: each install kind needs its own.
 set -euo pipefail
 
 VERSION="" OS_FILTER="" DIR=""
@@ -28,16 +30,16 @@ DIR="${DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/desktop-d
 
 VER_RE='[0-9]+\.[0-9]+\.[0-9]+'
 ARCH_RE='(x86_64|aarch64)'
-ASSET_RE="^FlightDeck-${VER_RE}-(macos-${ARCH_RE}\.zip|linux-${ARCH_RE}\.AppImage|windows-${ARCH_RE}-portable\.zip)\$"
+ASSET_RE="^FlightDeck-${VER_RE}-(macos-${ARCH_RE}\.zip|linux-${ARCH_RE}\.AppImage|windows-${ARCH_RE}(-portable\.zip|\.msi))\$"
 case "$OS_FILTER" in
   macos) WANT_RE="^FlightDeck-${VER_RE}-macos-${ARCH_RE}\.zip\$" ;;
   linux) WANT_RE="^FlightDeck-${VER_RE}-linux-${ARCH_RE}\.AppImage\$" ;;
-  windows) WANT_RE="^FlightDeck-${VER_RE}-windows-${ARCH_RE}-portable\.zip\$" ;;
+  windows) WANT_RE="^FlightDeck-${VER_RE}-windows-${ARCH_RE}(-portable\.zip|\.msi)\$" ;;
   "") WANT_RE="$ASSET_RE" ;;
   *) echo "unknown --os: $OS_FILTER" >&2; exit 2 ;;
 esac
 
-fail=0 found=0
+fail=0 found=0 msis=0 zips=0
 err() { echo "FAIL: $*" >&2; fail=1; }
 
 for f in "$DIR"/FlightDeck-*; do
@@ -45,8 +47,8 @@ for f in "$DIR"/FlightDeck-*; do
   name="$(basename "$f")"
   case "$name" in
     *.sha256) [[ -e "${f%.sha256}" ]] || err "$name has no matching asset"; continue ;;
-    *.zip|*.AppImage) ;;
-    *) continue ;; # .msi/.deb/.rpm are for package managers, never fetched by the app
+    *.zip|*.AppImage|*.msi) ;;
+    *) continue ;; # .deb/.rpm are for package managers, never fetched by the app
   esac
   if ! [[ "$name" =~ $ASSET_RE ]]; then
     err "$name does not match the updater's asset name regex"
@@ -54,6 +56,10 @@ for f in "$DIR"/FlightDeck-*; do
   fi
   [[ "$name" =~ $WANT_RE ]] || continue # a valid asset of another OS
   found=$((found + 1))
+  case "$name" in
+    *.msi) msis=$((msis + 1)) ;;
+    *-portable.zip) zips=$((zips + 1)) ;;
+  esac
   if [[ -n "$VERSION" && "$name" != FlightDeck-"$VERSION"-* ]]; then err "$name is not version $VERSION"; fi
   sums="$f.sha256"
   if [[ ! -f "$sums" ]]; then err "$name has no .sha256"; continue; fi
@@ -72,4 +78,8 @@ for f in "$DIR"/FlightDeck-*; do
 done
 
 if [[ $found -eq 0 ]]; then err "no ${OS_FILTER:-desktop} asset found in $DIR"; fi
+if [[ "$OS_FILTER" == windows ]]; then
+  [[ $msis -gt 0 ]] || err "no versioned .msi found in $DIR"
+  [[ $zips -gt 0 ]] || err "no portable .zip found in $DIR"
+fi
 exit $fail

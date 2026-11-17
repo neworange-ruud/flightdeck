@@ -100,6 +100,11 @@ pub fn banner_copy(status: &UpdateStatus) -> BannerCopy {
                 "It is applied the next time FlightDeck starts.",
                 BannerAction::Restart,
             ),
+            Outcome::RunInstaller { .. } => copy(
+                format!("FlightDeck v{version} is downloaded"),
+                "Restart to install it. Windows asks for permission first.",
+                BannerAction::Restart,
+            ),
         },
         UpdateStatus::Failed { version, message } => copy(
             format!("Could not update to v{version}"),
@@ -166,7 +171,7 @@ pub fn update_banner(
                 "Restart",
                 ButtonKind::Primary,
                 &p,
-                |_, _, cx| cx.restart(),
+                |_, _, cx| selfupdate::restart(cx),
             ));
         }
         BannerAction::None => {}
@@ -309,6 +314,11 @@ mod tests {
         let staged = done(Outcome::StagedForNextLaunch);
         assert_eq!(staged.action, BannerAction::Restart);
         assert!(staged.detail.contains("next time"), "{}", staged.detail);
+        let msi = done(Outcome::RunInstaller {
+            msi: "C:/x/update/a.msi".into(),
+        });
+        assert_eq!(msi.action, BannerAction::Restart);
+        assert!(msi.detail.contains("permission"), "{}", msi.detail);
 
         let failed = banner_copy(&UpdateStatus::Failed {
             version: "2.0.0".into(),
