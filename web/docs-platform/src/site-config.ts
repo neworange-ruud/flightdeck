@@ -9,6 +9,7 @@ import { APPROVED_MDX_COMPONENTS, type DocsSiteConfig, type DocsSiteDefinition }
 const schema = z.object({
   siteTitle: z.string().min(1),
   repositoryUrl: z.string().url().optional(),
+  headerLinks: z.array(z.object({ label: z.string().min(1), href: z.string().min(1) }).strict()).optional(),
   contentRoot: z.string().min(1).optional(),
   mountPath: z.string().regex(/^\//).optional(),
   theme: z.object({
@@ -40,6 +41,7 @@ export async function loadSiteConfig(site: DocsSiteDefinition | string): Promise
   return {
     siteTitle: config.siteTitle,
     repositoryUrl: config.repositoryUrl,
+    headerLinks: config.headerLinks ?? [],
     contentRoot: path.resolve(siteDir, config.contentRoot ?? "content"),
     mountPath,
     theme: {

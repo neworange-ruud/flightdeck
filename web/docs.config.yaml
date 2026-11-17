@@ -3,6 +3,11 @@ repositoryUrl: https://github.com/neworange-ruud/flightdeck
 contentRoot: docs
 mountPath: /docs
 
+# Header links before GitHub (used as written, not under /docs).
+headerLinks:
+  - label: Download
+    href: /download
+
 theme:
   defaultColorMode: system
   allowToggle: true

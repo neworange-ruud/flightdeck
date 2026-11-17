@@ -15,6 +15,11 @@ export interface DocsSiteDefinition {
 export interface DocsSiteConfig {
   siteTitle: string;
   repositoryUrl?: string;
+  /**
+   * Links in the header, before GitHub. `href` is used as written (not
+   * resolved under the docs' mount path), so it can point at the main site.
+   */
+  headerLinks: Array<{ label: string; href: string }>;
   contentRoot: string;
   mountPath: string;
   theme: { defaultColorMode: "light" | "dark" | "system"; allowToggle: boolean };

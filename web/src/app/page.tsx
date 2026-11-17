@@ -14,8 +14,8 @@ const DOCS_URL = "/docs";
 const TUTORIALS_URL = "/docs/tutorials";
 const INTRO_VIDEO = "/videos/tutorials/intro";
 const PRIVACY_URL = "/privacy";
-const DESKTOP_RELEASES_URL =
-  "https://github.com/neworange-ruud/flightdeck/releases?q=desktop&expanded=true";
+// Redirects to the newest FlightDeck Desktop release's downloads (src/app/download).
+const DOWNLOAD_URL = "/download";
 
 export default function HomePage() {
   return (
@@ -129,6 +129,9 @@ export default function HomePage() {
             <Link href={TUTORIALS_URL} style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
               Tutorials
             </Link>
+            <a href={DOWNLOAD_URL} style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
+              Download
+            </a>
             <a
               href={GITHUB_URL}
               style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}
@@ -260,7 +263,7 @@ export default function HomePage() {
             Get started
           </Link>
           <a
-            href={DESKTOP_RELEASES_URL}
+            href={DOWNLOAD_URL}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -577,8 +580,8 @@ export default function HomePage() {
           }}
         >
           <InstallCard label="FLIGHTDECK DESKTOP · macOS · WINDOWS · LINUX">
-            <a href={DESKTOP_RELEASES_URL} style={{ color: "#6fdcf2", fontWeight: 700 }}>
-              ↓ Download from GitHub Releases
+            <a href={DOWNLOAD_URL} style={{ color: "#6fdcf2", fontWeight: 700 }}>
+              ↓ Download the latest release
             </a>
             <br />
             <span style={{ color: "#8b98a8" }}>.zip (macOS) · .msi (Windows) · .deb .rpm .AppImage</span>
@@ -664,6 +667,9 @@ export default function HomePage() {
           <Link href={TUTORIALS_URL} style={{ color: "#8b98a8" }}>
             Tutorials
           </Link>
+          <a href={DOWNLOAD_URL} style={{ color: "#8b98a8" }}>
+            Download
+          </a>
           <a href={GITHUB_URL} style={{ color: "#8b98a8" }}>
             GitHub
           </a>

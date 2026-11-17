@@ -23,7 +23,10 @@ export function DocsLayout({ children, currentRoute, navigationSections, siteCon
       <header className="sticky top-0 z-10 border-b border-[color:var(--docs-border)] bg-[color:var(--docs-bg)]/90 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4">
           <Link className="font-semibold tracking-tight" href={siteConfig.mountPath}>{siteConfig.siteTitle}</Link>
-          {siteConfig.repositoryUrl ? <a className="text-sm text-[color:var(--docs-muted)] hover:text-[color:var(--docs-fg)]" href={siteConfig.repositoryUrl} rel="noreferrer" target="_blank">GitHub</a> : null}
+          <div className="flex items-center gap-5">
+            {siteConfig.headerLinks.map((link) => <a className="text-sm text-[color:var(--docs-muted)] hover:text-[color:var(--docs-fg)]" href={link.href} key={link.href}>{link.label}</a>)}
+            {siteConfig.repositoryUrl ? <a className="text-sm text-[color:var(--docs-muted)] hover:text-[color:var(--docs-fg)]" href={siteConfig.repositoryUrl} rel="noreferrer" target="_blank">GitHub</a> : null}
+          </div>
         </div>
       </header>
       <div className="mx-auto grid max-w-7xl gap-8 px-5 py-8 lg:grid-cols-[15rem_minmax(0,1fr)]">
