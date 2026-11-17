@@ -450,6 +450,14 @@ pub static INVENTORY: &[CommandSpec] = &[
         route: Route::Palette(PaletteAction::OpenProject),
     },
     CommandSpec {
+        name: names::NEW_PROJECT,
+        label: "New Project",
+        group: "Projects",
+        host_only: false,
+        annotation: None,
+        route: Route::Palette(PaletteAction::NewProject),
+    },
+    CommandSpec {
         name: names::CLOSE_PROJECT,
         label: "Close Project",
         group: "Projects",
@@ -1012,7 +1020,7 @@ pub const WORKER_UNPAIR_PHONE_REFUSAL: &str =
 /// Why a worker's window does not get the TUI's folder browser: it would step
 /// outside the `$HOME` confinement the worker's own picker enforces.
 pub const WORKER_OPEN_PROJECT_REFUSAL: &str =
-    "Use the worker's project picker (browse, scan, clone).";
+    "Use the worker's project picker (browse, scan, clone, create).";
 
 /// Why a worker does not run `upload_files` for a window that sends it: the
 /// row is the window's own upload panel (W34), which asks with
@@ -1093,7 +1101,7 @@ pub fn worker_refusal(name: &str) -> Option<&'static str> {
         }
         names::PAIR_PHONE => Some(WORKER_PHONE_REFUSAL),
         names::UNPAIR_PHONE => Some(WORKER_UNPAIR_PHONE_REFUSAL),
-        names::OPEN_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
+        names::OPEN_PROJECT | names::NEW_PROJECT => Some(WORKER_OPEN_PROJECT_REFUSAL),
         UPLOAD_FILES => Some(WORKER_UPLOAD_FILES_REFUSAL),
         DOWNLOAD_FILES => Some(WORKER_DOWNLOAD_FILES_REFUSAL),
         _ => None,
@@ -1154,6 +1162,7 @@ pub fn exposure_of(action: &PaletteAction) -> Exposure {
         PaletteAction::CloseAgentTab => Exposure::Wire(names::CLOSE_AGENT_SESSION_TAB),
         PaletteAction::SetManualStatus => Exposure::Wire(names::SET_MANUAL_STATUS),
         PaletteAction::OpenProject => Exposure::Wire(names::OPEN_PROJECT),
+        PaletteAction::NewProject => Exposure::Wire(names::NEW_PROJECT),
         PaletteAction::CloseProject => Exposure::Wire(names::CLOSE_PROJECT),
         PaletteAction::ChangeProjectBase => Exposure::Wire(names::CHANGE_PROJECT_DEFAULT_BASE),
         PaletteAction::SwitchProjectNext => Exposure::Wire(names::NEXT_PROJECT),

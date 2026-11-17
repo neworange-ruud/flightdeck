@@ -144,10 +144,12 @@ describe("the project picker", () => {
       { type: "picker/request", intent: { kind: "open" } },
       { type: "picker/field", field: "url", value: "git@x:r.git" },
       { type: "picker/field", field: "name", value: "r" },
+      { type: "picker/field", field: "newName", value: "fresh" },
       { type: "picker/toggleHidden" },
     );
     expect(typed.picker?.urlField).toBe("git@x:r.git");
     expect(typed.picker?.nameField).toBe("r");
+    expect(typed.picker?.newNameField).toBe("fresh");
     expect(typed.picker?.showHidden).toBe(true);
   });
 });

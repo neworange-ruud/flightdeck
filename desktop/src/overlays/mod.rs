@@ -433,6 +433,8 @@ pub fn field_spec(view: &OverlayView) -> Option<FieldSpec> {
 pub(crate) fn dialog_field_spec(view: &flightdeck::host::DialogView) -> Option<FieldSpec> {
     let text = view.input.clone()?;
     let (placeholder, mono) = match &view.kind {
+        // Create mode (New Project): the field names the new folder.
+        DialogKind::OpenProject { create: true, .. } => ("name of the new folder", true),
         DialogKind::OpenProject { .. } => ("or type a path", true),
         DialogKind::ChangeProjectBase => ("filter branches", true),
         DialogKind::NewAgent(form) => match form.target {
@@ -640,6 +642,28 @@ fn choose_folder(emit: Emit, open_prompt_first: bool, window: &mut Window, cx: &
             };
             let events = folder_answer(path, open_prompt_first);
             // The window may have closed while the picker was up.
+            cx.update(|window, cx| emit_all(&emit, events, window, cx))
+                .ok();
+        })
+        .detach();
+}
+
+/// Answer an open create-mode folder browser (New Project) with the
+/// platform's save dialog, started in the folder being browsed: the chosen
+/// path is typed as the prompt's and Create pressed, so the browser's own
+/// create path runs with all its checks (a typed absolute path wins over the
+/// browsed folder). Never the *open* picker: that chooses an existing folder,
+/// and a create needs one that does not exist yet. A cancelled dialog does
+/// nothing.
+fn choose_new_folder(emit: Emit, dir: PathBuf, window: &mut Window, cx: &mut App) {
+    let chosen = cx.prompt_for_new_path(&dir, None);
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let events = folder_answer(path, false);
+            // The window may have closed while the dialog was up.
             cx.update(|window, cx| emit_all(&emit, events, window, cx))
                 .ok();
         })

@@ -554,6 +554,7 @@ const WORKER_REFUSED: &[&str] = &[
     names::PAIR_PHONE,
     names::UNPAIR_PHONE,
     names::OPEN_PROJECT,
+    names::NEW_PROJECT,
 ];
 
 #[test]
@@ -676,7 +677,7 @@ fn the_worker_refusals_say_where_to_go_instead() {
     );
     assert_eq!(
         worker_refusal(names::OPEN_PROJECT),
-        Some("Use the worker's project picker (browse, scan, clone).")
+        Some("Use the worker's project picker (browse, scan, clone, create).")
     );
     assert_eq!(
         worker_refusal(names::PAIR_PHONE),

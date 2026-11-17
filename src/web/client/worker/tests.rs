@@ -158,6 +158,36 @@ fn opening_a_project_reports_the_hosts_words_or_its_refusal() {
 }
 
 #[test]
+fn a_create_is_answered_like_an_open() {
+    let mut picker = ProjectPicker::new("/home/u");
+    picker.create_sent(Some(30), "/home/u/code/fresh");
+    assert!(picker.is_busy());
+    assert!(picker.on_ack(&ack(
+        30,
+        AckOutcome::Applied,
+        Some("Created project fresh at /home/u/code/fresh.")
+    )));
+    assert_eq!(
+        picker.opened.as_ref().map(|o| o.path.as_str()),
+        Some("/home/u/code/fresh")
+    );
+    assert!(!picker.is_busy());
+
+    let mut picker = ProjectPicker::new("/home/u");
+    picker.create_sent(Some(31), "/home/u/code/taken");
+    assert!(picker.on_ack(&ack(
+        31,
+        AckOutcome::Rejected,
+        Some("/home/u/code/taken already exists.")
+    )));
+    assert_eq!(
+        picker.error.as_deref(),
+        Some("/home/u/code/taken already exists.")
+    );
+    assert!(picker.opened.is_none());
+}
+
+#[test]
 fn a_clone_shows_progress_then_opens_or_shows_gits_own_words() {
     let mut picker = ProjectPicker::new("/home/u");
     picker.clone_sent(Some(12), "git@github.com:me/app.git");

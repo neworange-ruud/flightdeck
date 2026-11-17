@@ -27,6 +27,9 @@ export const WORKER_COMMAND = {
   SCAN_PROJECTS: "scan_projects",
   OPEN_PROJECT_PATH: "open_project_path",
   CLONE_PROJECT: "clone_project",
+  /** v12: a new folder, `git init` and an empty first commit, then opened —
+   * answered like `open_project_path`. */
+  CREATE_PROJECT: "create_project",
   RESTART_WORKER_SHELL: "restart_worker_shell",
   /** v10: open another worker shell (W35). */
   OPEN_WORKER_SHELL: "open_worker_shell",

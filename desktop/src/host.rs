@@ -124,6 +124,7 @@ impl RealServices {
             container: &self.container,
             command: &self.command,
             terminal: crate::terminal::desktop_profile(),
+            repo_init: &flightdeck::git::init::REAL_REPO_INIT,
         }
     }
 

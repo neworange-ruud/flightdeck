@@ -152,6 +152,7 @@ pub fn open_project() -> DialogView {
     let mut d = dialog(
         DialogKind::OpenProject {
             dir: PathBuf::from("/Users/ruud/Projects"),
+            create: false,
         },
         "Open project — /Users/ruud/Projects   (↑↓ select · → open folder · ← parent · Enter to \
          open · or type a path)",
@@ -170,6 +171,24 @@ pub fn open_project() -> DialogView {
         ],
         0,
     );
+    d
+}
+
+/// The folder browser in create mode (New Project, SPECS §5.3): the field
+/// names the new folder, and Enter creates it.
+pub fn new_project() -> DialogView {
+    let mut d = open_project();
+    d.kind = DialogKind::OpenProject {
+        dir: PathBuf::from("/Users/ruud/Projects"),
+        create: true,
+    };
+    d.title = "New project in /Users/ruud/Projects   (type the new folder's name · Enter to \
+               create · ↑↓ select · → open folder · ← parent)"
+        .to_string();
+    d.buttons = vec![
+        b("Enter", "Create", ButtonRole::Primary, true),
+        b("Esc", "Cancel", ButtonRole::Cancel, false),
+    ];
     d
 }
 

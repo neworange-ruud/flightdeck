@@ -113,6 +113,8 @@ pub struct ProjectPicker {
     pub clone_name: String,
     /// The clone this picker started, if any.
     pub clone: Option<CloneState>,
+    /// The new project's folder-name field (SPECS §5.3, v12).
+    pub new_name: String,
     /// The last refusal or failure, verbatim, for the picker's error line.
     pub error: Option<String>,
     /// The last success worth saying (`Opened project 'x'.`).
@@ -176,6 +178,12 @@ impl ProjectPicker {
     /// An `open_project_path` for `path` went out as `seq`.
     pub fn open_sent(&mut self, seq: Option<u64>, path: &str) {
         self.pending.open = self.sent(seq).map(|seq| (seq, path.to_string()));
+    }
+
+    /// A `create_project` for the folder `path` went out as `seq`. Answered
+    /// like an open: the ack's sentence, and on success the project opened.
+    pub fn create_sent(&mut self, seq: Option<u64>, path: &str) {
+        self.open_sent(seq, path);
     }
 
     /// A `clone_project` for `url` went out as `seq`, which is its clone id.

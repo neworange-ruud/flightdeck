@@ -4,7 +4,7 @@
  *
  * A worker has no screen and no folder dialog, so Open Project on a worker is
  * this panel: scan the projects root for repositories, browse `$HOME` folder by
- * folder, or clone a URL. The worker answers each request with its own frame
+ * folder, clone a URL, or start a new project in the folder listed. The worker answers each request with its own frame
  * (`dir_listing`, `project_scan`, `clone_progress`, `clone_result`) beside the
  * `ack` for the command, and refuses anything outside `$HOME` in words.
  *
@@ -149,11 +149,13 @@ export interface PickerState {
   readonly truncated: boolean;
   readonly showHidden: boolean;
   readonly scanned: PickerScan | null;
-  /** The three text fields. Held here, not in the DOM, so a re-render cannot
+  /** The four text fields. Held here, not in the DOM, so a re-render cannot
    * lose what was typed. */
   readonly pathField: string;
   readonly urlField: string;
   readonly nameField: string;
+  /** The new project's folder name (v12's `create_project`). */
+  readonly newNameField: string;
   readonly clone: PickerClone | null;
   /** The last refusal or failure, verbatim. */
   readonly error: string | null;
@@ -186,6 +188,7 @@ export function newPicker(home: string, purpose: PickerPurpose = "open"): Picker
     pathField: "",
     urlField: "",
     nameField: "",
+    newNameField: "",
     clone: null,
     error: null,
     status: null,
@@ -223,6 +226,8 @@ export type PickerIntent =
   | { readonly kind: "open_path"; readonly path: string }
   /** Clone what the URL field says, into the name field's folder if any. */
   | { readonly kind: "clone" }
+  /** Create a project named by the new-name field in the folder listed (v12). */
+  | { readonly kind: "create" }
   /** Open the picker to choose a folder for the upload panel, listing `path`
    * first (the panel's folder). Nothing is scanned or opened. */
   | { readonly kind: "choose_folder"; readonly path: string };
@@ -243,6 +248,9 @@ export interface PickerRequest {
 
 /** Said when the clone URL field is empty — the native picker's own words. */
 export const CLONE_URL_MISSING = "Type the URL of the repository to clone.";
+
+/** Said when the new project's name field is empty. */
+export const CREATE_NAME_MISSING = "Type a name for the new project's folder.";
 
 /** A browse of `path` (`null`: `$HOME`), honouring the hidden toggle. A blank
  * path is `$HOME`, as the native picker trims it. */
@@ -287,6 +295,36 @@ export function cloneRequest(
     args: name === "" ? { url } : { url, name },
     sent: { kind: "clone", url },
   };
+}
+
+/**
+ * The new project the field describes, in the folder listed (the projects
+ * root, with no `dir`, before anything is listed) — or the reason there is
+ * none to send. The worker checks the name; this only refuses an empty one.
+ *
+ * It is answered like `open_project_path` — an `ack`, applied with the worker
+ * having opened it — so it goes out as an open of the folder it will make,
+ * and that is the path the picker then looks for among the projects.
+ */
+export function createRequest(
+  picker: PickerState,
+): PickerRequest | { readonly error: string } {
+  const name = picker.newNameField.trim();
+  if (name === "") {
+    return { error: CREATE_NAME_MISSING };
+  }
+  const dir = picker.cwd;
+  const parent = dir ?? picker.scanned?.root ?? null;
+  return {
+    name: WORKER_COMMAND.CREATE_PROJECT,
+    args: dir === null ? { name } : { name, dir },
+    sent: { kind: "open", path: parent === null ? name : joinPath(parent, name) },
+  };
+}
+
+/** `parent/name`, without doubling a trailing separator (`/` itself). */
+function joinPath(parent: string, name: string): string {
+  return parent.endsWith("/") ? `${parent}${name}` : `${parent}/${name}`;
 }
 
 // ---------------------------------------------------------------------------

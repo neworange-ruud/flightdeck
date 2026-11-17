@@ -10,11 +10,19 @@
 //! |          folder rows (git ones with Open) ..............  |
 //! | CLONE    [URL                  ] [name (optional)] Clone  |
 //! |          progress line, or git's error                    |
+//! | NEW PROJECT IN ~/src   [folder name           ] Create    |
 //! +----------------------------------------------------------+
 //! ```
 //!
+//! NEW PROJECT (SPECS §5.3) makes a folder in the one BROWSE lists (the
+//! projects root before anything is listed), `git init`s it with an empty
+//! first commit and opens it; a refusal is the error line. Only a worker
+//! that speaks protocol v12 has it
+//! ([`RemoteModel::picker_creates_projects`]).
+//!
 //! Opened from the upload panel's Choose… it is a folder chooser instead
-//! ([`RemoteModel::choosing_upload_dir`]): only BROWSE, with **Choose this
+//! ([`RemoteModel::choosing_upload_dir`]): only BROWSE (no CLONE or NEW
+//! PROJECT), with **Choose this
 //! folder** where Open this folder was, a Home button, no Open on the
 //! repositories, and **Back** to the panel.
 //!
@@ -41,6 +49,8 @@ pub struct ProjectPickerView {
     path: Entity<InputState>,
     url: Entity<InputState>,
     name: Entity<InputState>,
+    /// NEW PROJECT's folder name.
+    new_name: Entity<InputState>,
     /// The folder the path bar was last set to, so a new listing moves it
     /// and typing in it does not get overwritten.
     shown_cwd: Option<String>,
@@ -53,6 +63,8 @@ impl ProjectPickerView {
         let url =
             cx.new(|cx| InputState::new(window, cx).placeholder("git@github.com:me/my-repo.git"));
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("folder name (optional)"));
+        let new_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("name of the new folder"));
         cx.subscribe_in(&path, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.go(cx);
@@ -67,11 +79,18 @@ impl ProjectPickerView {
             })
             .detach();
         }
+        cx.subscribe_in(&new_name, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.create(cx);
+            }
+        })
+        .detach();
         Self {
             remote,
             path,
             url,
             name,
+            new_name,
             shown_cwd: None,
         }
     }
@@ -91,6 +110,16 @@ impl ProjectPickerView {
             .update(cx, |s, cx| s.set_value(name.to_string(), window, cx));
     }
 
+    /// Click into NEW PROJECT's name field and type `name`, as a person
+    /// would (tests).
+    #[cfg(test)]
+    pub fn fill_new_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_name.update(cx, |s, cx| {
+            s.set_value(name.to_string(), window, cx);
+            s.focus(window, cx);
+        });
+    }
+
     /// List the folder typed in the path bar.
     fn go(&mut self, cx: &mut Context<Self>) {
         let path = self.path.read(cx).value().to_string();
@@ -106,6 +135,15 @@ impl ProjectPickerView {
         let name = self.name.read(cx).value().to_string();
         self.remote.update(cx, |model, cx| {
             model.picker_clone(&url, &name);
+            cx.notify();
+        });
+    }
+
+    /// Create a new project named as typed, in the folder listed.
+    fn create(&mut self, cx: &mut Context<Self>) {
+        let name = self.new_name.read(cx).value().to_string();
+        self.remote.update(cx, |model, cx| {
+            model.picker_create(&name);
             cx.notify();
         });
     }
@@ -195,6 +233,7 @@ impl Render for ProjectPickerView {
         self.follow_cwd(&picker, window, cx);
         let label = self.remote.read(cx).label().to_string();
         let choosing = self.remote.read(cx).choosing_upload_dir();
+        let creates = !choosing && self.remote.read(cx).picker_creates_projects();
         let remote = self.remote.clone();
         let this = cx.entity();
 
@@ -472,6 +511,21 @@ impl Render for ProjectPickerView {
                 .child(text)
         });
 
+        // New project: a folder name, made in the folder listed.
+        let create_title = match &picker.cwd {
+            Some(cwd) => format!("NEW PROJECT IN {cwd}"),
+            None => "NEW PROJECT".to_string(),
+        };
+        let create_form = h_flex()
+            .w_full()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(Input::new(&self.new_name)))
+            .child({
+                let this = this.clone();
+                button(&p, "remote-picker-create", "Create", true)
+                    .on_click(move |_, _, cx| this.update(cx, |view, cx| view.create(cx)))
+            });
+
         div().id("remote-picker").size_full().child(
             v_flex()
                 .debug_selector(|| "remote-picker".into())
@@ -496,6 +550,9 @@ impl Render for ProjectPickerView {
                     col.child(section(&p, "CLONE".to_string()))
                         .child(clone_form)
                         .children(clone_status)
+                })
+                .when(creates, |col| {
+                    col.child(section(&p, create_title)).child(create_form)
                 }),
         )
     }

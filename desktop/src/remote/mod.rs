@@ -491,6 +491,19 @@ impl RemoteModel {
         self.session.picker_clone(url, name);
     }
 
+    /// Whether this worker creates new projects (protocol v12): the
+    /// picker's NEW PROJECT section exists only then.
+    pub fn picker_creates_projects(&self) -> bool {
+        self.session.picker_creates_projects()
+    }
+
+    /// Create the folder `name` in the folder the picker lists (the
+    /// projects root when none), `git init` it with an empty first commit,
+    /// and open it (SPECS §5.3).
+    pub fn picker_create(&mut self, name: &str) {
+        self.session.picker_create(name);
+    }
+
     // -- uploads (W34, v8) ---------------------------------------------------
 
     /// Whether this worker takes uploads: the entry points exist only then.

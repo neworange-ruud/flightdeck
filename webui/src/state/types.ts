@@ -1147,7 +1147,7 @@ export type AppAction =
   | { readonly type: "picker/cloneResult"; readonly result: CloneResult }
   | {
       readonly type: "picker/field";
-      readonly field: "path" | "url" | "name";
+      readonly field: "path" | "url" | "name" | "newName";
       readonly value: string;
     }
   | { readonly type: "picker/toggleHidden" }

@@ -1169,6 +1169,30 @@ impl<'a> AppHost<'a> {
                 w.log(format!("cloning {url} into {}", dest.display()));
                 Ok((Some(format!("Cloning into {}…", dest.display())), None))
             }
+            WorkerOp::CreateProject { name, dir } => {
+                let dest = projects::plan_create(
+                    fs,
+                    &w.confinement,
+                    &name,
+                    dir.as_deref(),
+                    &w.projects_root,
+                )
+                .map_err(OpRefusal::new)?;
+                crate::git::init::create_project_dir(fs, self.env.repo_init, &dest).map_err(
+                    |reason| OpRefusal::new(format!("Could not create {name}: {reason}")),
+                )?;
+                w.log(format!("created project {}", dest.display()));
+                self.open_worker_project(&dest).map_err(|reason| {
+                    OpRefusal::new(format!("Created {} but {reason}", dest.display()))
+                })?;
+                Ok((
+                    Some(format!(
+                        "Created project {name} at {}. Add a remote with `git remote add` when you are ready to push.",
+                        dest.display()
+                    )),
+                    None,
+                ))
+            }
             WorkerOp::RestartWorkerShell { terminal_id } => {
                 let home = w.home.clone();
                 // A pre-v10 window names no shell: it means the first.

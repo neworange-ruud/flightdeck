@@ -284,6 +284,7 @@ fn dialog_kind(prompt: &Prompt) -> DialogKind {
         },
         Prompt::OpenProject { browse } => DialogKind::OpenProject {
             dir: browse.dir.clone(),
+            create: browse.create,
         },
         Prompt::ChangeProjectBase { .. } => DialogKind::ChangeProjectBase,
         Prompt::CloseProjectConfirm { index } => DialogKind::CloseProject { index: *index },

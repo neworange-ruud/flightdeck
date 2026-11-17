@@ -1162,6 +1162,40 @@ impl RemoteSession {
         picker.open_sent(self.client.open_project_path(path), path);
     }
 
+    /// Whether the worker creates projects (v12), so a picker can offer it.
+    pub fn picker_creates_projects(&self) -> bool {
+        self.client.supports_create_project()
+    }
+
+    /// Create the folder `name` in the folder being browsed (the worker's
+    /// projects root when nothing is listed yet), `git init` it with an empty
+    /// root commit, and open it (SPECS §5.3).
+    pub fn picker_create(&mut self, name: &str) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let name = name.trim();
+        picker.new_name = name.to_string();
+        if name.is_empty() {
+            picker.error = Some("Type a name for the new project's folder.".to_string());
+            return;
+        }
+        if !self.client.supports_create_project() {
+            picker.error = Some(
+                "This worker cannot create projects: update FlightDeck on it, then try again."
+                    .to_string(),
+            );
+            return;
+        }
+        let dir = picker.cwd.clone();
+        let path = match &dir {
+            Some(dir) => format!("{}/{name}", dir.trim_end_matches('/')),
+            None => name.to_string(),
+        };
+        let seq = self.client.create_project(name, dir.as_deref());
+        picker.create_sent(seq, &path);
+    }
+
     /// Clone `url` (into `name`, if one is given) and open it.
     pub fn picker_clone(&mut self, url: &str, name: &str) {
         let Some(picker) = self.picker.as_mut() else {
@@ -1753,6 +1787,12 @@ impl RemoteSession {
             HostEvent::OpenProject(_) => {
                 self.local = Local::Message(
                     "Projects open on the host: use Open Project from this window's palette."
+                        .to_string(),
+                )
+            }
+            HostEvent::CreateProject(_) => {
+                self.local = Local::Message(
+                    "Projects are created on the host: use New Project from this window's palette."
                         .to_string(),
                 )
             }

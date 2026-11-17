@@ -95,6 +95,7 @@
 //! | [`ResizeTerminal`] | PRD W5 — a worker has no pane of its own, so its one window sizes the PTYs |
 //! | [`worker_command::BEGIN_UPLOAD`], [`UploadPlan`], [`UPLOAD_MIN_VERSION`] | uploading files to a worker: a grant over the socket, the bytes over `PUT /upload/{ticket}` (v8) |
 //! | [`worker_command::BEGIN_DOWNLOAD`], [`DownloadPlan`], [`FileEntryView`], [`DOWNLOAD_MIN_VERSION`] | downloading files from a worker: a grant over the socket, the bytes over `GET /download/{ticket}` (v9) |
+//! | [`worker_command::CREATE_PROJECT`], [`CREATE_PROJECT_MIN_VERSION`] | creating a new project on a worker: folder, `git init`, empty root commit (SPECS §5.3, v12) |
 //!
 //! # Forward compatibility
 //!
@@ -257,10 +258,16 @@ mod tests;
 /// detecting a difference renders "reload to update" rather than mis-parsing
 /// frames (turn 2 §4).
 ///
+/// **v12 is creating a new project on a worker** (SPECS §5.3). A window asks
+/// with [`worker_command::CREATE_PROJECT`] and is answered like
+/// [`worker_command::OPEN_PROJECT_PATH`] — an ack and a sentence. No new
+/// frame; the bump is how a window knows the worker understands the command,
+/// so it can offer Create only where it works ([`CREATE_PROJECT_MIN_VERSION`]).
+///
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
@@ -270,7 +277,7 @@ pub const PROTOCOL_VERSION: u16 = 11;
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 11;
+pub const MAX_SUPPORTED_VERSION: u16 = 12;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
@@ -295,6 +302,11 @@ pub const WORKER_SHELLS_MIN_VERSION: u16 = 10;
 /// [`worker_command::OPEN_BROWSER_TUNNEL`] and is sent a
 /// [`ServerMsg::BrowserTunnel`].
 pub const BROWSER_TUNNEL_MIN_VERSION: u16 = 11;
+
+/// The oldest peer that may ask a worker to create a project
+/// ([`worker_command::CREATE_PROJECT`], v12). An older worker does not know
+/// the command, so a window offers Create only from this version on.
+pub const CREATE_PROJECT_MIN_VERSION: u16 = 12;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -3255,6 +3267,9 @@ pub mod command {
 
     /// Open a project folder picker (SPECS §22 "Open Project").
     pub const OPEN_PROJECT: &str = "open_project";
+    /// Open the folder picker in create mode: a new folder becomes a new
+    /// project (SPECS §5.3 "New Project").
+    pub const NEW_PROJECT: &str = "new_project";
     /// Close the active project.
     pub const CLOSE_PROJECT: &str = "close_project";
     /// Change the active project's default base branch.
@@ -3353,6 +3368,11 @@ pub mod worker_command {
     /// Clone a URL under the projects root and open it. Args `{url: string,
     /// name?: string}`. Progress arrives as [`super::ServerMsg::CloneProgress`].
     pub const CLONE_PROJECT: &str = "clone_project";
+    /// Create a new project and open it (SPECS §5.3, v12): the folder
+    /// `name` under `dir` (under `$HOME`; none is the projects root, created
+    /// when missing), `git init`, and an empty root commit. Args `{name:
+    /// string, dir?: string}`. Answered like [`OPEN_PROJECT_PATH`].
+    pub const CREATE_PROJECT: &str = "create_project";
     /// Restart a worker shell. Args `{terminal_id?: string}` (v10); none
     /// restarts the first shell, as before v10.
     pub const RESTART_WORKER_SHELL: &str = "restart_worker_shell";
@@ -3382,6 +3402,7 @@ pub mod worker_command {
         SCAN_PROJECTS,
         OPEN_PROJECT_PATH,
         CLONE_PROJECT,
+        CREATE_PROJECT,
         RESTART_WORKER_SHELL,
         OPEN_WORKER_SHELL,
         CLOSE_WORKER_SHELL,
@@ -3417,6 +3438,13 @@ pub enum WorkerOp {
         url: String,
         /// The folder name to clone into; `None` derives it from the URL.
         name: Option<String>,
+    },
+    /// [`worker_command::CREATE_PROJECT`] (v12).
+    CreateProject {
+        /// The new folder's name.
+        name: String,
+        /// The folder to create it in; `None` is the projects root.
+        dir: Option<String>,
     },
     /// [`worker_command::RESTART_WORKER_SHELL`].
     RestartWorkerShell {
@@ -3491,6 +3519,13 @@ impl WorkerOp {
                 Ok(WorkerOp::CloneProject {
                     url: args.required_str("url")?,
                     name: args.optional_str("name")?,
+                })
+            }
+            worker_command::CREATE_PROJECT => {
+                let args = WorkerArgs::new(name, args)?;
+                Ok(WorkerOp::CreateProject {
+                    name: args.required_str("name")?,
+                    dir: args.optional_str("dir")?,
                 })
             }
             worker_command::RESTART_WORKER_SHELL => {

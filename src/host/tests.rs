@@ -54,6 +54,7 @@ impl Fakes {
             container: &self.container,
             command: &self.command,
             terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &crate::git::init::TEST_REPO_INIT,
         }
     }
 
@@ -1638,6 +1639,33 @@ mod overlays {
     }
 
     #[test]
+    fn new_project_opens_the_folder_browser_in_create_mode() {
+        let fakes = Fakes::new();
+        let (state, _pty) = fakes.state_with_a_tab();
+        let mut host = fakes.host(state);
+        run(&mut host, PaletteAction::NewProject);
+        let d = dialog(&host);
+        assert_eq!(
+            d.kind,
+            DialogKind::OpenProject {
+                dir: PathBuf::from("/"),
+                create: true,
+            }
+        );
+        assert!(d.title.starts_with("New project in"), "{}", d.title);
+        assert!(d.buttons.iter().any(|b| b.label == "Create"));
+
+        // Enter with no name typed creates nothing and keeps the browser.
+        host.handle(HostEvent::Overlay(OverlayInput::Submit))
+            .unwrap();
+        assert!(matches!(
+            dialog(&host).kind,
+            DialogKind::OpenProject { create: true, .. }
+        ));
+        assert_eq!(host.project_count(), 1);
+    }
+
+    #[test]
     fn the_folder_browser_and_the_base_picker_read_out() {
         let fakes = Fakes::new();
         let (state, _pty) = fakes.state_with_a_tab();
@@ -1647,7 +1675,8 @@ mod overlays {
         assert_eq!(
             d.kind,
             DialogKind::OpenProject {
-                dir: PathBuf::from("/")
+                dir: PathBuf::from("/"),
+                create: false,
             }
         );
         assert_eq!(d.input.as_deref(), Some(""));
@@ -2018,6 +2047,33 @@ mod front_end_reads {
             "the folder browser's own refusal"
         );
         assert_eq!(host.project_count(), 1, "nothing was opened");
+    }
+
+    #[test]
+    fn create_project_refuses_a_folder_that_already_exists() {
+        let fakes = Fakes::new();
+        fakes.fs.create_dir_all(Path::new("/work/app")).unwrap();
+        let mut host = host_over(&fakes, vec![TestProject::new("alpha", &[])]);
+        host.handle(HostEvent::CreateProject(PathBuf::from("/work/app")))
+            .unwrap();
+        let said = message(&host);
+        assert!(said.starts_with("Could not create project"), "{said}");
+        assert!(said.contains("already exists"), "{said}");
+        assert_eq!(host.project_count(), 1, "nothing was opened");
+    }
+
+    #[test]
+    fn create_project_is_refused_in_an_isolated_run() {
+        let fakes = Fakes::new();
+        fakes.fs.create_dir_all(Path::new("/work")).unwrap();
+        let mut project = TestProject::new("alpha", &[]);
+        project.state.isolated = true;
+        let mut host = host_over(&fakes, vec![project]);
+        host.handle(HostEvent::CreateProject(PathBuf::from("/work/app")))
+            .unwrap();
+        assert!(message(&host).contains("isolated"));
+        assert!(!fakes.fs.exists(Path::new("/work/app")), "nothing was made");
+        assert_eq!(host.project_count(), 1);
     }
 
     #[test]

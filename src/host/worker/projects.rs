@@ -336,6 +336,42 @@ pub fn validate_open(
     Ok(path)
 }
 
+/// Where a new project `name` would be created (SPECS §5.3): under `dir`
+/// (inside home, an existing folder) or, with no `dir`, under
+/// `projects_root` (created when missing, as a clone's is). Refuses an
+/// unusable name and a folder that already exists. Creates nothing but a
+/// missing projects root; the caller makes the project folder itself.
+pub fn plan_create(
+    fs: &dyn FileSystem,
+    conf: &Confinement,
+    name: &str,
+    dir: Option<&str>,
+    projects_root: &Path,
+) -> std::result::Result<PathBuf, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Enter a name for the new project's folder.".to_string());
+    }
+    if !crate::git::init::valid_folder_name(name) {
+        return Err(crate::git::init::invalid_folder_name(name));
+    }
+    let parent = match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let p = conf.resolve(fs, Some(d)).map_err(|e| e.to_string())?;
+            if !fs.is_dir(&p) {
+                return Err(ProjectOpError::NotADirectory(d.to_string()).to_string());
+            }
+            p
+        }
+        None => super::clone::ensure_projects_root(fs, conf, projects_root)?,
+    };
+    let dest = parent.join(name);
+    if fs.exists(&dest) {
+        return Err(format!("{} already exists.", dest.display()));
+    }
+    Ok(dest)
+}
+
 /// Whether `dir` is a Git repository: `dir/.git` exists (a folder, or the
 /// file a linked worktree has).
 pub fn is_git_repo(fs: &dyn FileSystem, dir: &Path) -> bool {

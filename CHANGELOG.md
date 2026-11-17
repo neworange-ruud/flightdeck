@@ -8,11 +8,12 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Create a new project from FlightDeck.** The palette has **New Project** next to Open Project. Pick the folder to create it in, type a name, and FlightDeck makes the folder, runs `git init`, makes one empty first commit (so agents have a base branch to branch from), and opens it. Adding a remote stays up to you (`git remote add`). It works on a worker too: the worker's project picker has a new-project field that creates in the folder you are browsing, inside your home folder. The folder must not exist yet and its name may use letters, digits, dots, dashes and underscores. If git has no `user.name`/`user.email` the first commit can't be made, so FlightDeck removes the folder again and tells you what to set. This is the only commit FlightDeck ever makes, and only in a folder it has just created (SPECS §5.3).
+- **`flightdeck connect` can create projects on a worker.** The worker picker has a fourth pane (Tab past Clone) for a new project's folder name.
 
 ### Improvements
 
-- None yet.
+- **The web protocol is now v12.** A worker uses it to tell windows that it can create projects. A browser tab left open across an update shows "reload to update", as with earlier version bumps.
 
 ### Bug fixes
 

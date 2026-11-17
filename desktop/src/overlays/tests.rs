@@ -688,6 +688,56 @@ fn the_folder_browser_navigates_and_takes_the_native_picker(app: &mut TestAppCon
     );
 }
 
+#[test]
+fn the_create_mode_browser_asks_for_the_new_folders_name() {
+    let spec = |view: &DialogView| dialog_field_spec(view).map(|f| f.placeholder);
+    assert_eq!(spec(&open_project()), Some("or type a path"));
+    assert_eq!(spec(&new_project()), Some("name of the new folder"));
+    // Both keep ←/→ for the host's folder moves.
+    assert!(!dialog_field_spec(&new_project()).unwrap().caret_keys);
+}
+
+#[gpui::test]
+fn the_create_mode_browser_takes_the_native_save_dialog(app: &mut TestAppContext) {
+    let mut h = open(app);
+    h.show(Some(OverlayView::Dialog(new_project())));
+    // Its own moves are the open browser's.
+    assert_eq!(h.click("overlay-button-←", 1), vec![key(OverlayKey::Left)]);
+    assert_eq!(
+        h.click("dialog-row-1", 2),
+        vec![
+            ev(OverlayInput::SelectRow(1)),
+            ev(OverlayInput::SelectRow(1)),
+            key(OverlayKey::Right)
+        ]
+    );
+
+    // The native button is a save dialog in the browsed folder, never the
+    // open picker (which can only choose a folder that exists).
+    assert_eq!(h.click("overlay-button-choose-folder", 1), vec![]);
+    assert!(!h.cx.did_prompt_for_paths());
+    assert!(h.cx.did_prompt_for_new_path());
+    h.cx.simulate_new_path_selection(|start| {
+        assert_eq!(start, std::path::Path::new("/Users/ruud/Projects"));
+        Some(PathBuf::from("/work/fresh"))
+    });
+    h.cx.run_until_parked();
+    assert_eq!(
+        h.take(),
+        vec![
+            ev(OverlayInput::SetText("/work/fresh".into())),
+            ev(OverlayInput::Submit)
+        ],
+        "typed as the prompt's, then Create"
+    );
+
+    // A cancelled dialog sends nothing.
+    assert_eq!(h.click("overlay-button-choose-folder", 1), vec![]);
+    h.cx.simulate_new_path_selection(|_| None);
+    h.cx.run_until_parked();
+    assert_eq!(h.take(), vec![]);
+}
+
 #[gpui::test]
 fn the_shell_entry_points_open_the_palette_and_a_picked_project(app: &mut TestAppContext) {
     let h = open(app);

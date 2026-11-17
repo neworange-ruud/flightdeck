@@ -454,3 +454,42 @@ fn a_real_fifo_and_a_link_out_of_home_are_not_files() {
     assert_eq!(file_names(&l), ["a.txt", "alias"]);
     assert!(l.files.iter().all(|f| f.size == 5));
 }
+
+// -- plan_create (SPECS §5.3, v12) ------------------------------------------
+
+#[test]
+fn plan_create_defaults_to_the_projects_root_and_creates_it() {
+    let fs = base();
+    let c = conf(&fs);
+    let dest = plan_create(&fs, &c, "fresh", None, Path::new("/home/u/flightdeck")).unwrap();
+    assert_eq!(dest, PathBuf::from("/home/u/flightdeck/fresh"));
+    assert!(fs.is_dir(Path::new("/home/u/flightdeck")), "root made");
+    assert!(
+        !fs.exists(&dest),
+        "the project folder is the caller's to make"
+    );
+}
+
+#[test]
+fn plan_create_uses_a_folder_inside_home() {
+    let fs = base();
+    let c = conf(&fs);
+    let dest = plan_create(&fs, &c, "fresh", Some("~/code"), Path::new("/home/u/x")).unwrap();
+    assert_eq!(dest, PathBuf::from("/home/u/code/fresh"));
+}
+
+#[test]
+fn plan_create_refuses_names_folders_and_places_it_must_not_use() {
+    let fs = base();
+    let c = conf(&fs);
+    let root = Path::new("/home/u/flightdeck");
+    let err = |name: &str, dir: Option<&str>| plan_create(&fs, &c, name, dir, root).unwrap_err();
+    assert!(err("", None).contains("Enter a name"));
+    assert!(err("my app", None).contains("not a usable folder name"));
+    assert!(err("..", None).contains("not a usable folder name"));
+    assert!(err("a/b", None).contains("not a usable folder name"));
+    assert!(err("x", Some("/etc")).contains("outside your home"));
+    assert!(err("x", Some("~/nope")).contains("does not exist"));
+    fs.create_dir_all(Path::new("/home/u/code/taken")).unwrap();
+    assert!(err("taken", Some("~/code")).contains("already exists"));
+}

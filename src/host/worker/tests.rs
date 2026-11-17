@@ -34,6 +34,8 @@ struct Fakes {
     git: Arc<FakeGit>,
     /// Holds the stand-in agent executable.
     dir: TempDir,
+    /// What a `create_project` initialises with: succeeds unless a test says.
+    repo_init: crate::git::init::FakeRepoInitializer,
 }
 
 impl Fakes {
@@ -48,6 +50,7 @@ impl Fakes {
             notifier: WorkerNotifier::new(),
             git: Arc::new(FakeGit::new().with_branches(["main"])),
             dir: TempDir::new().expect("tempdir"),
+            repo_init: crate::git::init::FakeRepoInitializer { outcome: Ok(()) },
         }
     }
 
@@ -59,6 +62,7 @@ impl Fakes {
             container: &self.container,
             command: &self.command,
             terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &self.repo_init,
         }
     }
 
@@ -153,6 +157,7 @@ fn worker_op(seq: u64, name: &str) -> WebInbound {
     let args = json!({
         "path": "projects/x",
         "url": "https://example.invalid/r.git",
+        "name": "fresh",
         "dir": "~",
         "files": [{ "name": "a.txt", "size": 1 }],
         "names": ["a.txt"],
@@ -1797,4 +1802,64 @@ fn a_tui_host_ignores_the_workers_disabled_agents() {
     }))
     .unwrap();
     assert_eq!(offered(&host), ["codex", "cursor", "opencode"]);
+}
+
+// ---------------------------------------------------------------------------
+// New project (SPECS §5.3, v12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_project_refusals_are_worded_and_leave_nothing_behind() {
+    let fakes = Fakes::new();
+    fakes
+        .fs
+        .create_dir_all(Path::new("/home/me/code/taken"))
+        .unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let create =
+        |seq, args: serde_json::Value| worker_op_with(seq, worker_command::CREATE_PROJECT, args);
+    for (seq, args, says) in [
+        (1, json!({ "name": "my app" }), "not a usable folder name"),
+        (
+            2,
+            json!({ "name": "taken", "dir": "~/code" }),
+            "already exists",
+        ),
+        (
+            3,
+            json!({ "name": "x", "dir": "/etc" }),
+            "outside your home",
+        ),
+    ] {
+        let out = host.route_inbound(create(seq, args));
+        let ack = first_ack(&out);
+        assert_eq!(ack.outcome, AckOutcome::Rejected);
+        let detail = ack.detail.as_deref().unwrap_or("");
+        assert!(detail.contains(says), "{detail}");
+    }
+    assert_eq!(host.project_count(), 0);
+}
+
+#[test]
+fn a_failed_first_commit_on_a_worker_removes_the_folder_and_says_why() {
+    let mut fakes = Fakes::new();
+    fakes.repo_init = crate::git::init::FakeRepoInitializer {
+        outcome: Err(crate::git::init::MISSING_IDENTITY.to_string()),
+    };
+    fakes.fs.create_dir_all(Path::new("/home/me/code")).unwrap();
+    let mut host = fakes.worker(Vec::new());
+    let out = host.route_inbound(worker_op_with(
+        1,
+        worker_command::CREATE_PROJECT,
+        json!({ "name": "fresh", "dir": "~/code" }),
+    ));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Rejected);
+    assert!(
+        ack.detail.as_deref().unwrap_or("").contains("user.email"),
+        "{:?}",
+        ack.detail
+    );
+    assert!(!fakes.fs.exists(Path::new("/home/me/code/fresh")));
+    assert_eq!(host.project_count(), 0);
 }
