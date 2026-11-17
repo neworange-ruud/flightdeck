@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# One entry point for driving the tutorial VM (bash, whatever the caller's shell).
+#
+#   tutorials/vm/vm ip                  the guest's IP
+#   tutorials/vm/vm ssh [cmd...]        run a command in the guest (or a shell)
+#   tutorials/vm/vm shot [out.png]      VNC screenshot, full size + a 1280px preview
+#   tutorials/vm/vm do <vncdo args...>  raw vncdotool: type hi, move 10 10 click 1 (pixels: 2x points)
+#   tutorials/vm/vm key cmd-k ...       key chords with Mac names (cmd = VNC alt)
+#   tutorials/vm/vm type "Text: 1!"     type text quickly, Shift handled
+#   tutorials/vm/vm run scene.txt|-     run a scene script (tutorials/vm/vnc_drive.py)
+#   tutorials/vm/vm record start | record stop NAME   screen recording -> 1080p30 MP4
+#   tutorials/vm/vm key-install         put the tutorial SSH key in the guest
+#
+# VM=<name> picks the VM (default fd-tutorial); its `tart run` log, which
+# holds the VNC URL, is target/tutorials/<name>.run.log.
+set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  ip) vm_ip ;;
+  ssh) vm_ssh "$@" ;;
+  key-install) vm_install_key ;;
+  do) vm_vnc_do "$@" ;;
+  run)
+    # Run a scene script (see vnc_drive.py) from a file, or `-` for stdin.
+    read -r addr pass < <(vm_vnc)
+    "$VENV/bin/python" "$(dirname "${BASH_SOURCE[0]}")/vnc_drive.py" "$addr" "$pass" "${1:--}" 2> >(grep -v -e CryptographyDeprecationWarning -e 'encryptor = Cipher' >&2)
+    ;;
+  type)
+    # Text with capitals and symbols, fast (vncdo's own `type` loses Shift).
+    printf 'paste %q\n' "$1" | "$0" run -
+    ;;
+  key)
+    # Mac names for chords: Virtualization.framework's VNC server maps the
+    # X11 Alt key to Command, so `vm key cmd-k` sends alt-k.
+    keys=()
+    for k in "$@"; do keys+=(key "${k//cmd/alt}"); done
+    vm_vnc_do "${keys[@]}"
+    ;;
+  record)
+    # record start            begin a screen recording in the guest (cursor + clicks)
+    # record stop NAME        end it; writes target/tutorials/videos/NAME.mp4 (1080p30)
+    #                         and keeps the 4K original as NAME-4k.mov
+    sub="${1:-}"
+    case "$sub" in
+      start)
+        vm_ssh 'rm -f /tmp/fd-rec.mov; nohup screencapture -v -C -k -x /tmp/fd-rec.mov >/tmp/fd-rec.log 2>&1 & echo $! > /tmp/fd-rec.pid'
+        sleep 1.5  # screencapture needs a moment before the first frame
+        echo "recording"
+        ;;
+      stop)
+        name="${2:?record stop NAME}"
+        vm_ssh 'kill -INT "$(cat /tmp/fd-rec.pid)"; while kill -0 "$(cat /tmp/fd-rec.pid)" 2>/dev/null; do sleep 0.2; done'
+        out="$TUT_STATE/videos"; mkdir -p "$out"
+        vm_ssh 'cat /tmp/fd-rec.mov' > "$out/$name-4k.mov"
+        ffmpeg -loglevel error -y -i "$out/$name-4k.mov" \
+          -vf "fps=30,scale=1920:1080:flags=lanczos,format=yuv420p" \
+          -c:v libx264 -preset slow -crf 18 -movflags +faststart -an "$out/$name.mp4"
+        echo "$out/$name.mp4"
+        ;;
+      *) echo "record start | record stop NAME" >&2; exit 2 ;;
+    esac
+    ;;
+  shot)
+    out="${1:-$TUT_STATE/shot.png}"
+    vm_vnc_do capture "$out"
+    "$VENV/bin/python" - "$out" <<'PY'
+import sys
+from PIL import Image
+path = sys.argv[1]
+im = Image.open(path)
+small = path.rsplit(".", 1)[0] + "-preview.png"
+im.resize((1280, round(1280 * im.height / im.width))).save(small)
+print(f"{path} {im.width}x{im.height}\n{small}")
+PY
+    ;;
+  *) sed -n '2,12p' "$0"; exit 2 ;;
+esac

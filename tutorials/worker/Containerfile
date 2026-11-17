@@ -27,9 +27,9 @@ RUN git config --global user.name "Dev" \
     && git config --global init.defaultBranch main
 
 # The mock projects (tutorials/projects/*), each a git repo with one commit,
-# under ~/projects where a tutorial opens them.
-COPY --chown=dev:dev projects /home/dev/projects
-RUN for p in /home/dev/projects/*/; do \
+# in ~/flightdeck: the folder the worker's Open Project list shows.
+COPY --chown=dev:dev projects /home/dev/flightdeck
+RUN for p in /home/dev/flightdeck/*/; do \
         git -C "$p" init -q && git -C "$p" add -A \
         && git -C "$p" commit -q -m "Initial commit"; \
     done
