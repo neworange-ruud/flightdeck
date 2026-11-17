@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **`flightdeck worker status` no longer reports a running worker as "starting" on macOS.** Once the worker's status answer grew past 4 KiB (a few projects and devices), the second read failed: macOS refuses to change a socket's read timeout after the other end has closed it. That error was then shown as "no answer". The reader now carries on. If a running worker's answer can't be read for any other reason, `worker status` says so and exits with 1.
 
 ## [1.38.0] - 2026-11-16
 

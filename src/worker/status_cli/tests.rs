@@ -352,6 +352,47 @@ mod over_the_socket {
         assert_eq!(json["devices"][0]["id"], "tok1");
     }
 
+    /// `remote-control-4kc7`: a worker that answers, but not with a status,
+    /// is reported as such instead of passing for one still starting.
+    #[test]
+    fn status_says_when_a_running_worker_could_not_report() {
+        let h = home();
+        let _server = answering(&h.paths, |_| ControlResponse::Error {
+            message: "boom".to_string(),
+        });
+        let (code, _, err) = run(|o, e| status_to(&h.paths, false, o, e));
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("the worker is running but could not report its status: boom"),
+            "{err}"
+        );
+    }
+
+    /// The bug itself, end to end: a status report bigger than one 4 KiB
+    /// read is read whole.
+    #[test]
+    fn a_status_report_over_4_kib_is_read_whole() {
+        let h = home();
+        let mut runtime = sample_runtime();
+        let template = runtime.devices[0].clone();
+        runtime.devices = (0..60)
+            .map(|i| {
+                let mut d = template.clone();
+                d.id = format!("tok{i}");
+                d
+            })
+            .collect();
+        assert!(serde_json::to_string(&runtime).unwrap().len() > 4096);
+        let _server = answering(&h.paths, move |_| {
+            ControlResponse::Status(Box::new(runtime.clone()))
+        });
+        let (code, out, err) = run(|o, e| status_to(&h.paths, true, o, e));
+        assert_eq!(code, 0, "{err}");
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["devices"][59]["id"], "tok59");
+    }
+
     #[test]
     fn commands_that_need_a_worker_say_how_to_start_one() {
         let h = home();

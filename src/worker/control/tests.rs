@@ -251,6 +251,53 @@ mod transport {
         loop_thread.join().unwrap();
     }
 
+    /// `remote-control-4kc7`: an answer longer than one 4 KiB read, from a
+    /// peer that has already closed its end. On macOS narrowing the read
+    /// timeout then fails with `EINVAL`; the reader must carry on.
+    #[test]
+    fn a_long_line_from_a_peer_that_already_closed_is_read_whole() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        // More than one 4 KiB read, but within the pair's send buffer (8 KiB
+        // on macOS), so it is all written — and the end closed — first.
+        let body = "x".repeat(6 * 1024);
+        writer.write_all(body.as_bytes()).unwrap();
+        writer.write_all(b"\n").unwrap();
+        drop(writer);
+        // This very call fails with EINVAL on macOS now the peer has closed:
+        // the bug's cause, here in plain sight.
+        let _ = reader.set_read_timeout(Some(Duration::from_secs(5)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = super::super::unix::read_line(&mut reader, deadline, 1024 * 1024)
+            .expect("the whole line");
+        assert_eq!(line.len(), body.len());
+    }
+
+    /// The same, end to end: a worker whose status answer is over 4 KiB,
+    /// written and closed before the client reads the rest.
+    #[test]
+    fn a_request_reads_an_answer_longer_than_4_kib_from_a_closed_peer() {
+        use std::os::unix::net::UnixListener;
+        let dir = short_dir();
+        let socket = socket_in(&dir);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let message = "y".repeat(12 * 1024);
+        let answer = serde_json::to_string(&ControlResponse::Error {
+            message: message.clone(),
+        })
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            // Read the request line, then answer and close at once.
+            while stream.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
+            stream.write_all(answer.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let got = request(&socket, &ControlRequest::Status, Duration::from_secs(5));
+        server.join().unwrap();
+        assert_eq!(got, Ok(ControlResponse::Error { message }));
+    }
+
     #[test]
     fn the_socket_is_private_to_the_account() {
         use std::os::unix::fs::PermissionsExt;
