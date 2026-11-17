@@ -74,6 +74,11 @@ pub struct TerminalProfile {
     pub env: &'static [(&'static str, &'static str)],
 }
 
+/// What a terminal that renders colour tells the programs inside it, for a
+/// front-end with no host terminal whose `TERM` they could inherit.
+pub const COLOR_TERMINAL_ENV: &[(&str, &str)] =
+    &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
 /// An RGB colour, as `TerminalGrid::set_default_colors` takes it.
 pub type Rgb = (u8, u8, u8);
 
@@ -85,6 +90,16 @@ impl TerminalProfile {
         emulator: TUI_EMULATOR,
         default_colors: None,
         env: &[],
+    };
+
+    /// `flightdeck worker`'s terminals: the TUI's emulator, plus
+    /// [`COLOR_TERMINAL_ENV`]. A worker has no host terminal to inherit `TERM`
+    /// from — under systemd or launchd it has none at all — and an agent
+    /// without one renders without colour.
+    pub const WORKER: TerminalProfile = TerminalProfile {
+        emulator: TUI_EMULATOR,
+        default_colors: None,
+        env: COLOR_TERMINAL_ENV,
     };
 
     /// A fresh grid for this profile at `rows` x `cols`.
@@ -814,6 +829,27 @@ mod tests {
             vec![Vec::new()],
             "inherits the host terminal's"
         );
+    }
+
+    #[test]
+    fn the_worker_profile_gives_every_terminal_a_colour_term() {
+        assert_eq!(TerminalProfile::WORKER.emulator, TUI_EMULATOR);
+        let pty = FakePty::new();
+        pty.queue_session();
+        pty.queue_session();
+        let mut session = Session::new();
+        session.set_profile(TerminalProfile::WORKER);
+        session
+            .spawn_primary(&pty, "claude", &[], Path::new(CWD), sz())
+            .unwrap();
+        session
+            .spawn_child(&pty, "sh", &[], Path::new(CWD), sz())
+            .unwrap();
+        for env in pty.spawn_envs() {
+            let env: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+            assert_eq!(env["TERM"], "xterm-256color");
+            assert_eq!(env["COLORTERM"], "truecolor");
+        }
     }
 
     /// Regression: resizing to a tiny grid and then feeding output must not

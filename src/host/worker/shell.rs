@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::contracts::{ProcessState, PtyBackend, PtySize, Result};
 use crate::terminal::grid::TUI_EMULATOR;
-use crate::terminal::session::{Terminal, MIN_GRID_COLS, MIN_GRID_ROWS};
+use crate::terminal::session::{Terminal, COLOR_TERMINAL_ENV, MIN_GRID_COLS, MIN_GRID_ROWS};
 use crate::web::protocol::{worker_shell_terminal_id, Geometry, TerminalId};
 use crate::web::stream::Written;
 
@@ -92,10 +92,10 @@ impl WorkerShell {
     ) -> Result<()> {
         self.terminate();
         let (program, args) = login_shell(env_shell, exists);
-        let env = [
-            ("TERM".to_string(), "xterm-256color".to_string()),
-            ("COLORTERM".to_string(), "truecolor".to_string()),
-        ];
+        let env: Vec<(String, String)> = COLOR_TERMINAL_ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let mut terminal =
             Terminal::spawn(pty, TUI_EMULATOR, &program, &args, &env, home, self.size)?;
         terminal.title = self.title.clone();

@@ -169,7 +169,7 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
         clock: &clock,
         container: &container,
         command: &command,
-        terminal: crate::terminal::session::TerminalProfile::TUI,
+        terminal: crate::terminal::session::TerminalProfile::WORKER,
         repo_init: &crate::git::init::REAL_REPO_INIT,
     };
     let notifier = WorkerNotifier::new();
