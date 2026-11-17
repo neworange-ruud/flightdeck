@@ -1,0 +1,40 @@
+WEBVTT
+
+00:00:00.684 --> 00:00:03.824
+Every worker also serves FlightDeck Web:
+
+00:00:03.824 --> 00:00:06.885
+the same control surface, in a browser.
+
+00:00:06.885 --> 00:00:11.830
+Use it from a laptop without the Desktop app, or from a tablet.
+
+00:00:12.210 --> 00:00:17.690
+To pair a browser, ask the worker for a pairing code, here in a worker shell.
+
+00:00:18.646 --> 00:00:23.162
+Next to the address and the code, it prints a link for a browser.
+
+00:00:23.162 --> 00:00:27.330
+The code is in the link, so opening it signs the browser in.
+
+00:00:28.394 --> 00:00:31.506
+Open it in any browser that can reach the worker.
+
+00:00:36.367 --> 00:00:42.730
+You're in. The browser shows the worker's projects, its agents, and their live terminals.
+
+00:00:43.184 --> 00:00:48.711
+Start agents and shells here, and type into any terminal, just like in the Desktop.
+
+00:00:49.157 --> 00:00:54.126
+Control G opens the command palette, with the same commands as the Desktop.
+
+00:00:56.246 --> 00:00:58.891
+A worker serves one window at a time.
+
+00:00:58.891 --> 00:01:02.608
+Back in the Desktop app, the browser has taken over.
+
+00:01:03.061 --> 00:01:09.423
+Reconnect takes it back. The browser stays paired, so it can take over again whenever you need it.

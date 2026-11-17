@@ -27,6 +27,7 @@ rm -rf "$CONTEXT" && mkdir -p "$CONTEXT"
 cp "$ROOT/target/tutorials/linux/flightdeck" "$CONTEXT/"
 cp -R "$ROOT/tutorials/projects" "$CONTEXT/projects"
 cp -R "$ROOT/tutorials/worker/bin" "$ROOT/tutorials/worker/home" "$CONTEXT/"
+cp -R "$ROOT/webui/dist" "$CONTEXT/webui-dist"
 podman build -t fd-tutorial-worker -f "$ROOT/tutorials/worker/Containerfile" "$CONTEXT"
 
 podman rm -f "$NAME" >/dev/null 2>&1 || true

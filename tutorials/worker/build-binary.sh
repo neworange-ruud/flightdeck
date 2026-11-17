@@ -16,6 +16,10 @@ OUT="$ROOT/target/tutorials/linux"
 IMAGE="${RUST_IMAGE:-docker.io/library/rust:1-bookworm}"
 mkdir -p "$OUT"
 
+# FlightDeck Web (the browser client) is embedded from webui/dist at build
+# time; without it the worker serves a "webui was not built" page.
+(cd "$ROOT/webui" && npm ci --silent && npm run build --silent >/dev/null)
+
 podman run --rm \
   -v "$ROOT":/src:ro \
   -v fd-tutorial-cargo-registry:/usr/local/cargo/registry \

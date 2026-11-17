@@ -25,6 +25,10 @@ COPY --chown=dev:dev home/ /home/dev/
 # prints its own name. The wrapper shows this box's name, devbox, instead.
 COPY flightdeck /usr/local/lib/flightdeck/flightdeck
 COPY bin/flightdeck bin/worker-start /usr/local/bin/
+# FlightDeck Web's files. A debug build does not embed them: rust-embed reads
+# them at run time from where they were at build time (/src in
+# build-binary.sh's container), so they go there.
+COPY webui-dist /src/webui/dist
 
 USER dev
 WORKDIR /home/dev
