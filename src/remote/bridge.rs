@@ -34,7 +34,9 @@
 //! render tick — nobody is there yet to receive it (remote-control-0ef.13) —
 //! but the instant a pairing becomes active the throttle is bypassed and a
 //! sync runs unconditionally, so a late-pairing phone still gets full history
-//! on that very tick.
+//! on that very tick. While paired it runs every
+//! [`PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`], plus at once for a session whose
+//! status just changed or whose prompt is still settling (remote-control-gcn3).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -76,13 +78,42 @@ const PROMPT_SETTLE_MS: u64 = 750;
 /// Cadence used to gate [`RemoteBridge::sync_transcript`] while no phone is
 /// paired. Resolving the agent's JSONL path and stat/reading it incrementally
 /// on every render tick is wasted filesystem work when there is no peer to
-/// receive the reconstructed history (remote-control-0ef.13). Once a phone IS
-/// paired the sync runs every tick as before (see the `is_paired()` check in
-/// [`RemoteBridge::tick`]), and that same check unconditionally bypasses this
-/// throttle on the tick a pairing becomes active, so a late-pairing phone
-/// still receives full history immediately rather than waiting out the
-/// window.
+/// receive the reconstructed history (remote-control-0ef.13). The tick a
+/// pairing becomes active bypasses it, so a late-pairing phone still receives
+/// full history immediately rather than waiting out the window.
 const UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS: i64 = 3_000;
+
+/// Cadence of [`RemoteBridge::sync_transcript`] while a phone is paired.
+///
+/// It used to run every tick, which on a worker is every 5–25 ms: for each
+/// session, resolve its session file (a walk of `~/.codex/sessions`, a listing
+/// of Claude's project folder) or query OpenCode's DB. With a few sessions that
+/// alone kept a core half busy (remote-control-gcn3). Half a second is still
+/// live for a person reading a transcript, and two cases skip the wait: a
+/// session whose status just changed (a turn ended, a prompt appeared), and a
+/// Claude wait whose question is still settling within [`PROMPT_SETTLE_MS`] —
+/// both sync on the tick they are seen.
+const PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS: i64 = 500;
+
+/// How long a session's resolved transcript source is trusted before it is
+/// looked up again. Finding it is the expensive half of a sync (directory
+/// walks), and it changes only when the agent starts a new session.
+const SOURCE_RESOLVE_INTERVAL_MS: i64 = 5_000;
+
+/// The same, while no source has been found yet: an agent that has just
+/// started writes its first session file soon, and the phone should see it
+/// without waiting the full [`SOURCE_RESOLVE_INTERVAL_MS`].
+const SOURCE_RETRY_INTERVAL_MS: i64 = 2_000;
+
+/// A session's transcript source as last resolved
+/// ([`RemoteBridge::sync_transcript`]): reused until the agent or worktree
+/// changes or [`SOURCE_RESOLVE_INTERVAL_MS`] passes.
+struct CachedSource {
+    agent: String,
+    worktree: PathBuf,
+    resolved_at_ms: i64,
+    source: Option<crate::remote::transcript::TranscriptSource>,
+}
 
 /// How long an outbound envelope may sit un-acknowledged by the phone before the
 /// peer stops counting as *live* (remote-control-5qu).
@@ -339,13 +370,16 @@ pub struct RemoteBridge {
     /// from the persisted high-water mark so the phone's dedup never stalls.
     out_seq: u64,
     /// Clock-ms (from the caller-supplied `now_ms`, i.e. the injected clock —
-    /// see [`crate::contracts::Clock`]) of the last transcript sync performed
-    /// while unpaired, throttling [`Self::sync_transcript`] to
-    /// [`UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`] when no phone is present
-    /// (remote-control-0ef.13). `None` before the first unpaired sync, so the
-    /// very first tick always syncs. Irrelevant once paired: `tick()` forces a
-    /// sync every tick while `is_paired()` is true, regardless of this timer.
-    last_unpaired_sync_ms: Option<i64>,
+    /// see [`crate::contracts::Clock`]) of the last tick that synced every
+    /// session's transcript, and whether a phone was paired then. Throttles
+    /// [`Self::sync_transcript`] to [`PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`] or
+    /// [`UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`] (remote-control-0ef.13,
+    /// remote-control-gcn3). `None` before the first sync, so the very first
+    /// tick always syncs; a pairing that became active since forces one too.
+    last_transcript_sync: Option<(i64, bool)>,
+    /// Each session's resolved transcript source, with the agent and worktree
+    /// it was resolved for and when (see [`SOURCE_RESOLVE_INTERVAL_MS`]).
+    transcript_sources: HashMap<SessionId, CachedSource>,
     /// Keystrokes queued to inject into a session's primary PTY after a short
     /// delay: `(session, due_ms, bytes)`. Used for Claude's multi-select submit
     /// Enter, which must arrive AFTER the Tab-driven switch to the Confirm tab
@@ -394,7 +428,8 @@ impl RemoteBridge {
             open,
             home: None,
             out_seq: 0,
-            last_unpaired_sync_ms: None,
+            last_transcript_sync: None,
+            transcript_sources: HashMap::new(),
             deferred_pty: Vec::new(),
             images: Default::default(),
         }
@@ -514,10 +549,36 @@ impl RemoteBridge {
         let Some(home) = self.home.clone() else {
             return;
         };
-        let Some(source) = crate::remote::transcript::resolve_source(agent, worktree, &home) else {
+        let sid = SessionId::new(session_id);
+        let fresh = self.transcript_sources.get(&sid).is_some_and(|cached| {
+            let ttl = if cached.source.is_some() {
+                SOURCE_RESOLVE_INTERVAL_MS
+            } else {
+                SOURCE_RETRY_INTERVAL_MS
+            };
+            cached.agent == agent
+                && cached.worktree == worktree
+                && now_ms.saturating_sub(cached.resolved_at_ms) < ttl
+        });
+        if !fresh {
+            let source = crate::remote::transcript::resolve_source(agent, worktree, &home);
+            self.transcript_sources.insert(
+                sid.clone(),
+                CachedSource {
+                    agent: agent.to_string(),
+                    worktree: worktree.to_path_buf(),
+                    resolved_at_ms: now_ms,
+                    source,
+                },
+            );
+        }
+        let Some(source) = self
+            .transcript_sources
+            .get(&sid)
+            .and_then(|cached| cached.source.clone())
+        else {
             return;
         };
-        let sid = SessionId::new(session_id);
         self.transcripts
             .entry(sid.clone())
             .or_insert_with(|| TranscriptBuilder::new(sid))
@@ -939,22 +1000,28 @@ impl RemoteBridge {
         send: &mut dyn FnMut(RemoteOutbound),
     ) {
         // Whether this tick performs the (filesystem-touching) transcript sync
-        // below. Paired: sync every tick, as before — a phone is actively
-        // receiving history and responsiveness matters. Unpaired: throttle to
+        // for every session. Paired: every `PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`
+        // (remote-control-gcn3). Unpaired: every
         // `UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS`, since nobody is there to
-        // receive it (remote-control-0ef.13). `currently_paired` alone forces
-        // this true on the very tick a pairing becomes active — no separate
-        // "just paired" bookkeeping needed — so a late-pairing phone still
-        // gets a sync (and thus full history) immediately on (re)pair.
+        // receive it (remote-control-0ef.13). The tick a pairing becomes
+        // active always syncs, so a late-pairing phone gets full history at
+        // once. A single session also syncs off-cadence when its status
+        // changed or its prompt is settling (below).
         let now_i64 = now_ms as i64;
         let currently_paired = self.is_paired();
-        let sync_transcripts_this_tick = currently_paired
-            || match self.last_unpaired_sync_ms {
-                None => true,
-                Some(last) => now_i64.saturating_sub(last) >= UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS,
-            };
-        if sync_transcripts_this_tick && !currently_paired {
-            self.last_unpaired_sync_ms = Some(now_i64);
+        let interval = if currently_paired {
+            PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS
+        } else {
+            UNPAIRED_TRANSCRIPT_SYNC_INTERVAL_MS
+        };
+        let sync_transcripts_this_tick = match self.last_transcript_sync {
+            None => true,
+            // A pairing that became active since: full history at once.
+            Some((_, was_paired)) if currently_paired && !was_paired => true,
+            Some((last, _)) => now_i64.saturating_sub(last) >= interval,
+        };
+        if sync_transcripts_this_tick {
+            self.last_transcript_sync = Some((now_i64, currently_paired));
         }
 
         // Pre-pass: per-session edge detection (events + needs-input preview).
@@ -969,7 +1036,16 @@ impl RemoteBridge {
                 // later still receives the accumulated history (remote-control-72k).
                 // Throttled while unpaired; see `sync_transcripts_this_tick` above.
                 let worktree = tab.meta.worktree_path_relative.resolve(&pv.state.repo_root);
-                if sync_transcripts_this_tick {
+                let ds = tab.display_status(now_ms);
+                let interpreted = ds.interpreted;
+                let status = feed::agent_status(ds);
+                // Off-cadence for this session alone: a status edge (the turn
+                // ended, a prompt appeared) wants the transcript as it is now,
+                // and a deferred Claude wait resolves only once its question is
+                // ingested, inside `PROMPT_SETTLE_MS`.
+                let session_needs_sync = self.prev_status.get(&sid) != Some(&status)
+                    || self.needs_input_since.contains_key(&sid);
+                if sync_transcripts_this_tick || session_needs_sync {
                     self.sync_transcript(&tab.meta.id, &tab.meta.agent, &worktree, now_i64);
                 }
 
@@ -986,10 +1062,6 @@ impl RemoteBridge {
                     .and_then(|f| f.parent()?.parent())
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| worktree.clone());
-
-                let ds = tab.display_status(now_ms);
-                let interpreted = ds.interpreted;
-                let status = feed::agent_status(ds);
 
                 // Needs-input edge → capture preview + inline permission prompt.
                 let was_needs = matches!(self.prev_status.get(&sid), Some(AgentStatus::NeedsInput));
@@ -1199,6 +1271,8 @@ impl RemoteBridge {
         // A session closed while its done push was pending must never push.
         self.push.retain_sessions(|sid| live_sessions.contains(sid));
         self.held_needs_input
+            .retain(|sid, _| live_sessions.contains(sid));
+        self.transcript_sources
             .retain(|sid, _| live_sessions.contains(sid));
 
         // Nothing to transmit without a pairing (state kept for the next pair), or

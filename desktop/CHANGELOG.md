@@ -25,6 +25,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- **Much less CPU while a phone is paired.** FlightDeck used to rebuild every session's transcript for the phone on every loop tick (a worker ticks every 5–25 ms). Each rebuild walked `~/.codex/sessions`, listed Claude's project folder, and opened OpenCode's database afresh, which can be tens of gigabytes. A worker with a few sessions spent about half a core on this. Transcripts now sync every half second. A session whose status changes syncs at once, so a finished turn or a new question still reaches the phone straight away. Where each session's file lives is looked up again only every few seconds, and the OpenCode database stays open between reads.
 - The Windows MSI is published as `FlightDeck-<version>-windows-x86_64.msi`,
   with a `.sha256` checksum.
 - `cargo run -p flightdeck-desktop --example update_smoke -- <copy> <version>`
