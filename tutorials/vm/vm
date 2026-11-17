@@ -42,9 +42,11 @@ case "$cmd" in
     sub="${1:-}"
     case "$sub" in
       start)
-        printf '%s start\n' "$(python3 -c 'import time; print(f"{time.time():.3f}")')" > "$TUT_TIMELINE"
+        : > "$TUT_TIMELINE"
         "$0" mark cut
         vm_ssh 'rm -f /tmp/fd-rec.mov; nohup screencapture -v -C -k -x /tmp/fd-rec.mov >/tmp/fd-rec.log 2>&1 & echo $! > /tmp/fd-rec.pid'
+        # The video's t=0 is reckoned from this mark (see edit.py).
+        "$0" mark start
         sleep 2  # screencapture's start-up; cut from the video
         "$0" mark uncut
         echo "recording"

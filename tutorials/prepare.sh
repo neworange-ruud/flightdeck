@@ -66,7 +66,7 @@ pause 0.8
 move 260 262
 click
 pause 2.5
-move 960 1300
+move 1500 560
 EOF
 "$VMCTL" shot >/dev/null
 echo "stage: worker window, full screen ($("$VMCTL" ip))"

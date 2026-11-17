@@ -4,11 +4,10 @@
 
 The timeline holds host timestamps: `start` and `stop` (written by `vm record`)
 and the marks a scene wrote (see vnc_drive.py): cut/uncut, fast/normal,
-caption. screencapture starts a moment after it is launched, so the video's
-t=0 is placed at stop - duration (the stop mark is written right before the
-stop signal, over an already-open SSH connection). The recording is
-variable frame rate (a frame only when the screen changes), so it is made
-constant before trimming.
+caption. The video's t=0 is the start mark plus screencapture's start-up
+time (or an explicit `t0 EPOCH` line). The recording is variable frame rate
+(a frame only when the screen changes), so it is made constant before
+trimming.
 
 Output: 1920x1080, 30 fps, H.264. Cut stretches are dropped, fast stretches
 sped up (with a small "Nx" badge), captions drawn as a bar at the bottom.
@@ -29,6 +28,9 @@ FONT = "/System/Library/Fonts/SFNS.ttf"
 # macOS draws a purple "screen is being recorded" dot in the top-right corner
 # of a full-screen app; paint it out from the pixels around it.
 INDICATOR = "delogo=x=1898:y=1:w=20:h=17"
+# From launching screencapture to its first frame (measured on a take by the
+# frame where a click's effect appears).
+START_LATENCY = 0.35
 
 
 @dataclass
@@ -52,15 +54,20 @@ def segments(timeline: Path, video_len: float) -> list[Segment]:
     for line in timeline.read_text().splitlines():
         stamp, *words = shlex.split(line)
         marks.append((float(stamp), words))
-    start = next(t for t, w in marks if w[0] == "start")
-    stop = next(t for t, w in reversed(marks) if w[0] == "stop")
-    t0 = stop - video_len  # host time of the video's first frame
-    del start
+    # Host time of the video's first frame: an explicit `t0` mark if a take
+    # was synced by hand, else the start mark (written right after
+    # screencapture was launched) plus its start-up time. Not the stop: the
+    # file's end does not line up with the stop signal.
+    explicit = [t for t, w in marks if w[0] == "t0"]
+    if explicit:
+        t0 = float(next(w[1] for t, w in marks if w[0] == "t0"))
+    else:
+        t0 = next(t for t, w in marks if w[0] == "start") + START_LATENCY
 
     segs, cut, speed, caption, at = [], False, 1.0, "", 0.0
     for t, words in sorted(marks):
         kind, args = words[0], words[1:]
-        if kind in ("start", "stop"):
+        if kind in ("start", "stop", "t0"):
             continue
         vt = min(max(t - t0, 0.0), video_len)
         if vt > at and not cut:
