@@ -18,6 +18,16 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [2.0.1] - 2026-11-17
+
+### Improvements
+
 - About FlightDeck is now a small window of its own. It shows the product
   name, the app's version, "Created and maintained by Ruud van Falier" (the
   name opens a mail to him) and a link to www.flightdeckai.app. From the app
