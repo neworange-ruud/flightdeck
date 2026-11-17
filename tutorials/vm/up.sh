@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start a fresh tutorial VM: a copy-on-write clone of the prepared base image
-# (see tutorials/README.md), booted headless with VNC and the shared folder,
+# (see tutorials/README.md), booted headless with the shared folder,
 # with FlightDeck.app from target/desktop-dist installed in /Applications.
 #
 #   tutorials/vm/up.sh          throw away the previous clone, start a new one
@@ -27,6 +27,7 @@ fi
 for _ in $(seq 1 60); do grep -q 'vnc://' "$VM_RUN_LOG" 2>/dev/null && break; sleep 1; done
 vm_ip >/dev/null
 for _ in $(seq 1 60); do vm_ssh true 2>/dev/null && break; sleep 2; done
+vm_vnc_daemon
 
 # Install the app through the shared folder (ditto keeps the bundle intact).
 rm -rf "$VM_SHARE/FlightDeck.app"

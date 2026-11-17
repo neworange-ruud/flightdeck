@@ -2,9 +2,18 @@
 #
 # The VM is a Tart clone of a Cirrus Labs "vanilla" macOS image: user
 # admin/admin, auto-login, SSH on. Vanilla images have no Tart guest agent,
-# so commands go over SSH (a key is installed on first contact) and the
-# screen over VNC (Virtualization.framework's own server, so input arrives
-# as from real hardware and needs no permission inside the guest).
+# so commands go over SSH (a key is installed on first contact), input over
+# Tart's --vnc-experimental server, and screenshots/recordings with
+# screencapture over SSH.
+#
+# That VNC server is Virtualization.framework's private _VZVNCServer: no
+# "screen is being controlled" banner or menu-bar indicator in the guest (the
+# guest's own Screen Sharing shows both, on every connection), and input
+# arrives as from real hardware. Its one known crash: a client connecting
+# while the guest is recording its screen can take the whole VM down
+# (assertion in -[_VZVNCServer _setupVirtualMachineAccessor]). So one daemon
+# (vnc_drive.py serve) connects once per boot, before any recording, and
+# everything else sends it scripts over a unix socket; nothing else connects.
 
 TUT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TUT_STATE="$TUT_ROOT/target/tutorials"
@@ -18,6 +27,8 @@ VM_SHARE="$TUT_STATE/share"
 VM_GUEST_SHARE="/Volumes/My Shared Files/share"
 VM_KEY="$TUT_STATE/ssh/id_ed25519"
 VM_RUN_LOG="$TUT_STATE/$VM.run.log"
+# Editing marks of the recording in progress (see vnc_drive.py, edit.py).
+export TUT_TIMELINE="$TUT_STATE/timeline.log"
 VENV="$TUT_ROOT/.tutorial-venv"
 # vncdotool's VNC auth uses TripleDES, which `cryptography` warns about.
 export PYTHONWARNINGS="ignore"
@@ -25,8 +36,12 @@ export PYTHONWARNINGS="ignore"
 mkdir -p "$VM_SHARE" "$(dirname "$VM_KEY")"
 [[ -f "$VM_KEY" ]] || ssh-keygen -q -t ed25519 -N '' -C fd-tutorial -f "$VM_KEY"
 
+# One shared connection per guest (ControlMaster): a call then takes
+# milliseconds instead of a second of handshake, which also keeps the
+# recording's stop mark in step with the moment screencapture is stopped.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-          -o LogLevel=ERROR -o ConnectTimeout=5)
+          -o LogLevel=ERROR -o ConnectTimeout=5
+          -o ControlMaster=auto -o "ControlPath=${TMPDIR%/}/fdt-%h" -o ControlPersist=15m)
 
 vm_ip() { tart ip "$VM" --wait "${1:-120}"; }
 
@@ -64,9 +79,26 @@ print(f"{u.hostname}::{u.port} {u.password or ''}")
 PY
 }
 
-# vncdo against the running VM: `vm_vnc_do key cmd-space type hello`.
-vm_vnc_do() {
+VNC_SOCK="${TMPDIR%/}/fdt-vnc.sock"
+VNC_LOG="$TUT_STATE/vncd.log"
+
+# (Re)start the VNC daemon for the running VM: only right after boot, never
+# while recording (connecting then can crash the VM).
+vm_vnc_daemon() {
   local addr pass
   read -r addr pass < <(vm_vnc)
-  "$VENV/bin/vncdo" -s "$addr" ${pass:+-p "$pass"} "$@"
+  pkill -f "vnc_drive.py serve" 2>/dev/null || true
+  rm -f "$VNC_SOCK"
+  nohup "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" serve "$addr" "$pass" "$VNC_SOCK" \
+    < /dev/null > "$VNC_LOG" 2>&1 &
+  disown
+  for _ in $(seq 1 100); do grep -q "daemon ready" "$VNC_LOG" 2>/dev/null && return 0; sleep 0.2; done
+  echo "VNC daemon did not start; see $VNC_LOG" >&2
+  return 1
+}
+
+# Run a scene script through the daemon: `vm_vnc_run file|-`.
+vm_vnc_run() {
+  [[ -S "$VNC_SOCK" ]] || { echo "no VNC daemon ($VNC_SOCK); run tutorials/vm/up.sh" >&2; return 1; }
+  "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" send "$VNC_SOCK" "${1:--}"
 }

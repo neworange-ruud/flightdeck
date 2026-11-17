@@ -4,15 +4,15 @@
 #   tutorials/vm/vm ip                  the guest's IP
 #   tutorials/vm/vm ssh [cmd...]        run a command in the guest (or a shell)
 #   tutorials/vm/vm shot [out.png]      VNC screenshot, full size + a 1280px preview
-#   tutorials/vm/vm do <vncdo args...>  raw vncdotool: type hi, move 10 10 click 1 (pixels: 2x points)
-#   tutorials/vm/vm key cmd-k ...       key chords with Mac names (cmd = VNC alt)
+#   tutorials/vm/vm key cmd-k ...       key chords with Mac names
+#   tutorials/vm/vm vnc-restart         reconnect the VNC daemon (never while recording)
 #   tutorials/vm/vm type "Text: 1!"     type text quickly, Shift handled
 #   tutorials/vm/vm run scene.txt|-     run a scene script (tutorials/vm/vnc_drive.py)
-#   tutorials/vm/vm record start | record stop NAME   screen recording -> 1080p30 MP4
+#   tutorials/vm/vm record start | record stop NAME   screen recording -> edited 1080p30 MP4
+#   tutorials/vm/vm mark cut|uncut|fast N|normal|caption TEXT   editing marks
 #   tutorials/vm/vm key-install         put the tutorial SSH key in the guest
 #
-# VM=<name> picks the VM (default fd-tutorial); its `tart run` log, which
-# holds the VNC URL, is target/tutorials/<name>.run.log.
+# VM=<name> picks the VM (default fd-tutorial).
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -21,50 +21,56 @@ case "$cmd" in
   ip) vm_ip ;;
   ssh) vm_ssh "$@" ;;
   key-install) vm_install_key ;;
-  do) vm_vnc_do "$@" ;;
+  vnc-restart) vm_vnc_daemon ;;
   run)
     # Run a scene script (see vnc_drive.py) from a file, or `-` for stdin.
-    read -r addr pass < <(vm_vnc)
-    "$VENV/bin/python" "$(dirname "${BASH_SOURCE[0]}")/vnc_drive.py" "$addr" "$pass" "${1:--}" 2> >(grep -v -e CryptographyDeprecationWarning -e 'encryptor = Cipher' >&2)
+    vm_vnc_run "${1:--}"
     ;;
   type)
     # Text with capitals and symbols, fast (vncdo's own `type` loses Shift).
     printf 'paste %q\n' "$1" | "$0" run -
     ;;
   key)
-    # Mac names for chords: Virtualization.framework's VNC server maps the
-    # X11 Alt key to Command, so `vm key cmd-k` sends alt-k.
-    keys=()
-    for k in "$@"; do keys+=(key "${k//cmd/alt}"); done
-    vm_vnc_do "${keys[@]}"
+    # Key chords with Mac names: `vm key cmd-a backspace` (see vnc_drive.py).
+    printf 'key %s\n' "$*" | vm_vnc_run -
     ;;
   record)
     # record start            begin a screen recording in the guest (cursor + clicks)
-    # record stop NAME        end it; writes target/tutorials/videos/NAME.mp4 (1080p30)
-    #                         and keeps the 4K original as NAME-4k.mov
+    #                         and a fresh timeline for the scene's editing marks
+    # record stop NAME        end it; cut it into target/tutorials/videos/NAME.mp4
+    #                         (1080p30, see edit.py), keeping NAME-raw.mov (4K)
     sub="${1:-}"
     case "$sub" in
       start)
+        printf '%s start\n' "$(python3 -c 'import time; print(f"{time.time():.3f}")')" > "$TUT_TIMELINE"
+        "$0" mark cut
         vm_ssh 'rm -f /tmp/fd-rec.mov; nohup screencapture -v -C -k -x /tmp/fd-rec.mov >/tmp/fd-rec.log 2>&1 & echo $! > /tmp/fd-rec.pid'
-        sleep 1.5  # screencapture needs a moment before the first frame
+        sleep 2  # screencapture's start-up; cut from the video
+        "$0" mark uncut
         echo "recording"
         ;;
       stop)
         name="${2:?record stop NAME}"
+        printf '%s stop\n' "$(python3 -c 'import time; print(f"{time.time():.3f}")')" >> "$TUT_TIMELINE"
         vm_ssh 'kill -INT "$(cat /tmp/fd-rec.pid)"; while kill -0 "$(cat /tmp/fd-rec.pid)" 2>/dev/null; do sleep 0.2; done'
         out="$TUT_STATE/videos"; mkdir -p "$out"
-        vm_ssh 'cat /tmp/fd-rec.mov' > "$out/$name-4k.mov"
-        ffmpeg -loglevel error -y -i "$out/$name-4k.mov" \
-          -vf "fps=30,scale=1920:1080:flags=lanczos,format=yuv420p" \
-          -c:v libx264 -preset slow -crf 18 -movflags +faststart -an "$out/$name.mp4"
-        echo "$out/$name.mp4"
+        vm_ssh 'cat /tmp/fd-rec.mov' > "$out/$name-raw.mov"
+        cp "$TUT_TIMELINE" "$out/$name.timeline"
+        "$VENV/bin/python" "$(dirname "${BASH_SOURCE[0]}")/edit.py" \
+          "$out/$name-raw.mov" "$out/$name.timeline" "$out/$name.mp4"
         ;;
       *) echo "record start | record stop NAME" >&2; exit 2 ;;
     esac
     ;;
+  mark)
+    # An editing mark between scene runs: `vm mark cut` before stopping to look
+    # at the screen, `vm mark uncut` when going on (see vnc_drive.py).
+    printf '%s %s\n' "$(python3 -c 'import time; print(f"{time.time():.3f}")')" "$*" >> "$TUT_TIMELINE"
+    ;;
   shot)
+    # screencapture in the guest (fast, full 4K), plus a 1280px preview.
     out="${1:-$TUT_STATE/shot.png}"
-    vm_vnc_do capture "$out"
+    vm_ssh 'screencapture -x -t png /tmp/fd-shot.png && cat /tmp/fd-shot.png' > "$out"
     "$VENV/bin/python" - "$out" <<'PY'
 import sys
 from PIL import Image

@@ -37,6 +37,10 @@ for _ in $(seq 1 50); do
   if podman exec "$NAME" flightdeck worker status >/dev/null 2>&1; then break; fi
   sleep 0.2
 done
+# Offer only the agent this box has: the New Agent form then lists just Claude Code.
+for agent in codex cursor opencode; do
+  podman exec "$NAME" flightdeck worker agents disable "$agent" >/dev/null
+done
 podman exec "$NAME" flightdeck worker status
 echo
 echo "Worker reachable from the VM at $BIND:$PORT"

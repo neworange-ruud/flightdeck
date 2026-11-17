@@ -1,0 +1,6 @@
+node_modules/
+.flightdeck/state.json
+.flightdeck/worktrees/
+.flightdeck/agent-status
+.flightdeck/runtime/
+.flightdeck/hooks.toml
