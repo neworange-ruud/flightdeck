@@ -142,7 +142,8 @@ pub fn parts_from_v2_message(
 mod imp {
     use super::{fetch_v2_parts, Part};
     use rusqlite::{Connection, OpenFlags};
-    use std::path::Path;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
 
     /// Open `db` read-only. Returns `None` if it cannot be opened (missing,
     /// locked in a way that blocks readers, or corrupt) — the caller then simply
@@ -165,32 +166,99 @@ mod imp {
         .is_ok()
     }
 
+    /// The connection [`with_conn`] keeps between calls.
+    struct Cached {
+        db: PathBuf,
+        conn: Connection,
+        /// Whether the DB has OpenCode 2's tables. Only `true` is trusted
+        /// across calls: a `false` is checked again (cheaply, on the warm
+        /// connection), so an OpenCode upgraded in place is noticed.
+        v2: bool,
+    }
+
+    thread_local! {
+        /// One read-only connection to the last OpenCode DB this thread read,
+        /// kept open between transcript polls (remote-control-gcn3).
+        ///
+        /// Opening is the expensive part, not the queries: every open reads
+        /// the schema and maps the WAL index, and OpenCode's DB can be tens of
+        /// gigabytes. A read-only connection outside a statement holds no read
+        /// lock, so OpenCode's writes and checkpoints are not held up, and each
+        /// query still sees everything committed before it ran.
+        static CACHED: RefCell<Option<Cached>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` on a read-only connection to `db` (reused when it is the same
+    /// DB as last time) and whether the DB has OpenCode 2's tables. `None`
+    /// when the DB cannot be opened or `f` fails; a failure also drops the
+    /// connection, so the next call opens afresh rather than reusing a broken
+    /// one.
+    fn with_conn<T>(
+        db: &Path,
+        f: impl FnOnce(&Connection, bool) -> rusqlite::Result<T>,
+    ) -> Option<T> {
+        CACHED.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let reuse = slot.as_ref().is_some_and(|c| c.db == db);
+            if !reuse {
+                let conn = open_ro(db)?;
+                let v2 = has_v2(&conn);
+                *slot = Some(Cached {
+                    db: db.to_path_buf(),
+                    conn,
+                    v2,
+                });
+            }
+            let cached = slot.as_mut()?;
+            if !cached.v2 {
+                cached.v2 = has_v2(&cached.conn);
+            }
+            match f(&cached.conn, cached.v2) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    *slot = None;
+                    None
+                }
+            }
+        })
+    }
+
+    /// `query_row`'s "no row" as `None` rather than a failure.
+    fn optional<T>(r: rusqlite::Result<T>) -> rusqlite::Result<Option<T>> {
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The id of the newest OpenCode session whose worktree is `directory`, or
     /// `None` if the DB has none (or cannot be read). An OpenCode 2 session (a
     /// top-level one: subagent sessions share the directory) wins; the 1.x
     /// table is read only when there is none.
     pub fn latest_session_id(db: &Path, directory: &str) -> Option<String> {
-        let conn = open_ro(db)?;
-        if has_v2(&conn) {
-            let v2 = conn
-                .query_row(
-                    "SELECT id FROM session_v2 WHERE directory = ?1 AND parent_id IS NULL \
-                     ORDER BY time_updated DESC LIMIT 1",
-                    [directory],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok();
-            if v2.is_some() {
-                return v2;
+        with_conn(db, |conn, v2| {
+            if v2 {
+                let found = optional(
+                    conn.prepare_cached(
+                        "SELECT id FROM session_v2 WHERE directory = ?1 AND parent_id IS NULL \
+                         ORDER BY time_updated DESC LIMIT 1",
+                    )?
+                    .query_row([directory], |row| row.get::<_, String>(0)),
+                )?;
+                if found.is_some() {
+                    return Ok(found);
+                }
             }
-        }
-        conn.query_row(
-            "SELECT id FROM session WHERE directory = ?1 \
-             ORDER BY time_updated DESC LIMIT 1",
-            [directory],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
+            optional(
+                conn.prepare_cached(
+                    "SELECT id FROM session WHERE directory = ?1 \
+                     ORDER BY time_updated DESC LIMIT 1",
+                )?
+                .query_row([directory], |row| row.get::<_, String>(0)),
+            )
+        })
+        .flatten()
     }
 
     /// Every `part` of `session_id` updated at or after `updated_since`, joined to
@@ -199,55 +267,48 @@ mod imp {
     /// revisits the newest row so an in-flight part remains observable until it
     /// finalizes. Returns empty on any read error.
     pub fn fetch_parts(db: &Path, session_id: &str, updated_since: Option<i64>) -> Vec<Part> {
-        let Some(conn) = open_ro(db) else {
-            return Vec::new();
-        };
-        if has_v2(&conn)
-            && conn
-                .query_row(
-                    "SELECT 1 FROM session_v2 WHERE id = ?1",
-                    [session_id],
-                    |_| Ok(()),
-                )
-                .is_ok()
-        {
-            return fetch_v2_parts(&conn, session_id, updated_since);
-        }
-        // `json_extract` is available because the bundled SQLite ships JSON1.
-        let mut stmt = match conn.prepare(
-            "SELECT p.id, json_extract(m.data, '$.role'), p.time_created, \
-                    p.time_updated, p.data \
-             FROM part p JOIN message m ON p.message_id = m.id \
-             WHERE p.session_id = ?1 AND (?2 IS NULL OR p.time_updated >= ?2) \
-             ORDER BY p.time_created ASC, p.rowid ASC",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map(rusqlite::params![session_id, updated_since], |row| {
-            let id: String = row.get(0)?;
-            let role: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-            let at_ms: i64 = row.get(2)?;
-            let updated_at_ms: i64 = row.get(3)?;
-            let data: String = row.get(4)?;
-            Ok((id, role, at_ms, updated_at_ms, data))
-        });
-        let Ok(rows) = rows else {
-            return Vec::new();
-        };
-        rows.flatten()
-            .filter_map(|(id, role, at_ms, updated_at_ms, data)| {
-                serde_json::from_str::<serde_json::Value>(&data)
-                    .ok()
-                    .map(|data| Part {
-                        id,
-                        role,
-                        at_ms,
-                        updated_at_ms,
-                        data,
-                    })
-            })
-            .collect()
+        with_conn(db, |conn, v2| {
+            if v2
+                && optional(
+                    conn.prepare_cached("SELECT 1 FROM session_v2 WHERE id = ?1")?
+                        .query_row([session_id], |_| Ok(())),
+                )?
+                .is_some()
+            {
+                return Ok(fetch_v2_parts(conn, session_id, updated_since));
+            }
+            // `json_extract` is available because the bundled SQLite ships JSON1.
+            let mut stmt = conn.prepare_cached(
+                "SELECT p.id, json_extract(m.data, '$.role'), p.time_created, \
+                        p.time_updated, p.data \
+                 FROM part p JOIN message m ON p.message_id = m.id \
+                 WHERE p.session_id = ?1 AND (?2 IS NULL OR p.time_updated >= ?2) \
+                 ORDER BY p.time_created ASC, p.rowid ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![session_id, updated_since], |row| {
+                let id: String = row.get(0)?;
+                let role: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                let at_ms: i64 = row.get(2)?;
+                let updated_at_ms: i64 = row.get(3)?;
+                let data: String = row.get(4)?;
+                Ok((id, role, at_ms, updated_at_ms, data))
+            })?;
+            Ok(rows
+                .flatten()
+                .filter_map(|(id, role, at_ms, updated_at_ms, data)| {
+                    serde_json::from_str::<serde_json::Value>(&data)
+                        .ok()
+                        .map(|data| Part {
+                            id,
+                            role,
+                            at_ms,
+                            updated_at_ms,
+                            data,
+                        })
+                })
+                .collect())
+        })
+        .unwrap_or_default()
     }
 }
 
@@ -267,7 +328,7 @@ mod imp_v2 {
         session_id: &str,
         updated_since: Option<i64>,
     ) -> Vec<Part> {
-        let mut stmt = match conn.prepare(
+        let mut stmt = match conn.prepare_cached(
             "SELECT id, type, time_created, time_updated, data FROM session_message \
              WHERE session_id = ?1 AND (?2 IS NULL OR time_updated >= ?2) \
              ORDER BY seq ASC",
@@ -397,6 +458,60 @@ mod tests {
             parts.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             vec!["p2"],
             "the newest update boundary is revisited without rereading history"
+        );
+    }
+
+    /// The connection is kept between polls (remote-control-gcn3), so it must
+    /// still see what OpenCode writes after it was opened: a new session, new
+    /// parts, and OpenCode 2's tables appearing in a DB that had none. Another
+    /// DB in between is read too, and reading the first again still works.
+    #[test]
+    fn a_kept_connection_sees_later_writes_and_a_second_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        seed(&db);
+        assert_eq!(
+            latest_session_id(&db, "/repo/wt").as_deref(),
+            Some("ses_new")
+        );
+        assert_eq!(fetch_parts(&db, "ses_new", None).len(), 2);
+
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "INSERT INTO session VALUES ('ses_newer','/repo/wt',400);
+                 INSERT INTO message VALUES ('m9','ses_newer','{\"role\":\"user\"}');
+                 INSERT INTO part VALUES ('p9','m9','ses_newer',30,400,'{\"type\":\"text\",\"text\":\"again\"}');",
+            )
+            .unwrap();
+        assert_eq!(
+            latest_session_id(&db, "/repo/wt").as_deref(),
+            Some("ses_newer"),
+            "a session written after the connection opened"
+        );
+        assert_eq!(fetch_parts(&db, "ses_newer", None).len(), 1);
+
+        // OpenCode upgraded in place: its 2.x tables appear and win.
+        writer
+            .execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, time_updated INTEGER);
+                 INSERT INTO session_v2 VALUES ('ses_v2', NULL, '/repo/wt', 10);",
+            )
+            .unwrap();
+        assert_eq!(
+            latest_session_id(&db, "/repo/wt").as_deref(),
+            Some("ses_v2")
+        );
+
+        let other = dir.path().join("other.db");
+        seed(&other);
+        assert_eq!(
+            latest_session_id(&other, "/repo/wt").as_deref(),
+            Some("ses_new")
+        );
+        assert_eq!(
+            latest_session_id(&db, "/repo/wt").as_deref(),
+            Some("ses_v2")
         );
     }
 

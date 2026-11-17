@@ -652,6 +652,115 @@ fn unpaired_transcript_sync_is_throttled_and_forced_on_repair() {
     );
 }
 
+// --- paired transcript-sync cadence (remote-control-gcn3) -------------------
+
+/// Whether session `t1`'s transcript holds an agent message containing
+/// `needle`.
+fn t1_contains(b: &RemoteBridge, needle: &str) -> bool {
+    b.transcripts
+        .get(&SessionId::new("t1"))
+        .is_some_and(|builder| {
+            builder.load(None).items.iter().any(
+                |i| matches!(i, TranscriptItem::AgentMessage { text, .. } if text.contains(needle)),
+            )
+        })
+}
+
+fn assistant_line(uuid: &str, text: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+    )
+}
+
+#[test]
+fn paired_transcript_sync_runs_every_half_second_not_every_tick() {
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    seed_claude_session(home.path(), worktree, &[&assistant_line("a1", "first")]);
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let tick = |b: &mut RemoteBridge, at: u64| {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, at, &mut |_| {});
+    };
+
+    tick(&mut b, 1_000);
+    assert!(t1_contains(&b, "first"), "the first paired tick syncs");
+    // Settle: the first tick's status edge is behind us.
+    tick(&mut b, 1_010);
+
+    append_claude_line(home.path(), worktree, &assistant_line("a2", "second"));
+    tick(&mut b, 1_100);
+    assert!(
+        !t1_contains(&b, "second"),
+        "nothing changed but the file: the sync waits for its cadence"
+    );
+    tick(&mut b, 1_500);
+    assert!(
+        t1_contains(&b, "second"),
+        "{PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS} ms after the last sync it runs again"
+    );
+}
+
+#[test]
+fn a_status_change_syncs_its_session_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    seed_claude_session(home.path(), worktree, &[&assistant_line("a1", "first")]);
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let mut app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    set_status(&mut app, 0, InterpretedStatus::Working);
+    let cache = GitStatusCache::new();
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 1_000, &mut |_| {});
+        b.tick(&views, 1_010, &mut |_| {});
+    }
+
+    // The turn ends: its last message and the status flip land together,
+    // well inside the cadence. The phone gets the message with the status.
+    append_claude_line(home.path(), worktree, &assistant_line("a2", "done now"));
+    set_status(&mut app, 0, InterpretedStatus::Idle);
+    {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, 1_020, &mut |_| {});
+    }
+    assert!(t1_contains(&b, "done now"));
+}
+
+#[test]
+fn a_session_file_that_appears_later_is_found_within_the_retry_interval() {
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/repo/worktrees/fix-login";
+    let mut b = paired_bridge();
+    b.set_transcript_home(Some(home.path().to_path_buf()));
+    let app = app_with_tabs(vec![tab_state("t1", "fix-login", "claude")]);
+    let cache = GitStatusCache::new();
+    let tick = |b: &mut RemoteBridge, at: i64| {
+        let views = vec![view("proj", &app, &cache)];
+        b.tick(&views, at as u64, &mut |_| {});
+    };
+    // No session file yet: nothing to read, and the lookup is remembered.
+    tick(&mut b, 1_000);
+    assert!(!t1_contains(&b, "hello"));
+
+    seed_claude_session(home.path(), worktree, &[&assistant_line("a1", "hello")]);
+    // A regular sync before the retry interval reuses "no source yet".
+    tick(&mut b, 1_000 + PAIRED_TRANSCRIPT_SYNC_INTERVAL_MS);
+    assert!(
+        !t1_contains(&b, "hello"),
+        "the source lookup is not repeated on every sync"
+    );
+    tick(&mut b, 1_000 + SOURCE_RETRY_INTERVAL_MS);
+    assert!(
+        t1_contains(&b, "hello"),
+        "found once the retry interval passed"
+    );
+}
+
 // --- inbound request handling ----------------------------------------------
 
 fn envelope(cmd: &PhoneCommand) -> EncryptedEnvelope {
