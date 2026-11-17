@@ -1,0 +1,31 @@
+WEBVTT
+
+00:00:00.737 --> 00:00:02.638
+The agent says it's done.
+
+00:00:02.638 --> 00:00:05.148
+Before you merge, check its work.
+
+00:00:05.470 --> 00:00:08.259
+The header shows how many files it changed.
+
+00:00:08.259 --> 00:00:09.881
+Nothing is committed yet.
+
+00:00:10.331 --> 00:00:14.418
+Open a terminal in the agent's worktree, and look at the diff.
+
+00:00:16.648 --> 00:00:19.620
+Then run the tests, right there on the worker.
+
+00:00:21.279 --> 00:00:27.827
+They pass. But deleting a note can't be undone, so ask the agent to confirm first.
+
+00:00:31.851 --> 00:00:35.744
+Done: revised, tested and committed.
+
+00:00:35.744 --> 00:00:38.771
+The worktree is clean again.
+
+00:00:39.235 --> 00:00:42.903
+Now it's ready. Finish merges the branch into main.

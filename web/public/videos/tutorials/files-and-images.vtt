@@ -1,0 +1,40 @@
+WEBVTT
+
+00:00:00.710 --> 00:00:05.439
+The agent runs on the worker, but your files are on your Mac:
+
+00:00:05.439 --> 00:00:07.765
+a logo, a design, a data file.
+
+00:00:07.765 --> 00:00:10.556
+Here's how to get them to the agent.
+
+00:00:10.955 --> 00:00:14.819
+Transfer files uploads files from your Mac to the worker.
+
+00:00:14.819 --> 00:00:17.735
+It starts in the selected agent's worktree.
+
+00:00:30.453 --> 00:00:34.029
+The logo is now in the agent's worktree, on devbox.
+
+00:00:36.165 --> 00:00:41.759
+For a picture, like a screenshot or a mockup, you don't even need to upload it.
+
+00:00:41.759 --> 00:00:43.317
+Copy it on your Mac...
+
+00:00:48.627 --> 00:00:51.446
+...and paste it into the agent's terminal.
+
+00:00:51.446 --> 00:00:57.218
+FlightDeck copies the image to the worker and types its path, so the agent can see it.
+
+00:00:57.565 --> 00:00:59.887
+Now tell the agent what to do with both.
+
+00:01:09.824 --> 00:01:14.514
+Let's see it. Start the app, and open it in the session's browser.
+
+00:01:27.043 --> 00:01:31.454
+The notes match the mockup, and the logo you uploaded is in the header.

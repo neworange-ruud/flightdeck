@@ -42,3 +42,5 @@
 /webui/test-results/
 /webui/playwright-report/
 /webui/blob-report/
+.tutorial-venv/
+__pycache__/

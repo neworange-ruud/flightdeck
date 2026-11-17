@@ -1,0 +1,40 @@
+WEBVTT
+
+00:00:00.699 --> 00:00:04.545
+Sometimes you want a shell on the worker yourself:
+
+00:00:04.545 --> 00:00:08.698
+to look around, run a build, or check an agent's work.
+
+00:00:08.698 --> 00:00:12.774
+The worker is an ordinary machine, so you can SSH in.
+
+00:00:13.173 --> 00:00:19.208
+Every agent works in its own git worktree, inside the project's dot flightdeck folder.
+
+00:00:19.208 --> 00:00:22.647
+Change into it, and you're on the agent's branch.
+
+00:00:23.307 --> 00:00:25.573
+But you don't need SSH at all.
+
+00:00:25.573 --> 00:00:29.577
+FlightDeck Desktop has shells on the worker built in.
+
+00:00:29.882 --> 00:00:34.909
+The Worker tab holds shells on the worker itself, outside any project.
+
+00:00:34.909 --> 00:00:37.637
+They keep running when you disconnect.
+
+00:00:38.111 --> 00:00:41.965
+Open as many as you need, and show them side by side.
+
+00:00:44.633 --> 00:00:48.686
+For an agent's worktree, open a terminal from the sidebar.
+
+00:00:48.686 --> 00:00:51.971
+It starts in the agent's folder, on its branch.
+
+00:00:53.408 --> 00:01:02.278
+And to edit an agent's files in your editor, Open Worktree in VS Code opens the folder over SSH, right on the worker.

@@ -1,0 +1,28 @@
+WEBVTT
+
+00:00:00.761 --> 00:00:05.967
+While this agent worked on search, a teammate pushed a change to main.
+
+00:00:05.967 --> 00:00:09.538
+Let's bring that change into the agent's branch.
+
+00:00:09.900 --> 00:00:13.871
+First, update the project's main branch on the worker.
+
+00:00:13.871 --> 00:00:16.077
+Open a worker shell, and pull.
+
+00:00:18.539 --> 00:00:24.483
+Back in the project, the agent's header now says main has moved ahead, by one commit.
+
+00:00:25.159 --> 00:00:31.057
+Rebase Worktree, from the command palette, moves the agent's commits on top of the new main.
+
+00:00:31.333 --> 00:00:36.990
+It rewrites the branch, so FlightDeck asks you to type the session's name first.
+
+00:00:36.990 --> 00:00:40.667
+If anything conflicts, it stops and changes nothing.
+
+00:00:44.358 --> 00:00:51.231
+Done. In a terminal in the worktree, the log shows the agent's commit, on top of your teammate's.

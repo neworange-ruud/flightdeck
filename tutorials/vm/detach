@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run a command in a session of its own: `detach CMD ARGS...`.
+
+The VM and the VNC daemon must outlive whatever started them (a scene, a
+shell, an agent's tool call). `nohup ... & disown` leaves them in the
+caller's process group, so stopping the caller stopped them too."""
+import os
+import sys
+
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])

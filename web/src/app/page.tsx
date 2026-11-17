@@ -1,9 +1,6 @@
 import { Fragment } from "react";
-import Image from "next/image";
 import Link from "next/link";
 import { JetBrains_Mono } from "next/font/google";
-
-import screenshot from "../../public/screenshots/desktop-app/worker-window.png";
 
 const mono = JetBrains_Mono({
   subsets: ["latin"],
@@ -14,9 +11,11 @@ const mono = JetBrains_Mono({
 const MONO = "var(--font-mono), monospace";
 const GITHUB_URL = "https://github.com/neworange-ruud/flightdeck";
 const DOCS_URL = "/docs";
+const TUTORIALS_URL = "/docs/tutorials";
+const INTRO_VIDEO = "/videos/tutorials/intro";
 const PRIVACY_URL = "/privacy";
-const DESKTOP_RELEASES_URL =
-  "https://github.com/neworange-ruud/flightdeck/releases?q=desktop&expanded=true";
+// Redirects to the newest FlightDeck Desktop release's downloads (src/app/download).
+const DOWNLOAD_URL = "/download";
 
 export default function HomePage() {
   return (
@@ -126,6 +125,12 @@ export default function HomePage() {
             </a>
             <a href="#install" style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
               Install
+            </a>
+            <Link href={TUTORIALS_URL} style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
+              Tutorials
+            </Link>
+            <a href={DOWNLOAD_URL} style={{ color: "#99a6b6", fontSize: 14.5, fontWeight: 500 }}>
+              Download
             </a>
             <a
               href={GITHUB_URL}
@@ -258,7 +263,7 @@ export default function HomePage() {
             Get started
           </Link>
           <a
-            href={DESKTOP_RELEASES_URL}
+            href={DOWNLOAD_URL}
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -288,7 +293,7 @@ export default function HomePage() {
         </p>
       </header>
 
-      {/* SCREENSHOT SHOWCASE */}
+      {/* INTRO VIDEO */}
       <section
         style={{
           position: "relative",
@@ -309,14 +314,17 @@ export default function HomePage() {
               "0 40px 120px -30px rgba(0,0,0,0.85), 0 0 0 1px rgba(111,220,242,0.05)",
           }}
         >
-          <Image
-            src={screenshot}
-            alt="FlightDeck Desktop connected to a worker: one row per agent with its live status, the selected agent's terminal, and the branch's git state along the bottom"
-            placeholder="blur"
-            priority
-            sizes="(max-width: 1120px) 100vw, 1064px"
-            style={{ display: "block", width: "100%", height: "auto" }}
-          />
+          <video
+            aria-label="FlightDeck in 100 seconds: two agents work in parallel on a worker, one asks a question that is answered from Mission control, a change is tried in the session's browser and merged with Finish"
+            controls
+            playsInline
+            preload="metadata"
+            poster={`${INTRO_VIDEO}.jpg`}
+            style={{ display: "block", width: "100%", height: "auto", aspectRatio: "16 / 9" }}
+          >
+            <source src={`${INTRO_VIDEO}.mp4`} type="video/mp4" />
+            <track default kind="captions" label="English" src={`${INTRO_VIDEO}.vtt`} srcLang="en" />
+          </video>
         </div>
         <p
           style={{
@@ -328,8 +336,11 @@ export default function HomePage() {
             color: "#6b7a8c",
           }}
         >
-          FlightDeck Desktop driving a worker: one row per agent with its live status, the
-          selected agent&apos;s terminal, and the branch&apos;s git state along the bottom.
+          FlightDeck in 100 seconds: two agents at work on a worker, a question answered from
+          Mission control, and a change tried and merged.{" "}
+          <Link href={TUTORIALS_URL} style={{ color: "#6fdcf2", fontWeight: 600 }}>
+            Watch the video tutorials →
+          </Link>
         </p>
       </section>
 
@@ -569,8 +580,8 @@ export default function HomePage() {
           }}
         >
           <InstallCard label="FLIGHTDECK DESKTOP · macOS · WINDOWS · LINUX">
-            <a href={DESKTOP_RELEASES_URL} style={{ color: "#6fdcf2", fontWeight: 700 }}>
-              ↓ Download from GitHub Releases
+            <a href={DOWNLOAD_URL} style={{ color: "#6fdcf2", fontWeight: 700 }}>
+              ↓ Download the latest release
             </a>
             <br />
             <span style={{ color: "#8b98a8" }}>.zip (macOS) · .msi (Windows) · .deb .rpm .AppImage</span>
@@ -653,6 +664,12 @@ export default function HomePage() {
           <Link href={DOCS_URL} style={{ color: "#8b98a8" }}>
             Documentation
           </Link>
+          <Link href={TUTORIALS_URL} style={{ color: "#8b98a8" }}>
+            Tutorials
+          </Link>
+          <a href={DOWNLOAD_URL} style={{ color: "#8b98a8" }}>
+            Download
+          </a>
           <a href={GITHUB_URL} style={{ color: "#8b98a8" }}>
             GitHub
           </a>

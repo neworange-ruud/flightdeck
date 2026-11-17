@@ -1,0 +1,37 @@
+WEBVTT
+
+00:00:00.687 --> 00:00:06.038
+This is FlightDeck. It runs your AI coding agents side by side:
+
+00:00:06.038 --> 00:00:10.625
+here on devbox, a worker machine, driven from the Mac.
+
+00:00:10.916 --> 00:00:13.810
+Start an agent, and tell it what to build.
+
+00:00:13.810 --> 00:00:17.186
+Every agent gets its own git branch and worktree.
+
+00:00:26.156 --> 00:00:29.128
+Then start another, while the first one works.
+
+00:00:41.664 --> 00:00:45.426
+Mission control shows every agent at once, as live tiles.
+
+00:00:49.235 --> 00:00:52.340
+When an agent needs you, it comes first.
+
+00:00:52.340 --> 00:00:54.436
+Answer right from its tile.
+
+00:01:01.242 --> 00:01:07.604
+Both are done. Try a change in the session's own browser, where localhost is the worker.
+
+00:01:20.824 --> 00:01:26.257
+Happy with it? Finish merges the branch into main, and cleans up the worktree.
+
+00:01:27.666 --> 00:01:33.456
+That's FlightDeck: many agents, one window, and you stay in control.
+
+00:01:33.456 --> 00:01:36.861
+The tutorials show every step in detail.

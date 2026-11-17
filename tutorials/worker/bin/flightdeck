@@ -1,0 +1,15 @@
+#!/bin/sh
+# Tutorial wrapper around the real flightdeck (see the Containerfile): the
+# debug worker listens on 0.0.0.0, which `worker pair` and `worker status`
+# would print as its address. Show this box's name instead, as a real worker
+# shows its own. `worker pair` also leaves its output in /tmp/fd-last-pair,
+# so a scene can type the code it showed.
+real=/usr/local/lib/flightdeck/flightdeck
+case "$1 $2" in
+  "worker pair"|"worker status")
+    "$real" "$@" | sed 's#0\.0\.0\.0:7420#devbox:7420#g' > /tmp/fd-out.$$
+    [ "$2" = pair ] && cp /tmp/fd-out.$$ /tmp/fd-last-pair
+    cat /tmp/fd-out.$$; rm -f /tmp/fd-out.$$
+    exit 0 ;;
+esac
+exec "$real" "$@"

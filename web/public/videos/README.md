@@ -47,6 +47,17 @@ anything longer on YouTube (or another CDN) and embed it with `youtube`.
   Drop `-an` to keep a voice-over. Aim for under about 1.5 MB per minute.
 - Add captions (`.vtt`) when a video has narration.
 
+## Tutorials (`tutorials/`)
+
+The narrated tutorials on the [Video Tutorials](../../docs/tutorials.mdx) page
+and the homepage's introduction are generated, not hand-recorded: the scene
+scripts in the repository's `tutorials/scenes/` drive FlightDeck Desktop in a
+macOS VM against a real worker, and `tutorials/publish.sh NAME` writes
+`NAME.mp4` (1080p, about 1.3–2 MB a minute), `NAME.jpg` (the poster) and
+`NAME.vtt` (captions of the voiceover) here. See `tutorials/README.md`. To
+update one for a new release, run its scene again and publish it; don't edit
+these files by hand.
+
 ## Planned videos
 
 | File | Length | Goes on | Shows |

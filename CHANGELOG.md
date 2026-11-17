@@ -8,7 +8,8 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Video tutorials on the website.** A new **Video Tutorials** page in the docs (under Start Here) has twelve short narrated videos of FlightDeck Desktop driving a worker with real agents: connecting a worker, a first agent from prompt to merge, starting a project, agents in parallel, Mission control, answering an agent, reviewing before you merge, rebasing onto a newer main, shells and SSH, files and pasted images, and FlightDeck Web. Every video has captions. The homepage now opens with a 100-second introduction video. The videos are recorded and narrated by scripts in `tutorials/`, so they can be made again for each release.
+- **A direct download link.** `/download` on the website goes straight to the newest FlightDeck Desktop release's downloads on GitHub. It's in the homepage's nav, hero and footer, and in the docs' header and Desktop quickstart.
 
 ### Improvements
 
