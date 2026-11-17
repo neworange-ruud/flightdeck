@@ -20,7 +20,7 @@ VM_KEY="$TUT_STATE/ssh/id_ed25519"
 VM_RUN_LOG="$TUT_STATE/$VM.run.log"
 VENV="$TUT_ROOT/.tutorial-venv"
 # vncdotool's VNC auth uses TripleDES, which `cryptography` warns about.
-export PYTHONWARNINGS="ignore::DeprecationWarning"
+export PYTHONWARNINGS="ignore"
 
 mkdir -p "$VM_SHARE" "$(dirname "$VM_KEY")"
 [[ -f "$VM_KEY" ]] || ssh-keygen -q -t ed25519 -N '' -C fd-tutorial -f "$VM_KEY"
