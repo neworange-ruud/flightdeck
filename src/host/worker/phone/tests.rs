@@ -44,6 +44,7 @@ impl Fakes {
             container: &self.container,
             command: &self.command,
             terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &crate::git::init::TEST_REPO_INIT,
         }
     }
 

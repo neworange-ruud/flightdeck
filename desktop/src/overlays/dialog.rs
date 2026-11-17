@@ -16,8 +16,8 @@ use gpui::{
 };
 
 use super::{
-    button_row, buttons, choose_folder, dialog_button, dialog_button_with, dialog_card, footer,
-    heading, origin_line, overlay, split_hint, KeyPress, OverlayCx, MONO,
+    button_row, buttons, choose_folder, choose_new_folder, dialog_button, dialog_button_with,
+    dialog_card, footer, heading, origin_line, overlay, split_hint, KeyPress, OverlayCx, MONO,
 };
 
 /// The debug selector on dialog list row `index`, for tests.
@@ -109,8 +109,14 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
 
     let footer = if browsing {
         // The folder browser's own moves as buttons on the left, plus the
-        // platform picker feeding the same prompt (so its checks still run).
+        // platform picker feeding the same prompt (so its checks still run):
+        // its folder chooser to open, its save dialog to create (New
+        // Project), which starts in the folder being browsed.
         let emit = cx.emit.clone();
+        let create_in = match &view.kind {
+            DialogKind::OpenProject { dir, create: true } => Some(dir.clone()),
+            _ => None,
+        };
         let parent = DialogButton {
             id: "←".to_string(),
             label: "Parent folder".to_string(),
@@ -120,7 +126,12 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
         };
         let native = DialogButton {
             id: "choose-folder".to_string(),
-            label: "Choose folder…".to_string(),
+            label: if create_in.is_some() {
+                "Choose location…"
+            } else {
+                "Choose folder…"
+            }
+            .to_string(),
             role: ButtonRole::Secondary,
             default: false,
             disabled: false,
@@ -135,7 +146,10 @@ pub fn render(view: &DialogView, cx: &OverlayCx) -> AnyElement {
                 p,
                 &native,
                 None,
-                move |_: &ClickEvent, window, cx| choose_folder(emit.clone(), false, window, cx),
+                move |_: &ClickEvent, window, cx| match &create_in {
+                    Some(dir) => choose_new_folder(emit.clone(), dir.clone(), window, cx),
+                    None => choose_folder(emit.clone(), false, window, cx),
+                },
             ))
             .child(div().flex_1())
             .children(buttons(p, &view.buttons, cx))

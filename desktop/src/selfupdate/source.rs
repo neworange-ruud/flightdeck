@@ -13,8 +13,9 @@
 //! that a machine without `curl` reports "could not check" and shows no
 //! notice, which is the same silent failure the TUI's check has offline.
 
+use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::kind::Os;
@@ -198,5 +199,130 @@ fn run_extract(command: &mut Command) -> Result<(), UpdateError> {
         Err(UpdateError::BadArchive(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ))
+    }
+}
+
+/// Windows, MSI installs: what runs the downloaded installer once the app has
+/// exited, then starts the app again. It runs in PowerShell, which every
+/// supported Windows has, and gets its inputs from the environment so no path
+/// is ever quoted into the script.
+///
+/// `msiexec` is not told to be quiet: `/passive` shows its progress bar and
+/// still lets Windows ask for elevation (the MSI installs per machine). A
+/// declined prompt or a failed install leaves the old version in place, and
+/// the app starts either way. The verbose log stays beside the download for
+/// when it fails; the next update clears that folder.
+const MSI_HANDOFF_SCRIPT: &str = r#"
+$appPid = [int]$env:FLIGHTDECK_UPDATE_PID
+$msi = $env:FLIGHTDECK_UPDATE_MSI
+$exe = $env:FLIGHTDECK_UPDATE_EXE
+foreach ($name in 'FLIGHTDECK_UPDATE_PID', 'FLIGHTDECK_UPDATE_MSI', 'FLIGHTDECK_UPDATE_EXE') {
+    [Environment]::SetEnvironmentVariable($name, $null)
+}
+while (Get-Process -Id $appPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 100 }
+$log = Join-Path (Split-Path -Parent $msi) 'install.log'
+Start-Process -FilePath 'msiexec.exe' -Wait -ArgumentList "/i `"$msi`" /passive /norestart /l*v `"$log`""
+Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe)
+"#;
+
+/// A process to start: program, arguments and extra environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub env: Vec<(&'static str, OsString)>,
+}
+
+/// The handoff that installs `msi` after process `pid` exits and then starts
+/// `exe`. `system_root` is `%SystemRoot%`, for PowerShell's full path (a bare
+/// `powershell.exe` is the fallback). Pure, so it is tested on any host.
+pub fn msi_handoff(pid: u32, msi: &Path, exe: &Path, system_root: Option<&Path>) -> Handoff {
+    let program = system_root.map_or_else(
+        || PathBuf::from("powershell.exe"),
+        |root| root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    );
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        MSI_HANDOFF_SCRIPT,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    Handoff {
+        program,
+        args,
+        env: vec![
+            ("FLIGHTDECK_UPDATE_PID", pid.to_string().into()),
+            ("FLIGHTDECK_UPDATE_MSI", msi.as_os_str().to_owned()),
+            ("FLIGHTDECK_UPDATE_EXE", exe.as_os_str().to_owned()),
+        ],
+    }
+}
+
+/// Start `handoff` detached: it must outlive the app, which quits next.
+pub fn spawn_handoff(handoff: &Handoff) -> Result<(), UpdateError> {
+    let mut command = Command::new(&handoff.program);
+    command.args(&handoff.args);
+    for (name, value) in &handoff.env {
+        command.env(name, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// No console window flashes up behind the app.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .spawn()
+        .map(drop)
+        .map_err(|e| UpdateError::Io(format!("could not start the installer: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_msi_handoff_passes_paths_through_the_environment() {
+        let msi = Path::new(r"C:\Users\o'neil\AppData\Local\flightdeck\update\a b.msi");
+        let exe = Path::new(r"C:\Program Files\FlightDeck\flightdeck-desktop.exe");
+        let handoff = msi_handoff(42, msi, exe, Some(Path::new(r"C:\Windows")));
+        assert_eq!(
+            handoff.program,
+            Path::new(r"C:\Windows").join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+        );
+        assert_eq!(
+            handoff.env,
+            vec![
+                ("FLIGHTDECK_UPDATE_PID", OsString::from("42")),
+                ("FLIGHTDECK_UPDATE_MSI", msi.as_os_str().to_owned()),
+                ("FLIGHTDECK_UPDATE_EXE", exe.as_os_str().to_owned()),
+            ]
+        );
+        // The script is fixed text: no path, however it is spelled, is in it.
+        let script = handoff.args.last().unwrap().to_string_lossy().into_owned();
+        assert_eq!(script, MSI_HANDOFF_SCRIPT);
+        assert!(!script.contains("o'neil"));
+        // It waits for the app, runs the MSI visibly (so Windows can ask for
+        // elevation), then starts the app again.
+        let wait = script.find("Get-Process -Id $appPid").unwrap();
+        let install = script.find("msiexec.exe").unwrap();
+        let start = script.find("Start-Process -FilePath $exe").unwrap();
+        assert!(wait < install && install < start);
+        assert!(script.contains("/passive") && !script.contains("/quiet"));
+    }
+
+    #[test]
+    fn without_system_root_powershell_is_found_on_the_path() {
+        let handoff = msi_handoff(1, Path::new("a.msi"), Path::new("a.exe"), None);
+        assert_eq!(handoff.program, Path::new("powershell.exe"));
     }
 }

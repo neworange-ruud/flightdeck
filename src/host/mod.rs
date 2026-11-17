@@ -157,6 +157,12 @@ pub enum HostEvent {
     /// folder outside any git repository is refused with a notification — and
     /// refused outright in an isolated run, like the palette's Open Project.
     OpenProject(PathBuf),
+    /// Create this folder as a new project and open it (SPECS §5.3): the
+    /// answer from a front-end's own (native) "new folder" dialog. The folder
+    /// must not exist and its parent must; it gets `git init` and an empty
+    /// root commit. Refused outright in an isolated run, like
+    /// [`HostEvent::OpenProject`]; any other refusal is a notification.
+    CreateProject(PathBuf),
     /// Answer the prompt a waiting session shows (a Mission control tile's
     /// Approve / Deny or option button; see [`AppHost::track_prompts`]). Runs
     /// through the phone's own translator and keystroke queue, so it types

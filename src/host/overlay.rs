@@ -198,6 +198,9 @@ pub enum DialogKind {
     OpenProject {
         /// The folder being browsed.
         dir: PathBuf,
+        /// Create mode (New Project, SPECS §5.3): the field names a new
+        /// folder under `dir` rather than a path to open.
+        create: bool,
     },
     /// Pick the project's default base branch.
     ChangeProjectBase,

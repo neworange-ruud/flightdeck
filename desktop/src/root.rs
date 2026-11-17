@@ -13,6 +13,9 @@
 //! Choosing a folder builds the host exactly as a launch from that folder
 //! would (`AppHost::open` on it, which also reopens the remembered projects),
 //! and the root swaps the launcher for the shell in the same window.
+//! "New project…" beside it asks the OS for a new folder's path, creates it
+//! as a repository with an empty first commit (SPECS §5.3) and opens it the
+//! same way.
 //!
 //! An `--isolated` run never lands here: it is defined by the directory it
 //! was started in, so a non-repository directory is the TUI's error.
@@ -33,6 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use flightdeck::contracts::real::RealFs;
+use flightdeck::git::init::RepoInitializer;
 use flightdeck::host::{AppHost, HostEvent};
 use flightdeck_desktop::keys::KeymapAction;
 use gpui::{
@@ -69,6 +74,9 @@ struct Running {
 
 pub struct AppRoot {
     opener: Opener,
+    /// Initialises a folder the launcher's New project… created; the
+    /// running host has its own (`Env::repo_init`).
+    repo_init: &'static dyn RepoInitializer,
     /// Remembered projects, offered while no project is open.
     recent: Vec<PathBuf>,
     /// Why the last folder could not be opened, shown under the button.
@@ -99,6 +107,7 @@ impl AppRoot {
     ) -> AppRoot {
         let mut root = AppRoot {
             opener,
+            repo_init: &flightdeck::git::init::REAL_REPO_INIT,
             recent,
             error: None,
             running: None,
@@ -161,6 +170,31 @@ impl AppRoot {
                 cx.notify();
             }
         }
+    }
+
+    /// Create the folder a New project dialog chose and open it (SPECS
+    /// §5.3). Running: the host's own `CreateProject` (validated, or refused,
+    /// as the TUI's create-mode folder browser). Launcher: create it here,
+    /// then open it like a picked folder; a refusal is the error line.
+    pub fn create_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.running.is_some() {
+            self.dispatch(HostEvent::CreateProject(path), cx);
+            return;
+        }
+        match flightdeck::git::init::create_project_dir(&RealFs, self.repo_init, &path) {
+            Ok(created) => self.open_folder(created, cx),
+            Err(e) => {
+                self.error = Some(format!("Could not create project: {e}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Initialise the launcher's new projects with `init` (tests: a fixed
+    /// git identity, as CI has none).
+    #[cfg(test)]
+    pub fn set_repo_init(&mut self, init: &'static dyn RepoInitializer) {
+        self.repo_init = init;
     }
 
     /// Hand `event` to the running host; nothing to do in the launcher.
@@ -252,6 +286,48 @@ pub fn pick_folder(cx: &mut App) {
     .detach();
 }
 
+/// Ask the OS for a new folder's path (its save dialog) and create it as a
+/// project there (see [`AppRoot::create_folder`]). The dialog starts beside
+/// the active project, where its siblings live, or in the home folder. A
+/// cancelled dialog does nothing.
+pub fn pick_new_project(cx: &mut App) {
+    let start = new_project_start(cx);
+    let chosen = cx.prompt_for_new_path(&start, None);
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(path))) = chosen.await else {
+            return;
+        };
+        cx.update(|cx| create_folder(path, cx));
+    })
+    .detach();
+}
+
+/// Where the New project dialog starts: the active project's parent folder,
+/// or the home folder with no project open.
+fn new_project_start(cx: &App) -> PathBuf {
+    running_model(cx)
+        .and_then(|model| {
+            let host = model.read(cx).host();
+            host.project_root(host.active_project_index())
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// [`AppRoot::create_folder`] on the app's root, if there is one.
+pub fn create_folder(path: PathBuf, cx: &mut App) {
+    if let Some(root) = cx.try_global::<RootHandle>().map(|h| h.0.clone()) {
+        root.update(cx, |root, cx| root.create_folder(path, cx));
+    }
+}
+
 /// [`AppRoot::open_folder`] on the app's root, if there is one.
 pub fn open_folder(path: PathBuf, cx: &mut App) {
     if let Some(root) = cx.try_global::<RootHandle>().map(|h| h.0.clone()) {
@@ -338,6 +414,24 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
         .cursor_pointer()
         .child("Connect to remote…")
         .on_click(|_, _, cx| crate::remote::connect::open_connect_window(None, cx));
+    // A brand-new project (SPECS §5.3): a new folder, `git init`, opened.
+    let new_project = div()
+        .id("launcher-new")
+        .debug_selector(|| "launcher-new".into())
+        .flex_none()
+        .h(px(34.))
+        .px_4()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(7.))
+        .border_1()
+        .border_color(p.border_strong.hsla())
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .child("New project…")
+        .on_click(|_, _, cx| pick_new_project(cx));
 
     // Saved workers, above the recent projects (`crate::workers`).
     let rows = crate::workers::links::rows(cx);
@@ -407,7 +501,13 @@ fn launcher(root: &AppRoot, cx: &mut Context<AppRoot>) -> impl IntoElement {
                              Pick a folder inside a git repository.",
                         ),
                 )
-                .child(h_flex().gap_3().child(open).child(connect))
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(open)
+                        .child(new_project)
+                        .child(connect),
+                )
                 .children(error)
                 .children(workers.map(|list| div().mt_4().w(px(420.)).child(list)))
                 .children(recent.map(|list| div().mt_4().w(px(420.)).child(list))),

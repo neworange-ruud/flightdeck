@@ -600,6 +600,28 @@ impl RemoteClient {
         self.worker_command(worker_command::CLONE_PROJECT, Some(args))
     }
 
+    /// Whether the worker creates projects (SPECS §5.3): a worker attached at
+    /// [`crate::web::protocol::CREATE_PROJECT_MIN_VERSION`] or later.
+    pub fn supports_create_project(&self) -> bool {
+        self.is_worker()
+            && self.workspace().protocol_version >= crate::web::protocol::CREATE_PROJECT_MIN_VERSION
+    }
+
+    /// Create the folder `name` under `dir` on the worker (none: its projects
+    /// root), `git init` it with an empty root commit, and open it. Answered
+    /// with an ack and a sentence, like [`RemoteClient::open_project_path`].
+    /// `None` when the worker predates the command or the link is down.
+    pub fn create_project(&self, name: &str, dir: Option<&str>) -> Option<u64> {
+        if !self.supports_create_project() {
+            return None;
+        }
+        let mut args = serde_json::json!({ "name": name.trim() });
+        if let Some(dir) = dir.map(str::trim).filter(|d| !d.is_empty()) {
+            args["dir"] = serde_json::json!(dir);
+        }
+        self.worker_command(worker_command::CREATE_PROJECT, Some(args))
+    }
+
     /// Restart worker shell `terminal_id` after it exited. A pre-v10 worker
     /// ignores the argument and restarts its one shell.
     pub fn restart_worker_shell(&self, terminal_id: &TerminalId) -> Option<u64> {
@@ -866,6 +888,7 @@ mod tests {
             assert_eq!(client.scan_projects(), None);
             assert_eq!(client.open_project_path("/x"), None);
             assert_eq!(client.clone_project("u", None), None);
+            assert_eq!(client.create_project("app", None), None);
             assert_eq!(
                 client.restart_worker_shell(&WORKER_SHELL_TERMINAL_ID.into()),
                 None
@@ -884,6 +907,46 @@ mod tests {
             ));
             assert!(sent_frames(&mut script).is_empty(), "{kind:?}");
         }
+    }
+
+    /// SPECS §5.3: Create goes out to a v12 worker with its name and folder,
+    /// and is never sent to an older one, which would not know it.
+    #[test]
+    fn create_project_needs_a_v12_worker() {
+        let (mut client, mut script) = RemoteClient::scripted();
+        script.snapshot(fake_host::snapshot(11, Some(HostKind::Worker)));
+        client.pump();
+        assert!(!client.supports_create_project());
+        assert_eq!(client.create_project("app", Some("~/code")), None);
+        assert!(sent_frames(&mut script).is_empty());
+
+        let (mut client, mut script) = RemoteClient::scripted();
+        script.snapshot(fake_host::snapshot(
+            PROTOCOL_VERSION,
+            Some(HostKind::Worker),
+        ));
+        client.pump();
+        assert!(client.supports_create_project());
+        client
+            .create_project(" app ", Some("/home/u/code"))
+            .unwrap();
+        client.create_project("lib", Some(" ")).unwrap();
+        let args: Vec<Option<serde_json::Value>> = sent_frames(&mut script)
+            .iter()
+            .filter_map(|f| match f {
+                ClientMsg::Command(c) if c.name == worker_command::CREATE_PROJECT => {
+                    Some(c.args.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                Some(serde_json::json!({ "name": "app", "dir": "/home/u/code" })),
+                Some(serde_json::json!({ "name": "lib" })),
+            ]
+        );
     }
 
     #[test]

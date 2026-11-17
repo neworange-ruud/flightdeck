@@ -225,6 +225,7 @@ describe("the panel", () => {
     expect(picker.getAttribute("data-purpose")).toBe("choose_folder");
     expect(picker.textContent).toContain("Choose a folder on the worker");
     expect(visible(h.q('.fd-picker [data-section="clone"]'))).toBe(false);
+    expect(visible(h.q('.fd-picker [data-section="create"]'))).toBe(false);
     expect(visible(h.q('.fd-picker [data-section="scan"]'))).toBe(false);
     h.app.store.dispatch({
       type: "picker/listing",

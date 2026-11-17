@@ -1487,12 +1487,14 @@ function reduceAction(state: AppState, action: AppAction): AppState {
       if (picker === null) {
         return state;
       }
-      const key =
-        action.field === "path"
-          ? "pathField"
-          : action.field === "url"
-            ? "urlField"
-            : "nameField";
+      const key = (
+        {
+          path: "pathField",
+          url: "urlField",
+          name: "nameField",
+          newName: "newNameField",
+        } as const
+      )[action.field];
       return picker[key] === action.value
         ? state
         : { ...state, picker: { ...picker, [key]: action.value } };

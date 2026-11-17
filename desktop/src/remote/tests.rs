@@ -1992,6 +1992,78 @@ mod worker {
     }
 
     #[gpui::test]
+    fn a_new_project_is_made_in_the_folder_listed_and_a_refusal_shows(app: &mut TestAppContext) {
+        let (model, mut script, window, cx) = open_on(app, empty_worker());
+        script.sent();
+        click(cx, "remote-open-project");
+        let browse = sent_commands(&mut script)
+            .into_iter()
+            .find(|c| c.1 == "browse_dir")
+            .map(|c| c.0)
+            .unwrap();
+        // Before a listing it is made in the projects root.
+        assert!(cx.debug_bounds("remote-picker-create").is_some());
+        script.send(LinkEvent::DirListing(DirListing {
+            seq: browse,
+            path: "/home/dev/src".to_string(),
+            parent: Some("/home/dev".to_string()),
+            home: "/home/dev".to_string(),
+            entries: Vec::new(),
+            files: Vec::new(),
+            truncated: false,
+        }));
+        turn(&model, cx);
+
+        let picker = window
+            .read_with(cx, |w, _| w.picker_view())
+            .expect("the picker view");
+        cx.update(|window, cx| picker.update(cx, |view, cx| view.fill_new_name("api", window, cx)));
+        click(cx, "remote-picker-create");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "create_project");
+        assert_eq!(
+            sent[0].2,
+            Some(serde_json::json!({ "name": "api", "dir": "/home/dev/src" }))
+        );
+
+        // A refusal is the worker's words on the error line, not a message.
+        script.send(ack(
+            sent[0].0,
+            AckOutcome::Rejected,
+            "/home/dev/src/api already exists.",
+        ));
+        turn(&model, cx);
+        assert!(cx.debug_bounds("remote-picker-error").is_some());
+        let error = model.read_with(cx, |m, _| m.picker().and_then(|p| p.error.clone()));
+        assert_eq!(error.as_deref(), Some("/home/dev/src/api already exists."));
+        assert!(message(&model, cx).is_empty(), "not a message overlay");
+        assert!(
+            model.read_with(cx, |m, _| m.picker().is_some()),
+            "still open"
+        );
+
+        // Enter in the field creates too.
+        cx.update(|window, cx| picker.update(cx, |view, cx| view.fill_new_name("web", window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent[0].1, "create_project");
+        assert_eq!(sent[0].2.as_ref().unwrap()["name"], "web");
+    }
+
+    #[gpui::test]
+    fn a_worker_older_than_v12_has_no_new_project_section(app: &mut TestAppContext) {
+        let mut snapshot = empty_worker();
+        snapshot.protocol_version = 11;
+        let (_model, mut script, _window, cx) = open_on(app, snapshot);
+        script.sent();
+        click(cx, "remote-open-project");
+        assert!(cx.debug_bounds("remote-picker-clone").is_some());
+        assert!(cx.debug_bounds("remote-picker-create").is_none());
+    }
+
+    #[gpui::test]
     fn a_finished_clone_opens_the_project(app: &mut TestAppContext) {
         let (model, mut script, _window, cx) = open_on(app, empty_worker());
         click(cx, "remote-open-project");

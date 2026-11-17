@@ -5,6 +5,8 @@ import {
   cloneLine,
   cloneNotice,
   cloneRequest,
+  CREATE_NAME_MISSING,
+  createRequest,
   newPicker,
   openRequest,
   pickerAck,
@@ -77,6 +79,42 @@ describe("what a click sends", () => {
     });
     expect(cloneRequest({ ...picker, urlField: "  " })).toEqual({ error: CLONE_URL_MISSING });
   });
+
+  it("creates a new project in the folder listed, tracked as an open of it", () => {
+    const listed = { ...newPicker(HOME), cwd: `${HOME}/code`, newNameField: " fresh " };
+    expect(createRequest(listed)).toEqual({
+      name: "create_project",
+      args: { name: "fresh", dir: `${HOME}/code` },
+      sent: { kind: "open", path: `${HOME}/code/fresh` },
+    });
+    /** At `/` the separator is not doubled. */
+    expect(createRequest({ ...listed, cwd: "/" })).toMatchObject({
+      sent: { kind: "open", path: "/fresh" },
+    });
+  });
+
+  it("creates in the projects root, sending no dir, before anything is listed", () => {
+    const unlisted = { ...newPicker(HOME), newNameField: "fresh" };
+    expect(createRequest(unlisted)).toEqual({
+      name: "create_project",
+      args: { name: "fresh" },
+      sent: { kind: "open", path: "fresh" },
+    });
+    const scanned = {
+      ...unlisted,
+      scanned: { root: `${HOME}/flightdeck`, rootExists: true, repos: [] },
+    };
+    expect(createRequest(scanned)).toMatchObject({
+      args: { name: "fresh" },
+      sent: { kind: "open", path: `${HOME}/flightdeck/fresh` },
+    });
+  });
+
+  it("sends no create without a name, and says why", () => {
+    const picker = { ...newPicker(HOME), cwd: HOME, newNameField: "   " };
+    expect(createRequest(picker)).toEqual({ error: CREATE_NAME_MISSING });
+    expect(CREATE_NAME_MISSING).toBe("Type a name for the new project's folder.");
+  });
 });
 
 describe("answers", () => {
@@ -137,6 +175,28 @@ describe("acks", () => {
     const answered = pickerAck(picker, 11, "applied", "Opened project 'a'.");
     expect(answered.picker.opened).toEqual({ path: `${HOME}/a`, projectId: null });
     expect(answered.picker.status).toBe("Opened project 'a'.");
+  });
+
+  it("an applied create is the new project opened, with the worker's sentence as status", () => {
+    const request = createRequest({ ...newPicker(HOME), cwd: HOME, newNameField: "fresh" });
+    if ("error" in request) {
+      throw new Error(request.error);
+    }
+    const picker = pickerSent(newPicker(HOME), request.sent, 12);
+    expect(pickerBusy(picker)).toBe(true);
+    const said = `Created project fresh at ${HOME}/fresh. Add a remote with \`git remote add\` when you are ready to push.`;
+    const answered = pickerAck(picker, 12, "applied", said);
+    expect(answered.owned).toBe(true);
+    expect(answered.picker.opened).toEqual({ path: `${HOME}/fresh`, projectId: null });
+    expect(answered.picker.status).toBe(said);
+  });
+
+  it("a refused create shows the worker's words and opens nothing", () => {
+    const picker = pickerSent(newPicker(HOME), { kind: "open", path: `${HOME}/x` }, 13);
+    const answered = pickerAck(picker, 13, "rejected", "x already exists.");
+    expect(answered.picker.opened).toBeNull();
+    expect(answered.picker.error).toBe("x already exists.");
+    expect(pickerBusy(answered.picker)).toBe(false);
   });
 
   it("a refused open says why and opens nothing", () => {

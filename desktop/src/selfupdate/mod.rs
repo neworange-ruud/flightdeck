@@ -19,6 +19,7 @@
 //!                              apply::Installer          │  download, verify, swap
 //!                                                        ▼
 //!                                              "Restart to use vX"
+//!                                       (MSI installs: restart runs the new MSI)
 //! ```
 //!
 //! - [`kind`]: install-kind detection from paths (pure, behind `FileSystem`).
@@ -43,5 +44,6 @@ pub mod state;
 pub use apply::Outcome;
 pub use kind::{InstallKind, PackageManager};
 pub use state::{
-    begin_install, finish_staged_update_at_launch, set_status, start_check, status, UpdateStatus,
+    begin_install, finish_staged_update_at_launch, restart, set_status, start_check, status,
+    UpdateStatus,
 };

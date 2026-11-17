@@ -363,7 +363,7 @@ pub fn route_palette(action: &PaletteAction) -> RemoteAction {
 /// Project on a worker opens its project picker.
 pub fn route_palette_for(ws: &RemoteWorkspace, action: &PaletteAction) -> RemoteAction {
     match action {
-        PaletteAction::OpenProject if ws.is_worker() => {
+        PaletteAction::OpenProject | PaletteAction::NewProject if ws.is_worker() => {
             RemoteAction::Local(LocalAction::ProjectPicker)
         }
         PaletteAction::OpenConfig if !forwards(ws, names::OPEN_CONFIGURATION) => {
@@ -432,7 +432,7 @@ fn scope_of(name: &str) -> Scope {
     match name {
         names::CLOSE_CHILD_TERMINAL | names::CLOSE_AGENT => Scope::Terminal,
         names::NEW_AGENT_SESSION_TAB | names::CLOSE_PROJECT => Scope::Project,
-        names::OPEN_PROJECT | names::QUIT => Scope::Instance,
+        names::OPEN_PROJECT | names::NEW_PROJECT | names::QUIT => Scope::Instance,
         _ => Scope::Session,
     }
 }

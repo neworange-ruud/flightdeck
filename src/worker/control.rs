@@ -364,7 +364,7 @@ mod unix {
 
     /// Why reading a line failed.
     #[derive(Debug)]
-    enum LineError {
+    pub(super) enum LineError {
         Timeout,
         TooLong,
         Io(std::io::Error),
@@ -418,6 +418,9 @@ mod unix {
         line.push('\n');
         if !timeout.is_zero() {
             let _ = stream.set_write_timeout(Some(timeout));
+            // Set the read timeout before the worker can answer and close:
+            // `read_line` may not be able to change it afterwards (see there).
+            let _ = stream.set_read_timeout(Some(timeout));
         }
         stream
             .write_all(line.as_bytes())
@@ -515,6 +518,9 @@ mod unix {
             return;
         }
         let deadline = Instant::now() + CLIENT_IO_TIMEOUT;
+        // Set once up front while the client is surely still connected:
+        // `read_line` may not be able to change it later (see there).
+        let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
         let response = match read_line(&mut stream, deadline, MAX_REQUEST_BYTES) {
             Ok(line) if line.is_empty() => return,
             Ok(line) => respond(&line, calls, reply_timeout),
@@ -534,7 +540,14 @@ mod unix {
     /// Read up to the first newline (excluded) or the end of the stream,
     /// whichever comes first, by `deadline`. More than `max` bytes without
     /// a newline is [`LineError::TooLong`].
-    fn read_line(
+    ///
+    /// Each read's timeout is narrowed to what is left of `deadline`, but a
+    /// failure to narrow it is not an error: on macOS `setsockopt` fails with
+    /// `EINVAL` once the peer has closed its end, which is exactly what a
+    /// worker does after writing an answer longer than one read
+    /// (`remote-control-4kc7`). The timeout set before stays in force, and a
+    /// read on a closed peer returns at once anyway.
+    pub(super) fn read_line(
         stream: &mut UnixStream,
         deadline: Instant,
         max: usize,
@@ -546,9 +559,7 @@ mod unix {
             if remaining.is_zero() {
                 return Err(LineError::Timeout);
             }
-            stream
-                .set_read_timeout(Some(remaining))
-                .map_err(LineError::Io)?;
+            let _ = stream.set_read_timeout(Some(remaining));
             let n = match stream.read(&mut buf) {
                 Ok(n) => n,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,

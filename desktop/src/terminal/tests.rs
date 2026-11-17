@@ -191,6 +191,7 @@ fn hosted(
         container: &f.container,
         command: &f.command,
         terminal: crate::terminal::desktop_profile(),
+        repo_init: &flightdeck::git::init::TEST_REPO_INIT,
     };
     let mut project = TestProject::new("alpha", &["a1"]);
     tweak(&mut project.state.config.ui);

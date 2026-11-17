@@ -56,10 +56,16 @@ fn no_agent_orchestrator_name_in_source() {
 /// commit-creating, or PR-creating git subcommand. We look for these as quoted
 /// argument literals (e.g. `"commit"`, `"amend"`) anywhere under `src/`.
 ///
-/// The single sanctioned exception is the `"rebase"` subcommand, which is
-/// permitted ONLY in `src/git/repo.rs` — the guarded, user-confirmed,
-/// conflict-aborting worktree rebase (SPECS §5.1 carve-out). It must appear
-/// nowhere else.
+/// The sanctioned exceptions:
+///
+/// - the `"rebase"` subcommand, permitted ONLY in `src/git/repo.rs` — the
+///   guarded, user-confirmed, conflict-aborting worktree rebase (SPECS §5.1
+///   carve-out);
+/// - the `"commit"` subcommand, permitted ONLY in `src/git/init.rs` — the empty
+///   root commit of a project FlightDeck has just created in a fresh folder
+///   (SPECS §5.3 carve-out).
+///
+/// Neither may appear anywhere else.
 #[test]
 fn git_layer_has_no_history_rewriting_subcommands() {
     let src = manifest_dir().join("src");
@@ -78,6 +84,8 @@ fn git_layer_has_no_history_rewriting_subcommands() {
     ];
     // The one file allowed to name the `"rebase"` subcommand (SPECS §5.1).
     let rebase_carve_out = src.join("git").join("repo.rs");
+    // The one file allowed to name the `"commit"` subcommand (SPECS §5.3).
+    let root_commit_carve_out = src.join("git").join("init.rs");
     // The container runtime (SPECS §31) shells out to **podman**, not git, and
     // legitimately uses flags that collide with these git tokens (`podman build
     // -f <Containerfile>`, `podman rm -f`). The §5 boundary is about git history
@@ -90,6 +98,9 @@ fn git_layer_has_no_history_rewriting_subcommands() {
         }
         let contents = fs::read_to_string(&file).unwrap_or_default();
         for token in forbidden {
+            if token == "\"commit\"" && file == root_commit_carve_out {
+                continue;
+            }
             assert!(
                 !contents.contains(token),
                 "SPECS §5 violation: forbidden git argument {token} found in {}",

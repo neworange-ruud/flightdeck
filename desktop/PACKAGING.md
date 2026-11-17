@@ -12,8 +12,10 @@ change with it; nothing here depends on the CLI being installed.
 
 | Piece | Status |
 | --- | --- |
-| `.github/workflows/desktop.yml` | Passes `actionlint`. **Never run**: CI cannot be run from this environment. The release jobs (`build-release`, `publish`) have never created a real release. |
-| macOS `.app` (`scripts/desktop/macos-bundle.sh`) | **Built and launched locally, unsigned** (see below). Zip name, `.sha256` and zip layout verified locally (aarch64). |
+| `.github/workflows/desktop.yml` | Runs on every `desktop-v*` tag; published desktop-v0.12 through desktop-v0.16. |
+| macOS `.app` (`scripts/desktop/macos-bundle.sh`) | Released signed and notarized (`spctl`: "Notarized Developer ID"). |
+| Self-update, macOS | **Verified 2026-11-16** with `desktop/examples/update_smoke.rs`: the released 0.15.0 bundle updated itself from the live desktop-v0.16.0 release (download, checksum, `ditto`, swap); the result passes `codesign --verify --deep --strict` and `spctl`. |
+| Self-update, Windows MSI | Written, unit-tested. The first release that publishes the versioned MSI (the one after desktop-v0.16.0) is the first one an install can update to. |
 | `scripts/desktop/check-asset-names.sh` | Run locally against the macOS output (pass) and a misnamed file (fail). |
 | Linux AppImage `.sha256`, Windows portable zip | Written, **not run** (no Linux/Windows machine). |
 | Codesign / notarize steps | Written, **not run** (no Developer ID identity here). |
@@ -64,7 +66,7 @@ after `check` passes. It builds **unsigned** artifacts and uploads them:
 | --- | --- | --- |
 | macOS | `FlightDeck-<ver>-macos-<arch>.zip` + `.sha256` | `scripts/desktop/macos-bundle.sh` |
 | Linux | `.deb`, `.rpm`, `FlightDeck-<ver>-linux-<arch>.AppImage` + `.sha256` | `cargo-deb`, `cargo-generate-rpm`, `scripts/desktop/linux-appimage.sh` |
-| Windows | `FlightDeck-windows-x64.msi`, `FlightDeck-<ver>-windows-<arch>-portable.zip` + `.sha256` | `cargo-wix` and the zip step of `scripts/desktop/windows-package.ps1` |
+| Windows | `FlightDeck-<ver>-windows-<arch>.msi`, `FlightDeck-<ver>-windows-<arch>-portable.zip`, each + `.sha256` | `cargo-wix` and the zip step of `scripts/desktop/windows-package.ps1` |
 
 This manual job is unsigned. Signing runs only in the release job (below).
 
@@ -284,9 +286,9 @@ the app was installed, detected from where the executable runs:
 | Install | Detected by | Banner |
 | --- | --- | --- |
 | Homebrew cask | bundle under `/opt/homebrew/Caskroom` or `/usr/local/Caskroom`, or in an `Applications` folder with a `Caskroom/flightdeck-desktop` receipt | "Update with: brew update && brew upgrade --cask flightdeck-desktop" |
-| `.deb` / `.rpm` | exe under `/usr` (not `/usr/local`) and `/var/lib/dpkg/info/flightdeck-desktop.list` / an rpm database | the apt / dnf command |
-| MSI / winget | exe under `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%` | winget or new MSI |
+| `.deb` / `.rpm` | exe under `/usr` (not `/usr/local`) and `/var/lib/dpkg/info/flightdeck-desktop.list` / an rpm database | download the new package from the release page and `apt install` / `dnf install` it (no repository publishes it, so `apt upgrade` would find nothing) |
 | macOS `.app` (zip), AppImage (`$APPIMAGE`), Windows portable zip | none of the above | **Update now** |
+| Windows MSI | exe under `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%ProgramW6432%` | **Update now**, which runs the new MSI on restart |
 | bare binary, `/usr/local`, unknown | anything else | "download from the releases page" |
 
 **Update now** downloads the asset and its checksum, verifies SHA-256, and only then
@@ -305,6 +307,14 @@ atomic only on one volume):
   launch**, before any window opens, `finish_staged` renames each old top-level entry
   into `.flightdeck-old/`, moves the new one in (all or nothing) and relaunches; the
   parked files are deleted on the launch after.
+- Windows MSI: the install is under Program Files (writable only elevated) and Windows
+  Installer keeps a record of it, so the app never touches those files. It downloads and
+  verifies `FlightDeck-<v>-windows-<arch>.msi` into `%LOCALAPPDATA%\flightdeck\update\`.
+  **Restart** starts a hidden PowerShell helper (`source::msi_handoff`) and quits; the
+  helper waits for the app to exit, runs `msiexec /i <msi> /passive /norestart` (Windows
+  asks for elevation; the WiX `MajorUpgrade` replaces the old version), deletes the MSI
+  and starts the app again. A declined prompt or failed install leaves the old version,
+  which starts anyway; `install.log` stays beside the download.
 
 **Asset naming contract** (the release pipeline must publish exactly this; the updater
 finds files by name and refuses, rather than guesses, when one is missing):
@@ -314,22 +324,24 @@ tag       desktop-v<version>                         e.g. desktop-v1.4.0  (plain
 macOS     FlightDeck-<version>-macos-<arch>.zip      FlightDeck.app at the zip root (ditto --keepParent)
 Linux     FlightDeck-<version>-linux-<arch>.AppImage
 Windows   FlightDeck-<version>-windows-<arch>-portable.zip   flightdeck-desktop.exe at the zip root
+          FlightDeck-<version>-windows-<arch>.msi            for installs the MSI made
 checksum  <asset name>.sha256                        `sha256sum` format: <64 hex>  <asset name>
 ```
 
 `<arch>` is `x86_64` or `aarch64`. Drafts and pre-releases are ignored. The packaging
 scripts and the release job emit exactly these names (see "Release job" and "Asset name
-check" above). The `.msi`, `.deb`, `.rpm` and the cask are for package managers and are never
+check" above). The `.deb`, `.rpm` and the cask are for package managers and are never
 downloaded by the app.
 
 **Downloads and unzip** use `curl` (HTTPS only, `--fail`), `ditto` (macOS), `tar` (Windows
 10+) and `unzip` (Linux), by argv, so the crate carries no HTTP/TLS client or zip library.
 A machine without `curl` simply never shows the notice.
 
-**Not verified.** The release pipeline is unpublished, so the real download, the real
-`ditto`/`tar` extraction, `App::restart` after a swap, writing into `/Applications`,
-Gatekeeper behaviour on a swapped (unsigned or notarized) bundle, and everything on
-Linux and Windows have not been run. What is tested: install-kind detection for every
+**Verification.** On macOS the whole install (real download, checksum, `ditto`, swap,
+a notarized bundle that still passes Gatekeeper) has been run against a live release
+with `cargo run -p flightdeck-desktop --example update_smoke -- <copy> <its version>`;
+the same tool checks a Windows or Linux copy. Not yet run: `App::restart` after the swap,
+the AppImage path, and the Windows paths (portable and MSI). What is unit-tested: install-kind detection for every
 OS from paths, asset selection, checksum parsing and mismatch refusal, GitHub response
 parsing, the once-a-day cache, and the whole install/rollback/staged-swap logic against a
 fake release source and temporary directories.

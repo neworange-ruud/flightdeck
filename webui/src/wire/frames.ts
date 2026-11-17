@@ -85,8 +85,13 @@
  * `download_plan` — each file's size and a single-use ticket for
  * `GET /download/{ticket}`, or a refusal. A worker never sends
  * `download_plan` to a peer below v9, and refuses `begin_download` from one.
+ *
+ * **v12 is creating a new project on a worker** (SPECS §5.3): the window asks
+ * with the `create_project` worker command (`{name, dir?}`) and is answered
+ * like `open_project_path` — an ack and a sentence. No new frame; the bump is
+ * how a window knows the worker understands the command.
  */
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";

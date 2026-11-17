@@ -11,17 +11,18 @@
 //! ## What is not in the table
 //!
 //! A handful of items are the desktop's own, not chords: About, Settings…,
-//! New window, Open project…, Connect to remote… and the GitHub link
-//! ([`AppCommand`]). Each is a small
+//! New window, Open project…, New project…, Connect to remote… and the
+//! GitHub link ([`AppCommand`]). Each is a small
 //! action whose handler asks the host for the same thing the palette row
 //! does (`Command::ShowAbout`, `PaletteAction::OpenConfig`, the native folder
-//! picker answering `HostEvent::OpenProject`).
+//! picker answering `HostEvent::OpenProject`, the native save dialog
+//! answering `HostEvent::CreateProject`).
 //!
 //! ## Layout
 //!
 //! ```text
 //! FlightDeck  About · Settings… ⌘, · Services · Quit ⌘Q
-//! File        New window ⌘N · New agent · New shell · Open project… ⌘O · Connect to remote… · Close session · Close shell · Open worktree
+//! File        New window ⌘N · New agent · New shell · Open project… ⌘O · New project… ⇧⌘N · Connect to remote… · Close session · Close shell · Open worktree
 //! View        Toggle split · Command palette · Projects / Agent sessions / Terminals ▸ · Focus
 //! Git         Push · Pull base · Finish
 //! Agent       Set manual status · Restart
@@ -45,8 +46,8 @@
 //!
 //! ## Shortcuts that are platform conventions, not table chords
 //!
-//! Cmd-, (Settings), Cmd-N (New window), Cmd-O (Open project) and Cmd-Q
-//! (Quit, the table's `Quit` action). The Dock icon's menu offers New window
+//! Cmd-, (Settings), Cmd-N (New window), Cmd-O (Open project), Cmd-Shift-N
+//! (New project) and Cmd-Q (Quit, the table's `Quit` action). The Dock icon's menu offers New window
 //! too, the usual way to get a second window of a Mac app. Cmd-V pastes and Cmd-C copies in the terminal (the table
 //! and the terminal view). **Cmd-W is left unbound**: it must never close a
 //! session by muscle memory (that is Ctrl-k), and the window has its own
@@ -68,6 +69,7 @@ actions!(
         About,
         OpenSettings,
         OpenProjectFolder,
+        NewProjectFolder,
         NewWindow,
         ConnectToRemote,
         OpenGithub
@@ -83,6 +85,8 @@ pub enum AppCommand {
     About,
     Settings,
     OpenProject,
+    /// A brand-new project: a new folder, `git init`, opened (SPECS §5.3).
+    NewProject,
     /// Another instance of the app, on its launcher
     /// ([`flightdeck_desktop::instance`]).
     NewWindow,
@@ -97,6 +101,7 @@ impl AppCommand {
             AppCommand::About => "About FlightDeck",
             AppCommand::Settings => "Settings…",
             AppCommand::OpenProject => "Open project…",
+            AppCommand::NewProject => "New project…",
             AppCommand::NewWindow => "New window",
             AppCommand::ConnectRemote => "Connect to remote…",
             AppCommand::GitHub => "FlightDeck on GitHub",
@@ -109,6 +114,7 @@ impl AppCommand {
             AppCommand::About => Some(HostEvent::Command(Command::ShowAbout)),
             AppCommand::Settings => Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig)),
             AppCommand::OpenProject
+            | AppCommand::NewProject
             | AppCommand::NewWindow
             | AppCommand::ConnectRemote
             | AppCommand::GitHub => None,
@@ -120,6 +126,7 @@ impl AppCommand {
             AppCommand::About => Box::new(About),
             AppCommand::Settings => Box::new(OpenSettings),
             AppCommand::OpenProject => Box::new(OpenProjectFolder),
+            AppCommand::NewProject => Box::new(NewProjectFolder),
             AppCommand::NewWindow => Box::new(NewWindow),
             AppCommand::ConnectRemote => Box::new(ConnectToRemote),
             AppCommand::GitHub => Box::new(OpenGithub),
@@ -163,6 +170,7 @@ impl AppCommand {
     pub fn perform(self, cx: &mut App) {
         match self {
             AppCommand::OpenProject => crate::root::pick_folder(cx),
+            AppCommand::NewProject => crate::root::pick_new_project(cx),
             AppCommand::NewWindow => {
                 if let Err(e) = flightdeck_desktop::instance::spawn_new_instance() {
                     crate::root::report(format!("Could not open a new window: {e}"), cx);
@@ -257,6 +265,7 @@ const LAYOUT: &[(&str, &[Slot])] = &[
             Entry("NewAgentTab"),
             Entry("NewChildTerminal"),
             AppSlot(AppCommand::OpenProject),
+            AppSlot(AppCommand::NewProject),
             AppSlot(AppCommand::ConnectRemote),
             Sep,
             Entry("CloseAgentTab"),
@@ -324,7 +333,8 @@ fn resolve(slot: &Slot, keymap: &Keymap, isolated: bool) -> Option<ItemModel> {
             label: command.label().to_string(),
             target: Target::App(*command),
             // An isolated run opens nothing else (SPECS §32).
-            disabled: isolated && *command == AppCommand::OpenProject,
+            disabled: isolated
+                && matches!(command, AppCommand::OpenProject | AppCommand::NewProject),
         },
         Entry(id) => {
             let entry = keymap.entry(id)?;
@@ -441,6 +451,7 @@ pub fn platform_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-o", OpenProjectFolder, None),
+        KeyBinding::new("cmd-shift-n", NewProjectFolder, None),
     ];
     if let Some(quit) = keymap.entry("Quit") {
         bindings.push(KeyBinding::new(
@@ -470,6 +481,7 @@ pub fn register_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| AppCommand::About.perform(cx));
     cx.on_action(|_: &OpenSettings, cx| AppCommand::Settings.perform(cx));
     cx.on_action(|_: &OpenProjectFolder, cx| AppCommand::OpenProject.perform(cx));
+    cx.on_action(|_: &NewProjectFolder, cx| AppCommand::NewProject.perform(cx));
     cx.on_action(|_: &NewWindow, cx| AppCommand::NewWindow.perform(cx));
     cx.on_action(|_: &ConnectToRemote, cx| AppCommand::ConnectRemote.perform(cx));
     cx.on_action(|_: &OpenGithub, cx| AppCommand::GitHub.perform(cx));
@@ -567,6 +579,7 @@ mod tests {
             Target::Entry("NewAgentTab"),
             Target::Entry("NewChildTerminal"),
             Target::App(AppCommand::OpenProject),
+            Target::App(AppCommand::NewProject),
             Target::App(AppCommand::NewWindow),
             Target::App(AppCommand::ConnectRemote),
             Target::Entry("CloseAgentTab"),
@@ -583,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_run_disables_new_agent_projects_and_open_project() {
+    fn an_isolated_run_disables_new_agent_projects_and_open_and_new_project() {
         let keymap = keymap_for(false);
         let disabled = |menus: &[MenuModel]| -> Vec<Target> {
             fn walk(items: &[ItemModel], out: &mut Vec<Target>) {
@@ -612,6 +625,7 @@ mod tests {
             [
                 Target::Entry("NewAgentTab"),
                 Target::App(AppCommand::OpenProject),
+                Target::App(AppCommand::NewProject),
                 Target::Entry("SwitchProjectPrev"),
                 Target::Entry("SwitchProjectNext"),
             ]
@@ -629,6 +643,7 @@ mod tests {
             Some(HostEvent::RunPaletteAction(PaletteAction::OpenConfig))
         );
         assert!(AppCommand::OpenProject.host_event().is_none());
+        assert!(AppCommand::NewProject.host_event().is_none());
     }
 
     #[test]
@@ -666,6 +681,23 @@ mod tests {
             }));
         } else {
             assert!(bindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn new_project_is_cmd_shift_n_on_macos_and_free_of_the_table() {
+        let keymap = keymap_for(false);
+        let bindings = platform_bindings(keymap);
+        let stroke = [gpui::Keystroke::parse("cmd-shift-n").unwrap()];
+        if platform::IS_MACOS {
+            assert!(bindings.iter().any(|b| {
+                b.match_keystrokes(&stroke) == Some(false)
+                    && b.action().name() == NewProjectFolder.name()
+            }));
+        }
+        // No table chord already claims it.
+        for spec in flightdeck_desktop::keys::binding_specs(keymap) {
+            assert_ne!(spec.keystroke, "cmd-shift-n", "{}", spec.entry_id);
         }
     }
 

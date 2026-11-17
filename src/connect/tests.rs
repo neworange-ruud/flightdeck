@@ -406,6 +406,47 @@ fn open_project_on_a_worker_is_the_picker_and_clones_a_url() {
     assert!(ui.session().picker().is_none());
 }
 
+/// SPECS §5.3: a v12 worker's picker has a fourth pane that creates a new
+/// project in the folder Browse listed.
+#[test]
+fn the_worker_picker_creates_a_new_project() {
+    let (mut ui, mut script) = open(true);
+    ui.key(ctrl('g'));
+    for c in "open project".chars() {
+        ui.key(key(KeyCode::Char(c)));
+    }
+    ui.key(key(KeyCode::Enter));
+    assert!(ui.session().picker().is_some(), "the picker opened");
+
+    // Tab three times: scanned → browse → clone → create.
+    for _ in 0..3 {
+        ui.key(key(KeyCode::Tab));
+    }
+    let screen = drawn(&ui);
+    assert!(screen.contains("New project in"), "{screen}");
+    // Nothing typed: nothing sent, and the picker says why.
+    script.sent();
+    ui.key(key(KeyCode::Enter));
+    assert!(!commands(&mut script)
+        .iter()
+        .any(|(name, _)| name == "create_project"));
+    assert!(drawn(&ui).contains("Type a name"));
+
+    for c in "fresh-app".chars() {
+        ui.key(key(KeyCode::Char(c)));
+    }
+    ui.key(key(KeyCode::Enter));
+    let sent = commands(&mut script);
+    assert!(
+        sent.iter().any(|(name, args)| name == "create_project"
+            && args.as_ref().is_some_and(|a| a["name"] == "fresh-app")),
+        "{sent:?}"
+    );
+    // One more Tab wraps back to the scanned repositories.
+    ui.key(key(KeyCode::Tab));
+    assert!(drawn(&ui).contains("repositories found"));
+}
+
 #[test]
 fn a_takeover_ends_on_a_screen_that_offers_reconnect() {
     let (mut ui, script) = open(true);
