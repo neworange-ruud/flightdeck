@@ -54,6 +54,9 @@ case "$cmd" in
       stop)
         name="${2:?record stop NAME}"
         printf '%s stop\n' "$(python3 -c 'import time; print(f"{time.time():.3f}")')" >> "$TUT_TIMELINE"
+        # screencapture drops the last seconds it has buffered when stopped:
+        # keep recording a little past the stop mark (scenes end in a cut).
+        sleep 4
         vm_ssh 'kill -INT "$(cat /tmp/fd-rec.pid)"; while kill -0 "$(cat /tmp/fd-rec.pid)" 2>/dev/null; do sleep 0.2; done'
         out="$TUT_STATE/videos"; mkdir -p "$out"
         vm_ssh 'cat /tmp/fd-rec.mov' > "$out/$name-raw.mov"
