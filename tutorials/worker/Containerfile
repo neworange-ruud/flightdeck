@@ -34,6 +34,11 @@ RUN for p in /home/dev/flightdeck/*/; do \
         && git -C "$p" commit -q -m "Initial commit"; \
     done
 
+# All of Claude Code's state, the login and its first-run answers
+# (.claude.json) included, in ~/.claude: up.sh keeps that in a named volume,
+# so a fresh container needs no login and shows no first-run screens.
+ENV CLAUDE_CONFIG_DIR=/home/dev/.claude
+
 # Debug-build seam: listen here instead of on Tailscale addresses.
 ENV FLIGHTDECK_WORKER_TEST_LISTEN=0.0.0.0:7420
 EXPOSE 7420
