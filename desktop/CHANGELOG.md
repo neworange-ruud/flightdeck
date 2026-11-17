@@ -18,14 +18,25 @@ uses that version's section as the GitHub Release notes.
 - **New project… in the launcher and on cmd-shift-n.** The launcher has a New project… button next to Open project…, so you can start from nothing on Windows and Linux too. In the palette's New Project browser, **Choose location…** opens the system save dialog.
 - **The remote worker picker can create projects.** Below Clone, type a folder name and press Create. The new project goes in the folder you are browsing on the worker. Needs a worker running this version.
 - **New Child Agent in the agent's right-click menu.** Right-click an agent in the sidebar and choose **New Child Agent** to run another agent in the same worktree, without opening the palette.
+- **A copy installed with the Windows MSI now updates itself.** The update
+  banner's **Update now** downloads and verifies the new MSI. **Restart** then
+  installs it, after Windows asks for permission, and starts the app again.
+  Installs from this release on can update to the next one.
 
 ### Improvements
 
-- None yet.
+- The Windows MSI is published as `FlightDeck-<version>-windows-x86_64.msi`,
+  with a `.sha256` checksum.
+- `cargo run -p flightdeck-desktop --example update_smoke -- <copy> <version>`
+  runs the self-update against the live releases without opening a window, so
+  a release can be checked before anyone clicks **Update now**.
 
 ### Bug fixes
 
-- None yet.
+- The update banner no longer tells `.deb` and `.rpm` installs to run
+  `apt upgrade` or `dnf upgrade`. No repository publishes the app, so those
+  commands found nothing. It now says to install the new package from the
+  release page.
 
 ## [0.16.0] - 2026-11-16
 

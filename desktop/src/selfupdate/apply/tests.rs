@@ -167,6 +167,21 @@ fn staging_is_always_beside_the_thing_it_replaces() {
     assert_eq!(win.staging, Path::new("D:/Tools/FD/.flightdeck-update"));
     assert_eq!(win.target, Path::new("D:/Tools/FD"));
     assert_eq!(win.aside, Path::new("D:/Tools/FD/.flightdeck-old"));
+
+    // Program Files needs elevation; the installer waits in local app data.
+    let msi = Layout::plan(
+        &DirectKind::WindowsMsi {
+            exe: "C:/Program Files/FlightDeck/flightdeck-desktop.exe".into(),
+            staging: "C:/Users/u/AppData/Local/flightdeck/update".into(),
+        },
+        v("1.4.0"),
+        "a.msi",
+    );
+    assert_eq!(
+        msi.download,
+        Path::new("C:/Users/u/AppData/Local/flightdeck/update/a.msi")
+    );
+    assert!(!msi.staging.starts_with("C:/Program Files"));
 }
 
 // --- macOS -------------------------------------------------------------
@@ -502,4 +517,59 @@ fn a_failure_part_way_through_the_windows_swap_restores_everything() {
     assert!(finish_staged(&failing, &exe).is_err());
     assert_eq!(read(&exe), "old exe");
     assert_eq!(read(dir.path().join("helper.dll")), "old dll");
+}
+
+// --- Windows MSI -------------------------------------------------------
+
+fn msi_fixture() -> (tempfile::TempDir, DirectKind, FakeSource, ReleaseInfo) {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("Program Files/FlightDeck");
+    fs::create_dir_all(&program).unwrap();
+    fs::write(program.join("flightdeck-desktop.exe"), "old exe").unwrap();
+    let name = asset_name(v("1.4.0"), PackageFormat::WindowsMsi, Arch::Aarch64);
+    let rel = release("1.4.0", &[name.clone(), checksum_name(&name)]);
+    let source = FakeSource::new(Some(rel.clone()));
+    source.publish(&name, b"msi bytes");
+    let kind = DirectKind::WindowsMsi {
+        exe: program.join("flightdeck-desktop.exe"),
+        staging: dir.path().join("Local/flightdeck/update"),
+    };
+    (dir, kind, source, rel)
+}
+
+#[test]
+fn an_msi_install_downloads_the_verified_installer_and_leaves_program_files_alone() {
+    let (dir, kind, source, rel) = msi_fixture();
+    let nothing = FakeUnzip { files: vec![] };
+    let outcome = installer(&RealFs, &source, &nothing)
+        .install(&rel, &kind)
+        .unwrap();
+    let msi = dir.path().join("Local/flightdeck/update").join(asset_name(
+        v("1.4.0"),
+        PackageFormat::WindowsMsi,
+        Arch::Aarch64,
+    ));
+    assert_eq!(outcome, Outcome::RunInstaller { msi: msi.clone() });
+    assert_eq!(read(&msi), "msi bytes", "kept for msiexec to run");
+    let program = dir.path().join("Program Files/FlightDeck");
+    assert_eq!(entries(&program), ["flightdeck-desktop.exe"]);
+    assert_eq!(read(program.join("flightdeck-desktop.exe")), "old exe");
+}
+
+#[test]
+fn a_corrupt_msi_is_discarded_and_never_offered_to_run() {
+    let (dir, kind, source, rel) = msi_fixture();
+    let name = asset_name(v("1.4.0"), PackageFormat::WindowsMsi, Arch::Aarch64);
+    source.publish_raw(&name, b"tampered");
+    let err = installer(&RealFs, &source, &FakeUnzip { files: vec![] })
+        .install(&rel, &kind)
+        .unwrap_err();
+    assert!(
+        matches!(err, UpdateError::ChecksumMismatch { .. }),
+        "{err:?}"
+    );
+    assert!(
+        !dir.path().join("Local/flightdeck/update").exists(),
+        "nothing unverified is left to run"
+    );
 }
