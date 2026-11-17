@@ -20,7 +20,10 @@ TUT_STATE="$TUT_ROOT/target/tutorials"
 VM_BASE="${VM_BASE:-fd-tutorial-base}"
 VM="${VM:-fd-tutorial}"
 VM_USER=admin
-VM_DISPLAY="${VM_DISPLAY:-1920x1080pt}"
+# The guest's screen in points (Retina: twice that in pixels). Smaller than
+# the 1920x1080 video on purpose: edit.py scales it up, so everything on
+# screen reads bigger, like a zoomed-in view.
+VM_DISPLAY="${VM_DISPLAY:-1440x810pt}"
 # Host folder shared into the guest at "/Volumes/My Shared Files/share":
 # the app goes in, recordings and screenshots come out.
 VM_SHARE="$TUT_STATE/share"
@@ -89,7 +92,7 @@ vm_vnc_daemon() {
   read -r addr pass < <(vm_vnc)
   pkill -f "vnc_drive.py serve" 2>/dev/null || true
   rm -f "$VNC_SOCK"
-  nohup "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" serve "$addr" "$pass" "$VNC_SOCK" \
+  VM_DISPLAY="$VM_DISPLAY" nohup "$VENV/bin/python" "$TUT_ROOT/tutorials/vm/vnc_drive.py" serve "$addr" "$pass" "$VNC_SOCK" \
     < /dev/null > "$VNC_LOG" 2>&1 &
   disown
   for _ in $(seq 1 100); do grep -q "daemon ready" "$VNC_LOG" 2>/dev/null && return 0; sleep 0.2; done

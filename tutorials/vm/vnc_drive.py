@@ -8,8 +8,8 @@ sends scripts to it. One connection for the VM's whole life, because
 connecting while the guest records its screen can crash the VM.
 
 One command per line; `#` starts a comment; arguments are shell-quoted.
-Coordinates are screen POINTS (1920x1080); the VM framebuffer is Retina, so
-they are doubled on the wire.
+Coordinates are screen POINTS (the VM's display, 1440x810 by default); the
+framebuffer is Retina, so they are doubled on the wire.
 
     glide X Y [SECS]     move the pointer smoothly (ease in-out), default 0.6 s
     move X Y             jump the pointer
@@ -31,6 +31,19 @@ Editing marks, written with host timestamps to $TUT_TIMELINE (set by
     fast FACTOR          play what follows FACTOR times faster (an agent working)
     normal               back to normal speed
     caption TEXT         show TEXT from here until the next caption (or `caption`)
+    highlight X Y W H [spot]   draw attention to a screen area (points) until
+                         `unhighlight`; `spot` also dims everything around it
+    unhighlight          remove all highlights
+
+Voiceover (ElevenLabs, see voice.py):
+
+    say TEXT             speak TEXT from here; waits first for the previous line
+                         to finish, so lines never overlap
+    waitvoice [EXTRA]    wait until the current line has been spoken (+EXTRA s)
+
+Before a script runs, the clips for all its `say` lines are fetched (between
+`hold` and `release` marks, dropped like a cut, so the fetching never shows in the video), which makes `say` instant and
+lets the driver know how long each line runs.
 
 Virtualization.framework's VNC server maps keys to a US layout and ignores a
 keysym's shift level, so capitals and shifted symbols are sent with Shift
@@ -46,6 +59,8 @@ import time
 
 from vncdotool import api
 
+import voice
+
 SCALE = 2  # points -> framebuffer pixels
 SHIFTED = dict(zip('~!@#$%^&*()_+{}|:"<>?', "`1234567890-=[]\\;',./"))
 NAMED = {"\n": "enter", "\t": "tab", " ": "space"}
@@ -54,7 +69,8 @@ NAMED = {"\n": "enter", "\t": "tab", " ": "space"}
 class Driver:
     def __init__(self, client):
         self.c = client
-        self.x, self.y = 960.0, 540.0
+        self.x, self.y = 720.0, 405.0
+        self.voice_end = 0.0
 
     def _move(self, x, y):
         self.x, self.y = x, y
@@ -155,10 +171,33 @@ class Driver:
     def caption(self, text=""):
         self._mark("caption", text)
 
+    def highlight(self, x, y, w, h, style="box"):
+        self._mark("highlight", x, y, w, h, style)
+
+    def unhighlight(self):
+        self._mark("unhighlight")
+
+    def say(self, text):
+        self.waitvoice("0.25")
+        secs = voice.length(voice.clip(text))
+        self._mark("voice", text)
+        self.voice_end = time.time() + secs
+
+    def waitvoice(self, extra="0"):
+        left = self.voice_end + float(extra) - time.time()
+        if left > 0:
+            time.sleep(left)
+
 
 def run_script(driver: Driver, text: str) -> None:
-    for n, raw in enumerate(text.splitlines(), 1):
-        words = shlex.split(raw, comments=True)
+    lines = [(n, shlex.split(raw, comments=True)) for n, raw in enumerate(text.splitlines(), 1)]
+    missing = [w[1] for _, w in lines if len(w) == 2 and w[0] == "say" and not voice.is_cached(w[1])]
+    if missing:
+        driver._mark("hold")  # a second or two a line: not on camera
+        for line in missing:
+            voice.clip(line)
+        driver._mark("release")
+    for n, words in lines:
         if not words:
             continue
         name, args = words[0], words[1:]
@@ -175,9 +214,25 @@ def serve(server: str, password: str, sock_path: str) -> None:
     connects after the daemon has (see tutorials/vm/lib.sh)."""
     import socket
 
-    client = api.connect(server, password=password or None, timeout=15)
+    # The framebuffer takes its size at connect time: right after the guest
+    # switched its display mode it can still be the old one, and every click
+    # would land in the wrong place. Reconnect until it matches the display.
+    want = os.environ.get("VM_DISPLAY", "").removesuffix("pt")
+    for attempt in range(30):
+        client = api.connect(server, password=password or None, timeout=15)
+        if not want:
+            break
+        client.refreshScreen()
+        got = client.screen.size
+        if f"{got[0] // SCALE}x{got[1] // SCALE}" == want:
+            break
+        print(f"framebuffer {got[0]}x{got[1]}, want {want} points; reconnecting", flush=True)
+        client.disconnect()
+        time.sleep(1)
+    else:
+        raise SystemExit(f"VNC framebuffer never matched {want}")
     driver = Driver(client)
-    driver.move(960, 540)  # proves the connection before we accept work
+    driver.move(720, 405)  # proves the connection before we accept work
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

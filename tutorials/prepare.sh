@@ -7,7 +7,7 @@
 #   SKIP_BUILD=0 tutorials/prepare.sh    also rebuild the worker binary
 #   STAGE=launcher tutorials/prepare.sh  stop at the launcher (for a pairing tutorial)
 #
-# Coordinates are screen points (see tutorials/vm/vnc_drive.py). The launcher
+# Coordinates are screen points, 1440x810 (see tutorials/vm/vnc_drive.py). The launcher
 # and the Connect form open centred; the worker window is made full screen
 # through the View menu, whose place never changes.
 set -euo pipefail
@@ -31,22 +31,22 @@ CODE="$(podman exec "$WORKER" flightdeck worker pair --json \
 
 # Launcher: Connect to remote… -> address, code -> Connect -> Connect anyway.
 "$VMCTL" run - <<EOF
-move 1089 651
+move 849 516
 click
 pause 1.5
-move 960 440
+move 720 305
 click
 pause 0.4
 paste devbox:7420
-move 960 505
+move 720 370
 click
 pause 0.4
 paste $CODE
 pause 0.3
-move 745 591
+move 505 457
 click
 pause 1.5
-move 776 699
+move 536 565
 click
 EOF
 
@@ -66,7 +66,7 @@ pause 0.8
 move 260 262
 click
 pause 2.5
-move 1500 560
+move 1100 420
 EOF
 "$VMCTL" shot >/dev/null
 echo "stage: worker window, full screen ($("$VMCTL" ip))"
