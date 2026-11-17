@@ -22,7 +22,11 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- macOS: the app no longer crashes when a worker removes a worktree while no
+  session browser has been opened in the app yet. Deleting that worktree's
+  browser profile called into WebKit before WebKit had started, which crashed
+  the app (SIGSEGV in `WebsiteDataStore::removeDataStoreWithIdentifierImpl`).
+  On macOS 13, where there is no session browser, nothing is deleted any more.
 
 ## [2.0.0] - 2026-11-17
 

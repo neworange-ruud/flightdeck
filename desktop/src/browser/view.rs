@@ -877,11 +877,18 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
         cx.update(|_| super::windows::forget_profile(&profile));
     })
     .detach();
+    // Before macOS 14 there is no session browser (B20), so no profile to
+    // delete, and no `removeDataStoreForIdentifier:` to delete it with.
+    #[cfg(target_os = "macos")]
+    if super::unavailable().is_some() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_secs(1)).await;
         cx.update(|_| {
             use wry::WebViewExtDarwin;
+            warm_webkit();
             WebView::remove_data_store(&profile, |result| {
                 if let Err(e) = result {
                     eprintln!("flightdeck-desktop: could not delete a browser profile: {e}");
@@ -890,6 +897,25 @@ pub fn forget_profile(profile: [u8; 16], cx: &mut gpui::App) {
         });
     })
     .detach();
+}
+
+/// Start WebKit up in this process, if no web view has yet. Without this,
+/// `WKWebsiteDataStore.removeDataStoreForIdentifier:` crashes the app: its
+/// work on WebKit's IO queue hands the result back to WebKit's main run loop,
+/// which only exists once WebKit has started, and dispatches to a null one
+/// (SIGSEGV in `WTF::RunLoop::dispatch`). A worker window forgets the profiles
+/// of the worker's abandoned worktrees whether or not a browser was ever open
+/// in it, so this is the usual case there. `defaultDataStore` is enough to
+/// start WebKit, and cheaper than a web view: it starts no web content process.
+#[cfg(target_os = "macos")]
+fn warm_webkit() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    // SAFETY: a class method with no arguments that returns the shared,
+    // autoreleased default store; called on the main thread (`cx.update`).
+    let _: Option<Retained<AnyObject>> =
+        unsafe { msg_send![class!(WKWebsiteDataStore), defaultDataStore] };
 }
 
 /// Place the web view at `bounds` (window-relative logical pixels, as GPUI
