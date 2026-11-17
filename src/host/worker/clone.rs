@@ -58,14 +58,10 @@ pub fn parse_progress(line: &str) -> Option<CloneLine> {
     })
 }
 
-/// Whether `name` is usable as a folder name: `[A-Za-z0-9._-]`, not `.`/`..`.
+/// Whether `name` is usable as a folder name: the same rule a new project's
+/// folder obeys.
 fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    crate::git::init::valid_folder_name(name)
 }
 
 /// The folder name a URL clones into: its last segment without `.git`,
@@ -98,11 +94,7 @@ pub fn plan_clone(
     }
     let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) if valid_name(n) => n.to_string(),
-        Some(n) => {
-            return Err(format!(
-            "{n} is not a usable folder name: use letters, digits, dots, dashes and underscores."
-        ))
-        }
+        Some(n) => return Err(crate::git::init::invalid_folder_name(n)),
         None => derive_name(url).ok_or_else(|| {
             "Could not work out a folder name from that address: enter one.".to_string()
         })?,
@@ -117,7 +109,7 @@ pub fn plan_clone(
 
 /// The canonical `projects_root`, created when missing, refusing a root that
 /// is (or would be created) outside home.
-fn ensure_projects_root(
+pub(super) fn ensure_projects_root(
     fs: &dyn FileSystem,
     conf: &Confinement,
     root: &Path,

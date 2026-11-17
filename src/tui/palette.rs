@@ -43,6 +43,10 @@ pub enum PaletteAction {
     /// T9 must open the project-folder picker then open the chosen folder as a
     /// new project (workspace-level, not an `AppState` command).
     OpenProject,
+    /// T9 must open the project-folder picker in create mode: the user names a
+    /// new folder, which is created, `git init`ed with an empty root commit
+    /// (SPECS §5.3) and opened as a new project (workspace-level).
+    NewProject,
     /// T9 must confirm, then close the active project (workspace-level).
     CloseProject,
     /// T9 must open the local-branch picker and update this project's default
@@ -171,6 +175,11 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
         group: "Projects",
         label: "Open Project",
         action: PaletteAction::OpenProject,
+    },
+    PaletteEntry {
+        group: "Projects",
+        label: "New Project",
+        action: PaletteAction::NewProject,
     },
     PaletteEntry {
         group: "Projects",
@@ -358,8 +367,8 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 /// override in the input-arbitration model) makes 34, plus "Show Web Access"
 /// (D5/Q1's access overlay, reachable again after it is dismissed and for a
 /// server that came up from `[web] enabled` rather than from the palette) makes
-/// 35.
-pub const REQUIRED_ACTION_COUNT: usize = 35;
+/// 35, plus "New Project" (SPECS §5.3) makes 36.
+pub const REQUIRED_ACTION_COUNT: usize = 36;
 
 /// The rows a graphical front-end adds to the palette (see
 /// [`PaletteAction::FrontEnd`]). Each joins the end of its group in
@@ -558,6 +567,7 @@ impl CommandPalette {
             PaletteAction::TakeInputLock => self.web_running,
             // An isolated run has one session in one project (SPECS §32).
             PaletteAction::OpenProject
+            | PaletteAction::NewProject
             | PaletteAction::CloseProject
             | PaletteAction::SwitchProjectNext
             | PaletteAction::SwitchProjectPrev

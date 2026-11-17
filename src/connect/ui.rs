@@ -15,7 +15,8 @@
 //! * **A worker's shell** is the first tab on the project row; its keys are
 //!   all the shell's, and the leave-focus key returns to the project.
 //! * **A worker's project picker** is a dialog: Tab cycles scanned
-//!   repositories, the home folder browser and a clone URL.
+//!   repositories, the home folder browser, a clone URL and (v12) a new
+//!   project's folder name.
 //! * **The link's end** (revoked, taken over, a version mismatch) is a full
 //!   screen with Reconnect.
 
@@ -90,6 +91,9 @@ enum PickerPane {
     Browse,
     /// A URL to clone.
     Clone,
+    /// A new project's folder name, created in the folder Browse last listed
+    /// (SPECS §5.3; only offered by a worker at protocol v12 or later).
+    Create,
 }
 
 /// See the module docs.
@@ -590,7 +594,7 @@ impl ConnectUi {
                 }
                 rows
             }
-            PickerPane::Clone => Vec::new(),
+            PickerPane::Clone | PickerPane::Create => Vec::new(),
         }
     }
 
@@ -605,6 +609,10 @@ impl ConnectUi {
                 picker.cwd.as_deref().unwrap_or(&picker.home)
             ),
             PickerPane::Clone => "Open a project — clone a repository".to_string(),
+            PickerPane::Create => format!(
+                "New project in {} — type the new folder's name",
+                picker.cwd.as_deref().unwrap_or("the projects root")
+            ),
         };
         let mut title = vec![heading];
         if let Some(clone) = &picker.clone {
@@ -628,6 +636,7 @@ impl ConnectUi {
         let mut buttons = vec![DialogButton::new(DialogAccel::Tab, "Next pane")];
         match pane {
             PickerPane::Clone => buttons.push(DialogButton::new(DialogAccel::Enter, "Clone")),
+            PickerPane::Create => buttons.push(DialogButton::new(DialogAccel::Enter, "Create")),
             PickerPane::Browse => {
                 buttons.push(DialogButton::new(DialogAccel::Enter, "Open / enter"));
                 buttons.push(DialogButton::new(DialogAccel::Char('.'), "Hidden"));
@@ -637,7 +646,11 @@ impl ConnectUi {
         buttons.push(DialogButton::cancelling(DialogAccel::Esc, "Close"));
         Some(Dialog {
             title: title.join("\n"),
-            input: (pane == PickerPane::Clone).then(|| picker.clone_url.clone()),
+            input: match pane {
+                PickerPane::Clone => Some(picker.clone_url.clone()),
+                PickerPane::Create => Some(picker.new_name.clone()),
+                PickerPane::Scanned | PickerPane::Browse => None,
+            },
             list,
             buttons,
             accent: Color::Cyan,
@@ -654,13 +667,15 @@ impl ConnectUi {
                 self.session.close_picker();
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                let next = match (pane, key.code) {
-                    (PickerPane::Scanned, KeyCode::Tab) => PickerPane::Browse,
-                    (PickerPane::Browse, KeyCode::Tab) => PickerPane::Clone,
-                    (PickerPane::Clone, KeyCode::Tab) => PickerPane::Scanned,
-                    (PickerPane::Scanned, _) => PickerPane::Clone,
-                    (PickerPane::Browse, _) => PickerPane::Scanned,
-                    (PickerPane::Clone, _) => PickerPane::Browse,
+                let mut panes = vec![PickerPane::Scanned, PickerPane::Browse, PickerPane::Clone];
+                if self.session.picker_creates_projects() {
+                    panes.push(PickerPane::Create);
+                }
+                let at = panes.iter().position(|p| *p == pane).unwrap_or(0);
+                let next = if key.code == KeyCode::Tab {
+                    panes[(at + 1) % panes.len()]
+                } else {
+                    panes[(at + panes.len() - 1) % panes.len()]
                 };
                 self.picker = (next, 0);
             }
@@ -674,6 +689,14 @@ impl ConnectUi {
                         .map(|p| p.clone_url.clone())
                         .unwrap_or_default();
                     self.session.picker_clone(&url, "");
+                }
+                PickerPane::Create => {
+                    let name = self
+                        .session
+                        .picker()
+                        .map(|p| p.new_name.clone())
+                        .unwrap_or_default();
+                    self.session.picker_create(&name);
                 }
                 PickerPane::Scanned => {
                     if let Some((_, Some(path))) = rows.get(selected) {
@@ -725,6 +748,16 @@ impl ConnectUi {
             KeyCode::Char(c) if pane == PickerPane::Clone => {
                 if let Some(p) = self.session.picker_mut() {
                     p.clone_url.push(c);
+                }
+            }
+            KeyCode::Backspace if pane == PickerPane::Create => {
+                if let Some(p) = self.session.picker_mut() {
+                    p.new_name.pop();
+                }
+            }
+            KeyCode::Char(c) if pane == PickerPane::Create => {
+                if let Some(p) = self.session.picker_mut() {
+                    p.new_name.push(c);
                 }
             }
             _ => {}
@@ -823,9 +856,12 @@ impl ConnectUi {
             return;
         }
         if self.session.picker().is_some() {
-            if self.picker.0 == PickerPane::Clone {
-                if let Some(p) = self.session.picker_mut() {
-                    p.clone_url.push_str(text.trim());
+            let pane = self.picker.0;
+            if let Some(p) = self.session.picker_mut() {
+                match pane {
+                    PickerPane::Clone => p.clone_url.push_str(text.trim()),
+                    PickerPane::Create => p.new_name.push_str(text.trim()),
+                    PickerPane::Scanned | PickerPane::Browse => {}
                 }
             }
             return;

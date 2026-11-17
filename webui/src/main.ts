@@ -11,6 +11,7 @@ import {
 import {
   browseRequest,
   cloneRequest,
+  createRequest,
   openRequest,
   scanRequest,
 } from "./state/picker";
@@ -588,6 +589,16 @@ function runPickerIntent(intent: PickerIntent): void {
       return;
     case "clone": {
       const request = cloneRequest(picker);
+      if ("error" in request) {
+        app.store.dispatch({ type: "picker/error", error: request.error });
+        return;
+      }
+      send(request);
+      return;
+    }
+    case "create": {
+      /** v12: answered like an open of a path, so tracked as one. */
+      const request = createRequest(picker);
       if ("error" in request) {
         app.store.dispatch({ type: "picker/error", error: request.error });
         return;

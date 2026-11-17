@@ -212,6 +212,7 @@ pub fn run() -> Result<()> {
         container: &container,
         command: &command,
         terminal: crate::terminal::session::TerminalProfile::TUI,
+        repo_init: &crate::git::init::REAL_REPO_INIT,
     };
 
     // Opening the workspace is the host's job, not the terminal's: the launch
@@ -1188,6 +1189,9 @@ struct BrowseState {
     selected: usize,
     /// A path typed directly by the user (takes precedence on confirm).
     typed: String,
+    /// Create mode (New Project, SPECS §5.3): Enter creates the typed folder
+    /// under `dir` and initialises it instead of opening an existing one.
+    create: bool,
 }
 
 /// An in-progress mouse text selection drag over the terminal viewport (SPECS
@@ -1586,6 +1590,10 @@ pub struct Env<'a> {
     /// (vt100); the desktop app builds alacritty grids answering colour
     /// queries with its theme.
     pub terminal: crate::terminal::session::TerminalProfile,
+    /// Initialises a New Project's fresh folder (SPECS §5.3):
+    /// [`crate::git::init::REAL_REPO_INIT`] everywhere but tests, which give
+    /// git an identity of their own.
+    pub repo_init: &'a dyn crate::git::init::RepoInitializer,
 }
 
 impl<'a> Env<'a> {
@@ -3387,6 +3395,7 @@ mod relay_owner_tests {
             container: &container,
             command: &command,
             terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &crate::git::init::TEST_REPO_INIT,
         };
         let state = Path::new("/home/u/.flightdeck/remote.json");
         let owner = fs
@@ -5751,6 +5760,19 @@ fn apply_host_event(
                 open_project_path(&path, workspace, env, ui);
             }
         }
+        // A native "new project" dialog's answer: the same guard, then the
+        // create-mode folder browser's own create path.
+        HostEvent::CreateProject(path) => {
+            let isolated = workspace
+                .projects
+                .get(workspace.active)
+                .is_some_and(|p| p.state.isolated);
+            if isolated {
+                ui.message(ISOLATED_REFUSAL);
+            } else {
+                create_project_path(&path, workspace, env, ui);
+            }
+        }
         HostEvent::Overlay(input) => {
             crate::tui::overlay_bridge::apply_overlay_input(input, workspace, env, ui)?
         }
@@ -6515,6 +6537,17 @@ fn list_subdirs(fs: &dyn FileSystem, dir: &Path) -> Vec<PathBuf> {
 /// directory of the active project (its neighbours are the likely next
 /// projects), falling back to `$HOME` then the filesystem root.
 fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    start_project_browser(workspace, env, ui, false);
+}
+
+/// Begin the New Project flow (SPECS §5.3): the same folder browser, rooted at
+/// the same place, in create mode — the user picks the parent folder and types
+/// the new folder's name.
+fn start_new_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
+    start_project_browser(workspace, env, ui, true);
+}
+
+fn start_project_browser(workspace: &Workspace, env: &Env, ui: &mut Ui, create: bool) {
     if workspace.active_project().state.isolated {
         ui.message(ISOLATED_REFUSAL);
         return;
@@ -6536,6 +6569,7 @@ fn start_open_project_flow(workspace: &Workspace, env: &Env, ui: &mut Ui) {
                 entries,
                 selected: 0,
                 typed: String::new(),
+                create,
             },
         },
     );
@@ -6721,7 +6755,7 @@ fn start_close_project_flow(workspace: &Workspace, ui: &mut Ui, index: usize) {
 fn resolve_browse_target(browse: &BrowseState) -> PathBuf {
     let typed = browse.typed.trim();
     if !typed.is_empty() {
-        let t = PathBuf::from(typed);
+        let t = expand_home(typed);
         return if t.is_absolute() {
             t
         } else {
@@ -6734,6 +6768,73 @@ fn resolve_browse_target(browse: &BrowseState) -> PathBuf {
     browse.dir.clone()
 }
 
+/// `~` and `~/x` against `$HOME` (or `%USERPROFILE%`); anything else as typed.
+fn expand_home(typed: &str) -> PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    };
+    if typed == "~" {
+        if let Some(h) = home() {
+            return h;
+        }
+    }
+    if let Some(rest) = typed
+        .strip_prefix("~/")
+        .or_else(|| typed.strip_prefix("~\\"))
+    {
+        if let Some(h) = home() {
+            return h.join(rest);
+        }
+    }
+    PathBuf::from(typed)
+}
+
+/// Create a new project at `target` (SPECS §5.3) and open it, reporting the
+/// outcome as a notification: the create-mode folder browser's Enter, and
+/// [`HostEvent::CreateProject`] from a front-end with its own (native) save
+/// dialog.
+fn create_project_path(target: &Path, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
+    match create_project(env, target) {
+        Ok(proj) => {
+            let name = proj.name.clone();
+            add_opened_project(proj, workspace, env);
+            ui.message(format!(
+                "Created project '{name}' at {}. Add a remote with `git remote add` when you are ready to push.",
+                target.display()
+            ));
+        }
+        Err(e) => ui.message(format!("Could not create project: {e}")),
+    }
+}
+
+/// Make the folder `target`, initialise it as a repository with an empty
+/// root commit (SPECS §5.3), and open it as a [`Project`].
+fn create_project(env: &Env, target: &Path) -> Result<Project> {
+    crate::git::init::create_project_dir(env.fs, env.repo_init, target)
+        .map_err(FlightDeckError::Git)?;
+    open_project(env, target, None)
+}
+
+/// Add a freshly opened `proj` to the workspace and make it active: its PTY
+/// size is seeded from the active project's and its recovered agents resume
+/// (never auto-relaunched beyond this explicit open), matching startup.
+fn add_opened_project(mut proj: Project, workspace: &mut Workspace, env: &Env) {
+    let sz = workspace
+        .projects
+        .get(workspace.active)
+        .map(|p| p.state.pty_size)
+        .unwrap_or_default();
+    {
+        let services = env.services(&proj.git);
+        proj.state.set_pty_size(sz);
+        let _ = proj.state.resume_agents(&services);
+    }
+    workspace.projects.push(proj);
+    workspace.active = workspace.projects.len() - 1;
+}
+
 /// Open the project at `target` (or switch to it when it is already open),
 /// reporting the outcome as a notification: the folder browser's Enter, and
 /// [`HostEvent::OpenProject`] from a front-end with its own (native) folder
@@ -6741,7 +6842,7 @@ fn resolve_browse_target(browse: &BrowseState) -> PathBuf {
 /// git repository is refused with its message, exactly as in the browser.
 fn open_project_path(target: &Path, workspace: &mut Workspace, env: &Env, ui: &mut Ui) {
     match open_project(env, target, None) {
-        Ok(mut proj) => {
+        Ok(proj) => {
             if workspace.contains_root(proj.git.root()) {
                 let root = proj.git.root().to_path_buf();
                 if let Some(i) = workspace.projects.iter().position(|p| p.git.root() == root) {
@@ -6750,22 +6851,8 @@ fn open_project_path(target: &Path, workspace: &mut Workspace, env: &Env, ui: &m
                 }
                 ui.message("Project already open — switched to it.");
             } else {
-                // Seed the new project's PTY size from the active one and
-                // resume its recovered agents (never auto-relaunched beyond
-                // this explicit open), matching startup behaviour.
-                let sz = workspace
-                    .projects
-                    .get(workspace.active)
-                    .map(|p| p.state.pty_size)
-                    .unwrap_or_default();
-                {
-                    let services = env.services(&proj.git);
-                    proj.state.set_pty_size(sz);
-                    let _ = proj.state.resume_agents(&services);
-                }
                 let name = proj.name.clone();
-                workspace.projects.push(proj);
-                workspace.active = workspace.projects.len() - 1;
+                add_opened_project(proj, workspace, env);
                 ui.message(format!("Opened project '{name}'."));
             }
         }
@@ -6784,16 +6871,26 @@ fn handle_open_project_key(
         return Ok(());
     };
 
-    // Enter confirms — resolve the target and open (or switch to) that project.
+    // Enter confirms — resolve the target and open (or switch to) that
+    // project, or in create mode make the typed folder a new project.
     if key.code == KeyCode::Enter {
-        let target = match &pstate.prompt {
-            Prompt::OpenProject { browse } => resolve_browse_target(browse),
-            _ => {
+        let Prompt::OpenProject { browse } = &pstate.prompt else {
+            ui.prompt = Some(pstate);
+            return Ok(());
+        };
+        if browse.create {
+            if browse.typed.trim().is_empty() {
+                // Nothing named yet: the title already asks for a name, so
+                // keep the browser open rather than guess one.
                 ui.prompt = Some(pstate);
                 return Ok(());
             }
-        };
-        open_project_path(&target, workspace, env, ui);
+            let target = resolve_browse_target(browse);
+            create_project_path(&target, workspace, env, ui);
+        } else {
+            let target = resolve_browse_target(browse);
+            open_project_path(&target, workspace, env, ui);
+        }
         return Ok(());
     }
 
@@ -7144,10 +7241,17 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             )
         }
         Prompt::OpenProject { browse } => {
-            let title = format!(
-                "Open project — {}   (↑↓ select · → open folder · ← parent · Enter to open · or type a path)",
-                browse.dir.display()
-            );
+            let title = if browse.create {
+                format!(
+                    "New project in {}   (type the new folder's name · Enter to create · ↑↓ select · → open folder · ← parent)",
+                    browse.dir.display()
+                )
+            } else {
+                format!(
+                    "Open project — {}   (↑↓ select · → open folder · ← parent · Enter to open · or type a path)",
+                    browse.dir.display()
+                )
+            };
             let list: Vec<DialogListItem> = if browse.entries.is_empty() {
                 vec![DialogListItem {
                     label: "(no subfolders)".to_string(),
@@ -7172,7 +7276,10 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                 browse.typed.clone(),
                 list,
                 vec![
-                    DialogButton::new(DialogAccel::Enter, "Open"),
+                    DialogButton::new(
+                        DialogAccel::Enter,
+                        if browse.create { "Create" } else { "Open" },
+                    ),
                     DialogButton::cancelling(DialogAccel::Esc, "Cancel"),
                 ],
             )
@@ -8013,6 +8120,10 @@ fn run_palette_action(
             start_open_project_flow(workspace, env, ui);
             return Ok(());
         }
+        PaletteAction::NewProject => {
+            start_new_project_flow(workspace, env, ui);
+            return Ok(());
+        }
         PaletteAction::CloseProject => {
             // A remote command names the project it is looking at (v6).
             let i = ui
@@ -8148,6 +8259,7 @@ fn run_palette_action(
         }
         // Handled above.
         PaletteAction::OpenProject
+        | PaletteAction::NewProject
         | PaletteAction::CloseProject
         | PaletteAction::SwitchProjectNext
         | PaletteAction::SwitchProjectPrev
@@ -8500,6 +8612,7 @@ fn dialog_kind(prompt: &Prompt) -> &'static str {
         Prompt::AbandonConfirm { .. } => "confirm_abandon",
         Prompt::MergeConfirm { .. } => "confirm_merge",
         Prompt::RebaseConfirm { .. } => "confirm_rebase",
+        Prompt::OpenProject { browse } if browse.create => "new_project",
         Prompt::OpenProject { .. } => "open_project",
         Prompt::ChangeProjectBase { .. } => "change_project_base",
         Prompt::CloseProjectConfirm { .. } => "close_project",
@@ -10738,6 +10851,44 @@ mod tests {
             .any(|warning| warning.contains("is not a local branch")));
     }
 
+    /// SPECS §5.3, for real: New Project makes the folder, a repository with
+    /// one empty root commit, and opens it with that commit's branch as base —
+    /// and refuses a folder that already exists without touching it.
+    #[test]
+    fn create_project_makes_a_repository_flightdeck_can_open() {
+        let tmp = TempDir::new().unwrap();
+        let fs = RealFs;
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = crate::testing::FakeContainerRuntime::new();
+        let command = crate::testing::FakeCommandRunner::new();
+        let env = Env {
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+            terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &crate::git::init::TEST_REPO_INIT,
+        };
+        let target = tmp.path().join("fresh-app");
+        let proj = create_project(&env, &target).expect("created and opened");
+        assert_eq!(proj.name, "fresh-app");
+        assert!(target.join(".git").exists());
+        assert!(!proj.state.base_branch.is_empty(), "HEAD names a branch");
+        assert!(
+            proj.git.rev_parse(&proj.state.base_branch).is_ok(),
+            "the base branch has a commit to branch from"
+        );
+
+        let again = create_project(&env, &target).err().expect("refused");
+        assert!(again.to_string().contains("already exists"), "{again}");
+
+        let nested = tmp.path().join("missing").join("app");
+        assert!(create_project(&env, &nested).is_err());
+        assert!(!tmp.path().join("missing").exists(), "no parent was made");
+    }
+
     #[test]
     fn project_base_picker_persists_across_restart_without_retargeting_tabs() {
         let dir = TempDir::new().unwrap();
@@ -10831,6 +10982,7 @@ mod tests {
             container: &container,
             command: &command,
             terminal: crate::terminal::session::TerminalProfile::TUI,
+            repo_init: &crate::git::init::TEST_REPO_INIT,
         };
 
         // Selecting the retained runtime value must still repair an invalid
@@ -11626,6 +11778,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -11688,6 +11841,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
             let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
             let chunk = |id: &str, index: u32, data: &[u8]| PhoneCommand {
@@ -11802,6 +11956,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -11869,6 +12024,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -11938,6 +12094,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -12098,6 +12255,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -12139,6 +12297,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -12207,6 +12366,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -12254,6 +12414,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut bridge = RemoteBridge::passthrough(0);
@@ -12310,6 +12471,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -12528,6 +12690,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
             let mut bridge = RemoteBridge::passthrough(0);
 
@@ -12699,6 +12862,7 @@ mod tests {
                 container: &container,
                 command: &command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             };
 
             let mut workspace = Workspace {
@@ -13161,6 +13325,7 @@ mod tests {
                 container,
                 command,
                 terminal: crate::terminal::session::TerminalProfile::TUI,
+                repo_init: &crate::git::init::TEST_REPO_INIT,
             }
         }
 
@@ -15928,6 +16093,7 @@ mod tests {
                     container: &self.container,
                     command: &self.command,
                     terminal: crate::terminal::session::TerminalProfile::TUI,
+                    repo_init: &crate::git::init::TEST_REPO_INIT,
                 }
             }
 

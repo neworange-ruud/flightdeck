@@ -52,6 +52,7 @@ fn env(f: &'static Fakes) -> Env<'static> {
         container: &f.container,
         command: &f.command,
         terminal: crate::terminal::desktop_profile(),
+        repo_init: &flightdeck::git::init::TEST_REPO_INIT,
     }
 }
 
@@ -332,11 +333,49 @@ fn the_open_project_item_answers_a_folder_picker_through_the_host(app: &mut Test
     );
 }
 
+#[gpui::test]
+fn the_new_project_item_answers_a_save_dialog_through_the_host(app: &mut TestAppContext) {
+    let f = fakes();
+    let host = testing::host(env(f), &f.notifier, two_projects(), 0);
+    let (root, cx) = open_root(app, Some(host), no_opener(), Vec::new());
+    let model = model_of(&root, cx);
+    reset(&model, cx);
+
+    // The dialog starts beside the active project, where its siblings live.
+    let siblings = model.read_with(cx, |m, _| {
+        let host = m.host();
+        host.project_root(host.active_project_index())
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    });
+    assert!(siblings.is_some());
+    cx.dispatch_action(menus::NewProjectFolder);
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path(), "the platform's save dialog");
+    cx.simulate_new_path_selection(|start| {
+        assert_eq!(Some(start), siblings.as_deref());
+        Some(PathBuf::from("/work/fresh"))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        take_dispatched(&model, cx),
+        [HostEvent::CreateProject(PathBuf::from("/work/fresh"))]
+    );
+
+    // A cancelled dialog does nothing.
+    reset(&model, cx);
+    cx.dispatch_action(menus::NewProjectFolder);
+    cx.run_until_parked();
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+    assert_eq!(take_dispatched(&model, cx), []);
+}
+
 #[test]
 fn macos_shortcuts_are_platform_conventions_and_cmd_w_stays_free() {
     let bindings = menus::platform_bindings(keymap());
     if flightdeck::tui::platform::IS_MACOS {
-        assert_eq!(bindings.len(), 4, "Cmd-, Cmd-N Cmd-O Cmd-Q");
+        assert_eq!(bindings.len(), 5, "Cmd-, Cmd-N Cmd-O Cmd-Shift-N Cmd-Q");
     } else {
         assert!(bindings.is_empty());
     }
@@ -382,8 +421,8 @@ fn an_isolated_run_disables_and_refuses_what_it_cannot_do(app: &mut TestAppConte
     click(cx, "new-agent");
     assert_eq!(take_dispatched(&model, cx), [], "New agent is inert");
 
-    // The menu draws New agent, the project switches and Open project…
-    // disabled, and nothing else.
+    // The menu draws New agent, the project switches, Open project… and New
+    // project… disabled, and nothing else.
     let mut disabled = Vec::new();
     for menu in menus::menu_model(keymap(), true) {
         fn walk(items: &[ItemModel], out: &mut Vec<Target>) {
@@ -406,6 +445,7 @@ fn an_isolated_run_disables_and_refuses_what_it_cannot_do(app: &mut TestAppConte
         [
             Target::Entry("NewAgentTab"),
             Target::App(AppCommand::OpenProject),
+            Target::App(AppCommand::NewProject),
             Target::Entry("SwitchProjectPrev"),
             Target::Entry("SwitchProjectNext"),
         ]
@@ -448,6 +488,16 @@ fn an_isolated_run_disables_and_refuses_what_it_cannot_do(app: &mut TestAppConte
     cx.simulate_path_prompt_response(|_| Some(vec![PathBuf::from("/work/other")]));
     cx.run_until_parked();
     refused(&model, cx);
+    reset(&model, cx);
+    cx.dispatch_action(menus::NewProjectFolder);
+    cx.run_until_parked();
+    cx.simulate_new_path_selection(|_| Some(PathBuf::from("/work/fresh")));
+    cx.run_until_parked();
+    refused(&model, cx);
+    assert!(
+        !flightdeck::contracts::FileSystem::exists(&f.fs, Path::new("/work/fresh")),
+        "nothing was created"
+    );
 
     // Nothing is saved on the way out.
     reset(&model, cx);
@@ -523,6 +573,49 @@ fn a_cancelled_picker_leaves_the_empty_state(app: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(seen.borrow().is_empty());
     assert!(root.read_with(cx, |r, _| r.is_launcher()));
+}
+
+#[gpui::test]
+fn new_project_in_the_empty_state_creates_the_folder_and_opens_it(app: &mut TestAppContext) {
+    let f = fakes();
+    let seen: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+    let (root, cx) = open_root(app, None, recording_opener(f, seen.clone()), Vec::new());
+    root.update(cx, |r, _| {
+        r.set_repo_init(&flightdeck::git::init::TEST_REPO_INIT)
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("fresh");
+
+    assert!(cx.debug_bounds("launcher-new").is_some(), "New project…");
+    click(cx, "launcher-new");
+    cx.simulate_new_path_selection(|_| Some(target.clone()));
+    cx.run_until_parked();
+
+    assert!(target.join(".git").is_dir(), "a repository was made");
+    assert_eq!(*seen.borrow(), std::slice::from_ref(&target));
+    assert!(!root.read_with(cx, |r, _| r.is_launcher()), "and opened");
+}
+
+#[gpui::test]
+fn a_new_project_that_cannot_be_made_keeps_the_empty_state_and_says_why(app: &mut TestAppContext) {
+    let f = fakes();
+    let seen: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+    let (root, cx) = open_root(app, None, recording_opener(f, seen.clone()), Vec::new());
+    let dir = tempfile::tempdir().unwrap();
+    // It exists already.
+    let target = dir.path().to_path_buf();
+    click(cx, "launcher-new");
+    cx.simulate_new_path_selection(|_| Some(target.clone()));
+    cx.run_until_parked();
+    assert!(seen.borrow().is_empty());
+    assert!(root.read_with(cx, |r, _| r.is_launcher()));
+    let error = root.read_with(cx, |r, _| r.error().map(str::to_string));
+    assert!(
+        error.as_deref().is_some_and(
+            |e| e.starts_with("Could not create project:") && e.contains("already exists")
+        ),
+        "{error:?}"
+    );
 }
 
 #[gpui::test]

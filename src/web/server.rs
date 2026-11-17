@@ -4300,6 +4300,16 @@ async fn handle_worker_op(
                     "Uploading files needs a newer FlightDeck on this side: update it, then try again.",
                 ))
             }
+            // A v11 window cannot know the command; refuse it in words all
+            // the same rather than run something the peer never offered.
+            (Ok(WorkerOp::CreateProject { .. }), _)
+                if version < crate::web::protocol::CREATE_PROJECT_MIN_VERSION =>
+            {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Creating a project needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
             // Likewise the download plan is a v9 frame.
             (Ok(WorkerOp::BeginDownload { .. }), _) if version < DOWNLOAD_MIN_VERSION => {
                 Some(WireError::new(

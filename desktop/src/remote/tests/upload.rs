@@ -354,6 +354,10 @@ fn choose_browses_the_workers_folders_and_sets_the_target(app: &mut TestAppConte
     assert!(cx.debug_bounds("remote-picker-open-here").is_none());
     assert!(cx.debug_bounds("remote-picker-open-0").is_none(), "no Open");
     assert!(cx.debug_bounds("remote-picker-clone").is_none(), "no clone");
+    assert!(
+        cx.debug_bounds("remote-picker-create").is_none(),
+        "no new project"
+    );
 
     click(cx, "remote-picker-choose-here");
     assert!(model.read_with(cx, |m, _| m.picker().is_none()));

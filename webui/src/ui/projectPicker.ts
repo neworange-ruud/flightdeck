@@ -21,6 +21,7 @@ const CHOOSE_TITLE = "Choose a folder on the worker";
  *          folder rows (git ones with Open) ..........................
  * CLONE    [URL                 ] [folder name (optional)]      Clone
  *          progress line, or git's error
+ * NEW PROJECT IN ~/code   [new folder name             ]       Create
  * ```
  *
  * The native window's layout (`desktop/src/remote/projects.rs`), in this
@@ -28,7 +29,11 @@ const CHOOSE_TITLE = "Choose a folder on the worker";
  * a `picker/request` that `main.ts` turns into the worker command — this
  * component sends nothing and decides nothing.
  *
- * **The three text fields are built once.** Every other region here rebuilds
+ * NEW PROJECT (v12's `create_project`) makes a folder in the one BROWSE has
+ * listed, runs `git init` and an empty first commit there, and the worker
+ * opens it — answered like an Open, so it closes the picker the same way.
+ *
+ * **The four text fields are built once.** Every other region here rebuilds
  * its children on each render, which would throw away a caret and a half-typed
  * URL on every keystroke; these keep their element and are only written to
  * when the *state* moved under them (a listing moving the path bar), so typing
@@ -41,12 +46,14 @@ export function createProjectPicker(store: Store): Region {
   const pathInput = field("path", "~/src/my-repo", "Folder to list");
   const urlInput = field("url", "git@github.com:me/my-repo.git", "Repository URL");
   const nameInput = field("name", "folder name (optional)", "Folder name");
-  const rendered = { path: "", url: "", name: "" };
+  const newNameInput = field("newName", "new folder name", "New project folder name");
+  const rendered = { path: "", url: "", name: "", newName: "" };
 
   for (const [input, name] of [
     [pathInput, "path"],
     [urlInput, "url"],
     [nameInput, "name"],
+    [newNameInput, "newName"],
   ] as const) {
     input.addEventListener("input", () => {
       rendered[name] = input.value;
@@ -67,6 +74,12 @@ export function createProjectPicker(store: Store): Region {
       }
     });
   }
+  newNameInput.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      request({ kind: "create" });
+    }
+  });
 
   const busyEl = el("span", { class: "fd-picker__busy" });
   const closeEl = el(
@@ -84,6 +97,7 @@ export function createProjectPicker(store: Store): Region {
   const browseList = el("div", { class: "fd-picker__list", attrs: { "data-list": "browse" } });
   const cloneTools = el("div", { class: "fd-picker__tools" });
   const cloneLineEl = el("p", { class: "fd-picker__clone-line" });
+  const createHead = el("span", { class: "fd-picker__section-title" });
 
   const titleEl = el("span", { class: "fd-picker__title" });
   const scanSection = el(
@@ -103,6 +117,20 @@ export function createProjectPicker(store: Store): Region {
     ],
   );
 
+  const createSection = el(
+    "section",
+    { class: "fd-picker__section", attrs: { "data-section": "create" } },
+    [
+      el("div", { class: "fd-picker__section-head" }, [createHead]),
+      el("div", { class: "fd-picker__row" }, [
+        newNameInput,
+        el("div", { class: "fd-picker__tools" }, [
+          toolButton("Create", "create", () => request({ kind: "create" })),
+        ]),
+      ]),
+    ],
+  );
+
   const panel = el("div", { class: "fd-picker__panel" }, [
     el("div", { class: "fd-picker__head" }, [titleEl, busyEl, closeEl]),
     errorEl,
@@ -116,8 +144,9 @@ export function createProjectPicker(store: Store): Region {
       browseList,
     ]),
     cloneSection,
+    createSection,
     el("div", { class: "fd-picker__foot" }, [
-      hint("Enter", "go / clone"),
+      hint("Enter", "go / clone / create"),
       hint("Esc", "close"),
     ]),
   ]);
@@ -149,9 +178,11 @@ export function createProjectPicker(store: Store): Region {
     layer.setAttribute("data-purpose", picker.purpose);
     scanSection.hidden = choosing;
     cloneSection.hidden = choosing;
+    createSection.hidden = choosing;
     syncField(pathInput, "path", picker.pathField);
     syncField(urlInput, "url", picker.urlField);
     syncField(nameInput, "name", picker.nameField);
+    syncField(newNameInput, "newName", picker.newNameField);
 
     busyEl.textContent = pickerBusy(picker) ? "Working…" : "";
     errorEl.textContent = picker.error ?? "";
@@ -200,6 +231,13 @@ export function createProjectPicker(store: Store): Region {
     clear(browseList);
     append(browseList, browseRows(picker, request));
 
+    /** It creates in the folder listed; before one is, the worker's projects
+     * root (no `dir` is sent). */
+    createHead.textContent =
+      picker.cwd === null
+        ? "NEW PROJECT"
+        : `NEW PROJECT IN ${tildePath(picker.cwd, picker.home)}`;
+
     clear(cloneTools);
     cloneTools.append(toolButton("Clone", "clone", () => request({ kind: "clone" })));
     const line = cloneLine(picker.clone);
@@ -228,7 +266,7 @@ export function createProjectPicker(store: Store): Region {
 
   function syncField(
     input: HTMLInputElement,
-    name: "path" | "url" | "name",
+    name: "path" | "url" | "name" | "newName",
     value: string,
   ): void {
     if (rendered[name] !== value) {

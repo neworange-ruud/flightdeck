@@ -320,6 +320,68 @@ describe("the project picker (W9)", () => {
     h.app.store.dispatch({ type: "picker/error", error: CLONE_ERROR });
     expect(h.text(".fd-picker__error")).toBe(CLONE_ERROR);
   });
+
+  it("offers a new project in the folder listed, and Create or Enter asks for it", () => {
+    const h = opened();
+    const section = h.q('.fd-picker [data-section="create"]');
+    expect(visible(section)).toBe(true);
+    expect(h.text('.fd-picker [data-section="create"] .fd-picker__section-title')).toBe(
+      "NEW PROJECT IN ~",
+    );
+    const name = h.q(".fd-picker__input[name='newName']") as HTMLInputElement;
+    name.value = "fresh";
+    name.dispatchEvent(new Event("input"));
+    expect(h.app.store.getState().picker?.newNameField).toBe("fresh");
+    h.app.store.dispatch({ type: "notice/set", notice: "re-render" });
+    expect(h.q(".fd-picker__input[name='newName']")).toBe(name);
+    expect(name.value).toBe("fresh");
+    h.q('.fd-picker [data-action="create"]').click();
+    name.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    const creates = h.dispatched.filter(
+      (a) => a.type === "picker/request" && a.intent.kind === "create",
+    );
+    expect(creates).toHaveLength(2);
+  });
+
+  it("says NEW PROJECT, with no folder, before anything is listed", () => {
+    const h = render();
+    h.app.store.dispatch({ type: "picker/request", intent: { kind: "open" } });
+    expect(h.text('.fd-picker [data-section="create"] .fd-picker__section-title')).toBe(
+      "NEW PROJECT",
+    );
+  });
+
+  it("a refused create is the worker's words; an applied one closes the picker", () => {
+    const h = opened();
+    h.app.store.dispatch({
+      type: "picker/sent",
+      sent: { kind: "open", path: "/home/me/x" },
+      seq: 3,
+    });
+    expect(h.text(".fd-picker__busy")).toBe("Working…");
+    h.app.store.dispatch({
+      type: "command/result",
+      seq: 3,
+      outcome: "rejected",
+      detail: "x already exists.",
+    });
+    expect(h.text(".fd-picker__error")).toBe("x already exists.");
+    expect(h.text(".fd-picker__busy")).toBe("");
+
+    h.app.store.dispatch({
+      type: "picker/sent",
+      sent: { kind: "open", path: "/home/me/fresh" },
+      seq: 4,
+    });
+    const said = "Created project fresh at /home/me/fresh.";
+    h.app.store.dispatch({ type: "command/result", seq: 4, outcome: "applied", detail: said });
+    expect(visible(h.q(".fd-picker"))).toBe(false);
+    expect(h.app.store.getState().pendingOpen).toEqual({
+      path: "/home/me/fresh",
+      projectId: null,
+    });
+    expect(h.app.store.getState().notice).toBe(said);
+  });
 });
 
 const CLONE_ERROR = "Type the URL of the repository to clone.";

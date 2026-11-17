@@ -510,6 +510,9 @@ enum AgentMenuEntry {
     NewAgent {
         disabled: bool,
     },
+    /// Another agent in this agent's worktree (the palette's Terminals → New
+    /// Agent): picks the backend, then runs it as a child terminal.
+    NewChildAgent,
     NewTerminal,
     NewBrowser,
     Separator,
@@ -533,6 +536,7 @@ fn agent_menu_entries(isolated: bool, offers_browser: bool) -> Vec<AgentMenuEntr
         NewAgent {
             disabled: new_agent_disabled,
         },
+        NewChildAgent,
         NewTerminal,
     ];
     if offers_browser {
@@ -586,6 +590,12 @@ fn agent_menu(
             AgentMenuEntry::NewAgent { disabled } => {
                 menu.item(keyed("New Agent", "NewAgentTab").disabled(disabled))
             }
+            AgentMenuEntry::NewChildAgent => menu.item(then("New Child Agent", |host, cx| {
+                host.dispatch(
+                    HostEvent::RunPaletteAction(PaletteAction::NewAgentChild),
+                    cx,
+                )
+            })),
             AgentMenuEntry::NewTerminal => menu.item(keyed("New Terminal", "NewChildTerminal")),
             AgentMenuEntry::NewBrowser => {
                 menu.item(then("New Browser", |host, cx| host.open_browser(cx)))
@@ -842,16 +852,17 @@ mod tests {
         use AgentMenuEntry::*;
         let entries = agent_menu_entries(false, true);
         assert_eq!(
-            entries[..4],
+            entries[..5],
             [
                 NewAgent { disabled: false },
+                NewChildAgent,
                 NewTerminal,
                 NewBrowser,
                 Separator
             ]
         );
         assert_eq!(
-            entries[4..],
+            entries[5..],
             [
                 Rename,
                 SetStatus,
@@ -869,8 +880,13 @@ mod tests {
         use AgentMenuEntry::*;
         let entries = agent_menu_entries(true, false);
         assert_eq!(
-            entries[..3],
-            [NewAgent { disabled: true }, NewTerminal, Separator]
+            entries[..4],
+            [
+                NewAgent { disabled: true },
+                NewChildAgent,
+                NewTerminal,
+                Separator
+            ]
         );
         assert!(!entries.contains(&NewBrowser));
     }

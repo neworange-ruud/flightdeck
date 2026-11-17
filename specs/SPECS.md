@@ -125,11 +125,12 @@ FlightDeck may:
 - Perform local merge-back only under strict conditions
 - Rebase an agent worktree onto its base branch, only under strict conditions (see carve-out below)
 - Pull the base branch in the base folder with `git pull --rebase`, on explicit request (see §5.2)
+- Create a new project: a fresh folder, `git init`, and one empty root commit (see §5.3)
 
 FlightDeck must not:
 
 - Stage files
-- Create commits
+- Create commits (except the root commit of a project it has just created, §5.3)
 - Amend commits
 - Squash commits
 - Rebase automatically
@@ -181,6 +182,28 @@ worktree, so it is not confirmation-gated — but it is constrained by:
 
 The `GitExecutor::pull_base` method is the only fetch-and-rebase op on the trait
 and must only be reached through this guarded workflow.
+
+### 5.3 New project
+
+**New Project** creates a folder, runs `git init` in it, and makes one empty
+root commit (`git commit --allow-empty -m "Initial commit"`), then opens it as a
+project. The root commit exists because FlightDeck needs a base branch with a
+commit on it: agent worktrees branch from it, and an unborn `HEAD` has neither.
+Setting up a remote is left to the user. It is constrained by:
+
+- **Fresh folders only.** The target folder must not exist and its parent must;
+  FlightDeck never initialises or commits in a folder that already existed, so
+  there is no history to touch.
+- **Nothing left behind on failure.** If `git init` or the commit fails (most
+  often: no `user.name`/`user.email`, which is reported with what to set), the
+  folder FlightDeck made is removed again.
+- **Strict folder names.** `[A-Za-z0-9._-]`, the same rule a worker clone's
+  folder obeys.
+- **The user's commit hooks are skipped** (`--no-verify`) for this one empty
+  commit; signing and identity come from the user's own git config.
+
+The commit lives in `src/git/init.rs`, the only file `tests/guards.rs` allows to
+name the `commit` subcommand. `GitExecutor` still has no commit method.
 
 ---
 
