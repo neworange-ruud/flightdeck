@@ -86,13 +86,37 @@ fn held(fs: &dyn FileSystem, lock: &Path) -> bool {
 
 /// `worker status` over explicit streams.
 fn status_to(paths: &WorkerPaths, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // Nothing listening, or no answer in time, is what the locks and the
+    // supervisor's state then explain. Anything else means a worker *did*
+    // answer and its answer was lost: say so rather than let the merge read
+    // it as "starting" (`remote-control-4kc7`).
+    let mut unread: Option<String> = None;
     let runtime = match control::request(
         &paths.control_socket,
         &ControlRequest::Status,
         REQUEST_TIMEOUT,
     ) {
         Ok(ControlResponse::Status(report)) => Some(*report),
-        _ => None,
+        Err(ControlError::NotRunning | ControlError::Timeout) => None,
+        Ok(ControlResponse::Error { message }) => {
+            unread = Some(format!(
+                "the worker is running but could not report its status: {message}"
+            ));
+            None
+        }
+        Ok(_) => {
+            unread = Some(
+                "the worker is running but answered the status request with something else"
+                    .to_string(),
+            );
+            None
+        }
+        Err(e) => {
+            unread = Some(format!(
+                "the worker is running but its answer could not be read: {e}"
+            ));
+            None
+        }
     };
     let sup = state::read(&paths.supervisor_state);
     // A worker that answered holds run.lock: probing it then would only risk
@@ -105,7 +129,13 @@ fn status_to(paths: &WorkerPaths, json: bool, out: &mut dyn Write, err: &mut dyn
     match render_status(&report, json) {
         Ok(text) => {
             let _ = write!(out, "{text}");
-            0
+            match unread {
+                Some(why) => {
+                    let _ = writeln!(err, "flightdeck worker: {why}");
+                    1
+                }
+                None => 0,
+            }
         }
         Err(e) => {
             let _ = writeln!(err, "flightdeck worker: {e}");
