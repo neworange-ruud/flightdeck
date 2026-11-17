@@ -34,6 +34,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **Abandoning from Close agent now acts on that agent.** From the Desktop app or a browser connected to another FlightDeck or a worker, right-clicking an agent the host wasn't showing and choosing Close agent… → Abandon asked you to type a different session's name, and confirming would have removed *that* session's worktree. The confirmation now names and acts on the agent you chose. A question that opens because you answered another one is now reported as answered instead of refused.
 - The update banner no longer tells `.deb` and `.rpm` installs to run
   `apt upgrade` or `dnf upgrade`. No repository publishes the app, so those
   commands found nothing. It now says to install the new package from the

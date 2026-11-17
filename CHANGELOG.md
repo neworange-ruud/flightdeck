@@ -18,6 +18,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **Abandoning from Close agent now acts on that agent.** From the Desktop app or a browser connected to another FlightDeck or a worker, right-clicking an agent the host wasn't showing and choosing Close agent… → Abandon asked you to type a different session's name, and confirming would have removed *that* session's worktree. The confirmation now names and acts on the agent you chose. A question that opens because you answered another one is now reported as answered instead of refused.
 - **`flightdeck worker status` no longer reports a running worker as "starting" on macOS.** Once the worker's status answer grew past 4 KiB (a few projects and devices), the second read failed: macOS refuses to change a socket's read timeout after the other end has closed it. That error was then shown as "no answer". The reader now carries on. If a running worker's answer can't be read for any other reason, `worker status` says so and exits with 1.
 
 ## [1.38.0] - 2026-11-16

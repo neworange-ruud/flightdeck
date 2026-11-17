@@ -7517,7 +7517,16 @@ fn handle_prompt_key_inner(
     };
     let p = &mut workspace.projects[active];
     let services = env.services(&p.git);
-    handle_prompt_key_project(key, &mut p.state, &services, ui, active)
+    // A dialog this answer opens (Close → Abandon's confirmation, a push
+    // warning, …) is about the same tab as the one being answered, so it
+    // inherits that dialog's target — not the answering frame's, which names
+    // none (remote-control-hosd). Without this the follow-up fell back to the
+    // host's selection: its typed-name gate named another session, and its
+    // `y` acted on that one.
+    let answering = std::mem::replace(&mut ui.web_target, target);
+    let result = handle_prompt_key_project(key, &mut p.state, &services, ui, active);
+    ui.web_target = answering;
+    result
 }
 
 /// Handle a key for a project-level prompt (new tab, rename, close, push, …) on
@@ -8945,10 +8954,19 @@ fn apply_web_dialog(
         DialogAccel::Tab => KeyCode::Tab,
         DialogAccel::Esc => KeyCode::Esc,
     };
+    let answered = ui.dialog_id();
     feed_dialog_key(code, workspace, env, ui);
 
     if deciding == DialogAccel::Tab && ui.prompt.is_some() {
         return Ok(Some("Changed the dialog target.".to_string()));
+    }
+    // The answer opened the next question (Close → Abandon asks before it
+    // discards): this one was answered, and the new one is published as any
+    // dialog is (remote-control-hosd).
+    if ui.prompt.is_some() && ui.dialog_id() != answered {
+        return Ok(Some(
+            "Answered. A follow-up question is open on both surfaces.".to_string(),
+        ));
     }
     if ui.prompt.is_some() {
         // Nothing wrong happened: a form that rejects an empty branch name keeps
@@ -15058,6 +15076,110 @@ mod tests {
                 ack.detail,
                 Some(crate::web::commands::gate_mismatch_refusal("nope", "Task"))
             );
+        }
+
+        /// `remote-control-hosd`: a dialog opened by answering another one is
+        /// about the same tab. A remote surface right-clicks a session the host
+        /// is *not* showing, picks Close, then Abandon: the abandon question —
+        /// its typed-name gate and the `y` behind it — must name and act on
+        /// that session, never on whatever the host has selected.
+        #[test]
+        fn abandon_from_a_targeted_close_dialog_stays_on_its_tab() {
+            let dir = TempDir::new().unwrap();
+            let git = FakeGit::new();
+            let pty = FakePty::new();
+            let mut ws = workspace_with_a_tab(&dir, &git, &pty);
+            {
+                let fs = FakeFs::new();
+                let clock = FakeClock::default();
+                let container = crate::testing::FakeContainerRuntime::new();
+                let runner = crate::testing::FakeCommandRunner::new();
+                let services = Services {
+                    git: &git,
+                    fs: &fs,
+                    pty: &pty,
+                    clock: &clock,
+                    container: &container,
+                    command: &runner,
+                };
+                pty.queue_session();
+                ws.projects[0]
+                    .state
+                    .dispatch(
+                        Command::NewAgentTab {
+                            name: "Second".to_string(),
+                            agent_key: None,
+                        },
+                        &services,
+                    )
+                    .expect("the second tab is created");
+            }
+            // Abandon reads the worktree's state through the project's git.
+            ws.projects[0].git = ProjectGit::new(
+                PathBuf::from("/repo"),
+                Arc::new(FakeGit::new().with_branches(["main"])),
+            );
+            let state = &mut ws.projects[0].state;
+            let task_id = state.tabs[0].id().clone();
+            assert_eq!(state.tabs[0].meta.name, "Task");
+            // The host shows the *other* session.
+            state.selected_tab = Some(1);
+
+            // The remote surface's close, targeted at "Task", leaves the menu.
+            let mut ui = Ui {
+                web_origin: Some(browser_origin()),
+                web_target: Some(WebTarget {
+                    project_root: PathBuf::from("/repo"),
+                    target: Some(crate::app::commands::TabTarget::tab(task_id)),
+                }),
+                ..Ui::default()
+            };
+            start_prompt(
+                &mut ui,
+                Prompt::CloseTab {
+                    actions: vec![CloseAction::IfAllStopped],
+                    abandon: true,
+                },
+            );
+            // That frame is done; the answer is a frame of its own.
+            ui.web_origin = None;
+            ui.web_target = None;
+
+            let pick = answer(2, names::DIALOG_CONFIRM, &ui, json!({ "choice": "a" }));
+            let ack = run(&mut ws, &mut ui, &pick);
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{:?}", ack.detail);
+            assert!(matches!(
+                ui.prompt.as_ref().map(|p| &p.prompt),
+                Some(Prompt::AbandonConfirm { .. })
+            ));
+            assert!(
+                ui.web_target.is_none(),
+                "the inherited target does not outlive the answer"
+            );
+
+            // The gate names the tab the close was about…
+            let body = body(&web_dialog_now(&ws, &ui).expect("the question is published"));
+            assert_eq!(
+                body.confirm_gate.expect("1g's step 2").expected,
+                "Task",
+                "not the host's selection"
+            );
+            // …and the confirm abandons that tab, leaving the selected one.
+            let confirm = answer(
+                3,
+                names::DIALOG_CONFIRM,
+                &ui,
+                json!({ "confirm_name": "Task" }),
+            );
+            let ack = run(&mut ws, &mut ui, &confirm);
+            assert_eq!(ack.outcome, AckOutcome::Applied, "{:?}", ack.detail);
+            let names: Vec<&str> = ws.projects[0]
+                .state
+                .tabs
+                .iter()
+                .map(|t| t.meta.name.as_str())
+                .collect();
+            assert_eq!(names, ["Second"], "Task was abandoned, Second kept");
         }
 
         /// **The git confirmations are answerable from a browser**
