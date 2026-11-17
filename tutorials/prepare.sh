@@ -21,6 +21,13 @@ fail() { "$VMCTL" shot "$ROOT/target/tutorials/prepare-failed.png" >/dev/null 2>
 "$ROOT/tutorials/vm/up.sh"                 # first: the worker binds to the VM bridge
 SKIP_BUILD="${SKIP_BUILD:-1}" "$ROOT/tutorials/worker/up.sh" >/dev/null
 
+# `ssh devbox` from the Mac's Terminal: a key and a host entry in the guest,
+# the key authorized on the worker (port 2222, user dev).
+"$VMCTL" ssh 'test -f ~/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+printf "Host devbox\n  Port 2222\n  User dev\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n" > ~/.ssh/config
+cat ~/.ssh/id_ed25519.pub' \
+  | podman exec -i "$WORKER" sh -c 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+
 "$VMCTL" ssh 'open /Applications/FlightDeck.app'
 "$VMCTL" ssh 'for i in $(seq 1 50); do pgrep -q flightdeck-desktop && break; sleep 0.2; done'
 sleep 3

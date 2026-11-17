@@ -1,0 +1,58 @@
+WEBVTT
+
+00:00:00.862 --> 00:00:03.619
+This is FlightDeck Desktop on a Mac.
+
+00:00:03.619 --> 00:00:05.534
+It's connected to devbox:
+
+00:00:05.534 --> 00:00:09.593
+a worker machine, where the agents and the code live.
+
+00:00:10.032 --> 00:00:12.400
+Let's open a project on the worker.
+
+00:00:17.332 --> 00:00:27.038
+Now start a new agent. Every agent gets its own git branch and worktree, so agents can work side by side without getting in each other's way.
+
+00:00:28.954 --> 00:00:32.855
+Claude Code starts right in that worktree, on devbox.
+
+00:00:33.496 --> 00:00:34.982
+Tell it what to build.
+
+00:00:40.927 --> 00:00:45.804
+While it works, the sidebar keeps you posted on what each agent is doing.
+
+00:00:48.485 --> 00:00:55.219
+Done. The agent sums up what it changed, and the header shows the changes waiting in its worktree.
+
+00:00:55.765 --> 00:01:00.827
+To try it, open a terminal in the same worktree, and start the app.
+
+00:01:02.006 --> 00:01:04.949
+Then open a browser inside the session.
+
+00:01:04.949 --> 00:01:09.854
+Its requests are made by the worker, so localhost here is devbox.
+
+00:01:10.211 --> 00:01:13.833
+Hover a note, and there's the new delete button.
+
+00:01:15.905 --> 00:01:18.551
+One click, and the note is gone.
+
+00:01:18.551 --> 00:01:19.295
+It works.
+
+00:01:19.931 --> 00:01:23.368
+Before finishing, ask the agent to commit its work.
+
+00:01:25.012 --> 00:01:29.935
+Committed. Now, Finish merges the agent's branch into main.
+
+00:01:31.408 --> 00:01:36.795
+FlightDeck asks first: merge into main, then remove the worktree.
+
+00:01:41.327 --> 00:01:49.129
+That's the whole loop: an agent on a remote worker, from the first prompt to a change merged into main.

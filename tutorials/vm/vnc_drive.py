@@ -120,9 +120,16 @@ class Driver:
             time.sleep(0.015)
 
     def key(self, *chords):
+        from vncdotool.client import KEYMAP
+
         for chord in chords:
             parts = chord.split("-")
             parts = ["alt" if p == "cmd" else p for p in parts]
+            # An unknown name would fail inside vncdotool's client and leave it
+            # failing every later call: check first.
+            for p in parts:
+                if len(p) != 1 and p not in KEYMAP:
+                    raise ValueError(f"unknown key {p!r} in {chord!r}")
             mods, last = parts[:-1], parts[-1]
             for m in mods:
                 self.c.keyDown(m)
@@ -254,7 +261,10 @@ def serve(server: str, password: str, sock_path: str) -> None:
                 reply = "ok\n"
             except Exception as exc:  # report, keep the connection alive
                 reply = f"error: {exc}\n"
-            conn.sendall(reply.encode())
+            try:
+                conn.sendall(reply.encode())
+            except OSError:
+                pass  # the sender went away; the daemon must outlive it
 
 
 def send(sock_path: str, script: str) -> None:

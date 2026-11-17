@@ -17,6 +17,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NAME="${WORKER_NAME:-fd-tutorial-worker}"
 BIND="${BIND:-192.168.64.1}"
 PORT="${PORT:-7420}"
+SSH_PORT="${SSH_PORT:-2222}"
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT/tutorials/worker/build-binary.sh"
@@ -25,11 +26,12 @@ CONTEXT="$ROOT/target/tutorials/worker-context"
 rm -rf "$CONTEXT" && mkdir -p "$CONTEXT"
 cp "$ROOT/target/tutorials/linux/flightdeck" "$CONTEXT/"
 cp -R "$ROOT/tutorials/projects" "$CONTEXT/projects"
+cp -R "$ROOT/tutorials/worker/bin" "$ROOT/tutorials/worker/home" "$CONTEXT/"
 podman build -t fd-tutorial-worker -f "$ROOT/tutorials/worker/Containerfile" "$CONTEXT"
 
 podman rm -f "$NAME" >/dev/null 2>&1 || true
 podman run -d --init --name "$NAME" --hostname devbox \
-  -p "$BIND:$PORT:7420" \
+  -p "$BIND:$PORT:7420" -p "$BIND:$SSH_PORT:2222" \
   -v fd-tutorial-claude:/home/dev/.claude \
   fd-tutorial-worker >/dev/null
 

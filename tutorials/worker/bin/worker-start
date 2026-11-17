@@ -1,0 +1,4 @@
+#!/bin/sh
+# The container's command: SSH on 2222 (as dev), then the worker.
+/usr/sbin/sshd -f /home/dev/.sshd/sshd_config -E /home/dev/.sshd/sshd.log
+exec flightdeck worker run

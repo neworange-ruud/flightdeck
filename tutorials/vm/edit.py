@@ -156,7 +156,7 @@ def base_png(path: Path, caption: str, speed: float) -> None:
         tw, th = box[2] - box[0], box[3] - box[1]
         pad_x, pad_y = 28, 18
         x0 = (W - tw) // 2 - pad_x
-        y0 = H - 110 - th - pad_y
+        y0 = H - 58 - th - 2 * pad_y
         d.rounded_rectangle(
             (x0, y0, x0 + tw + 2 * pad_x, y0 + th + 2 * pad_y),
             radius=14, fill=(20, 18, 16, 225), outline=(255, 255, 255, 40), width=1,
@@ -198,6 +198,31 @@ def highlight_png(path: Path, lights: tuple, k: float) -> None:
     for r, _ in rects:
         d.rounded_rectangle(r, radius=14, outline=ACCENT + (255,), width=5)
     img.save(path)
+
+
+def write_vtt(path: Path, cues: list) -> None:
+    """Subtitles for the voiceover: each line split at its sentences, the
+    line's time shared out by length."""
+    def stamp(t: float) -> str:
+        return f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{t % 60:06.3f}"
+
+    out = ["WEBVTT", ""]
+    for start, end, text in cues:
+        parts, cur = [], ""
+        for word in text.split():
+            cur = f"{cur} {word}".strip()
+            if word[-1] in ".?!:" and len(cur) > 24:
+                parts.append(cur)
+                cur = ""
+        if cur:
+            parts.append(cur)
+        total = sum(len(p) for p in parts)
+        t = start
+        for part in parts:
+            span = (end - start) * len(part) / total
+            out += [f"{stamp(t)} --> {stamp(t + span)}", part, ""]
+            t += span
+    path.write_text("\n".join(out))
 
 
 def ffmpeg(*args: str) -> None:
@@ -251,13 +276,14 @@ def main() -> None:
     total = at / FPS
 
     # Voice lines where they were said, pushed later if they would overlap.
-    clips, end = [], 0.0
+    clips, cues, end = [], [], 0.0
     for vt, text in sorted(tl.voices):
         path = voice.clip(text)
         start = max(output_time(segs, vt), end + VOICE_GAP if clips else 0.0)
         if clips and start - output_time(segs, vt) > 0.5:
             print(f"voice: pushed {start - output_time(segs, vt):.1f}s later: {text[:50]}")
         clips.append((start, path))
+        cues.append((start, start + voice.length(path), text))
         end = start + voice.length(path)
     final = max(total, end + 0.8)
     hold = final - total
@@ -297,6 +323,8 @@ def main() -> None:
             args += ["-filter_complex", graph]
             maps += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
         ffmpeg(*args, *maps, "-t", f"{final:.3f}", "-movflags", "+faststart", str(out))
+    if cues:
+        write_vtt(out.with_suffix(".vtt"), cues)
     print(f"{out}  {final:.1f}s from {len(segs)} segments, {len(clips)} voice lines")
 
 

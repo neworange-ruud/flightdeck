@@ -5,6 +5,7 @@
 # above it is not enough); a scripted tutorial knows its task names up front.
 #
 #   tutorials/worker/trust.sh pinboard "delete notes" "dark theme"
+#   tutorials/worker/trust.sh /home/dev/bean-there "landing page"   (any folder)
 #
 # A task name becomes the worktree folder the way FlightDeck names branches:
 # lower case, spaces as dashes ("delete notes" -> delete-notes).
@@ -17,7 +18,10 @@ NAME="${WORKER_NAME:-fd-tutorial-worker}"
 project="$1"; shift
 for task in "$@"; do
   slug="$(echo "$task" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
-  echo "/home/dev/flightdeck/$project/.flightdeck/worktrees/$slug"
+  case "$project" in
+    /*) echo "$project/.flightdeck/worktrees/$slug" ;;
+    *) echo "/home/dev/flightdeck/$project/.flightdeck/worktrees/$slug" ;;
+  esac
 done | podman exec -i "$NAME" python3 -c '
 import json, os, sys
 p = os.path.expanduser("~/.claude/.claude.json")

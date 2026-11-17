@@ -4,6 +4,7 @@
   "private": true,
   "description": "A tiny notes board. No dependencies.",
   "scripts": {
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node --test"
   }
 }

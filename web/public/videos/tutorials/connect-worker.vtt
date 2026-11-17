@@ -1,0 +1,49 @@
+WEBVTT
+
+00:00:01.046 --> 00:00:04.518
+A worker is the machine where your agents run:
+
+00:00:04.518 --> 00:00:07.914
+a Linux server, or a Mac mini under the desk.
+
+00:00:07.914 --> 00:00:13.121
+This one is called devbox, and FlightDeck is already installed on it.
+
+00:00:13.489 --> 00:00:17.855
+Log in to the worker, and check that FlightDeck's worker is running.
+
+00:00:19.637 --> 00:00:21.726
+Then ask it for a pairing code.
+
+00:00:21.726 --> 00:00:27.857
+It shows the address to connect to, and a four-digit code that works once, for two minutes.
+
+00:00:29.263 --> 00:00:33.722
+Now switch to FlightDeck Desktop, and choose Connect to remote.
+
+00:00:34.031 --> 00:00:36.817
+Enter the worker's address, and the code.
+
+00:00:39.534 --> 00:00:42.146
+Control lets you drive the worker.
+
+00:00:42.146 --> 00:00:43.760
+Observe only watches.
+
+00:00:46.716 --> 00:00:49.881
+On Tailscale, the link is encrypted for you.
+
+00:00:49.881 --> 00:00:55.924
+On any other network, FlightDeck warns you once, because this link is not encrypted.
+
+00:00:55.924 --> 00:00:59.162
+This is a private network, so connect anyway.
+
+00:01:04.662 --> 00:01:08.005
+You're connected. This window is the worker:
+
+00:01:08.005 --> 00:01:12.790
+its projects, its agents and its shells, all running on devbox.
+
+00:01:12.790 --> 00:01:16.969
+The pairing is remembered, so next time it's one click.
