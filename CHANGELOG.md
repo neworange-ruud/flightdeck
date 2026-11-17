@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Agents on a worker have colour again.** A worker running as a service (systemd on Linux, launchd on macOS) has no `TERM`, so its agents inherited none and Claude Code drew everything in plain text. The worker now starts every agent and agent shell with `TERM=xterm-256color` and `COLORTERM=truecolor`, as its own shell already did. If you added these to the worker's unit by hand as a workaround, you can remove that.
 
 ## [2.0.0] - 2026-11-17
 
