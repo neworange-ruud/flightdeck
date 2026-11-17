@@ -42,3 +42,4 @@
 /webui/test-results/
 /webui/playwright-report/
 /webui/blob-report/
+.tutorial-venv/

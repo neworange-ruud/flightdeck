@@ -1,0 +1,40 @@
+# The tutorial worker: a Linux box running `flightdeck worker`, which the
+# FlightDeck Desktop in the macOS tutorial VM pairs with.
+#
+# The build context is staged by tutorials/worker/up.sh: the Linux binary
+# from tutorials/worker/build-binary.sh plus tutorials/projects/. Use up.sh.
+FROM docker.io/library/node:22-bookworm-slim
+
+# What a developer's worker box would have: git for worktrees, a shell, and
+# the usual tools agents reach for.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl ripgrep less procps zsh nano python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The agent the tutorials drive.
+RUN npm install -g @anthropic-ai/claude-code
+
+# A plain non-root developer account; the videos show its prompt and paths.
+RUN useradd --create-home --shell /usr/bin/zsh dev \
+    && touch /home/dev/.zshrc && chown dev:dev /home/dev/.zshrc
+COPY flightdeck /usr/local/bin/flightdeck
+
+USER dev
+WORKDIR /home/dev
+RUN git config --global user.name "Dev" \
+    && git config --global user.email "dev@example.com" \
+    && git config --global init.defaultBranch main
+
+# The mock projects (tutorials/projects/*), each a git repo with one commit,
+# under ~/projects where a tutorial opens them.
+COPY --chown=dev:dev projects /home/dev/projects
+RUN for p in /home/dev/projects/*/; do \
+        git -C "$p" init -q && git -C "$p" add -A \
+        && git -C "$p" commit -q -m "Initial commit"; \
+    done
+
+# Debug-build seam: listen here instead of on Tailscale addresses.
+ENV FLIGHTDECK_WORKER_TEST_LISTEN=0.0.0.0:7420
+EXPOSE 7420
+CMD ["flightdeck", "worker", "run"]
