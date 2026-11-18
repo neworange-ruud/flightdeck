@@ -11,11 +11,15 @@
 //! item performs its keymap entry through [`crate::commands`], so it is the
 //! same action as its chord.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use flightdeck::app::commands::{Command, Selector};
 use flightdeck::host::HostEvent;
 use flightdeck::tui::palette::{FrontEndAction, PaletteAction};
 use flightdeck::view::{
-    format_elapsed, AgentBadge, AgentRowView, TerminalRef, TerminalView, UpstreamState,
+    format_elapsed, AgentBadge, AgentRowView, TerminalRef, TerminalRole, TerminalView,
+    UpstreamState,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -472,6 +476,12 @@ fn agent_row(row: &AgentRowView, data: &SidebarData, host: &Surface, p: &Palette
         });
 
     let menu_host = host.clone();
+    // The child agent a right-click landed on, if any: its row records it on
+    // the press, before the menu builds (gpui-component builds it deferred,
+    // after every mouse-down handler), and the builder takes it, so it never
+    // outlives the one menu.
+    let menu_child: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let row_menu_child = menu_child.clone();
     let block = v_flex()
         .id(("agent-block", index))
         .rounded(px(8.))
@@ -493,11 +503,27 @@ fn agent_row(row: &AgentRowView, data: &SidebarData, host: &Surface, p: &Palette
         })
         .child(head)
         .when(selected, |b| {
-            b.child(terminal_rows(&row.terminals, data, host, p))
+            b.child(terminal_rows(
+                &row.terminals,
+                data,
+                host,
+                p,
+                &row_menu_child,
+            ))
         })
         .context_menu({
             let (isolated, offers_browser) = (data.isolated, data.offers_browser);
-            move |menu, _, _| agent_menu(menu, index, &menu_host, isolated, offers_browser)
+            move |menu, _, _| {
+                let child_agent = menu_child.take();
+                agent_menu(
+                    menu,
+                    index,
+                    &menu_host,
+                    isolated,
+                    offers_browser,
+                    child_agent,
+                )
+            }
         });
     block.into_any_element()
 }
@@ -521,13 +547,21 @@ enum AgentMenuEntry {
     Restart,
     OpenInFileManager,
     OpenInVsCode,
+    /// Only when the menu was opened on a child agent's row: closes that
+    /// agent (after the same confirmation as Ctrl-w).
+    CloseChildAgent,
     Close,
 }
 
 /// The row's context menu, top to bottom: first what the footer's buttons
 /// open (New Browser only where the footer offers it), then what acts on the
-/// agent, then Close.
-fn agent_menu_entries(isolated: bool, offers_browser: bool) -> Vec<AgentMenuEntry> {
+/// agent, then Close (Close Child Agent above it when the menu was opened on
+/// a child agent's row).
+fn agent_menu_entries(
+    isolated: bool,
+    offers_browser: bool,
+    on_child_agent: bool,
+) -> Vec<AgentMenuEntry> {
     use AgentMenuEntry::*;
     let new_agent_disabled = keymap()
         .entry("NewAgentTab")
@@ -550,8 +584,11 @@ fn agent_menu_entries(isolated: bool, offers_browser: bool) -> Vec<AgentMenuEntr
         OpenInFileManager,
         OpenInVsCode,
         Separator,
-        Close,
     ]);
+    if on_child_agent {
+        entries.push(CloseChildAgent);
+    }
+    entries.push(Close);
     entries
 }
 
@@ -565,6 +602,7 @@ fn agent_menu(
     host: &Surface,
     isolated: bool,
     offers_browser: bool,
+    child_agent: Option<usize>,
 ) -> gpui_component::menu::PopupMenu {
     let keyed = |label: &'static str, id: &'static str| {
         let host = host.clone();
@@ -584,7 +622,7 @@ fn agent_menu(
             act(&host, cx);
         })
     };
-    agent_menu_entries(isolated, offers_browser)
+    agent_menu_entries(isolated, offers_browser, child_agent.is_some())
         .into_iter()
         .fold(menu, |menu, entry| match entry {
             AgentMenuEntry::NewAgent { disabled } => {
@@ -622,7 +660,20 @@ fn agent_menu(
                     cx,
                 )
             })),
-            AgentMenuEntry::Close => menu.item(keyed("Close agent…", "CloseAgentTab")),
+            AgentMenuEntry::CloseChildAgent => {
+                let host = host.clone();
+                let child = child_agent.unwrap_or_default();
+                let text = match keycap("CloseChildTerminal") {
+                    Some(cap) => format!("Close Child Agent…    {cap}"),
+                    None => "Close Child Agent…".to_string(),
+                };
+                menu.item(PopupMenuItem::new(text).on_click(move |_, _, cx| {
+                    host.select_agent(index, cx);
+                    host.focus_terminal(TerminalRef::Child(child), cx);
+                    host.dispatch(HostEvent::Command(Command::CloseAgentTerminal), cx);
+                }))
+            }
+            AgentMenuEntry::Close => menu.item(keyed("Close Agent Session…", "CloseAgentTab")),
         })
 }
 
@@ -632,6 +683,7 @@ fn terminal_rows(
     data: &SidebarData,
     host: &Surface,
     p: &Palette,
+    menu_child: &Rc<Cell<Option<usize>>>,
 ) -> impl IntoElement {
     let focused_child = data.focused_child;
     let browser_on_screen = data.browser_on_screen;
@@ -649,6 +701,11 @@ fn terminal_rows(
                 };
             let target = term.target;
             let host = host.clone();
+            let child_agent = match (term.role, target) {
+                (TerminalRole::Agent, TerminalRef::Child(c)) => Some(c),
+                _ => None,
+            };
+            let menu_child = menu_child.clone();
             h_flex()
                 .id(("terminal-row", i))
                 .debug_selector(move || format!("terminal-row-{i}"))
@@ -682,6 +739,9 @@ fn terminal_rows(
                         .text_color(p.muted.hsla())
                         .child(command_hint(&term.title)),
                 )
+                .when_some(child_agent, |r, c| {
+                    r.on_mouse_down(MouseButton::Right, move |_, _, _| menu_child.set(Some(c)))
+                })
                 .on_click(move |_, _, cx| host.focus_terminal(target, cx))
         }))
         .children(data.browsers.iter().enumerate().map(|(i, row)| {
@@ -850,7 +910,7 @@ mod tests {
     #[test]
     fn the_agent_menu_opens_new_things_first_then_a_divider() {
         use AgentMenuEntry::*;
-        let entries = agent_menu_entries(false, true);
+        let entries = agent_menu_entries(false, true, false);
         assert_eq!(
             entries[..5],
             [
@@ -876,9 +936,20 @@ mod tests {
     }
 
     #[test]
+    fn close_child_agent_sits_above_close_only_on_a_child_agent() {
+        use AgentMenuEntry::*;
+        let on_child = agent_menu_entries(false, false, true);
+        assert_eq!(
+            on_child[on_child.len() - 3..],
+            [Separator, CloseChildAgent, Close]
+        );
+        assert!(!agent_menu_entries(false, false, false).contains(&CloseChildAgent));
+    }
+
+    #[test]
     fn new_browser_only_where_offered_and_new_agent_greyed_when_isolated() {
         use AgentMenuEntry::*;
-        let entries = agent_menu_entries(true, false);
+        let entries = agent_menu_entries(true, false, false);
         assert_eq!(
             entries[..4],
             [
