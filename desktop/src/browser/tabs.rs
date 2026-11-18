@@ -101,6 +101,7 @@ impl Browsers {
     /// A new tab an agent asked for (§6): like [`Browsers::open`] or
     /// [`Browsers::open_direct`] (`seq: None` and `direct`), but not put on
     /// screen, so the window keeps showing what the user looks at.
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub fn open_unshown(
         &mut self,
         session: TabId,
