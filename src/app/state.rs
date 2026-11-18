@@ -471,6 +471,34 @@ pub fn agent_status_file(status_root: &Path) -> PathBuf {
     status_root.join(".flightdeck").join("agent-status")
 }
 
+/// The status root of a base-branch tab (`runs_on_base`) in a normal local run:
+/// `<repo>/.flightdeck/runtime/tabs/<tab-id>`.
+///
+/// Several base-branch tabs can share the project root (SPECS §32), so their
+/// status file and question/prompt sidecars cannot live at the root's own
+/// `.flightdeck/` — every agent would report into one file and one tab's
+/// question could surface (and be answered) on another. Each gets its own
+/// directory instead, under the `.flightdeck/runtime/` `.gitignore` entry so
+/// it is never tracked. The tab id carries an ISO timestamp, so it is reduced
+/// to a portable directory name (no `:` on Windows).
+pub fn base_tab_status_root(repo_root: &Path, tab_id: &str) -> PathBuf {
+    let dir: String = tab_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    repo_root
+        .join(".flightdeck")
+        .join("runtime")
+        .join("tabs")
+        .join(dir)
+}
+
 /// Map a status-file keyword (written by an agent hook/plugin) to an
 /// [`InterpretedStatus`] (SPECS §24). Unknown keywords yield `None`.
 pub fn status_keyword_to_interpreted(keyword: &str) -> Option<InterpretedStatus> {
@@ -1443,9 +1471,11 @@ impl AppState {
 
     /// Reserve a placeholder tab that runs directly on the base branch in the
     /// project root (no worktree). The agent must already be validated by the
-    /// caller. Only one base-branch tab is allowed at a time — running two
-    /// agents in the same folder on the same branch would let them stomp each
-    /// other's uncommitted work. The returned [`WorktreeJob`] has
+    /// caller. Several base-branch tabs may share the root (SPECS §32): a
+    /// workspace repo whose agents arrange their own worktrees needs that, and
+    /// the New Agent Session dialog warns that agents sharing one working tree
+    /// will otherwise overwrite each other. Each keeps its own status root
+    /// ([`base_tab_status_root`]). The returned [`WorktreeJob`] has
     /// `needs_create == false`, so [`materialize_worktree`] is a no-op.
     fn begin_base_agent_tab(
         &mut self,
@@ -1455,11 +1485,13 @@ impl AppState {
     ) -> Result<WorktreeJob> {
         let base = self.base_branch.clone();
 
-        // Only one base-branch tab: a second agent sharing the root folder and
-        // branch would race the first on the same working tree.
-        if self.tabs.iter().any(|t| t.meta.runs_on_base) {
+        // In container mode a second base-branch tab stays refused: a
+        // container's status file must live in the bind-mounted worktree
+        // (specs/ISOLATED_MODE.md §8.2), so two of them in the root would
+        // report into one file.
+        if self.config.containers.enabled && self.tabs.iter().any(|t| t.meta.runs_on_base) {
             return Err(FlightDeckError::Refused(format!(
-                "an Agent Tab already runs on the base branch '{base}'"
+                "an Agent Tab already runs on the base branch '{base}' (containerized agents cannot share the project root)"
             )));
         }
 
@@ -1516,7 +1548,14 @@ impl AppState {
 
         let base_commit_sha = services.git.rev_parse(&base)?;
         let created_at = services.clock.now_iso8601();
-        let id = format!("{slug}-{created_at}");
+        // Base-branch tabs default to the branch's name, so two created within
+        // one clock tick would share an id — and with it a status root.
+        let mut id = format!("{slug}-{created_at}");
+        let mut n = 2;
+        while self.tabs.iter().any(|t| t.meta.id == id) {
+            id = format!("{slug}-{created_at}-{n}");
+            n += 1;
+        }
         let meta = TabState {
             id: id.clone(),
             name: display_name,
@@ -1625,7 +1664,7 @@ impl AppState {
             return Err(e);
         }
 
-        let status_file = agent_status_file(&self.status_root(&worktree_abs));
+        let status_file = agent_status_file(&self.status_root(&tab_id, &worktree_abs));
         let (initial_status, status_cursor) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         let tab = &mut self.tabs[idx];
@@ -1739,6 +1778,14 @@ impl AppState {
 
         // Remove the backing container (if any), then the tab from runtime state.
         let container_result = self.destroy_container_if_any(idx, services);
+        // A base-branch tab's own status root (hooks, status file, sidecars)
+        // is FlightDeck scratch; drop it with the tab. Best-effort.
+        if self.tabs[idx].meta.runs_on_base {
+            let dir = base_tab_status_root(&self.repo_root, &self.tabs[idx].meta.id);
+            if services.fs.exists(&dir) {
+                let _ = services.fs.remove_dir_all(&dir);
+            }
+        }
         self.tabs.remove(idx);
         self.fix_selection_after_removal(idx);
         self.persist(services)?;
@@ -2349,13 +2396,36 @@ impl AppState {
     /// reach `prepare_status_launch`. If that constraint is ever relaxed,
     /// this must derive a per-tab subdirectory instead of every tab
     /// colliding on one status file and one plugin dir.
-    fn status_root(&self, worktree: &Path) -> PathBuf {
+    ///
+    /// A base-branch tab (`runs_on_base`) in a normal local run gets its own
+    /// [`base_tab_status_root`], because several of them can share the
+    /// project root.
+    fn status_root(&self, tab_id: &str, worktree: &Path) -> PathBuf {
         if self.config.containers.enabled {
             return worktree.to_path_buf();
         }
-        self.isolated_status_root
-            .clone()
-            .unwrap_or_else(|| worktree.to_path_buf())
+        if let Some(root) = &self.isolated_status_root {
+            return root.clone();
+        }
+        let on_base = self
+            .tabs
+            .iter()
+            .any(|t| t.meta.id == tab_id && t.meta.runs_on_base);
+        if on_base {
+            base_tab_status_root(&self.repo_root, tab_id)
+        } else {
+            worktree.to_path_buf()
+        }
+    }
+
+    /// Whether the New Agent Session dialog should warn that a base-branch
+    /// session would share the project root with another agent: true once a
+    /// base-branch tab exists, in a run that allows a second one (not
+    /// isolated, not containerized).
+    pub fn base_tab_shared(&self) -> bool {
+        !self.isolated
+            && !self.config.containers.enabled
+            && self.tabs.iter().any(|t| t.meta.runs_on_base)
     }
 
     /// Resolve how to launch (or reattach) a primary terminal (SPECS §31).
@@ -2378,7 +2448,7 @@ impl AppState {
                 services.fs,
                 agent,
                 worktree_abs,
-                &self.status_root(worktree_abs),
+                &self.status_root(tab_id, worktree_abs),
                 false,
             )?;
             let mut launch_agent = agent.clone();
@@ -2433,7 +2503,7 @@ impl AppState {
             services.fs,
             agent,
             worktree_abs,
-            &self.status_root(worktree_abs),
+            &self.status_root(tab_id, worktree_abs),
             true,
         )?;
         let mut launch_agent = agent.clone();
@@ -2618,14 +2688,24 @@ impl AppState {
         // top. Local mode only; gated on the auto-continuation setting. When
         // there is no session to resume, snapshot the store so the session this
         // fresh agent creates can be pinned to the tab later.
+        //
+        // A base-branch tab that shares the project root with another one must
+        // not take the fallback: the newest session for the root may well be
+        // the other tab's, and two agents would then continue one session.
+        let shares_root = self.tabs[idx].meta.runs_on_base
+            && self
+                .tabs
+                .iter()
+                .enumerate()
+                .any(|(i, t)| i != idx && t.meta.runs_on_base);
         if self.config.ui.auto_continue && !self.config.containers.enabled {
             if let Some(home) = user_home() {
-                let resume = crate::agents::resume::resolve_resume_args(
-                    &agent.key,
-                    &cwd,
-                    &home,
-                    &self.tabs[idx].meta.resume_args,
-                );
+                let pinned = &self.tabs[idx].meta.resume_args;
+                let resume = if shares_root && pinned.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::agents::resume::resolve_resume_args(&agent.key, &cwd, &home, pinned)
+                };
                 if resume.is_empty() {
                     let ids = crate::agents::resume::store_session_ids(&agent.key, &cwd, &home)
                         .into_iter()
@@ -2639,8 +2719,8 @@ impl AppState {
             }
         }
 
-        let status_file = agent_status_file(&self.status_root(&cwd));
         let tab_id = self.tabs[idx].meta.id.clone();
+        let status_file = agent_status_file(&self.status_root(&tab_id, &cwd));
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
         // Fresh container: start it detached before attaching its PTY.
         if let Some(start_args) = &spawn.start_args {
@@ -3650,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn only_one_base_branch_tab_is_allowed() {
+    fn several_base_branch_tabs_each_keep_their_own_status_root() {
         let dir = TempDir::new().unwrap();
         let (agent, _cmd) = make_real_agent(&dir, "opencode");
         let config = config_with_agent(agent);
@@ -3659,16 +3739,93 @@ mod tests {
         let fs = FakeFs::new();
         let pty = FakePty::new();
         pty.queue_session();
+        pty.queue_session();
         let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
 
         let mut app = fresh_state(config);
-        app.begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+        assert!(!app.base_tab_shared(), "nothing shares the root yet");
+        let first = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
+        app.finalize_new_tab(&first.tab_id, &svc).unwrap();
+        assert!(app.base_tab_shared(), "the form now warns");
+
+        // A workspace repo whose agents arrange their own worktrees runs
+        // several agents on the base branch.
+        let second = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
+        app.finalize_new_tab(&second.tab_id, &svc).unwrap();
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.tabs.iter().all(|t| t.meta.runs_on_base));
+        assert_ne!(
+            first.tab_id, second.tab_id,
+            "same name, same tick: still two ids"
+        );
+
+        // Never the root's own `.flightdeck/agent-status`, never each other's.
+        let files: Vec<PathBuf> = app
+            .tabs
+            .iter()
+            .map(|t| t.status_file.clone().expect("a status file"))
+            .collect();
+        assert_ne!(files[0], files[1]);
+        for (tab, file) in app.tabs.iter().zip(&files) {
+            assert_ne!(*file, agent_status_file(Path::new(REPO)));
+            assert_eq!(
+                *file,
+                agent_status_file(&base_tab_status_root(Path::new(REPO), &tab.meta.id))
+            );
+            assert!(file.starts_with(Path::new(REPO).join(".flightdeck/runtime/tabs")));
+        }
+
+        // Closing one drops its status root and leaves the other's.
+        let root0 = base_tab_status_root(Path::new(REPO), &app.tabs[0].meta.id);
+        app.selected_tab = Some(0);
+        app.dispatch(
+            Command::CloseAgentTab {
+                action: Some(CloseAction::ForceTerminate),
+            },
+            &svc,
+        )
+        .unwrap();
+        assert_eq!(app.tabs.len(), 1);
+        assert!(!fs.exists(&root0), "the closed tab's status root is gone");
+        assert!(fs.exists(app.tabs[0].status_file.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn a_base_tab_status_root_is_a_portable_directory_name() {
+        let root = base_tab_status_root(Path::new("/r"), "main-2026-11-18T10:00:00Z");
+        assert_eq!(
+            root,
+            Path::new("/r/.flightdeck/runtime/tabs/main-2026-11-18T10-00-00Z")
+        );
+    }
+
+    #[test]
+    fn containerized_runs_keep_one_base_branch_tab() {
+        let mut app = fresh_state(exec_config());
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        let clock = FakeClock::default();
+        let container = FakeContainerRuntime::new().with_image(project_image());
+        let command = FakeCommandRunner::new();
+        let svc = Services {
+            git: &git,
+            fs: &fs,
+            pty: &pty,
+            clock: &clock,
+            container: &container,
+            command: &command,
+        };
+        app.begin_new_agent_tab_ex("", Some("opencode"), true, &svc)
             .unwrap();
-        // A second base-branch tab would race the first on the same working tree.
+        assert!(!app.base_tab_shared(), "no second one to warn about");
+        // A container's status file must live in the bind-mounted worktree, so
+        // two in the root would report into one file.
         let err = app
-            .begin_new_agent_tab_ex("", None, true, &services(&git, &fs, &pty, &clock))
+            .begin_new_agent_tab_ex("", Some("opencode"), true, &svc)
             .unwrap_err();
-        assert!(matches!(err, FlightDeckError::Refused(_)));
+        assert!(matches!(err, FlightDeckError::Refused(_)), "{err:?}");
         assert_eq!(app.tabs.len(), 1);
     }
 

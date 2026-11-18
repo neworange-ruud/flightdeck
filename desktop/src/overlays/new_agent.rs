@@ -91,6 +91,7 @@ pub fn arrows_to_agent(form: &NewAgentForm, index: usize) -> Option<Vec<HostEven
 pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElement {
     let p = cx.palette;
     let (question, hint) = split_hint(&view.title);
+    let (body_lines, warning) = split_warning(&view.body);
 
     let agents_fixed = form.target == NewAgentTarget::ExistingBranch;
     let agents = div().flex().flex_row().flex_wrap().gap(px(6.)).children(
@@ -152,8 +153,12 @@ pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElem
             )
         }
         // The body line says it: "Runs on base branch 'main' in the project
-        // root — no worktree."
-        NewAgentTarget::Base => div(),
+        // root — no worktree." A second base-branch session also carries the
+        // host's warning line (`⚠ …`), drawn as a callout instead.
+        NewAgentTarget::Base => match &warning {
+            Some(text) => base_shared_callout(p, text),
+            None => div(),
+        },
     };
 
     let body = div()
@@ -161,7 +166,7 @@ pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElem
         .flex_col()
         .gap(px(16.))
         .p(px(20.))
-        .child(heading(p, question, &view.body))
+        .child(heading(p, question, &body_lines))
         .children(origin_line(p, view.origin_label.as_deref()))
         .child(field_block(p, "Agent", agents))
         .child(field_block(p, "Runs on", targets))
@@ -187,6 +192,45 @@ pub fn render(view: &DialogView, form: &NewAgentForm, cx: &OverlayCx) -> AnyElem
         .child(body)
         .child(footer)
         .into_any_element()
+}
+
+/// The host's body lines split into the plain ones and its `⚠` warning (the
+/// base target's shared-root warning, `flightdeck::BASE_SHARED_WARNING`).
+fn split_warning(body: &[String]) -> (Vec<String>, Option<String>) {
+    let mut lines = Vec::new();
+    let mut warning = None;
+    for line in body {
+        match line.strip_prefix('⚠') {
+            Some(rest) => warning = Some(rest.trim().to_string()),
+            None => lines.push(line.clone()),
+        }
+    }
+    (lines, warning)
+}
+
+/// The base target's warning that another agent already runs in the project
+/// root.
+fn base_shared_callout(p: &Palette, text: &str) -> Div {
+    div()
+        .debug_selector(|| "new-agent-base-shared".into())
+        .flex()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(7.))
+        .border_1()
+        .border_color(p.attention_border.hsla())
+        .bg(p.attention_surface.hsla())
+        .text_size(px(12.5))
+        .line_height(px(18.))
+        .text_color(p.ink.hsla())
+        .child(
+            div()
+                .flex_none()
+                .text_color(p.status_attention.hsla())
+                .child("⚠"),
+        )
+        .child(div().flex_1().min_w_0().child(text.to_string()))
 }
 
 /// A labelled group.

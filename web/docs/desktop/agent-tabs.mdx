@@ -74,14 +74,28 @@ Sometimes you want two agents on the *same* branch and worktree — for example,
 coder and a reviewer. Use the **`+ agent`** button on the terminal tab row (or
 palette → *New Agent*) to spawn an additional agent in the current worktree. It
 appears alongside the first as `agent`, `agent 2`, `agent 3`… Close one with
-*Close Agent* or its `✕`.
+*Close Agent* or its `✕`. In the desktop app you can also right-click the
+agent's row in the sidebar and choose **Close Child Agent**.
 
 This is different from `Ctrl-n`, which always creates a brand-new tab with its
 own branch and worktree.
 
+## Several tabs on the base branch
+
+The base-branch target runs the agent in the project root, with no worktree.
+You can start more than one tab there. This suits a "workspace" repository
+whose agents create the worktrees they need themselves. FlightDeck doesn't keep
+these agents apart: they share one working tree. From the second base-branch tab
+onward the form warns about this, and your agent workflow must create its own
+worktrees, or the agents will overwrite each other's changes.
+
+With [containers](/desktop/containers) enabled, only one base-branch tab is
+allowed.
+
 ## Close a tab
 
-Press **`Ctrl-k`** (or palette → *Close Agent Session Tab*). FlightDeck shows an
+Press **`Ctrl-k`** (or palette → *Close Agent Session Tab*, or right-click the
+tab's row in the desktop sidebar → *Close Agent Session*). FlightDeck shows an
 options menu and **never auto-escalates to a force-kill**:
 
 - **Send Ctrl-C to primary** (the default),

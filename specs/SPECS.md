@@ -703,6 +703,41 @@ Target advanced: 12 commits since this tab last synced
 
 This should be computed by comparing the stored base commit SHA to the current base branch.
 
+### 12.1 Agent Tabs on the Base Branch
+
+The New Agent Session Tab form's third target runs the agent directly on the
+base branch in the project root, with no worktree (`runs_on_base`). The project
+root must have the base branch checked out. Finish / Local Merge, Rebase
+Worktree and Abandon Worktree are refused on such a tab.
+
+Several base-branch tabs may run at once. This serves a "workspace" repository
+whose agents create the worktrees they need themselves (for example across
+several mirrored repositories), so none of them should get a FlightDeck
+worktree. FlightDeck does not arrange anything for them: they share one working
+tree, and from the second base-branch tab onward the form's base target carries
+a warning that the agent workflow must create its own worktrees, or the agents
+will overwrite each other's changes.
+
+Each base-branch tab keeps its own status root at
+`.flightdeck/runtime/tabs/<tab-id>/` (covered by the `.flightdeck/runtime/`
+`.gitignore` entry, the tab id reduced to a portable directory name), so its
+`agent-status` file and question/prompt sidecars never mix with another
+agent's in the same folder. Closing the tab removes that directory. Auto-continue
+does not fall back to "the newest session in the project root" for a base-branch
+tab that shares the root with another one, since that session may be the other
+tab's; only the tab's own pinned session is resumed.
+
+Exceptions keep one base-branch tab:
+
+- **Containerized runs.** A container's status file must live in the
+  bind-mounted worktree, so two containers in the root would report into one
+  file. A second base-branch tab is refused.
+- **Isolated runs** (§32) allow exactly one tab of any kind.
+
+Known limit: OpenCode 2 runs one background service for every directory and
+loads the plugin of whichever client started it, so two OpenCode base-branch
+tabs can still report into the first one's status file.
+
 This matters because long-running agent branches can become stale quickly.
 
 ---

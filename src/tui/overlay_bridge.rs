@@ -229,6 +229,7 @@ fn dialog_kind(prompt: &Prompt) -> DialogKind {
             use_existing_branch,
             run_on_base,
             base_branch,
+            base_shared: _,
         } => DialogKind::NewAgent(NewAgentForm {
             agents: agent_choices(agents),
             selected_agent: *selected,
