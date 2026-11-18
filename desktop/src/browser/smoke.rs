@@ -322,3 +322,176 @@ impl Drop for ServerGuard {
         let _ = self.0.kill();
     }
 }
+
+/// `flightdeck-desktop --spike-agent-browser`: every agent browser tool
+/// (`specs/SESSION_BROWSER_PRD.md` §6) on a real web view, against a form
+/// served here, printing each answer, then quitting. A debugging aid, like
+/// `--spike-browser`.
+pub fn run_agent() -> i32 {
+    use flightdeck::browser_tools::{BrowserReply, ReplyContent, Tool};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let port = form_server();
+    println!("form server 127.0.0.1:{port}");
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let bounds = Bounds::centered(None, size(px(1000.), px(700.)), cx);
+            let mut view = None;
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let browser = cx.new(|cx| {
+                        BrowserView::new_direct(super::profile_id("smoke", "agent"), window, cx)
+                    });
+                    browser.update(cx, |b, cx| {
+                        b.set_shown(true);
+                        b.set_agent_allowed(true, cx);
+                    });
+                    view = Some(browser.clone());
+                    cx.new(|cx| Root::new(browser, window, cx))
+                },
+            );
+            let Some(view) = view else {
+                eprintln!("could not open the window");
+                cx.quit();
+                return;
+            };
+            cx.spawn(async move |cx| {
+                let finished: super::agent::Finished = Rc::new(RefCell::new(Vec::new()));
+                let mut call = 0u64;
+                // Run one tool and wait for its answer.
+                let mut run = async |tool: Tool, label: &str, cx: &mut gpui::AsyncApp| -> BrowserReply {
+                    call += 1;
+                    let id = call;
+                    let f = finished.clone();
+                    view.update(cx, |b, cx| b.agent_run(id, tool, f, cx));
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(50)).await;
+                        let done = finished.borrow_mut().iter().position(|(c, _)| *c == id);
+                        if let Some(at) = done {
+                            let (_, reply) = finished.borrow_mut().remove(at);
+                            let mut shown = String::new();
+                            for part in &reply.content {
+                                match part {
+                                    ReplyContent::Text { text } => shown.push_str(text),
+                                    ReplyContent::Image { data, mime_type } => shown.push_str(
+                                        &format!(" [{mime_type}, {} base64 chars]", data.len()),
+                                    ),
+                                }
+                            }
+                            println!(
+                                "== {label}{}\n{}\n",
+                                if reply.is_error { " (error)" } else { "" },
+                                shown.lines().take(40).collect::<Vec<_>>().join("\n")
+                            );
+                            return reply;
+                        }
+                    }
+                };
+                let tab = None;
+                run(Tool::Navigate { url: format!("localhost:{port}"), tab }, "navigate", cx).await;
+                let snap = run(Tool::Snapshot { tab }, "snapshot", cx).await.joined_text();
+                let find = |what: &str| {
+                    snap.lines()
+                        .find(|l| l.contains(what))
+                        .and_then(|l| l.split("[ref=").nth(1))
+                        .and_then(|r| r.split(']').next())
+                        .unwrap_or("e0")
+                        .to_string()
+                };
+                let (email, plan, terms, button) =
+                    (find("textbox \"Email"), find("combobox"), find("checkbox"), find("button \"Sign in"));
+                run(Tool::Type { r#ref: email, text: "ada@example.com".into(), submit: false, tab }, "type email", cx).await;
+                run(Tool::Type { r#ref: plan, text: "Pro".into(), submit: false, tab }, "choose plan", cx).await;
+                run(Tool::Click { r#ref: terms, tab }, "tick terms", cx).await;
+                run(Tool::Click { r#ref: "e999".into(), tab }, "stale ref", cx).await;
+                run(Tool::Console { clear: true, tab }, "console before submit", cx).await;
+                run(Tool::Console { clear: false, tab }, "console after clearing", cx).await;
+                run(Tool::Click { r#ref: button, tab }, "submit", cx).await;
+                run(Tool::Snapshot { tab }, "snapshot after submit", cx).await;
+                run(Tool::Console { clear: false, tab }, "console", cx).await;
+                run(Tool::Eval { expression: "document.title;".into(), tab }, "eval title", cx).await;
+                run(Tool::Eval { expression: "() => new Promise(r => setTimeout(() => r({ ok: location.search }), 300))".into(), tab }, "eval promise", cx).await;
+                run(Tool::Eval { expression: "1 +".into(), tab }, "eval syntax error", cx).await;
+                run(Tool::Eval { expression: "Promise.reject(new Error('nope'))".into(), tab }, "eval rejected", cx).await;
+                let shot = run(Tool::Screenshot { tab }, "screenshot (shown)", cx).await;
+                // FD_SMOKE_SHOT=<file.png> keeps it, to look at.
+                if let Some(path) = std::env::var_os("FD_SMOKE_SHOT") {
+                    use base64::Engine;
+                    for part in &shot.content {
+                        if let ReplyContent::Image { data, .. } = part {
+                            if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(data) {
+                                let _ = std::fs::write(&path, png);
+                            }
+                        }
+                    }
+                }
+                run(Tool::Back { tab }, "back", cx).await;
+                run(Tool::Press { key: "Tab".into(), tab }, "press Tab", cx).await;
+                run(Tool::Reload { tab }, "reload", cx).await;
+                run(Tool::Navigate { url: "file:///etc/hosts".into(), tab }, "navigate to a file", cx).await;
+                run(Tool::Navigate { url: "not an address".into(), tab }, "navigate to nonsense", cx).await;
+                view.update(cx, |b, _| b.set_shown(false));
+                run(Tool::Navigate { url: format!("localhost:{port}"), tab }, "navigate (hidden)", cx).await;
+                run(Tool::Screenshot { tab }, "screenshot (hidden)", cx).await;
+                let signals = view.update(cx, |b, _| b.take_signals());
+                println!("signals: {signals:?}");
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    0
+}
+
+/// A sign-in form and the page it submits to, for `--spike-agent-browser`.
+fn form_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let body = if path.starts_with("/done") {
+                format!(
+                    "<!doctype html><title>Done</title><h1>Thanks</h1><p>You sent {}</p>",
+                    path.replace('<', "&lt;")
+                )
+            } else {
+                "<!doctype html><title>Sign in</title><h1>Sign in</h1>\
+                 <p>Welcome to the   test page.</p>\
+                 <form action=\"/done\" method=\"get\">\
+                 <label>Email <input name=\"email\" placeholder=\"you@example.com\"></label>\
+                 <select name=\"plan\"><option value=\"a\">Basic</option><option value=\"b\">Pro</option></select>\
+                 <label><input type=\"checkbox\" name=\"terms\"> I agree</label>\
+                 <button type=\"submit\">Sign in</button></form>\
+                 <nav><a href=\"/about\">About us</a></nav>\
+                 <script>console.log('hello from the page', {n: 1}); console.warn('careful');\
+                 setTimeout(() => { throw new Error('boom') }, 10); Promise.reject(new Error('nope'));</script>"
+                    .to_string()
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+    port
+}

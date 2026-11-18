@@ -38,6 +38,16 @@ fn main() {
         // The session browser against a stand-in worker (browser::smoke).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(flag) if flag == "--spike-browser" => std::process::exit(browser::smoke::run()),
+        // Every agent browser tool on a real web view (browser::smoke).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Some(flag) if flag == "--spike-agent-browser" => {
+            std::process::exit(browser::smoke::run_agent())
+        }
+        // The MCP server an agent runs to use the session browser
+        // (specs/SESSION_BROWSER_PRD.md §6): stdio only, no window.
+        Some(cmd) if cmd == "browser-mcp" => std::process::exit(
+            flightdeck::browser_tools::mcp::main(&args.collect::<Vec<_>>()),
+        ),
         Some(flag) if flag == "--dump-grid" => {
             std::process::exit(terminal::spike::dump(args.collect()))
         }

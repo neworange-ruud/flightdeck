@@ -894,6 +894,126 @@ mod local_browser {
         assert!(model.read_with(cx, |m, _| m.browsers().all().is_empty()));
     }
 
+    /// An agent's call through the real bridge (§6): the call thread waits
+    /// while the window takes turns, as the app's ticker does.
+    fn agent_call(
+        model: &Entity<HostModel>,
+        cx: &mut VisualTestContext,
+        ticket: &std::path::Path,
+        session: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> flightdeck::browser_tools::BrowserReply {
+        let caller = {
+            let ticket = ticket.to_path_buf();
+            let session = session.to_string();
+            let tool = tool.to_string();
+            std::thread::spawn(move || {
+                flightdeck::browser_tools::mcp::call(&ticket, &session, tool, args)
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !caller.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{tool} was never answered"
+            );
+            model.update(cx, |m, cx| {
+                m.turn(cx);
+            });
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        caller.join().unwrap()
+    }
+
+    #[gpui::test]
+    fn an_agent_uses_its_sessions_browser_only_once_the_switch_is_on(app: &mut TestAppContext) {
+        use crate::browser::drive::AgentModel;
+        use flightdeck::browser_tools::NOT_ALLOWED;
+        use serde_json::json;
+
+        let (_f, model, cx) = open(app, two_projects());
+        let dir = tempfile::tempdir().unwrap();
+        let ticket = dir.path().join("desktop.json");
+        model.update(cx, |m, _| {
+            m.host_mut()
+                .enable_browser_tools_at(ticket.clone())
+                .unwrap()
+        });
+        // Agents launched from here on are told where the server is.
+        assert!(model.read_with(cx, |m, _| m.host().active_state().browser_mcp.is_some()));
+        new_browser(&model, cx);
+        let shown = on_screen(&model, cx).expect("on screen");
+        let session = model.read_with(cx, |m, _| {
+            let state = m.host().active_state();
+            state.tabs[state.selected_tab.unwrap()].meta.id.clone()
+        });
+
+        // Off by default: refused, in words the agent can act on.
+        let refused = agent_call(&model, cx, &ticket, &session, "browser_tabs", json!({}));
+        assert!(refused.is_error);
+        assert_eq!(refused.joined_text(), NOT_ALLOWED);
+
+        // On: the session's tabs are listed.
+        let key = model.read_with(cx, |m, _| m.browsers().tab(shown).unwrap().session.clone());
+        model.update(cx, |m, _| m.desk().set_allowed(&key, true));
+        let tabs = agent_call(&model, cx, &ticket, &session, "browser_tabs", json!({}));
+        assert!(!tabs.is_error, "{tabs:?}");
+        assert!(
+            tabs.joined_text().contains(&format!("tab {shown}")),
+            "{tabs:?}"
+        );
+
+        // An agent's new tab joins the session without taking the screen.
+        let before = model.read_with(cx, |m, _| m.browsers().all().len());
+        let opener = {
+            let ticket = ticket.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                flightdeck::browser_tools::mcp::call(
+                    &ticket,
+                    &session,
+                    "browser_open".to_string(),
+                    json!({ "url": "localhost:3000" }),
+                )
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while model.read_with(cx, |m, _| m.browsers().all().len()) == before {
+            assert!(std::time::Instant::now() < deadline, "no tab was opened");
+            model.update(cx, |m, cx| {
+                m.turn(cx);
+            });
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(on_screen(&model, cx), Some(shown), "the screen stays");
+
+        // Stop answers the waiting open (it has no web view here) and turns
+        // the switch off.
+        model.update(cx, |m, cx| {
+            m.desk().stop(&key);
+            m.turn(cx);
+        });
+        let stopped = opener.join().unwrap();
+        assert!(stopped.is_error);
+        assert_eq!(stopped.joined_text(), flightdeck::browser_tools::STOPPED);
+        assert!(!model.update(cx, |m, _| m.desk().allowed(&key)));
+
+        // A session this window does not have.
+        let unknown = agent_call(
+            &model,
+            cx,
+            &ticket,
+            "no-such-session",
+            "browser_tabs",
+            json!({}),
+        );
+        assert!(unknown.is_error);
+        assert!(unknown.joined_text().contains("not open"), "{unknown:?}");
+    }
+
     #[gpui::test]
     fn a_session_gone_with_its_worktree_is_an_abandoned_worktree(app: &mut TestAppContext) {
         let (_f, model, cx) = open(app, two_projects());

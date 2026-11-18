@@ -98,6 +98,35 @@ impl Browsers {
         )
     }
 
+    /// A new tab an agent asked for (§6): like [`Browsers::open`] or
+    /// [`Browsers::open_direct`] (`seq: None` and `direct`), but not put on
+    /// screen, so the window keeps showing what the user looks at.
+    pub fn open_unshown(
+        &mut self,
+        session: TabId,
+        worktree: String,
+        direct: bool,
+        seq: Option<u64>,
+    ) -> u64 {
+        let refusal = (!direct && seq.is_none()).then(|| NOT_SENT.to_string());
+        let shown = self.shown.take();
+        let id = self.push(
+            BrowserTab {
+                id: 0,
+                session,
+                worktree,
+                direct,
+                seq,
+                key: None,
+                refusal,
+                title: String::new(),
+            },
+            None,
+        );
+        self.shown = shown;
+        id
+    }
+
     fn push(&mut self, mut tab: BrowserTab, terminal: Option<String>) -> u64 {
         self.next += 1;
         tab.id = self.next;
@@ -257,6 +286,22 @@ mod tests {
 
     fn open(b: &mut Browsers, id: &str, seq: Option<u64>, terminal: Option<String>) -> u64 {
         b.open(session(id), format!("/wt/{id}"), seq, terminal)
+    }
+
+    #[test]
+    fn a_tab_an_agent_opens_leaves_the_screen_as_it_was() {
+        let mut b = Browsers::default();
+        let mine = open(&mut b, "s1", Some(1), term("s1:primary"));
+        let agents = b.open_unshown(session("s1"), "/wt/s1".into(), false, Some(2));
+        assert_ne!(mine, agents);
+        assert_eq!(b.shown_id(), Some(mine));
+        assert_eq!(b.waiting(), vec![(mine, 1), (agents, 2)]);
+        // Unsent, a remote tab says why; a local one needs nothing.
+        let unsent = b.open_unshown(session("s1"), "/wt/s1".into(), false, None);
+        assert_eq!(b.tab(unsent).unwrap().refusal.as_deref(), Some(NOT_SENT));
+        let local = b.open_unshown(session("s1"), "/wt/s1".into(), true, None);
+        assert!(b.tab(local).unwrap().refusal.is_none());
+        assert_eq!(b.shown_id(), Some(mine));
     }
 
     #[test]

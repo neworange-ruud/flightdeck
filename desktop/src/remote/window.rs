@@ -868,6 +868,16 @@ impl RemoteWindow {
                     }
                 }
             }
+            // The worker's agents' calls on these browsers (§6). A tab an
+            // agent just opened gets its view once the worker grants its key.
+            let views: Vec<(u64, Entity<crate::browser::view::BrowserView>)> = self
+                .browser_views
+                .iter()
+                .map(|(id, (view, _))| (*id, view.clone()))
+                .collect();
+            if crate::browser::drive::drive(&self.remote, &views, cx) {
+                cx.notify();
+            }
             let ports: Vec<(u64, Vec<u16>)> = self
                 .browser_views
                 .keys()

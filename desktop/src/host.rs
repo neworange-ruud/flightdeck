@@ -179,6 +179,9 @@ pub struct HostModel {
     /// Worktrees found gone (abandoned) whose browser profiles the window is
     /// still to delete (B19).
     abandoned: Vec<String>,
+    /// The agents' calls on those browsers, and each session's switch
+    /// (`specs/SESSION_BROWSER_PRD.md` §6).
+    agent: crate::browser::agent::AgentDesk,
 }
 
 impl HostModel {
@@ -206,6 +209,7 @@ impl HostModel {
             _ticker: None,
             browsers: crate::browser::tabs::Browsers::default(),
             abandoned: Vec::new(),
+            agent: crate::browser::agent::AgentDesk::default(),
         }
     }
 
@@ -306,6 +310,41 @@ impl HostModel {
             Some(at) => self.host.listening_ports(&dirs).swap_remove(at),
             None => Vec::new(),
         }
+    }
+
+    /// The agents' share of a turn (§6): their new calls to the desk, the
+    /// desk's answers back to the host. Whether the window must look.
+    fn pump_agent_calls(&mut self) -> bool {
+        let calls = self.host.take_browser_calls();
+        let arrived = !calls.is_empty();
+        for call in calls {
+            match self.agent_session(&call.session) {
+                Some(session) => self
+                    .agent
+                    .arrived(call.call, session, &call.tool, &call.args),
+                None => self.agent.unknown_session(call.call),
+            }
+        }
+        let live: Vec<u64> = self.browsers.all().iter().map(|t| t.id).collect();
+        let answers = self.agent.take_answers(&live);
+        let answered = !answers.is_empty();
+        for (call, reply) in answers {
+            self.host.answer_browser_call(call, reply);
+        }
+        arrived || answered
+    }
+
+    /// The browser list's name for the session whose tab id is `tab_id`.
+    fn agent_session(&self, tab_id: &str) -> Option<flightdeck::contracts::TabId> {
+        (0..self.host.project_count())
+            .filter_map(|i| self.host.project_state(i))
+            .find_map(|state| {
+                state
+                    .tabs
+                    .iter()
+                    .any(|t| t.meta.id == tab_id)
+                    .then(|| browser_session(&state.repo_root, tab_id))
+            })
     }
 
     /// Worktrees found abandoned since the last call (B19).
@@ -415,6 +454,7 @@ impl HostModel {
         self.sync_terminal_sizes();
         let changed = self.host.tick();
         self.prune_browsers();
+        let changed = self.pump_agent_calls() || changed;
         // A program on screen that draws its own selection (Claude Code's
         // fullscreen renderer) copies with OSC 52, not through our selection.
         if let Some(text) = self.host.take_clipboard() {
@@ -591,4 +631,51 @@ impl HostModel {
 /// tab id, since a tab id is only unique within its project.
 pub fn browser_session(root: &std::path::Path, tab_id: &str) -> flightdeck::contracts::TabId {
     flightdeck::contracts::TabId(format!("{}\0{tab_id}", root.display()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl crate::browser::drive::AgentModel for HostModel {
+    fn agent_browsers(&self) -> &crate::browser::tabs::Browsers {
+        &self.browsers
+    }
+
+    fn desk(&mut self) -> &mut crate::browser::agent::AgentDesk {
+        &mut self.agent
+    }
+
+    fn desk_ref(&self) -> &crate::browser::agent::AgentDesk {
+        &self.agent
+    }
+
+    fn open_agent_browser(
+        &mut self,
+        session: &flightdeck::contracts::TabId,
+    ) -> Result<u64, String> {
+        if let Some(why) = crate::browser::unavailable_here() {
+            return Err(why.to_string());
+        }
+        let worktree = (0..self.host.project_count())
+            .filter_map(|i| self.host.project_state(i))
+            .find_map(|state| {
+                state
+                    .tabs
+                    .iter()
+                    .find(|t| &browser_session(&state.repo_root, &t.meta.id) == session)
+                    .map(|t| {
+                        t.meta
+                            .worktree_path_relative
+                            .resolve(&state.repo_root)
+                            .display()
+                            .to_string()
+                    })
+            })
+            .ok_or("This session is not open any more.")?;
+        Ok(self
+            .browsers
+            .open_unshown(session.clone(), worktree, true, None))
+    }
+
+    fn shown_browser(&mut self) -> Option<u64> {
+        self.browser_on_screen()
+    }
 }
