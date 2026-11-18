@@ -61,6 +61,41 @@ impl GitCli {
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Result<Output> {
         run_git_in(cwd, args)
     }
+
+    /// Make sure Git for Windows may create paths longer than 260 characters
+    /// before a worktree is checked out.
+    ///
+    /// A worktree lives under `<repo>/.flightdeck/worktrees/<slug>/`, so every
+    /// file in it has a path tens of characters longer than in the main
+    /// checkout. A repository whose deepest files fit in the main checkout can
+    /// therefore fail `git worktree add` with "Filename too long" unless
+    /// `core.longpaths` is on. When no config level has set it, it is written to
+    /// the user's global config, so the agent's own git in the worktree works
+    /// too. An explicit value — `false` included — is the user's choice and is
+    /// left alone. Best-effort: on any failure the add runs anyway and reports
+    /// git's own error.
+    #[cfg(windows)]
+    fn ensure_long_paths(&self) {
+        let Ok(get) = self.run(&["config", "--get", "core.longpaths"]) else {
+            return;
+        };
+        if should_enable_long_paths(get.status.code()) {
+            let _ = self.run(&["config", "--global", "core.longpaths", "true"]);
+        }
+    }
+
+    /// No-op: only Git for Windows has the 260-character path limit.
+    #[cfg(not(windows))]
+    fn ensure_long_paths(&self) {}
+}
+
+/// Whether `core.longpaths` must be switched on, given the exit code of
+/// `git config --get core.longpaths`. Exit 1 means the key is set nowhere;
+/// 0 means some config level set it (to whatever value the user chose); any
+/// other code is an error we do not act on.
+#[cfg(any(windows, test))]
+fn should_enable_long_paths(get_exit_code: Option<i32>) -> bool {
+    get_exit_code == Some(1)
 }
 
 /// One open project's repository handle: its root plus the [`GitExecutor`]
@@ -325,6 +360,7 @@ impl GitExecutor for GitCli {
     }
 
     fn add_worktree(&self, path: &Path, branch: &str) -> Result<()> {
+        self.ensure_long_paths();
         let path_str = path.to_string_lossy();
         let out = self.run(&["worktree", "add", &path_str, branch])?;
         require_success(&out, &format!("worktree add {path_str} {branch}"))
@@ -655,6 +691,18 @@ pub fn detect_base_branch(
 mod tests {
     use super::*;
     use crate::testing::FakeGit;
+
+    #[test]
+    fn long_paths_enabled_only_when_unset_everywhere() {
+        // Exit 1: the key is set at no config level — switch it on.
+        assert!(should_enable_long_paths(Some(1)));
+        // Exit 0: the user (or an earlier run) chose a value, `false` included
+        // — leave it alone.
+        assert!(!should_enable_long_paths(Some(0)));
+        // Any other outcome is a git error we do not act on.
+        assert!(!should_enable_long_paths(Some(128)));
+        assert!(!should_enable_long_paths(None));
+    }
 
     #[test]
     fn detect_base_uses_configured_when_it_exists() {
