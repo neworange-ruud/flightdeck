@@ -163,6 +163,8 @@ fn worker_op(seq: u64, name: &str) -> WebInbound {
         "names": ["a.txt"],
         "terminal_id": WORKER_SHELL_TERMINAL_ID,
         "key": "no-such-key",
+        "call": 1,
+        "reply": { "content": [], "is_error": false },
     });
     let op = WorkerOp::parse(name, Some(&args))
         .expect("a worker command")

@@ -202,6 +202,12 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
             return 1;
         }
     };
+    // A Desktop that attaches holds the sessions' browsers; their agents
+    // may use them (specs/SESSION_BROWSER_PRD.md §6). Before resuming, so
+    // resumed agents get the tools too.
+    if let Err(e) = host.enable_browser_tools() {
+        log_line("warn", &format!("agents get no browser tools: {e}"));
+    }
     host.resume_all_projects();
     host.start_worker();
 

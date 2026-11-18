@@ -96,6 +96,7 @@
 //! | [`worker_command::BEGIN_UPLOAD`], [`UploadPlan`], [`UPLOAD_MIN_VERSION`] | uploading files to a worker: a grant over the socket, the bytes over `PUT /upload/{ticket}` (v8) |
 //! | [`worker_command::BEGIN_DOWNLOAD`], [`DownloadPlan`], [`FileEntryView`], [`DOWNLOAD_MIN_VERSION`] | downloading files from a worker: a grant over the socket, the bytes over `GET /download/{ticket}` (v9) |
 //! | [`worker_command::CREATE_PROJECT`], [`CREATE_PROJECT_MIN_VERSION`] | creating a new project on a worker: folder, `git init`, empty root commit (SPECS §5.3, v12) |
+//! | [`ServerMsg::BrowserToolCall`], [`worker_command::BROWSER_TOOL_RESULT`], [`AGENT_BROWSER_MIN_VERSION`] | a session's agent drives the session browser in the attached Desktop window (`specs/SESSION_BROWSER_PRD.md` §6, v13) |
 //!
 //! # Forward compatibility
 //!
@@ -264,10 +265,19 @@ mod tests;
 /// frame; the bump is how a window knows the worker understands the command,
 /// so it can offer Create only where it works ([`CREATE_PROJECT_MIN_VERSION`]).
 ///
+/// **v13 is agent browser tools** (`specs/SESSION_BROWSER_PRD.md` §6). The
+/// worker sends the window holding its seat a new frame,
+/// [`ServerMsg::BrowserToolCall`] — a session's agent wants its browser to do
+/// something — and the window answers with
+/// [`worker_command::BROWSER_TOOL_RESULT`]. A new frame a peer must answer,
+/// hence the bump: a worker never sends it to a window below
+/// [`AGENT_BROWSER_MIN_VERSION`], and tells the agent the Desktop needs
+/// updating instead.
+///
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
@@ -277,7 +287,7 @@ pub const PROTOCOL_VERSION: u16 = 12;
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 12;
+pub const MAX_SUPPORTED_VERSION: u16 = 13;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
@@ -307,6 +317,11 @@ pub const BROWSER_TUNNEL_MIN_VERSION: u16 = 11;
 /// ([`worker_command::CREATE_PROJECT`], v12). An older worker does not know
 /// the command, so a window offers Create only from this version on.
 pub const CREATE_PROJECT_MIN_VERSION: u16 = 12;
+
+/// The oldest window a worker sends an agent's browser tool call to
+/// ([`ServerMsg::BrowserToolCall`], v13), and so the oldest that may answer
+/// one with [`worker_command::BROWSER_TOOL_RESULT`].
+pub const AGENT_BROWSER_MIN_VERSION: u16 = 13;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -2245,6 +2260,24 @@ pub struct BrowserTunnel {
     pub refusal: Option<String>,
 }
 
+/// A session's agent wants its browser to do something (v13,
+/// `specs/SESSION_BROWSER_PRD.md` §6): sent by a worker to the window holding
+/// its seat, which runs it on the session's browser tab and answers with
+/// [`worker_command::BROWSER_TOOL_RESULT`]. The tools and their arguments are
+/// [`crate::browser_tools::tools`]'s.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserToolCall {
+    /// The worker's number for the call; the answer names it.
+    pub call: u64,
+    /// The session whose agent asked.
+    pub session_id: TabId,
+    /// The tool, e.g. `browser_snapshot`.
+    pub tool: String,
+    /// Its arguments, as the agent sent them.
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
 /// One file of an [`UploadPlan`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadPlanFile {
@@ -3071,6 +3104,9 @@ pub enum ServerMsg {
     /// [`worker_command::OPEN_BROWSER_TUNNEL`] (v11): a key, or a refusal.
     /// Never sent to a peer below [`BROWSER_TUNNEL_MIN_VERSION`].
     BrowserTunnel(BrowserTunnel),
+    /// A session's agent wants its browser to do something (v13). Never sent
+    /// to a peer below [`AGENT_BROWSER_MIN_VERSION`].
+    BrowserToolCall(BrowserToolCall),
     /// Another window attached to this worker and took it over (v7, PRD W17).
     /// The socket closes right after this frame. The credential stays valid:
     /// the recipient may reconnect, and then takes it back.
@@ -3387,6 +3423,10 @@ pub mod worker_command {
     /// End a browser tunnel key and every tunnel open on it (v11). Args
     /// `{key: string}`.
     pub const CLOSE_BROWSER_TUNNEL: &str = "close_browser_tunnel";
+    /// Answer an agent's browser tool call (v13). Args `{call: number,
+    /// reply: {content: [...], is_error: bool}}`, the reply as
+    /// [`crate::browser_tools::BrowserReply`] encodes it.
+    pub const BROWSER_TOOL_RESULT: &str = "browser_tool_result";
     /// Ask to upload files into one folder under `$HOME` (v8). Args `{dir:
     /// string, files: [{name: string, size: number}], on_conflict?: "ask" |
     /// "replace" | "keep_both"}` (`ask` when absent). Answered with
@@ -3408,6 +3448,7 @@ pub mod worker_command {
         CLOSE_WORKER_SHELL,
         OPEN_BROWSER_TUNNEL,
         CLOSE_BROWSER_TUNNEL,
+        BROWSER_TOOL_RESULT,
         BEGIN_UPLOAD,
         BEGIN_DOWNLOAD,
     ];
@@ -3464,6 +3505,13 @@ pub enum WorkerOp {
     CloseBrowserTunnel {
         /// The key to end.
         key: String,
+    },
+    /// [`worker_command::BROWSER_TOOL_RESULT`] (v13).
+    BrowserToolResult {
+        /// The call answered.
+        call: u64,
+        /// The answer.
+        reply: crate::browser_tools::BrowserReply,
     },
     /// [`worker_command::BEGIN_UPLOAD`] (v8).
     BeginUpload {
@@ -3541,6 +3589,19 @@ impl WorkerOp {
                 Ok(WorkerOp::CloseBrowserTunnel {
                     key: args.required_str("key")?,
                 })
+            }
+            worker_command::BROWSER_TOOL_RESULT => {
+                let args = WorkerArgs::new(name, args)?;
+                let call = args
+                    .get("call")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| format!("`{name}`: `call` must be a number"))?;
+                let reply = args
+                    .get("reply")
+                    .cloned()
+                    .and_then(|reply| serde_json::from_value(reply).ok())
+                    .ok_or_else(|| format!("`{name}`: `reply` is not a tool result"))?;
+                Ok(WorkerOp::BrowserToolResult { call, reply })
             }
             worker_command::CLOSE_WORKER_SHELL => {
                 let args = WorkerArgs::new(name, args)?;
