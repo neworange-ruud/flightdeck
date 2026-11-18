@@ -7005,7 +7005,7 @@ mod tests {
             "agent child runs the agent command, not a shell"
         );
 
-        // "Close Agent" closes the selected agent child.
+        // "Close Child Agent" closes the selected agent child.
         app.dispatch(Command::CloseAgentTerminal, &svc).unwrap();
         assert_eq!(app.tabs[0].session.child_count(), 0);
 
@@ -7016,7 +7016,7 @@ mod tests {
         assert_eq!(
             app.tabs[0].session.child_count(),
             1,
-            "the shell must survive a Close Agent"
+            "the shell must survive a Close Child Agent"
         );
     }
 

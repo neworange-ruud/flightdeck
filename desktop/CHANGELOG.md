@@ -19,7 +19,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **Clearer palette name for closing an extra agent.** The command palette's **Close Agent**, which closes an additional agent inside a session, is now called **Close Child Agent**. That keeps it apart from **Close Agent Session Tab**, which closes the whole session.
 
 ### Bug fixes
 
