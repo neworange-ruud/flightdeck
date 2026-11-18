@@ -13,7 +13,7 @@ use gpui::{App, Global};
 
 use super::apply::UpdateFs;
 use super::apply::{Installer, Outcome};
-use super::check::{cache_path, newer_version};
+use super::check::{cache_path, fetch_newer_version, newer_version};
 use super::kind::{detect, Arch, DirectKind, InstallKind, Os, Probe};
 use super::release::Version;
 use super::source::{
@@ -59,12 +59,52 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The effective `[update] check` setting, and whether this session has
+/// already asked the release source past the daily cache.
+#[derive(Default)]
+struct CheckSettings {
+    enabled: bool,
+    forced: bool,
+}
+
+impl Global for CheckSettings {}
+
 /// Start the once-a-day check on a background thread. `enabled` is the
 /// effective `[update] check` setting; when off nothing is contacted.
 pub fn start_check(cx: &mut App, enabled: bool) {
-    if !enabled {
+    cx.set_global(CheckSettings {
+        enabled,
+        forced: false,
+    });
+    if enabled {
+        run_check(cx, false);
+    }
+}
+
+/// Check for a newer release now, past the daily cache: a worker running a
+/// newer FlightDeck than this app means a release may have come out since the
+/// last check, and the version-skew banner should then offer it. At most once
+/// a session, never while an update is already known or underway, and never
+/// when `[update] check` is off.
+pub fn check_now(cx: &mut App) {
+    if !wants_check(cx) {
         return;
     }
+    cx.global_mut::<CheckSettings>().forced = true;
+    run_check(cx, true);
+}
+
+/// Whether [`check_now`] would ask: nothing is known yet, checks are on, and
+/// this session has not forced one. Read-only, so a render can test it.
+pub fn wants_check(cx: &App) -> bool {
+    status(cx).is_none()
+        && cx
+            .try_global::<CheckSettings>()
+            .is_some_and(|s| s.enabled && !s.forced)
+}
+
+/// The check itself, on a background thread; `force` skips the daily cache.
+fn run_check(cx: &mut App, force: bool) {
     let (Some(current), Some(probe)) = (current_version(), Probe::from_env()) else {
         return;
     };
@@ -82,7 +122,12 @@ pub fn start_check(cx: &mut App, enabled: bool) {
         let found = cx
             .background_executor()
             .spawn(async move {
-                newer_version(
+                let check = if force {
+                    fetch_newer_version
+                } else {
+                    newer_version
+                };
+                check(
                     &RealFs,
                     &GithubReleases::flightdeck(),
                     &cache_file,
@@ -93,13 +138,17 @@ pub fn start_check(cx: &mut App, enabled: bool) {
             .await;
         if let Some(version) = found {
             cx.update(|cx| {
-                set_status(
-                    cx,
-                    UpdateStatus::Available {
-                        version: version.to_string(),
-                        kind,
-                    },
-                )
+                // A check that lands after "Update now" started must not
+                // reset the banner to "available".
+                if status(cx).is_none() {
+                    set_status(
+                        cx,
+                        UpdateStatus::Available {
+                            version: version.to_string(),
+                            kind,
+                        },
+                    )
+                }
             });
         }
     })

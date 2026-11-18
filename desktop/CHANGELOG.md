@@ -22,7 +22,12 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- A worker window whose worker runs a newer FlightDeck than the app no longer
+  just says "Update FlightDeck Desktop" with nothing to click. Its banner now
+  offers the update: **Update now** (then **Restart**) where the app can replace
+  itself, the `brew` command for a Homebrew install, and a **Download** link to
+  the releases page otherwise. Seeing the newer worker also checks for a new
+  release at once instead of waiting for the daily check.
 
 ## [2.1.0] - 2026-11-18
 
