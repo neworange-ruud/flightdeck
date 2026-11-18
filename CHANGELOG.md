@@ -8,12 +8,13 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Several agent sessions on the base branch.** You can now start more than one Agent Session Tab on the base branch in the project root. This suits a "workspace" repository whose agents create the worktrees they need themselves. From the second base-branch tab onward, the New Agent Session form warns that these agents share one working tree, so their workflow must create its own worktrees. Each base-branch tab keeps its agent status and question files in its own `.flightdeck/runtime/tabs/<tab>/` folder, so the tabs never show each other's status or questions. Containerized projects still allow one base-branch tab.
 - **Video tutorials on the website.** A new **Video Tutorials** page in the docs (under Start Here) has twelve short narrated videos of FlightDeck Desktop driving a worker with real agents: connecting a worker, a first agent from prompt to merge, starting a project, agents in parallel, Mission control, answering an agent, reviewing before you merge, rebasing onto a newer main, shells and SSH, files and pasted images, and FlightDeck Web. Every video has captions. The homepage now opens with a 100-second introduction video. The videos are recorded and narrated by scripts in `tutorials/`, so they can be made again for each release.
 - **A direct download link.** `/download` on the website goes straight to the newest FlightDeck Desktop release's downloads on GitHub. It's in the homepage's nav, hero and footer, and in the docs' header and Desktop quickstart.
 
 ### Improvements
 
-- None yet.
+- **Clearer palette name for closing an extra agent.** The command palette's **Close Agent**, which closes an additional agent inside a session, is now called **Close Child Agent**. That keeps it apart from **Close Agent Session Tab**, which closes the whole session.
 
 ### Bug fixes
 

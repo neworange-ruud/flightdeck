@@ -14,11 +14,12 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Several agent sessions on the base branch.** You can now start more than one Agent Session Tab on the base branch in the project root. This suits a "workspace" repository whose agents create the worktrees they need themselves. From the second base-branch tab onward, the New Agent Session form warns that these agents share one working tree, so their workflow must create its own worktrees. Each base-branch tab keeps its agent status and question files in its own `.flightdeck/runtime/tabs/<tab>/` folder, so the tabs never show each other's status or questions. Containerized projects still allow one base-branch tab.
+- **Close Child Agent in the sidebar menu.** Right-clicking a child agent's row in the sidebar now offers **Close Child Agent**, above the session's own close entry, which is now called **Close Agent Session** so it's clear what it closes.
 
 ### Improvements
 
-- None yet.
+- **Clearer palette name for closing an extra agent.** The command palette's **Close Agent**, which closes an additional agent inside a session, is now called **Close Child Agent**. That keeps it apart from **Close Agent Session Tab**, which closes the whole session.
 
 ### Bug fixes
 

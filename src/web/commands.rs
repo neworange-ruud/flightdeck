@@ -678,7 +678,7 @@ pub static INVENTORY: &[CommandSpec] = &[
     },
     CommandSpec {
         name: names::CLOSE_AGENT,
-        label: "Close Agent",
+        label: "Close Child Agent",
         group: "Terminals",
         host_only: false,
         annotation: None,
