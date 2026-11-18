@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **New worktrees no longer fail with "Filename too long" on Windows.** A worktree sits under `.flightdeck/worktrees/<name>/`, which makes every path in it longer than in the main checkout, so a repository with deep folders could pass the 260-character Windows limit and fail halfway through the checkout. Before creating a worktree on Windows, FlightDeck now checks `core.longpaths` in your global git config. If it is not set there, FlightDeck turns it on for that repository. If you turned it off globally, FlightDeck leaves it alone and warns that long paths cannot be checked out.
 
 ## [2.1.0] - 2026-11-18
 
@@ -32,7 +32,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- **New worktrees no longer fail with "Filename too long" on Windows.** A worktree sits under `.flightdeck/worktrees/<name>/`, which makes every path in it longer than in the main checkout, so a repository with deep folders could pass the 260-character Windows limit and fail halfway through the checkout. Before creating a worktree on Windows, FlightDeck now checks `core.longpaths` in your global git config. If it is not set there, FlightDeck turns it on for that repository. If you turned it off globally, FlightDeck leaves it alone and warns that long paths cannot be checked out.
+- None yet.
 
 ## [2.0.1] - 2026-11-17
 
