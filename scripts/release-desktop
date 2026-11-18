@@ -135,6 +135,12 @@ if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; t
   exit 1
 fi
 
+# The Desktop package version is shown in About, but the remote version-skew
+# banner compares the worker with the embedded core version. Keep those numbers
+# aligned so the published app does not immediately warn against its matching
+# CLI/worker release.
+sh scripts/desktop/check-version-alignment.sh "$version"
+
 # The app reports the core version it was built with (`flightdeck::VERSION`,
 # from the root Cargo.toml) and compares it with a worker's. A desktop release
 # cut while the core has unreleased changes carries the old number for the new

@@ -22,7 +22,9 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- Desktop release checks now require the Desktop and embedded FlightDeck core
+  versions to match, preventing a release from publishing with a misleading
+  version-skew warning against its corresponding worker.
 
 ## [2.0.1] - 2026-11-17
 

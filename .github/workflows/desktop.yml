@@ -250,8 +250,13 @@ jobs:
         shell: bash
         run: |
           version="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' desktop/Cargo.toml | head -1)"
+          core_version="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml | head -1)"
           if [[ "$RELEASE_TAG" != "desktop-v$version" ]]; then
             echo "tag $RELEASE_TAG does not match desktop/Cargo.toml version $version (expected desktop-v$version)" >&2
+            exit 1
+          fi
+          if [[ "$core_version" != "$version" ]]; then
+            echo "Desktop $version would bundle FlightDeck core $core_version; release matching CLI/core version $version first" >&2
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
