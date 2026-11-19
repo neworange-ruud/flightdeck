@@ -709,6 +709,12 @@ pub struct ConnectionInfo {
     pub address: IpAddr,
     /// Host wall-clock (unix ms) it attached.
     pub since_ms: i64,
+    /// The protocol version it was answered at ([`negotiated`]).
+    pub protocol_version: u16,
+    /// It is FlightDeck Desktop (by its `User-Agent`), not a browser or the
+    /// terminal's `flightdeck connect`: only a Desktop holds session
+    /// browsers (`specs/SESSION_BROWSER_PRD.md` §6).
+    pub desktop: bool,
 }
 
 // ===========================================================================
@@ -1035,6 +1041,12 @@ impl WebServerHandle {
                 label: viewer.identity.label(),
                 address: viewer.identity.address,
                 since_ms: viewer.since_ms,
+                protocol_version: viewer.protocol_version,
+                desktop: viewer
+                    .identity
+                    .user_agent_label
+                    .as_deref()
+                    .is_some_and(|agent| agent.starts_with(NATIVE_CLIENT_AGENT)),
             })
             .collect()
     }
@@ -2640,6 +2652,7 @@ fn background_may_receive(msg: &ServerMsg) -> bool {
             | ServerMsg::UploadPlan(_)
             | ServerMsg::DownloadPlan(_)
             | ServerMsg::BrowserTunnel(_)
+            | ServerMsg::BrowserToolCall(_)
             | ServerMsg::Delta(Delta::HostMessage(_))
     )
 }
@@ -2653,6 +2666,7 @@ fn min_version_for(msg: &ServerMsg) -> u16 {
         ServerMsg::UploadPlan(_) => UPLOAD_MIN_VERSION,
         ServerMsg::DownloadPlan(_) => DOWNLOAD_MIN_VERSION,
         ServerMsg::BrowserTunnel(_) => crate::web::protocol::BROWSER_TUNNEL_MIN_VERSION,
+        ServerMsg::BrowserToolCall(_) => crate::web::protocol::AGENT_BROWSER_MIN_VERSION,
         // A pre-v10 peer reads any shell delta as "the" shell: it only hears
         // about the first (W35).
         ServerMsg::Delta(Delta::WorkerShell(shell))
@@ -4308,6 +4322,16 @@ async fn handle_worker_op(
                 Some(WireError::new(
                     ErrorCode::NotSupported,
                     "Creating a project needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
+            // A tool call reaches a v13 window only, so an older one has
+            // nothing to answer.
+            (Ok(WorkerOp::BrowserToolResult { .. }), _)
+                if version < crate::web::protocol::AGENT_BROWSER_MIN_VERSION =>
+            {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Agent browser tools need a newer FlightDeck on this side: update it, then try again.",
                 ))
             }
             // Likewise the download plan is a v9 frame.

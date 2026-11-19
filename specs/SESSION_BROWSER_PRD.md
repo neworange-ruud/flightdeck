@@ -1,6 +1,7 @@
 # Session browser — product requirements
 
-> Status: **requirements agreed, not started** (2026-11-13). Epic
+> Status: **phase 1 built; phase 2 (agent browser tools, §6) built for Claude
+> Code and Codex** (2026-11-18). Epic
 > `remote-control-cefv`. Decisions B1–B21 were taken with Ruud in a design
 > conversation. The macOS spike (`remote-control-cefv.1`) decided O3 as B22;
 > the Windows half of the spike is `remote-control-cefv.8`.
@@ -90,6 +91,10 @@ domains need no changes.
 | B22 | Loopback | *From the spike (§4.1).* WKWebView never sends `localhost`, `127.0.0.1` or `[::1]` through a proxy, so on macOS the Desktop **forwards loopback ports itself**: for each loopback port a remote session uses (a port typed in the address field, and every port B11 reports for the session) it listens on `127.0.0.1:<port>` and `[::1]:<port>` and sends each connection through the same tunnel to that port on the worker. The page still asks for `localhost:<port>`. A port already in use on the Mac is shown on our error page by number, never loaded from the Mac. A forward exists only while a browser tab of that session is open. On Windows, WebView2's `<-loopback>` bypass rule may make forwards unnecessary (Windows spike). |
 | B23 | Relay credentials | *From the spike.* `wry`'s proxy setting has no credentials, so on macOS the Desktop installs its own Network.framework proxy configuration on the session's data store, with a username and password the relay checks (RFC 1929). Chromium has no SOCKS5 credentials, so Windows needs another check (Windows spike). |
 | B24 | Ports on demand | Because we own the address field (B8), a loopback address typed there, or reached by a link or redirect (`wry`'s navigation handler), gets its forward (B22) **before** it loads; a port in use on the Mac is our error page, by number. Requests a page makes by itself (scripts, `fetch`, WebSockets) never pass the address field, which is why B11's ports are forwarded in advance. **Ports are never remapped**: `localhost:3000` is never quietly loaded as another local port, since that changes the page's origin (OAuth callbacks, CORS, cookies, absolute links, Vite's host check). |
+| B25 | Agent transport | *Built (§6).* The agent's MCP server reaches its host through a **browser bridge**, not the worker's control socket: a listener on `127.0.0.1` (random port) whose address and a random token are in a **ticket**, `~/.flightdeck/browser/<worker|desktop>.json` (0600 in a 0700 folder on Unix; the profile's ACL on Windows). The agent is launched with the ticket's path and its session id, never the token, so no command line or environment carries it. The same on every OS, and the Desktop app (which has no control socket) uses it for its local sessions too. |
+| B26 | Agents | *Built.* **Claude Code** (`--mcp-config <file>`, which adds to the user's own servers and needs no approval) and **Codex** (`-c mcp_servers.flightdeck-browser.…`). **OpenCode** waits: OpenCode 2 runs one background service for every directory, so a server bound to one session would serve the others (`remote-control-cefv.7.6`). **Cursor** waits: it reads servers only from `.cursor/mcp.json` in the worktree and asks before starting one (`remote-control-cefv.7.7`). A **containerized** agent gets none: the bridge and the ticket are the host's (`remote-control-cefv.7.8`). The TUI enables none: its sessions have no browser. |
+| B27 | Routing | *Built.* A worker sends a call to the attached **FlightDeck Desktop** window (by its `User-Agent`; FlightDeck Web or `flightdeck connect` holding the seat has no browser), as `browser_tool_call` (protocol v13), and the window answers with `browser_tool_result`. No Desktop window: the agent hears so at once. A Desktop older than v13: it hears the Desktop needs updating. The window goes before answering: it hears that. A call is waited for at most 45 s. |
+| B28 | Switch and takeover | *Built.* The switch is the browser toolbar's **Agent: off / on** button, per session, held by the window (like B6: not mirrored, not persisted), off by default. While the agent drives a tab, and for 4 s after its last call, the toolbar shows **Agent driving** with **Stop**. Stop, or the user clicking or typing in the page (a trusted event, reported by our page script) or using the toolbar meanwhile, **turns the switch off** and answers the agent's waiting calls with "the user stopped you". A tab the agent opens (`browser_open`) joins the session's list but does not take the screen. |
 
 ## 4. Requirements, phase 1
 
@@ -251,22 +256,36 @@ waits for `remote-control-cefv.8`.*
 
 ## 6. Phase 2: agent browser tools (epic `remote-control-cefv.7`)
 
+*Built (protocol v13): `src/browser_tools/` (the tool catalog, the bridge,
+`flightdeck browser-mcp`, the launch arguments), `src/host/browser.rs` (the
+host's routing), `desktop/src/browser/agent.rs` (the window's switch, queue
+and tab choice), `agent_js.rs` (the page scripts), `drive.rs`, `view.rs`
+(running a tool, the toolbar) and `capture_*.rs` (screenshots). Decisions
+B25–B28. `flightdeck-desktop --spike-agent-browser` runs every tool on a real
+web view.*
+
 The session's agent can use the session's browser, and you watch it do so.
 
 ```
 agent (in the worktree, on the worker)
-  → flightdeck browser-mcp --session <id>   stdio MCP, injected at launch
-  → host's control socket
-  → the attached Desktop window holding the seat
+  → flightdeck browser-mcp --ticket <file> --session <id>   stdio MCP, injected at launch (B26)
+  → the host's browser bridge on 127.0.0.1, token from the ticket (B25)
+  → the attached Desktop window holding the seat (v13), or the Desktop's own window (B27)
   → the browser tab, which acts and answers
 ```
 
-- **Injection:** the same launch-time mechanism as the status hooks
-  (`src/agents/setup.rs`), for Claude Code, Codex, Cursor and OpenCode.
+- **Injection:** the same launch-time idea as the status hooks
+  (`src/agents/setup.rs`), nothing written to the user's own configuration:
+  Claude Code and Codex for now (B26).
 - **Tools:** `browser_tabs`, `browser_open`, `browser_navigate`, `browser_back`,
   `browser_reload`, `browser_snapshot` (a compact outline of the page with refs),
   `browser_click` / `browser_type` / `browser_press` by ref, `browser_screenshot`,
   `browser_console` (console messages, errors, failed promises) and `browser_eval`.
+  A tool acts on the tab it names, else the one the agent used last, else the
+  one on screen, else the session's newest; one call per tab at a time. A
+  navigation, and a click or Enter that starts one, answers once the page has
+  loaded (at most 20 s). `browser_eval` takes an expression or a function and
+  awaits a promise (at most 30 s). Screenshots are taken at one pixel per point.
 - **How the Desktop does them:** reading the page, the snapshot and console use
   scripts we inject. Clicking and typing use events fired from those scripts in
   v1, and real input later where apps reject fired events (macOS system input
@@ -313,3 +332,7 @@ Children of epic `remote-control-cefv`. "After" lists blocking dependencies.
 | `.7.3` | Desktop executes the tools | `.7.2` |
 | `.7.4` | Per-session switch, Agent driving, Stop | `.7.3` |
 | `.7.5` | `browser_eval` | `.7.3` |
+| `.7.6` | OpenCode: browser tools despite OpenCode 2's shared service | `.7.1` |
+| `.7.7` | Cursor: browser tools through `.cursor/mcp.json` | `.7.1` |
+| `.7.8` | Browser tools for a containerized agent | `.7.1` |
+| `.7.9` | Real input where pages reject fired events (macOS system events, WebView2 DevTools Protocol) | `.7.3` |

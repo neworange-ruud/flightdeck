@@ -711,9 +711,14 @@ fn protocol_version_is_seven_and_still_serves_six() {
     //
     // **v12 is creating a project on a worker** (SPECS §5.3): no frame, one
     // worker command a window offers only from v12 on.
-    assert_eq!(PROTOCOL_VERSION, 12);
+    //
+    // **v13 is agent browser tools** (`specs/SESSION_BROWSER_PRD.md` §6): one
+    // frame kind, `BrowserToolCall`, held back below v13, and one worker
+    // command answering it.
+    assert_eq!(PROTOCOL_VERSION, 13);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 12);
+    assert_eq!(MAX_SUPPORTED_VERSION, 13);
+    assert_eq!(AGENT_BROWSER_MIN_VERSION, 13);
     assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
     assert_eq!(UPLOAD_MIN_VERSION, 8);
     assert_eq!(DOWNLOAD_MIN_VERSION, 9);
@@ -798,15 +803,15 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round. v12 keeps v6 in its range and still refuses v5.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v12 host");
+    // refused both ways round. v13 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v13 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 12,
+            local: 13,
             peer: 5,
             min_supported: 6,
-            max_supported: 12,
+            max_supported: 13,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
@@ -815,7 +820,7 @@ fn mismatched_version_is_representable_and_detectable() {
     }
     // Newer than our ceiling is equally a mismatch. A native client that
     // dialled too new may redial at `max_supported`; a browser reloads.
-    assert!(check_version(13).is_err());
+    assert!(check_version(14).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -823,7 +828,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 12);
+    assert_eq!(value["version"]["max_supported"], 13);
     assert_eq!(round_trip(&frame), frame);
 }
 
@@ -2258,6 +2263,17 @@ fn every_worker_command_parses_into_its_op() {
             WorkerOp::CloseBrowserTunnel { key: "k1".into() },
         ),
         (
+            worker_command::BROWSER_TOOL_RESULT,
+            Some(json!({
+                "call": 7,
+                "reply": { "content": [{ "type": "text", "text": "ok" }], "is_error": false },
+            })),
+            WorkerOp::BrowserToolResult {
+                call: 7,
+                reply: crate::browser_tools::BrowserReply::text("ok"),
+            },
+        ),
+        (
             worker_command::CLOSE_WORKER_SHELL,
             Some(json!({ "terminal_id": "worker:shell:2" })),
             WorkerOp::CloseWorkerShell {
@@ -2419,4 +2435,33 @@ fn a_session_removed_frame_without_worktree_removed_keeps_the_worktree() {
             worktree_removed: false,
         }
     );
+}
+
+/// v13: an agent's browser tool call travels as `browser_tool_call`, and a
+/// result without a readable reply or call number is refused.
+#[test]
+fn an_agents_browser_tool_call_round_trips_and_a_bad_result_is_refused() {
+    let call = ServerMsg::BrowserToolCall(BrowserToolCall {
+        call: 3,
+        session_id: TabId("feat-1".into()),
+        tool: "browser_click".into(),
+        args: json!({ "ref": "e4" }),
+    });
+    let wire = serde_json::to_value(&call).unwrap();
+    assert_eq!(wire["type"], "browser_tool_call");
+    assert_eq!(serde_json::from_value::<ServerMsg>(wire).unwrap(), call);
+
+    for args in [
+        json!({ "reply": { "content": [] } }),
+        json!({ "call": 1 }),
+        json!({ "call": 1, "reply": { "content": "nope" } }),
+    ] {
+        assert!(
+            matches!(
+                WorkerOp::parse(worker_command::BROWSER_TOOL_RESULT, Some(&args)),
+                Some(Err(_))
+            ),
+            "{args}"
+        );
+    }
 }

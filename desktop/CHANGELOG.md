@@ -14,7 +14,7 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Agents can use the session browser.** The agent in a session can now open browser tabs in it, load pages, read them, click, type, press keys, take screenshots, read the console and run JavaScript, while you watch. It is off by default: turn on **Agent: on** in a browser's toolbar to let that session's agent use its browsers. While the agent drives a tab the toolbar shows **Agent driving** with **Stop**; Stop, or clicking or typing in the page yourself, turns it off again and tells the agent to ask you before continuing. A tab the agent opens is listed under its session without taking over your screen. Works for local sessions and for sessions on a worker (which needs the same release, web protocol v13), on macOS and Windows, with Claude Code and Codex. `--spike-agent-browser` runs every tool against a test page, for debugging.
 
 ### Improvements
 

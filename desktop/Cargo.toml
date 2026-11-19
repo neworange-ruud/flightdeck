@@ -73,6 +73,9 @@ gpui-component = "0.7.0"
 # Both are already in the graph through gpui and the TUI library.
 anyhow = "1.0.102"
 serde_json = "1.0.150"
+# `--spike-agent-browser` keeps the screenshot it took (`src/browser/smoke.rs`).
+# Already in the graph through the core crate.
+base64 = "0.22"
 # The pairing and web-access QR codes are drawn natively (GPUI quads) from the
 # modules of this matrix, not from the TUI's half-block art. Already in the
 # graph through the TUI library; no image or SVG renderers wanted.
@@ -118,8 +121,12 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    # `browser_screenshot` (`src/browser/capture_windows.rs`): WebView2's
+    # CapturePreview writes into a memory stream.
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
