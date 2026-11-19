@@ -349,6 +349,15 @@ impl WorkerShells {
         self.shells.is_empty()
     }
 
+    /// Shell `id`'s state for a late viewer's truncated replay, when it is
+    /// open and running a terminal (see
+    /// [`crate::web::stream::TerminalHost::terminal_restore`]).
+    pub fn restore(&mut self, id: &TerminalId) -> Option<crate::web::stream::TerminalRestore> {
+        self.get_mut(id)
+            .and_then(|shell| shell.terminal.as_mut())
+            .map(crate::web::stream::terminal_restore)
+    }
+
     /// Shell `id`, mutably.
     pub fn get_mut(&mut self, id: &TerminalId) -> Option<&mut WorkerShell> {
         self.shells

@@ -11,6 +11,7 @@ pub mod testing;
 
 pub mod agents;
 pub mod app;
+pub mod browser_tools;
 pub mod config;
 pub mod connect;
 pub mod defender;
@@ -162,6 +163,11 @@ pub fn run() -> Result<()> {
     // host, so nothing below (the worker lock, the workspace) applies.
     if argv.get(1).map(String::as_str) == Some("connect") {
         std::process::exit(crate::connect::main(&argv[2..]));
+    }
+    // `flightdeck browser-mcp …` is the MCP server an agent runs for the
+    // session browser (specs/SESSION_BROWSER_PRD.md §6): stdio only, no host.
+    if argv.get(1).map(String::as_str) == Some("browser-mcp") {
+        std::process::exit(crate::browser_tools::mcp::main(&argv[2..]));
     }
 
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
@@ -2130,6 +2136,27 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
             text.as_bytes(),
         )
         .unwrap_or(crate::web::stream::Written::NoSuchTerminal)
+    }
+
+    /// The state this host's own emulator holds for the terminal (a worker
+    /// shell, or a tab's primary or child terminal), for a late viewer's
+    /// truncated replay.
+    fn terminal_restore(
+        &mut self,
+        terminal_id: &crate::web::protocol::TerminalId,
+    ) -> Option<crate::web::stream::TerminalRestore> {
+        if let Some(shells) = self.worker_shells.as_deref_mut() {
+            if let Some(restore) = shells.restore(terminal_id) {
+                return Some(restore);
+            }
+        }
+        self.projects.iter_mut().find_map(|project| {
+            project.state.tabs.iter_mut().find_map(|tab| {
+                let tab_id = tab.meta.id.clone();
+                crate::web::stream::terminal_in_session(&mut tab.session, &tab_id, terminal_id)
+                    .map(crate::web::stream::terminal_restore)
+            })
+        })
     }
 }
 

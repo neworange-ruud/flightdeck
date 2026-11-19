@@ -1258,6 +1258,11 @@ impl<'a> AppHost<'a> {
                 }
                 Ok((None, None))
             }
+            WorkerOp::BrowserToolResult { call, reply } => {
+                // Late (the agent gave up) or not this window's: dropped.
+                self.window_answered_browser_call(viewer_id, call, reply);
+                Ok((None, None))
+            }
             WorkerOp::CloseWorkerShell { terminal_id } => match w.shells.close(&terminal_id) {
                 Ok(()) => {
                     // Its ring goes with it: the number is never reused, so

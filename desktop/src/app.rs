@@ -117,6 +117,14 @@ fn open_workspace(
         .map_err(|e| e.to_string())?;
     // The help overlay documents this app's own shortcuts too.
     host.set_desktop_front_end();
+    // The local sessions' agents may use their browsers
+    // (specs/SESSION_BROWSER_PRD.md §6), where there is one. Before
+    // resuming, so resumed agents get the tools too.
+    if crate::browser::unavailable_here().is_none() {
+        if let Err(e) = host.enable_browser_tools() {
+            eprintln!("flightdeck-desktop: agents get no browser tools: {e}");
+        }
+    }
     // Agents spawn at the right width: seed the size first (the terminal
     // element's first frame then measures the real one), then resume.
     host.seed_pty_sizes(|_| NOMINAL_PTY_SIZE);

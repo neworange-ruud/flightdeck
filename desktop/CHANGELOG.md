@@ -14,11 +14,11 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Agents can use the session browser.** The agent in a session can now open browser tabs in it, load pages, read them, click, type, press keys, take screenshots, read the console and run JavaScript, while you watch. It is off by default: turn on **Agent: on** in a browser's toolbar to let that session's agent use its browsers. While the agent drives a tab the toolbar shows **Agent driving** with **Stop**; Stop, or clicking or typing in the page yourself, turns it off again and tells the agent to ask you before continuing. A tab the agent opens is listed under its session without taking over your screen. Works for local sessions and for sessions on a worker (which needs the same release, web protocol v13), on macOS and Windows, with Claude Code and Codex. `--spike-agent-browser` runs every tool against a test page, for debugging.
 
 ### Improvements
 
-- None yet.
+- **No second row of tabs in OpenCode.** OpenCode 2 started by FlightDeck no longer shows its own session tab strip: FlightDeck already gives every session its own tab. FlightDeck sets `OPENCODE_CLI_CONFIG_CONTENT` to `{"tabs":{"mode":"off"}}`, which OpenCode merges over your own `cli.json`, so your other OpenCode settings still apply.
 
 ### Bug fixes
 
@@ -28,6 +28,7 @@ uses that version's section as the GitHub Release notes.
   itself, the `brew` command for a Homebrew install, and a **Download** link to
   the releases page otherwise. Seeing the newer worker also checks for a new
   release at once instead of waiting for the daily check.
+- **OpenCode scrolls again in a window opened onto a running session.** A FlightDeck Desktop window, `flightdeck connect` or a browser that attached to a host (above all a worker) after an agent had written more than the replay buffer (`[web] replay_bytes`, 256 KiB) lost the modes the agent set when it started: its alternate screen, mouse reporting and bracketed paste. The window then kept the mouse wheel to itself, so OpenCode 2's transcript did not scroll (its scrollbar could still move) and clicks never reached it. The window also showed only the rows the agent had redrawn since, leaving the rest blank or stale (OpenCode's prompt area, for one). The host now starts such a truncated replay with the modes its own terminal holds for the program, and ends it with a repaint of that terminal's screen, so the window opens exactly as the host sees it.
 
 ## [2.1.0] - 2026-11-18
 

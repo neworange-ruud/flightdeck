@@ -1228,6 +1228,83 @@ fn the_worker_shell_round_trips_and_restarts_after_exit() {
     client.stop();
 }
 
+/// A window that attaches after a full-screen program set its modes and
+/// painted its screen, and after more output than the replay ring holds,
+/// still ends with both. Without the modes its mirror drew the program on the
+/// main screen and kept the wheel to itself, so OpenCode 2's transcript never
+/// scrolled in a Desktop reopened onto a long-running worker session
+/// (remote-control-ayjq); without the screen, the rows the program had not
+/// redrawn since stayed blank (remote-control-bkv9).
+#[test]
+fn a_late_window_learns_the_modes_and_screen_from_before_the_replay_ring() {
+    use flightdeck::terminal::grid::{Emulator, MouseEncoding, MouseMode};
+    use flightdeck::terminal::session::{Terminal, TerminalKind, TerminalProfile};
+
+    let mut worker = Worker::prepare_with(|config| config.web.replay_bytes = 2048);
+    worker.run();
+    let (_token, mut laptop) = worker.window("laptop");
+    let shell = shell_id();
+    let mut pty = laptop.pty(&shell);
+    // An agent TUI's startup: its modes and a first paint, then four rings'
+    // worth of redraws of one row only, as a diff renderer sends them.
+    shell_round_trip(
+        &worker,
+        &mut laptop,
+        &mut pty,
+        "printf '\\033[?1049h\\033[?1003h\\033[?1006h\\033[?2004h\\033[1;1Hpainted-%s' $((3*4)); \
+         i=0; while [ $i -lt 400 ]; do printf '\\033[5;1Hredraw %s' $i; i=$((i+1)); done; \
+         echo; echo fd-flood-$((2*3))",
+        "fd-flood-6",
+    );
+    laptop.stop();
+
+    let (_token, mut studio) = worker.window("studio");
+    let profile = TerminalProfile {
+        emulator: Emulator::Alacritty,
+        default_colors: None,
+        env: &[],
+    };
+    let geometry = studio.workspace().worker_shells()[0].geometry;
+    let size = PtySize {
+        rows: geometry.rows,
+        cols: geometry.cols,
+    };
+    let mut mirror = Terminal::mirror(
+        TerminalKind::Child,
+        "shell".to_string(),
+        Box::new(studio.pty(&shell)),
+        size,
+        profile,
+    );
+    let row = |mirror: &Terminal, r: u16| {
+        let mut line = String::new();
+        mirror
+            .screen()
+            .visit_row(r, &mut |_, cell| line.push_str(cell.text));
+        line
+    };
+    worker.wait(
+        "the late mirror to take the program's modes and screen",
+        || {
+            studio.pump();
+            let out = mirror.session_mut().try_read_output().unwrap();
+            mirror.process_output(&out);
+            mirror.screen().modes().wants_mouse() && row(&mirror, 0).starts_with("painted-12")
+        },
+    );
+    let modes = mirror.screen().modes();
+    assert!(modes.alt_screen, "{modes:?}");
+    assert_eq!(modes.mouse_mode, MouseMode::AnyMotion);
+    assert_eq!(modes.mouse_encoding, MouseEncoding::Sgr);
+    assert!(modes.bracketed_paste, "{modes:?}");
+    assert!(
+        row(&mirror, 4).starts_with("redraw 399"),
+        "{:?}",
+        row(&mirror, 4)
+    );
+    studio.stop();
+}
+
 // ---------------------------------------------------------------------------
 // 9. Revoke
 // ---------------------------------------------------------------------------
@@ -2333,6 +2410,57 @@ fn a_browser_tunnel_ends_with_its_key_and_with_its_window() {
     assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "cut: {read:?}");
     let after = on_runtime(open(&access, &key, &target)).err().unwrap();
     assert_eq!(after.reason, "invalid_tunnel");
+}
+
+/// An agent on the worker uses the session browser
+/// (`specs/SESSION_BROWSER_PRD.md` §6, v13): its call, through the worker's
+/// bridge, reaches the window holding the seat, and the window's answer
+/// reaches the agent. With no window attached, or once it is gone, the agent
+/// hears so instead of waiting.
+#[test]
+fn an_agents_browser_call_reaches_the_window_and_its_answer_the_agent() {
+    use flightdeck::browser_tools::{mcp, BrowserReply, NO_DESKTOP};
+    use serde_json::json;
+    let worker = Worker::start();
+    let ticket = worker.home().join(".flightdeck/browser/worker.json");
+    worker.wait("the browser bridge's ticket", || ticket.exists());
+
+    let alone = mcp::call(&ticket, "s-1", "browser_tabs".to_string(), json!({}));
+    assert!(alone.is_error, "{alone:?}");
+    assert_eq!(alone.joined_text(), NO_DESKTOP);
+
+    let (_token, mut client) = worker.window("laptop");
+    let ask = |tool: &str| {
+        let ticket = ticket.clone();
+        let tool = tool.to_string();
+        std::thread::spawn(move || mcp::call(&ticket, "s-1", tool, json!({ "tab": 2 })))
+    };
+    let caller = ask("browser_snapshot");
+    let mut call = None;
+    worker.wait("the agent's call at the window", || {
+        client.pump();
+        call = client.take_browser_tool_calls().pop();
+        call.is_some()
+    });
+    let call = call.unwrap();
+    assert_eq!(call.session_id.0, "s-1");
+    assert_eq!(call.tool, "browser_snapshot");
+    assert_eq!(call.args["tab"], 2);
+    let answer = BrowserReply::text("- heading \"Hi\" [level=1]");
+    let seq = client.answer_browser_tool_call(call.call, &answer);
+    worker.applied(&mut client, seq, "browser_tool_result");
+    assert_eq!(caller.join().unwrap(), answer);
+
+    // The window goes before answering: the agent hears it went.
+    let caller = ask("browser_reload");
+    worker.wait("the second call at the window", || {
+        client.pump();
+        !client.take_browser_tool_calls().is_empty()
+    });
+    client.stop();
+    let gone = caller.join().unwrap();
+    assert!(gone.is_error, "{gone:?}");
+    assert!(gone.joined_text().contains("went away"), "{gone:?}");
 }
 
 /// The Windows session browser's proxy hub (`remote-control-cefv.12.1`):

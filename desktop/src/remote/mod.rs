@@ -174,6 +174,9 @@ pub struct RemoteModel {
     /// Worktrees the worker abandoned whose browser profiles the window is
     /// still to delete (B19).
     abandoned: Vec<String>,
+    /// The worker's agents' calls on these browsers, and each session's
+    /// switch (`specs/SESSION_BROWSER_PRD.md` §6).
+    agent: crate::browser::agent::AgentDesk,
 }
 
 impl RemoteModel {
@@ -205,6 +208,7 @@ impl RemoteModel {
             browsers: crate::browser::tabs::Browsers::default(),
             keyed_as: None,
             abandoned: Vec::new(),
+            agent: crate::browser::agent::AgentDesk::default(),
         }
     }
 
@@ -1078,7 +1082,7 @@ impl RemoteModel {
     /// for, keys asked again after a reconnect, and the tabs of sessions
     /// that are gone. Whether anything changed.
     fn pump_browsers(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.pump_agent_calls();
         for (id, seq) in self.browsers.waiting() {
             if let Some(answer) = self.session.client_mut().take_browser_tunnel(seq) {
                 self.browsers.answered(id, answer.key, answer.refusal);
@@ -1114,6 +1118,37 @@ impl RemoteModel {
             changed = true;
         }
         changed
+    }
+
+    /// The agents' share of a turn (§6): the worker's calls to the desk,
+    /// the desk's answers back to the worker. Whether the window must look.
+    fn pump_agent_calls(&mut self) -> bool {
+        let calls = self.session.client_mut().take_browser_tool_calls();
+        let arrived = !calls.is_empty();
+        let unavailable = crate::browser::unavailable();
+        for call in calls {
+            if let Some(why) = unavailable {
+                // No browser on this computer (Linux, macOS before 14).
+                self.session.client().answer_browser_tool_call(
+                    call.call,
+                    &flightdeck::browser_tools::BrowserReply::error(format!(
+                        "{why} Use your own headless browser instead."
+                    )),
+                );
+            } else if self.session.workspace().session(&call.session_id).is_some() {
+                self.agent
+                    .arrived(call.call, call.session_id, &call.tool, &call.args);
+            } else {
+                self.agent.unknown_session(call.call);
+            }
+        }
+        let live: Vec<u64> = self.browsers.all().iter().map(|t| t.id).collect();
+        let answers = self.agent.take_answers(&live);
+        let answered = !answers.is_empty();
+        for (call, reply) in answers {
+            self.session.client().answer_browser_tool_call(call, &reply);
+        }
+        arrived || answered
     }
 
     /// Ask for a seat: observe, write, or take the input lock.
@@ -1276,5 +1311,46 @@ pub fn open_remote_window(remote: SavedRemote, seat: SeatRequest, cx: &mut App) 
     });
     if let Err(e) = opened {
         eprintln!("flightdeck-desktop: could not open the remote window: {e}");
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl crate::browser::drive::AgentModel for RemoteModel {
+    fn agent_browsers(&self) -> &crate::browser::tabs::Browsers {
+        &self.browsers
+    }
+
+    fn desk(&mut self) -> &mut crate::browser::agent::AgentDesk {
+        &mut self.agent
+    }
+
+    fn desk_ref(&self) -> &crate::browser::agent::AgentDesk {
+        &self.agent
+    }
+
+    fn open_agent_browser(
+        &mut self,
+        session: &flightdeck::contracts::TabId,
+    ) -> Result<u64, String> {
+        if let Some(why) = crate::browser::unavailable() {
+            return Err(why.to_string());
+        }
+        let worktree = self
+            .session
+            .workspace()
+            .session(session)
+            .map(|s| s.worktree_path.clone())
+            .ok_or("This session is not open on the worker any more.")?;
+        let seq = self.session.client().open_browser_tunnel();
+        if seq.is_some() {
+            self.keyed_as = self.session.workspace().viewer_id.clone();
+        }
+        Ok(self
+            .browsers
+            .open_unshown(session.clone(), worktree, false, seq))
+    }
+
+    fn shown_browser(&mut self) -> Option<u64> {
+        self.browser_on_screen()
     }
 }
