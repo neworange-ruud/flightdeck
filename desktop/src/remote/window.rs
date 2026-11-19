@@ -868,6 +868,16 @@ impl RemoteWindow {
                     }
                 }
             }
+            // The worker's agents' calls on these browsers (§6). A tab an
+            // agent just opened gets its view once the worker grants its key.
+            let views: Vec<(u64, Entity<crate::browser::view::BrowserView>)> = self
+                .browser_views
+                .iter()
+                .map(|(id, (view, _))| (*id, view.clone()))
+                .collect();
+            if crate::browser::drive::drive(&self.remote, &views, cx) {
+                cx.notify();
+            }
             let ports: Vec<(u64, Vec<u16>)> = self
                 .browser_views
                 .keys()
@@ -1224,6 +1234,10 @@ impl Render for RemoteWindow {
         let off_project = model.tab() != Tab::Project;
         let link_down = model.ended().is_some() || !ws.ready;
         let skew = model.skew_warning();
+        let app_update = skew.is_some() && model.skew_wants_app_update();
+        // The worker is newer, so a release may be out that the daily check
+        // has not seen yet: ask now, so the banner can offer it.
+        let check_update = app_update && flightdeck_desktop::selfupdate::wants_check(cx);
         let picker = self.picker.clone().filter(|_| model.ended().is_none());
         // Hidden, not closed, while its Choose… has the picker up.
         let upload = self.upload.clone().filter(|_| !model.choosing_upload_dir());
@@ -1337,6 +1351,10 @@ impl Render for RemoteWindow {
             .clone()
             .map(|input| self.rename_dialog(&input, &p, cx).into_any_element());
 
+        if check_update {
+            cx.defer(flightdeck_desktop::selfupdate::check_now);
+        }
+
         v_flex()
             .key_context(flightdeck::app::keymap::Context::Global.name())
             .on_action(cx.listener(Self::on_keymap_action))
@@ -1346,7 +1364,11 @@ impl Render for RemoteWindow {
             .text_color(p.ink.hsla())
             .font_family(crate::fonts::UI_FAMILY)
             .child(titlebar)
-            .children(skew.map(|text| skew_banner(&p, text)))
+            .children(skew.map(|text| {
+                let actions =
+                    app_update.then(|| flightdeck_desktop::overlays::update::skew_actions(cx));
+                skew_banner(&p, text, actions)
+            }))
             .child(match picker {
                 Some(picker) => div()
                     .flex_1()
@@ -1705,12 +1727,15 @@ fn open_project_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoEl
         })
 }
 
-/// The soft warning that the worker's FlightDeck is not this app's.
-fn skew_banner(p: &Palette, text: String) -> impl IntoElement {
-    div()
+/// The soft warning that the worker's FlightDeck is not this app's, with
+/// this app's update actions when it is the side to update.
+fn skew_banner(p: &Palette, text: String, actions: Option<gpui::Div>) -> impl IntoElement {
+    h_flex()
         .debug_selector(|| "remote-version-skew".into())
         .flex_shrink_0()
         .w_full()
+        .gap_3()
+        .items_center()
         .px(px(14.))
         .py(px(6.))
         .border_b_1()
@@ -1718,7 +1743,8 @@ fn skew_banner(p: &Palette, text: String) -> impl IntoElement {
         .bg(p.surface_raised.hsla())
         .text_size(px(12.))
         .text_color(p.ink_2.hsla())
-        .child(text)
+        .child(div().flex_1().min_w_0().child(text))
+        .children(actions)
 }
 
 /// One clickable hint: its keycap and word.

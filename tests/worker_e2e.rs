@@ -2412,6 +2412,57 @@ fn a_browser_tunnel_ends_with_its_key_and_with_its_window() {
     assert_eq!(after.reason, "invalid_tunnel");
 }
 
+/// An agent on the worker uses the session browser
+/// (`specs/SESSION_BROWSER_PRD.md` §6, v13): its call, through the worker's
+/// bridge, reaches the window holding the seat, and the window's answer
+/// reaches the agent. With no window attached, or once it is gone, the agent
+/// hears so instead of waiting.
+#[test]
+fn an_agents_browser_call_reaches_the_window_and_its_answer_the_agent() {
+    use flightdeck::browser_tools::{mcp, BrowserReply, NO_DESKTOP};
+    use serde_json::json;
+    let worker = Worker::start();
+    let ticket = worker.home().join(".flightdeck/browser/worker.json");
+    worker.wait("the browser bridge's ticket", || ticket.exists());
+
+    let alone = mcp::call(&ticket, "s-1", "browser_tabs".to_string(), json!({}));
+    assert!(alone.is_error, "{alone:?}");
+    assert_eq!(alone.joined_text(), NO_DESKTOP);
+
+    let (_token, mut client) = worker.window("laptop");
+    let ask = |tool: &str| {
+        let ticket = ticket.clone();
+        let tool = tool.to_string();
+        std::thread::spawn(move || mcp::call(&ticket, "s-1", tool, json!({ "tab": 2 })))
+    };
+    let caller = ask("browser_snapshot");
+    let mut call = None;
+    worker.wait("the agent's call at the window", || {
+        client.pump();
+        call = client.take_browser_tool_calls().pop();
+        call.is_some()
+    });
+    let call = call.unwrap();
+    assert_eq!(call.session_id.0, "s-1");
+    assert_eq!(call.tool, "browser_snapshot");
+    assert_eq!(call.args["tab"], 2);
+    let answer = BrowserReply::text("- heading \"Hi\" [level=1]");
+    let seq = client.answer_browser_tool_call(call.call, &answer);
+    worker.applied(&mut client, seq, "browser_tool_result");
+    assert_eq!(caller.join().unwrap(), answer);
+
+    // The window goes before answering: the agent hears it went.
+    let caller = ask("browser_reload");
+    worker.wait("the second call at the window", || {
+        client.pump();
+        !client.take_browser_tool_calls().is_empty()
+    });
+    client.stop();
+    let gone = caller.join().unwrap();
+    assert!(gone.is_error, "{gone:?}");
+    assert!(gone.joined_text().contains("went away"), "{gone:?}");
+}
+
 /// The Windows session browser's proxy hub (`remote-control-cefv.12.1`):
 /// one HTTP proxy, a login per session; a worker session's CONNECT and
 /// plain HTTP reach the worker's page, an unknown login gets a 407, and a

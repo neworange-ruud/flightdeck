@@ -11,6 +11,7 @@ pub mod testing;
 
 pub mod agents;
 pub mod app;
+pub mod browser_tools;
 pub mod config;
 pub mod connect;
 pub mod defender;
@@ -162,6 +163,11 @@ pub fn run() -> Result<()> {
     // host, so nothing below (the worker lock, the workspace) applies.
     if argv.get(1).map(String::as_str) == Some("connect") {
         std::process::exit(crate::connect::main(&argv[2..]));
+    }
+    // `flightdeck browser-mcp …` is the MCP server an agent runs for the
+    // session browser (specs/SESSION_BROWSER_PRD.md §6): stdio only, no host.
+    if argv.get(1).map(String::as_str) == Some("browser-mcp") {
+        std::process::exit(crate::browser_tools::mcp::main(&argv[2..]));
     }
 
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {

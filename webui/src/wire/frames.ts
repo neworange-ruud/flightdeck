@@ -90,8 +90,14 @@
  * with the `create_project` worker command (`{name, dir?}`) and is answered
  * like `open_project_path` — an ack and a sentence. No new frame; the bump is
  * how a window knows the worker understands the command.
+ *
+ * **v13 is agent browser tools** (`specs/SESSION_BROWSER_PRD.md` §6): a
+ * worker sends FlightDeck Desktop's window a `browser_tool_call` frame and the
+ * window answers with the `browser_tool_result` worker command. Only a
+ * Desktop holds session browsers, so this app is never sent the frame; the
+ * bump keeps it in step with the host it ships in (D9).
  */
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";

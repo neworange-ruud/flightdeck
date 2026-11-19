@@ -268,6 +268,8 @@ pub struct RemoteClient {
     download_plan: Option<DownloadPlan>,
     /// A worker's answers to `open_browser_tunnel`, until taken by seq (v11).
     browser_tunnels: Vec<crate::web::protocol::BrowserTunnel>,
+    /// Agents' browser tool calls, until taken (v13).
+    browser_tool_calls: Vec<crate::web::protocol::BrowserToolCall>,
     /// Where and as whom an upload's `PUT` goes: the link's own address,
     /// token and agent. `None` for a scripted client.
     http_access: Option<upload_http::HttpAccess>,
@@ -304,6 +306,7 @@ impl RemoteClient {
             upload_plan: None,
             download_plan: None,
             browser_tunnels: Vec::new(),
+            browser_tool_calls: Vec::new(),
             http_access: Some(http_access),
             resync: None,
         }
@@ -334,6 +337,7 @@ impl RemoteClient {
             upload_plan: None,
             download_plan: None,
             browser_tunnels: Vec::new(),
+            browser_tool_calls: Vec::new(),
             http_access: None,
             resync: None,
         };
@@ -440,6 +444,10 @@ impl RemoteClient {
             }
             LinkEvent::BrowserTunnel(tunnel) => {
                 self.browser_tunnels.push(tunnel);
+                true
+            }
+            LinkEvent::BrowserToolCall(call) => {
+                self.browser_tool_calls.push(call);
                 true
             }
         }
@@ -737,6 +745,31 @@ impl RemoteClient {
         self.worker_command(
             worker_command::CLOSE_BROWSER_TUNNEL,
             Some(serde_json::json!({ "key": key })),
+        )
+    }
+
+    /// Agents' browser tool calls that arrived since the last look (v13,
+    /// `specs/SESSION_BROWSER_PRD.md` §6), oldest first.
+    pub fn take_browser_tool_calls(&mut self) -> Vec<crate::web::protocol::BrowserToolCall> {
+        std::mem::take(&mut self.browser_tool_calls)
+    }
+
+    /// Answer an agent's browser tool call (v13). `None` — nothing sent —
+    /// unless the worker speaks v13 and the link is up; the agent then
+    /// hears nothing and its call times out.
+    pub fn answer_browser_tool_call(
+        &self,
+        call: u64,
+        reply: &crate::browser_tools::BrowserReply,
+    ) -> Option<u64> {
+        if !self.is_worker()
+            || self.workspace().protocol_version < crate::web::protocol::AGENT_BROWSER_MIN_VERSION
+        {
+            return None;
+        }
+        self.worker_command(
+            worker_command::BROWSER_TOOL_RESULT,
+            Some(serde_json::json!({ "call": call, "reply": reply })),
         )
     }
 

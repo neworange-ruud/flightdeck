@@ -15,8 +15,10 @@
 //!   [`flightdeck::web::client::proxy_hub::ProxyHub`]) and its login
 //!   (`specs/SESSION_BROWSER_PRD.md` §4.1, "The Windows design").
 //!
-//! Which tabs exist is the window's model's ([`tabs`]).
+//! Which tabs exist is the window's model's ([`tabs`]), and so are the
+//! agents' calls on them ([`agent`], `specs/SESSION_BROWSER_PRD.md` §6).
 
+pub mod agent;
 pub mod tabs;
 
 // Only the web view (macOS and Windows) reads addresses and draws error
@@ -24,7 +26,11 @@ pub mod tabs;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod address;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod agent_js;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod cert;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod drive;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod error_page;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -36,6 +42,14 @@ pub mod trust;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod view;
 
+#[cfg(target_os = "macos")]
+mod capture_macos;
+#[cfg(target_os = "macos")]
+pub(crate) use capture_macos::capture;
+#[cfg(target_os = "windows")]
+mod capture_windows;
+#[cfg(target_os = "windows")]
+pub(crate) use capture_windows::capture;
 #[cfg(target_os = "macos")]
 mod host_macos;
 #[cfg(target_os = "macos")]

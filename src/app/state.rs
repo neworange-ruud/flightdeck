@@ -725,6 +725,11 @@ pub struct AppState {
     /// How this project's tab terminals are built (emulator, default colours):
     /// the front-end's choice, from `Env::terminal`. Runtime-only.
     pub terminal_profile: TerminalProfile,
+    /// How an agent launched here finds the session browser's tools
+    /// (`specs/SESSION_BROWSER_PRD.md` §6): set by a host with a browser
+    /// somewhere (the Desktop app, a worker), `None` in the TUI.
+    /// Runtime-only.
+    pub browser_mcp: Option<crate::browser_tools::launch::BrowserMcpLaunch>,
 }
 
 impl AppState {
@@ -762,6 +767,7 @@ impl AppState {
             isolated_status_root: None,
             last_session_scan_ms: None,
             terminal_profile: TerminalProfile::TUI,
+            browser_mcp: None,
         }
     }
 
@@ -2474,6 +2480,22 @@ impl AppState {
             )?;
             let mut launch_agent = agent.clone();
             launch_agent.args = status.args;
+            // The browser tools (§6), right after the agent's own arguments:
+            // before ours, so Claude's variadic `--mcp-config` is always
+            // followed by another flag. Best effort: an agent that cannot
+            // have them launches without.
+            if let Some(mcp) = &self.browser_mcp {
+                if let Ok(extra) = crate::browser_tools::launch::agent_args(
+                    services.fs,
+                    agent,
+                    &self.status_root(tab_id, worktree_abs),
+                    mcp,
+                    tab_id,
+                ) {
+                    let at = agent.args.len().min(launch_agent.args.len());
+                    launch_agent.args.splice(at..at, extra);
+                }
+            }
             let launch = build_launch(&launch_agent, worktree_abs);
             return Ok(PrimarySpawn {
                 start_args: None,

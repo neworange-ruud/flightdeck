@@ -35,19 +35,27 @@
 //!   back from a page or DevTools that grabbed it on its own.
 //! - **Downloads** go to this computer's Downloads folder, under a free
 //!   name; `window.open` opens in this tab.
+//! - **The agent may drive it** (§6) once the session's switch is on (the
+//!   toolbar's Agent button): [`BrowserView::agent_run`] runs one tool
+//!   call with the scripts in [`super::agent_js`]. While it does, the
+//!   toolbar shows **Agent driving** with **Stop**; clicking or typing in
+//!   the page, or using the toolbar, takes the browser back (the window
+//!   reads [`AgentSignal`]s and stops the agent).
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use flightdeck::browser_tools::{BrowserReply, Tool};
 
 use flightdeck::web::client::http::HttpAccess;
 use flightdeck::web::client::relay::RelayEvent;
 use gpui::{
-    canvas, div, px, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement,
+    canvas, div, px, AppContext, AsyncApp, Bounds, Context, Entity, Focusable, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window,
+    Task, WeakEntity, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
@@ -55,6 +63,8 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use super::address::{self, Address, FILE_REFUSED};
+use super::agent::Finished;
+use super::agent_js;
 use super::error_page;
 #[cfg(target_os = "macos")]
 use super::host_macos::Host;
@@ -83,6 +93,24 @@ impl Host {
 /// How often the view looks at what the web view and the relay reported.
 const POLL: Duration = Duration::from_millis(100);
 
+/// How long **Agent driving** stays up after the agent's last call, so a
+/// run of calls reads as one drive and the user's click right after one
+/// still takes the browser back.
+const DRIVING_LINGER: Duration = Duration::from_secs(4);
+
+/// How long a navigation the agent asked for is waited for.
+const LOAD_WAIT: Duration = Duration::from_secs(20);
+
+/// What the user did that the window must act on (§6, B17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSignal {
+    /// The toolbar's Agent button: let the session's agent use the browser,
+    /// or not.
+    SetAllowed(bool),
+    /// Stop, or the user used the browser while the agent drove it.
+    Stop,
+}
+
 /// What the web view's handlers report, read by the view's poll. The
 /// handlers run on the main thread outside GPUI, so they only write here.
 #[derive(Default)]
@@ -106,6 +134,16 @@ struct PageState {
     /// the page's own.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     navigating: String,
+    /// Pages started and finished loading, counted, so the agent's tools can
+    /// wait for a navigation.
+    starts: u64,
+    loads: u64,
+    /// The page on screen is one of ours (an error page), not the web's.
+    own_page: bool,
+    /// The last error page shown: its title and detail, for the agent.
+    last_error: Option<(String, String)>,
+    /// The user clicked or typed in the page (a trusted event).
+    user_input: bool,
     /// Something above changed.
     dirty: bool,
 }
@@ -147,6 +185,15 @@ pub struct BrowserView {
     /// The ports the session listens on (B11), each with whether this
     /// computer has it in use (a worker session's forward was refused).
     ports: Vec<(u16, bool)>,
+    /// The session's switch, "Let the agent use the browser" (B17), as the
+    /// window last said.
+    agent_allowed: bool,
+    /// An agent's call is running here.
+    agent_busy: bool,
+    /// **Agent driving** stays up until then after the last call.
+    driving_until: Option<Instant>,
+    /// What the user did that the window must act on, until taken.
+    signals: Vec<AgentSignal>,
     _poll: Task<()>,
     _address_events: Subscription,
 }
@@ -229,6 +276,10 @@ impl BrowserView {
             profile: [0; 16],
             pending_cert: None,
             ports: Vec::new(),
+            agent_allowed: false,
+            agent_busy: false,
+            driving_until: None,
+            signals: Vec::new(),
             _poll,
             _address_events,
         }
@@ -426,7 +477,125 @@ impl BrowserView {
         self.page.borrow().title.clone()
     }
 
+    // -- the agent (§6) -----------------------------------------------------
+
+    /// The session's switch, as the window has it.
+    pub fn set_agent_allowed(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        if self.agent_allowed != allowed {
+            self.agent_allowed = allowed;
+            if !allowed {
+                self.driving_until = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// What the user did that the window must act on, once.
+    pub fn take_signals(&mut self) -> Vec<AgentSignal> {
+        std::mem::take(&mut self.signals)
+    }
+
+    /// Whether an agent drives the browser now, or did a moment ago.
+    fn driving(&self) -> bool {
+        self.agent_busy
+            || self
+                .driving_until
+                .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// The user took the browser over: the agent stops.
+    fn take_over(&mut self) {
+        self.driving_until = None;
+        self.signals.push(AgentSignal::Stop);
+    }
+
+    /// The user used the toolbar: while the agent drives, that takes the
+    /// browser over.
+    fn user_acted(&mut self, cx: &mut Context<Self>) {
+        if self.driving() {
+            self.take_over();
+            cx.notify();
+        }
+    }
+
+    /// Run an agent's `tool` (call `call`) on this browser and put the
+    /// answer in `finished`. The window runs one call per tab at a time.
+    pub fn agent_run(&mut self, call: u64, tool: Tool, finished: Finished, cx: &mut Context<Self>) {
+        self.agent_busy = true;
+        self.driving_until = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let reply = run_tool(&this, cx, call, tool).await;
+            finished.borrow_mut().push((call, reply));
+            let _ = this.update(cx, |view, cx| {
+                view.agent_busy = false;
+                view.driving_until = Some(Instant::now() + DRIVING_LINGER);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Start `js` in the page; its answer (JSON, as wry hands it back)
+    /// arrives on the receiver. `None` without a web view.
+    fn start_js(&self, js: &str) -> Option<std::sync::mpsc::Receiver<String>> {
+        let webview = self.webview.borrow();
+        let webview = webview.as_ref()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        webview
+            .evaluate_script_with_callback(js, move |raw| {
+                let _ = tx.send(raw);
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Take a screenshot; its PNG arrives on the receiver.
+    fn start_capture(&self) -> Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>> {
+        let webview = self.webview.borrow();
+        let webview = webview.as_ref()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::capture(webview, move |png| {
+            let _ = tx.send(png);
+        });
+        Some(rx)
+    }
+
+    /// Pages started and finished so far.
+    fn load_counts(&self) -> (u64, u64) {
+        let page = self.page.borrow();
+        (page.starts, page.loads)
+    }
+
+    /// The page as the agent is told it: its address and title, or our
+    /// error page's words.
+    fn page_summary(&self) -> Result<String, String> {
+        let page = self.page.borrow();
+        if page.own_page {
+            if let Some((title, detail)) = &page.last_error {
+                return Err(format!("The browser shows an error: {title}. {detail}"));
+            }
+        }
+        let title = if page.title.trim().is_empty() {
+            "(no title)".to_string()
+        } else {
+            page.title.trim().to_string()
+        };
+        Ok(format!("{} — {title}", page.url))
+    }
+
+    /// Load `text` for the agent, as the address field would. Refused
+    /// addresses come back as the field's note.
+    fn agent_go(&mut self, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        self.go(text, cx);
+        match self.note.take() {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
+    }
+
     fn show_error(&self, title: &str, detail: &str) {
+        self.page.borrow_mut().last_error = Some((title.to_string(), detail.to_string()));
         if let Some(webview) = self.webview.borrow().as_ref() {
             let _ = webview.load_html(&error_page::page(title, detail, self.via.as_deref()));
         }
@@ -447,6 +616,19 @@ impl BrowserView {
         let mut changed = dirty;
         if let Some(host) = &self.host {
             host.enforce(self.shown);
+        }
+        // The user used the page while the agent drove it: theirs again.
+        let used = std::mem::take(&mut self.page.borrow_mut().user_input);
+        if used && self.driving() {
+            self.take_over();
+            changed = true;
+        }
+        if self
+            .driving_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.driving_until = None;
+            changed = true;
         }
         self.poll_certificates(continue_requested);
         if let Some((title, detail)) = blocked {
@@ -612,15 +794,30 @@ impl Render for BrowserView {
             .text_size(px(13.))
             .child(button("back", "‹", "Back").on_click({
                 let entity = entity.clone();
-                move |_, _, cx| entity.read(cx).back()
+                move |_, _, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.user_acted(cx);
+                        view.back();
+                    })
+                }
             }))
             .child(button("forward", "›", "Forward").on_click({
                 let entity = entity.clone();
-                move |_, _, cx| entity.read(cx).forward()
+                move |_, _, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.user_acted(cx);
+                        view.forward();
+                    })
+                }
             }))
             .child(button("reload", "⟳", "Reload").on_click({
                 let entity = entity.clone();
-                move |_, _, cx| entity.read(cx).reload()
+                move |_, _, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.user_acted(cx);
+                        view.reload();
+                    })
+                }
             }))
             .child(div().flex_1().min_w_0().child(Input::new(&self.address)))
             .child(button("go", "Go", "Load this address").on_click({
@@ -628,7 +825,10 @@ impl Render for BrowserView {
                 let field = self.address.clone();
                 move |_, _, cx| {
                     let text = field.read(cx).value().to_string();
-                    entity.update(cx, |view, cx| view.go(&text, cx));
+                    entity.update(cx, |view, cx| {
+                        view.user_acted(cx);
+                        view.go(&text, cx);
+                    });
                 }
             }))
             .children(self.via.clone().map(|via| {
@@ -643,6 +843,67 @@ impl Render for BrowserView {
                     .text_color(p.muted.hsla())
                     .child(format!("via {via}"))
             }))
+            // §6: the session's switch, and while the agent drives, Stop.
+            .children(self.driving().then(|| {
+                h_flex()
+                    .flex_none()
+                    .gap(px(6.))
+                    .pl(px(8.))
+                    .pr(px(3.))
+                    .py(px(2.))
+                    .rounded(px(10.))
+                    .bg(p.accent.hsla().opacity(0.15))
+                    .text_size(px(11.5))
+                    .text_color(p.accent.hsla())
+                    .child("Agent driving")
+                    .child(
+                        div()
+                            .id("agent-stop")
+                            .debug_selector(|| "browser-agent-stop".to_string())
+                            .px(px(7.))
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .bg(p.surface_window.hsla())
+                            .text_color(p.ink_2.hsla())
+                            .hover(|s| s.bg(p.surface_raised.hsla()))
+                            .tooltip(crate::views::icons::tooltip(
+                                "Stop the agent and turn off its use of the browser",
+                            ))
+                            .child("Stop")
+                            .on_click({
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.take_over();
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    )
+            }))
+            .child({
+                let allowed = self.agent_allowed;
+                let label = if allowed { "Agent: on" } else { "Agent: off" };
+                let tip = if allowed {
+                    "The session's agent may use this browser. Click to stop it."
+                } else {
+                    "Let the agent use the browser: the session's agent can then open pages, read them, click and type here while you watch."
+                };
+                let chip = button("agent", label, tip).on_click({
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.signals.push(AgentSignal::SetAllowed(!allowed));
+                            cx.notify();
+                        })
+                    }
+                });
+                if allowed {
+                    chip.text_color(p.accent.hsla())
+                } else {
+                    chip
+                }
+            })
             .child(
                 button("devtools", "DevTools", "Open the page's developer tools").on_click({
                     let entity = entity.clone();
@@ -795,14 +1056,23 @@ fn create_webview(
         })
         .with_on_page_load_handler(move |event, url| {
             let mut page = load_page.borrow_mut();
-            if matches!(event, PageLoadEvent::Started) {
-                page.requested.clear();
-                if is_web(&url) {
-                    page.url = url;
+            match event {
+                PageLoadEvent::Started => {
+                    page.requested.clear();
+                    page.starts += 1;
+                    page.own_page = !is_web(&url);
+                    if is_web(&url) {
+                        page.url = url;
+                        page.last_error = None;
+                    }
                 }
+                PageLoadEvent::Finished => page.loads += 1,
             }
             page.dirty = true;
         })
+        // §6: the page's console for the agent, and the user's own clicks
+        // and keys, which take the browser back from a driving agent.
+        .with_initialization_script(agent_js::INIT)
         .with_document_title_changed_handler(move |title| {
             let mut page = title_page.borrow_mut();
             page.title = title;
@@ -822,6 +1092,10 @@ fn create_webview(
             if request.body() == error_page::CONTINUE_MESSAGE {
                 let mut page = ipc_page.borrow_mut();
                 page.continue_requested = true;
+                page.dirty = true;
+            } else if request.body() == agent_js::USER_INPUT_MESSAGE {
+                let mut page = ipc_page.borrow_mut();
+                page.user_input = true;
                 page.dirty = true;
             }
         });
@@ -1057,6 +1331,329 @@ fn download_path(url: &str, suggested: &Path) -> PathBuf {
         n += 1;
     }
     path
+}
+
+// -- the agent's tools (§6) -------------------------------------------------
+
+/// What the agent hears when the browser went away mid-call.
+const GONE: &str = "The browser tab was closed before it answered.";
+
+/// Run one tool on the view `this` and answer it.
+async fn run_tool(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    call: u64,
+    tool: Tool,
+) -> BrowserReply {
+    match tool {
+        // The window answers these itself.
+        Tool::Tabs | Tool::Open { .. } => BrowserReply::error("Not a tab's tool."),
+        Tool::Navigate { url, .. } => {
+            let Some((_, before)) = counts(this, cx) else {
+                return BrowserReply::error(GONE);
+            };
+            match this.update(cx, |view, cx| view.agent_go(&url, cx)) {
+                Err(_) => return BrowserReply::error(GONE),
+                Ok(Err(why)) => return BrowserReply::error(why),
+                Ok(Ok(())) => {}
+            }
+            loaded(this, cx, before, LOAD_WAIT).await
+        }
+        Tool::Back { .. } => {
+            let Some((_, before)) = counts(this, cx) else {
+                return BrowserReply::error(GONE);
+            };
+            let _ = this.update(cx, |view, _| view.script("history.back()"));
+            if !wait_load(this, cx, before, Duration::from_secs(5)).await {
+                let here = summary(this, cx).unwrap_or_else(|e| e);
+                return BrowserReply::text(format!(
+                    "There was no page to go back to (or it is still loading). Now on {here}"
+                ));
+            }
+            loaded(this, cx, before, Duration::ZERO).await
+        }
+        Tool::Reload { .. } => {
+            let Some((_, before)) = counts(this, cx) else {
+                return BrowserReply::error(GONE);
+            };
+            let _ = this.update(cx, |view, _| view.reload());
+            loaded(this, cx, before, LOAD_WAIT).await
+        }
+        Tool::Snapshot { .. } => {
+            let Some(v) = js(this, cx, agent_js::snapshot(), Duration::from_secs(10)).await else {
+                return BrowserReply::error(
+                    "The page did not answer. It may still be loading; try again.",
+                );
+            };
+            if let Some(why) = v["error"].as_str() {
+                return BrowserReply::error(format!("Could not read the page: {why}"));
+            }
+            let mut text = format!(
+                "Page: {}\nAddress: {}\n",
+                v["title"].as_str().unwrap_or_default(),
+                v["url"].as_str().unwrap_or_default()
+            );
+            if v["dialog"].as_bool() == Some(true) {
+                text.push_str("A dialog is open.\n");
+            }
+            text.push('\n');
+            let outline = v["text"].as_str().unwrap_or_default();
+            text.push_str(if outline.is_empty() {
+                "(The page shows nothing that can be read.)"
+            } else {
+                outline
+            });
+            if v["truncated"].as_bool() == Some(true) {
+                text.push_str("\n(The outline was cut short: the page is long.)");
+            }
+            BrowserReply::text(text)
+        }
+        Tool::Click { r#ref, .. } => act(this, cx, agent_js::click(&r#ref), "Clicked").await,
+        Tool::Type {
+            r#ref,
+            text,
+            submit,
+            ..
+        } => {
+            act(
+                this,
+                cx,
+                agent_js::type_text(&r#ref, &text, submit),
+                "Typed into",
+            )
+            .await
+        }
+        Tool::Press { key, .. } => {
+            act(
+                this,
+                cx,
+                agent_js::press(&key),
+                &format!("Pressed {key} on"),
+            )
+            .await
+        }
+        Tool::Screenshot { .. } => {
+            let Ok(Some(rx)) = this.update(cx, |view, _| view.start_capture()) else {
+                return BrowserReply::error(GONE);
+            };
+            match recv(&rx, cx, Duration::from_secs(15)).await {
+                Some(Ok(png)) => {
+                    let here = summary(this, cx).unwrap_or_else(|e| e);
+                    BrowserReply::png_bytes(&png, format!("Screenshot of {here}"))
+                }
+                Some(Err(why)) => BrowserReply::error(why),
+                None => BrowserReply::error("The browser did not take the screenshot in time."),
+            }
+        }
+        Tool::Console { clear, .. } => {
+            let Some(v) = js(this, cx, agent_js::console(clear), Duration::from_secs(10)).await
+            else {
+                return BrowserReply::error("The page did not answer; try again.");
+            };
+            let messages = v["messages"].as_array().cloned().unwrap_or_default();
+            if messages.is_empty() {
+                return BrowserReply::text("The console is empty.");
+            }
+            let lines: Vec<String> = messages
+                .iter()
+                .map(|m| {
+                    format!(
+                        "[{}] {}",
+                        m["level"].as_str().unwrap_or("log"),
+                        m["text"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect();
+            BrowserReply::text(lines.join("\n"))
+        }
+        Tool::Eval { expression, .. } => eval(this, cx, call, &expression).await,
+    }
+}
+
+/// The view's page counts, or `None` once it is gone.
+fn counts(this: &WeakEntity<BrowserView>, cx: &mut AsyncApp) -> Option<(u64, u64)> {
+    this.update(cx, |view, _| view.load_counts()).ok()
+}
+
+fn summary(this: &WeakEntity<BrowserView>, cx: &mut AsyncApp) -> Result<String, String> {
+    this.update(cx, |view, _| view.page_summary())
+        .unwrap_or_else(|_| Err(GONE.to_string()))
+}
+
+/// `rx`'s value, waiting at most `wait`.
+async fn recv<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    cx: &mut AsyncApp,
+    wait: Duration,
+) -> Option<T> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Some(value),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+}
+
+/// Run `script` in the page and decode its answer.
+async fn js(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    script: String,
+    wait: Duration,
+) -> Option<serde_json::Value> {
+    let rx = this.update(cx, |view, _| view.start_js(&script)).ok()??;
+    let raw = recv(&rx, cx, wait).await?;
+    agent_js::decode(&raw)
+}
+
+/// Wait until more than `before` pages finished loading.
+async fn wait_load(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    before: u64,
+    wait: Duration,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match counts(this, cx) {
+            Some((_, loads)) if loads > before => return true,
+            None => return false,
+            Some(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(50))
+            .await;
+    }
+}
+
+/// Answer a navigation once the page loaded (or `wait` ran out).
+async fn loaded(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    before: u64,
+    wait: Duration,
+) -> BrowserReply {
+    let done = wait == Duration::ZERO || wait_load(this, cx, before, wait).await;
+    match summary(this, cx) {
+        Err(why) => BrowserReply::error(why),
+        Ok(here) if done => BrowserReply::text(format!("Loaded {here}")),
+        Ok(here) => BrowserReply::text(format!(
+            "Still loading after {} s: {here}. Take a browser_snapshot to see how far it got.",
+            wait.as_secs()
+        )),
+    }
+}
+
+/// Run an action `script` (click, type, press) and say what it did,
+/// waiting for a page it started to load.
+async fn act(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    script: String,
+    verb: &str,
+) -> BrowserReply {
+    let Some((starts, loads)) = counts(this, cx) else {
+        return BrowserReply::error(GONE);
+    };
+    let Some(v) = js(this, cx, script, Duration::from_secs(10)).await else {
+        return BrowserReply::error("The page did not answer. It may still be loading; try again.");
+    };
+    if let Some(why) = v["error"].as_str() {
+        return BrowserReply::error(why.to_string());
+    }
+    let desc = v["desc"].as_str().unwrap_or("the element").to_string();
+    // A page it started (a link, a submit) is waited for.
+    cx.background_executor()
+        .timer(Duration::from_millis(350))
+        .await;
+    match counts(this, cx) {
+        Some((now, _)) if now > starts => {
+            let done = wait_load(this, cx, loads, LOAD_WAIT).await;
+            let here = summary(this, cx).unwrap_or_else(|e| e);
+            BrowserReply::text(if done {
+                format!("{verb} {desc}. A new page loaded: {here}")
+            } else {
+                format!("{verb} {desc}. A new page is still loading: {here}")
+            })
+        }
+        _ => BrowserReply::text(format!(
+            "{verb} {desc}. Take a browser_snapshot to see the result."
+        )),
+    }
+}
+
+/// `browser_eval`: start the expression, then wait for its value, giving
+/// up when the page navigates away.
+async fn eval(
+    this: &WeakEntity<BrowserView>,
+    cx: &mut AsyncApp,
+    call: u64,
+    expression: &str,
+) -> BrowserReply {
+    const LONGEST: usize = 50_000;
+    let Some((starts, _)) = counts(this, cx) else {
+        return BrowserReply::error(GONE);
+    };
+    let started = js(
+        this,
+        cx,
+        agent_js::eval_start(call, expression),
+        Duration::from_secs(10),
+    )
+    .await;
+    if started.is_none() {
+        return BrowserReply::error(
+            "The expression did not run: it is not valid JavaScript, or the page is still \
+             loading. Give one expression, or a function like () => { ... }.",
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(v) = js(this, cx, agent_js::eval_poll(call), Duration::from_secs(5)).await {
+            if !v.is_null() {
+                let mut value = v["value"].as_str().unwrap_or_default().to_string();
+                if value.len() > LONGEST {
+                    let mut cut = LONGEST;
+                    while !value.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    value.truncate(cut);
+                    value.push_str("\n(cut short)");
+                }
+                return if v["ok"].as_bool() == Some(true) {
+                    BrowserReply::text(value)
+                } else {
+                    BrowserReply::error(format!("The expression threw: {value}"))
+                };
+            }
+        }
+        match counts(this, cx) {
+            None => return BrowserReply::error(GONE),
+            Some((now, _)) if now > starts => {
+                return BrowserReply::error(
+                    "The page navigated away before the expression finished.",
+                )
+            }
+            Some(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return BrowserReply::error("The expression did not finish within 30 s.");
+        }
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+    }
 }
 
 /// The page a new browser starts on.

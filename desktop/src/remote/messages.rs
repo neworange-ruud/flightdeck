@@ -29,6 +29,12 @@ pub fn skew_warning(host: &str, app: &str) -> Option<String> {
     core::skew_warning(host, app, &ADVICE)
 }
 
+/// Whether the worker (`host`) runs a newer FlightDeck than this app (`app`):
+/// the banner then offers this app's update.
+pub fn app_is_older(host: &str, app: &str) -> bool {
+    core::worker_is_newer(host, app)
+}
+
 /// What a worker link that ended on a protocol mismatch says: the link's own
 /// reason, then the same advice as the banner.
 pub fn mismatch_advice(reason: &str, host: &str, app: &str) -> String {
@@ -71,6 +77,16 @@ mod tests {
         assert!(skew_warning("1.9.0", "1.10.0")
             .unwrap()
             .ends_with(core::WORKER_UPDATE_ADVICE));
+    }
+
+    #[test]
+    fn only_a_newer_worker_makes_the_app_the_side_to_update() {
+        assert!(app_is_older("2.1.0", "2.0.0"));
+        assert!(app_is_older("1.10.0", "1.9.0"));
+        assert!(!app_is_older("2.0.0", "2.1.0"));
+        assert!(!app_is_older("2.1.0", "2.1.0"));
+        assert!(!app_is_older("nightly", "2.0.0"));
+        assert!(!app_is_older("", "2.0.0"));
     }
 
     #[test]
