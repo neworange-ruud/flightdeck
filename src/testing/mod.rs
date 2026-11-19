@@ -412,7 +412,15 @@ struct FakeGitState {
     /// When set, [`GitExecutor::remove_worktree`] fails with this `Git` message
     /// (e.g. to simulate git's "is not a worktree" for an orphaned directory).
     remove_worktree_error: Option<String>,
+    /// What [`GitExecutor::global_long_paths`] reports: the global
+    /// `core.longpaths` value, `None` when unset. Defaults to `Some(true)`, so
+    /// tests that do not care never see the long-paths warning.
+    global_long_paths: Option<bool>,
+    /// When set, [`GitExecutor::global_long_paths`] fails with this message.
+    global_long_paths_error: Option<String>,
     // recordings
+    /// Number of [`GitExecutor::enable_repo_long_paths`] calls.
+    repo_long_paths_enabled: u32,
     /// Number of [`GitExecutor::status_porcelain`] calls.
     porcelain_calls: u32,
     created_branches: Vec<(String, String)>,
@@ -453,6 +461,9 @@ impl Default for FakeGit {
                 stash_created: true,
                 stash_apply_ok: true,
                 remove_worktree_error: None,
+                global_long_paths: Some(true),
+                global_long_paths_error: None,
+                repo_long_paths_enabled: 0,
                 created_branches: Vec::new(),
                 added_worktrees: Vec::new(),
                 removed_worktrees: Vec::new(),
@@ -649,7 +660,23 @@ impl FakeGit {
         self.inner.lock().unwrap().remove_worktree_error = Some(message.into());
     }
 
+    /// Set the global `core.longpaths` value [`GitExecutor::global_long_paths`]
+    /// reports (`None` = not set in the global config).
+    pub fn set_global_long_paths(&self, value: Option<bool>) {
+        self.inner.lock().unwrap().global_long_paths = value;
+    }
+
+    /// Make [`GitExecutor::global_long_paths`] fail with `msg`.
+    pub fn set_global_long_paths_error(&self, msg: impl Into<String>) {
+        self.inner.lock().unwrap().global_long_paths_error = Some(msg.into());
+    }
+
     // --- recordings ---
+
+    /// Number of times [`GitExecutor::enable_repo_long_paths`] was called.
+    pub fn repo_long_paths_enabled(&self) -> u32 {
+        self.inner.lock().unwrap().repo_long_paths_enabled
+    }
 
     /// Branches created via [`GitExecutor::create_branch`], as `(name, from)`.
     pub fn created_branches(&self) -> Vec<(String, String)> {
@@ -814,6 +841,19 @@ impl GitExecutor for FakeGit {
 
     fn prune_worktrees(&self) -> Result<()> {
         self.inner.lock().unwrap().pruned_count += 1;
+        Ok(())
+    }
+
+    fn global_long_paths(&self) -> Result<Option<bool>> {
+        let st = self.inner.lock().unwrap();
+        if let Some(msg) = st.global_long_paths_error.clone() {
+            return Err(FlightDeckError::Git(msg));
+        }
+        Ok(st.global_long_paths)
+    }
+
+    fn enable_repo_long_paths(&self) -> Result<()> {
+        self.inner.lock().unwrap().repo_long_paths_enabled += 1;
         Ok(())
     }
 

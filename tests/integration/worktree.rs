@@ -56,6 +56,20 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn enable_repo_long_paths_writes_the_repo_config() {
+    let (_repo, root) = setup_repo();
+    let git_cli = GitCli::new(root.clone());
+
+    git_cli.enable_repo_long_paths().expect("enable long paths");
+
+    // Written to the repository's own config, which its worktrees share.
+    assert_eq!(
+        git(&root, &["config", "--local", "--get", "core.longpaths"]),
+        "true"
+    );
+}
+
+#[test]
 fn create_branch_and_worktree_for_new_slug() {
     let (_repo, root) = setup_repo();
     let git_cli = GitCli::new(root.clone());

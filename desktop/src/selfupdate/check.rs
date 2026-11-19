@@ -91,6 +91,20 @@ pub fn newer_version(
     if !due {
         return cached;
     }
+    fetch_newer_version(fs, source, cache_file, now_unix, current)
+}
+
+/// Ask the release source now, whatever the cache says, and remember the
+/// answer. For when there is reason to think a release came out since the
+/// last check: a worker running a newer FlightDeck than this app. Any failure
+/// is `None`, as for [`newer_version`].
+pub fn fetch_newer_version(
+    fs: &dyn FileSystem,
+    source: &dyn ReleaseSource,
+    cache_file: &Path,
+    now_unix: u64,
+    current: Version,
+) -> Option<Version> {
     let latest = source.latest().ok()??.version;
     if let Some(dir) = cache_file.parent() {
         let _ = fs.create_dir_all(dir);
@@ -206,6 +220,28 @@ mod tests {
         let later = 10_000 + CHECK_INTERVAL_SECS;
         newer_version(&fs, &source, path, later, v("1.4.0"));
         assert_eq!(source.asked.get(), 2);
+    }
+
+    #[test]
+    fn a_forced_check_ignores_a_fresh_cache_and_updates_it() {
+        let fs = FakeFs::new();
+        let path = Path::new(CACHE);
+        // Checked a minute ago, when 1.4.0 was the newest.
+        newer_version(&fs, &fixed(Ok(Some("1.4.0"))), path, 10_000, v("1.4.0"));
+        let source = fixed(Ok(Some("1.5.0")));
+        assert_eq!(newer_version(&fs, &source, path, 10_060, v("1.4.0")), None);
+        assert_eq!(source.asked.get(), 0, "the cache answered");
+        assert_eq!(
+            fetch_newer_version(&fs, &source, path, 10_060, v("1.4.0")),
+            Some(v("1.5.0"))
+        );
+        assert_eq!(source.asked.get(), 1);
+        // The cache now knows, so the daily check says so without asking.
+        assert_eq!(
+            newer_version(&fs, &source, path, 10_120, v("1.4.0")),
+            Some(v("1.5.0"))
+        );
+        assert_eq!(source.asked.get(), 1);
     }
 
     #[test]

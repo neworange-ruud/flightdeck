@@ -4634,10 +4634,7 @@ fn spawn_worktree_job(
             materialize_worktree(&git, &command, &job)
         };
         let (result, hook_warning) = match outcome {
-            Ok(report) => (
-                Ok(()),
-                report.and_then(|r| r.warning_message("worktree_created")),
-            ),
+            Ok(done) => (Ok(()), done.warning()),
             Err(e) => (Err(e), None),
         };
         let _ = tx.send(CreateOutcome {

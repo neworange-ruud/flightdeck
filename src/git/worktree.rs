@@ -42,19 +42,61 @@ fn is_under(path: &Path, root: &Path) -> bool {
 
 /// Create a worktree at `target` for `branch`, creating the branch from `base`
 /// first when `create_branch` is set (SPECS §11). Never force-checks-out.
+///
+/// Returns a warning for the user when the worktree was created but may run
+/// into trouble — today only the long-paths case of [`prepare_long_paths`].
 pub fn create_worktree(
     git: &dyn GitExecutor,
     branch: &str,
     base: &str,
     target: &Path,
     create_branch: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
+    // Only Git for Windows has the 260-character path limit.
+    let warning = if cfg!(windows) {
+        prepare_long_paths(git)
+    } else {
+        None
+    };
     if create_branch {
         // Create the branch from base first (no checkout), then materialize the
         // worktree onto the existing branch.
         git.create_branch(branch, base)?;
     }
-    git.add_worktree(target, branch)
+    git.add_worktree(target, branch)?;
+    Ok(warning)
+}
+
+/// Shown when the user's global git config turns `core.longpaths` off.
+pub const LONG_PATHS_OFF_WARNING: &str = "core.longpaths is off in your global git config, so \
+     files with a path over 260 characters cannot be checked out in this worktree. Turn it on \
+     with: git config --global core.longpaths true";
+
+/// Make sure Git for Windows may check out paths over 260 characters before a
+/// worktree is added, and return a warning when it may not.
+///
+/// A worktree lives under `<repo>/.flightdeck/worktrees/<slug>/`, so every
+/// path in it is tens of characters longer than in the main checkout, and a
+/// repository whose deepest files fit there can fail `git worktree add` with
+/// "Filename too long".
+///
+/// - Set globally to `true`: nothing to do.
+/// - Set globally to `false`: that is the user's choice, so FlightDeck changes
+///   nothing and only warns.
+/// - Not set globally: FlightDeck turns it on in this repository's config,
+///   which all its worktrees share, so the agent's own git works there too.
+///
+/// Best-effort: a failing config read or write never blocks the add, which
+/// then reports git's own error if the paths are indeed too long.
+pub fn prepare_long_paths(git: &dyn GitExecutor) -> Option<String> {
+    match git.global_long_paths() {
+        Ok(Some(true)) | Err(_) => None,
+        Ok(Some(false)) => Some(LONG_PATHS_OFF_WARNING.to_string()),
+        Ok(None) => {
+            let _ = git.enable_repo_long_paths();
+            None
+        }
+    }
 }
 
 /// Remove a managed worktree (SPECS §5, §15). When `force` is false the removal
@@ -219,6 +261,65 @@ mod tests {
             git.added_worktrees(),
             vec![(target.to_path_buf(), "flightdeck/feat".to_string())]
         );
+    }
+
+    #[test]
+    fn long_paths_set_globally_on_needs_nothing() {
+        let git = FakeGit::new();
+        git.set_global_long_paths(Some(true));
+        assert_eq!(prepare_long_paths(&git), None);
+        assert_eq!(git.repo_long_paths_enabled(), 0);
+    }
+
+    #[test]
+    fn long_paths_set_globally_off_only_warns() {
+        // The user turned it off on purpose: warn, but never override them.
+        let git = FakeGit::new();
+        git.set_global_long_paths(Some(false));
+        assert_eq!(
+            prepare_long_paths(&git).as_deref(),
+            Some(LONG_PATHS_OFF_WARNING)
+        );
+        assert_eq!(git.repo_long_paths_enabled(), 0);
+    }
+
+    #[test]
+    fn long_paths_unset_globally_is_enabled_on_the_repo() {
+        let git = FakeGit::new();
+        git.set_global_long_paths(None);
+        assert_eq!(prepare_long_paths(&git), None);
+        assert_eq!(git.repo_long_paths_enabled(), 1);
+    }
+
+    #[test]
+    fn long_paths_read_failure_changes_nothing() {
+        // A git that cannot answer is not a reason to write config or warn.
+        let git = FakeGit::new();
+        git.set_global_long_paths_error("fatal: bad config");
+        assert_eq!(prepare_long_paths(&git), None);
+        assert_eq!(git.repo_long_paths_enabled(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_worktree_on_windows_returns_the_long_paths_warning() {
+        let git = FakeGit::new();
+        git.set_global_long_paths(Some(false));
+        let target = Path::new("/repo/.flightdeck/worktrees/feat");
+        let warning = create_worktree(&git, "flightdeck/feat", "main", target, true).unwrap();
+        assert_eq!(warning.as_deref(), Some(LONG_PATHS_OFF_WARNING));
+        assert_eq!(git.added_worktrees().len(), 1, "the add still runs");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn create_worktree_off_windows_leaves_long_paths_alone() {
+        let git = FakeGit::new();
+        git.set_global_long_paths(None);
+        let target = Path::new("/repo/.flightdeck/worktrees/feat");
+        let warning = create_worktree(&git, "flightdeck/feat", "main", target, true).unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(git.repo_long_paths_enabled(), 0);
     }
 
     #[test]

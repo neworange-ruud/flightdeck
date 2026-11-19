@@ -2221,6 +2221,9 @@ mod worker {
         let warning = model.read_with(cx, |m, _| m.skew_warning()).unwrap();
         assert!(warning.starts_with("This worker runs FlightDeck 0.0.1; this app was built with"));
         assert!(warning.ends_with("`flightdeck update`, then `flightdeck worker restart`."));
+        // The worker is the side to update: this app offers nothing of its own.
+        assert!(!model.read_with(cx, |m, _| m.skew_wants_app_update()));
+        assert!(cx.debug_bounds("skew-releases").is_none());
     }
 
     #[gpui::test]
@@ -2232,6 +2235,9 @@ mod worker {
         let warning = model.read_with(cx, |m, _| m.skew_warning()).unwrap();
         assert!(warning.starts_with("This worker runs FlightDeck 999.0.0;"));
         assert!(warning.ends_with(crate::remote::messages::APP_UPDATE_ADVICE));
+        assert!(model.read_with(cx, |m, _| m.skew_wants_app_update()));
+        // Not left at words: the banner links to the new release.
+        assert!(cx.debug_bounds("skew-releases").is_some());
     }
 
     #[gpui::test]
