@@ -30,7 +30,9 @@ defaults:
 
 jobs:
   test:
-    runs-on: macos-latest
+    # The same Xcode the TestFlight upload ships with (see ios-testflight.yml for
+    # why it is not macos-latest), so CI tests the toolchain that ships.
+    runs-on: xcode-27
     # Backstop against a hung simulator or a test waiting on a socket that never
     # connects: fail in minutes rather than parking an expensive runner for
     # GitHub's 360-minute default.
@@ -78,7 +80,7 @@ jobs:
           xcodebuild test \
             -project FlightDeckRemote.xcodeproj \
             -scheme FlightDeckRemote \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
             -derivedDataPath .derived \
             -skipPackagePluginValidation \
             -only-testing:FlightDeckRemoteTests \
@@ -90,7 +92,7 @@ jobs:
   # do not compile out cleanly, the Release entitlements file going missing)
   # without needing any signing credentials in CI.
   release-build:
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

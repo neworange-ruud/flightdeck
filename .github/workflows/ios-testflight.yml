@@ -69,7 +69,12 @@ jobs:
     # A desktop release published by hand (a `release` event for a desktop-v
     # tag) is not a release of this; `ref_name` is the release's tag there too.
     if: ${{ !startsWith(github.ref_name, 'desktop-v') }}
-    runs-on: macos-latest
+    # Not `macos-latest`: App Store Connect requires the iOS 27 SDK from April
+    # 2027 (ITMS-90725), and macos-latest (macOS 26) tops out at Xcode 26.x /
+    # the iOS 26.5 SDK. `xcode-27` is GitHub's image carrying Xcode 27 (a public
+    # preview at the time of writing). The "Require the iOS SDK floor" step
+    # below fails the run rather than letting a runner change ship an old SDK.
+    runs-on: xcode-27
     # An archive plus SwiftPM resolution plus two altool round-trips; well under
     # this, but far under GitHub's 360-minute default if something wedges.
     timeout-minutes: 60
@@ -90,6 +95,23 @@ jobs:
             xcodebuild -downloadComponent MetalToolchain
           else
             echo "Metal Toolchain present or bundled; nothing to do."
+          fi
+
+      - name: Require the iOS SDK floor
+        # Apple accepts the upload of an app built against an SDK older than its
+        # current minimum and only emails a warning (ITMS-90725) afterwards — and
+        # once the deadline passes it rejects the upload outright. Check before
+        # spending an archive on it. Raise MIN_SDK_MAJOR when Apple raises the bar.
+        env:
+          MIN_SDK_MAJOR: "27"
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iOS SDK: $sdk"
+          if [ "${sdk%%.*}" -lt "$MIN_SDK_MAJOR" ]; then
+            echo "::error::This runner's Xcode has the iOS $sdk SDK; App Store Connect requires iOS $MIN_SDK_MAJOR or later. Point runs-on at an image with a newer Xcode."
+            exit 1
           fi
 
       - name: Import the Apple Distribution certificate
