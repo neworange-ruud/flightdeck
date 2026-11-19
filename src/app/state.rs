@@ -3229,11 +3229,17 @@ mod tests {
             .collect();
         assert_eq!(
             spawn_envs,
-            vec![vec![(
-                "OPENCODE_CONFIG_DIR".to_string(),
-                "/repo/.flightdeck/worktrees/fix-login-bug/.flightdeck/runtime/status/opencode"
-                    .to_string(),
-            )]]
+            vec![vec![
+                (
+                    "OPENCODE_CONFIG_DIR".to_string(),
+                    "/repo/.flightdeck/worktrees/fix-login-bug/.flightdeck/runtime/status/opencode"
+                        .to_string(),
+                ),
+                (
+                    "OPENCODE_CLI_CONFIG_CONTENT".to_string(),
+                    r#"{"tabs":{"mode":"off"}}"#.to_string(),
+                ),
+            ]]
         );
         // Tab focused.
         assert_eq!(app.selected_tab, Some(0));
