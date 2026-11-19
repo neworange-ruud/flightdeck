@@ -12,7 +12,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- **The iOS app is built with Xcode 27.** TestFlight uploads and iOS CI now run on GitHub's Xcode 27 runner, so the app ships with the iOS 27 SDK that App Store Connect requires from April 2027 (ITMS-90725). Before this, builds used the iOS 26.5 SDK. The TestFlight job now stops before archiving if the runner's iOS SDK is older than 27.
 
 ### Bug fixes
 

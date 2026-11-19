@@ -105,6 +105,11 @@ just enough to compile and be navigable; feature teams fill these in.
   execute tool 'metal' due to missing Metal Toolchain". Install it once with
   `xcodebuild -downloadComponent MetalToolchain`; the CI workflows do this
   automatically when the runner's Xcode reports it uninstalled.
+- **Xcode 27 to ship:** App Store Connect requires apps built with the iOS 27
+  SDK from April 2027 (ITMS-90725). The CI workflows therefore run on GitHub's
+  `xcode-27` runner, not `macos-latest` (macOS 26, whose newest Xcode carries
+  the iOS 26.5 SDK), and the TestFlight job fails before archiving if the SDK is
+  older. A local `scripts/archive.sh --upload` needs Xcode 27 too.
 - **`.xcodeproj` (and the app target's generated `Info.plist`) are
   gitignored.** `project.yml` is the source of truth for both; run
   `xcodegen generate` after cloning or pulling changes to `project.yml`.
