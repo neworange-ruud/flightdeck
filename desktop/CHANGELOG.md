@@ -22,7 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
-- None yet.
+- **OpenCode scrolls again in a window opened onto a running session.** A FlightDeck Desktop window, `flightdeck connect` or a browser that attached to a host (above all a worker) after an agent had written more than the replay buffer (`[web] replay_bytes`, 256 KiB) lost the modes the agent set when it started: its alternate screen, mouse reporting and bracketed paste. The window then kept the mouse wheel to itself, so OpenCode 2's transcript did not scroll (its scrollbar could still move) and clicks never reached it. The host now starts such a truncated replay with the modes its own terminal holds for the program.
 
 ## [2.1.0] - 2026-11-18
 

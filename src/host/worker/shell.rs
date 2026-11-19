@@ -349,6 +349,16 @@ impl WorkerShells {
         self.shells.is_empty()
     }
 
+    /// The modes shell `id`'s program has set, when it is open and running a
+    /// terminal (see [`crate::web::stream::TerminalHost::terminal_modes`]).
+    pub fn modes(&self, id: &TerminalId) -> Option<crate::terminal::grid::TerminalModes> {
+        self.shells
+            .iter()
+            .find(|(have, _)| have == id)
+            .and_then(|(_, shell)| shell.terminal.as_ref())
+            .map(|terminal| terminal.screen().modes())
+    }
+
     /// Shell `id`, mutably.
     pub fn get_mut(&mut self, id: &TerminalId) -> Option<&mut WorkerShell> {
         self.shells

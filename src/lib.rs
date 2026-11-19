@@ -2131,6 +2131,27 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
         )
         .unwrap_or(crate::web::stream::Written::NoSuchTerminal)
     }
+
+    /// The modes this host's own emulator holds for the terminal: a worker
+    /// shell's, or a tab's primary or child terminal's.
+    fn terminal_modes(
+        &self,
+        terminal_id: &crate::web::protocol::TerminalId,
+    ) -> Option<crate::terminal::grid::TerminalModes> {
+        if let Some(modes) = self
+            .worker_shells
+            .as_deref()
+            .and_then(|shells| shells.modes(terminal_id))
+        {
+            return Some(modes);
+        }
+        self.projects.iter().find_map(|project| {
+            project.state.tabs.iter().find_map(|tab| {
+                crate::web::stream::terminal_in_session(&tab.session, &tab.meta.id, terminal_id)
+                    .map(|terminal| terminal.screen().modes())
+            })
+        })
+    }
 }
 
 /// One open project: a full [`AppState`] plus everything the event loop needs to

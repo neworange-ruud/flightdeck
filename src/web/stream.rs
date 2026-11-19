@@ -73,6 +73,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::terminal::grid::TerminalModes;
 use crate::web::protocol::{
     Ack, AckOutcome, ImagePaste, Input, TermBytes, TermCursor, TerminalId, ViewerId, Viewport,
 };
@@ -136,6 +137,17 @@ pub trait TerminalHost {
     fn paste_terminal_image(&mut self, terminal_id: &TerminalId, image: &ImagePaste) -> Written {
         let _ = (terminal_id, image);
         Written::Failed("this host does not take pasted images".to_string())
+    }
+
+    /// The modes the program behind `terminal_id` has set, as this host's own
+    /// emulator parsed them: what a truncated replay is prefixed with so a
+    /// late viewer's emulator ends up in them too (see
+    /// [`TerminalStreams::resume_frame`]). Read-only, like the rest of the
+    /// seam's reach into a terminal. `None` (the default) for a host that
+    /// cannot say, which replays without a prefix.
+    fn terminal_modes(&self, terminal_id: &TerminalId) -> Option<TerminalModes> {
+        let _ = terminal_id;
+        None
     }
 }
 
@@ -272,6 +284,21 @@ pub fn write_into_session(
 
 /// Whether `terminal_id` names a terminal of `session` (tab `tab_id`): its
 /// primary, or one of its children that is still open.
+/// The terminal `terminal_id` names in `session` (the tab `tab_id`), if it is
+/// one of this session's.
+pub fn terminal_in_session<'a>(
+    session: &'a crate::terminal::session::Session,
+    tab_id: &str,
+    terminal_id: &TerminalId,
+) -> Option<&'a crate::terminal::session::Terminal> {
+    if terminal_id == &primary_terminal_id(tab_id) {
+        return session.primary();
+    }
+    (0..session.child_count())
+        .filter_map(|c| session.child(c))
+        .find(|child| terminal_id == &child_terminal_id(tab_id, child.stream_id()))
+}
+
 pub fn session_has_terminal(
     session: &crate::terminal::session::Session,
     tab_id: &str,
@@ -482,7 +509,10 @@ impl TerminalStreams {
     ///
     /// Frames are returned sorted by terminal id, so the order is stable for
     /// tests and for a reader watching two terminals repaint.
-    pub fn attach_frames(&self, cursors: &[TermCursor]) -> Vec<TermBytes> {
+    ///
+    /// `host` is asked only for each terminal's current modes, which a
+    /// truncated replay carries (see [`TerminalStreams::resume_frame`]).
+    pub fn attach_frames(&self, cursors: &[TermCursor], host: &dyn TerminalHost) -> Vec<TermBytes> {
         let mut ids: Vec<&TerminalId> = self.streams.keys().collect();
         ids.sort();
         let mut out = Vec::new();
@@ -492,7 +522,7 @@ impl TerminalStreams {
                 .find(|c| &c.terminal_id == id)
                 .map(|c| c.next_offset)
                 .unwrap_or(0);
-            if let Some(frame) = self.resume_frame(id, from) {
+            if let Some(frame) = self.resume_frame(id, from, host.terminal_modes(id)) {
                 out.push(frame);
             }
         }
@@ -503,7 +533,29 @@ impl TerminalStreams {
     ///
     /// Split out from [`TerminalStreams::attach_frames`] because this is the
     /// decision the unit tests are about.
-    pub fn resume_frame(&self, terminal_id: &TerminalId, from: ByteOffset) -> Option<TermBytes> {
+    ///
+    /// **A truncated replay starts with `modes`.** A program sets its modes
+    /// (the alternate screen, mouse reporting, bracketed paste) once, when it
+    /// starts, so once the ring has wrapped they are gone from it: a viewer
+    /// replaying the tail would put a full-screen agent on its main screen and
+    /// keep the mouse to itself, and the wheel would never reach the agent
+    /// (remote-control-ayjq). So the frame opens with
+    /// [`TerminalModes::restore_sequence`] of the modes the host's emulator
+    /// holds now. Applying today's modes *before* the retained bytes is exact:
+    /// every mode the retained bytes change, they leave as they are now.
+    ///
+    /// The prefix stands for bytes the viewer lost, so it is placed in the
+    /// lost range, just before the oldest retained byte: `offset + data.len()`
+    /// still ends at the stream's current offset, and a viewer's cursor stays
+    /// true. It is left out when the viewer did not lose that many bytes (a
+    /// cursor just short of the ring), so no viewer ever has part of it
+    /// trimmed off as a repeat and sees half an escape sequence.
+    pub fn resume_frame(
+        &self,
+        terminal_id: &TerminalId,
+        from: ByteOffset,
+        modes: Option<TerminalModes>,
+    ) -> Option<TermBytes> {
         let stream = self.streams.get(terminal_id)?;
         match stream.replay.resume(from) {
             Resume::UpToDate => None,
@@ -530,12 +582,23 @@ impl TerminalStreams {
                     // viewer learns the gap from `TerminalView::replay_from`.
                     return None;
                 }
+                // A truncated replay begins at the oldest retained byte,
+                // which is *ahead* of what the viewer asked for. That
+                // inequality is the gap, and `truncated` names it.
+                let oldest = stream.replay.oldest_offset();
+                let prelude = modes.map(|m| m.restore_sequence()).unwrap_or_default();
+                let room = oldest.saturating_sub(from);
+                let (offset, data) = if !prelude.is_empty() && room >= prelude.len() as u64 {
+                    let offset = oldest - prelude.len() as u64;
+                    let mut with = prelude;
+                    with.extend_from_slice(&data);
+                    (offset, with)
+                } else {
+                    (oldest, data)
+                };
                 Some(TermBytes {
                     terminal_id: terminal_id.clone(),
-                    // A truncated replay begins at the oldest retained byte,
-                    // which is *ahead* of what the viewer asked for. That
-                    // inequality is the gap, and `truncated` names it.
-                    offset: stream.replay.oldest_offset(),
+                    offset,
                     data,
                     truncated: true,
                 })
@@ -653,7 +716,7 @@ impl TerminalStreams {
                 if let Some(previous) = resume_viewer {
                     self.adopt_watermark(previous, viewer_id);
                 }
-                self.attach_frames(cursors)
+                self.attach_frames(cursors, host)
                     .into_iter()
                     .map(|frame| WebOutbound::Viewer {
                         viewer_id: viewer_id.clone(),

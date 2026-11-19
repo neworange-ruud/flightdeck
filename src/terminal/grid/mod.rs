@@ -196,6 +196,48 @@ impl TerminalModes {
     pub fn wants_mouse(&self) -> bool {
         self.mouse_mode != MouseMode::None
     }
+
+    /// The escape sequences that put a terminal in its power-on state into
+    /// these modes; empty when every mode is at its default.
+    ///
+    /// A program sets its modes once, at startup. A viewer that joins later
+    /// and replays only the tail of the output (a truncated replay, see
+    /// [`crate::web::stream`]) would otherwise never learn them: it would
+    /// draw a full-screen app on the main screen and keep the mouse to
+    /// itself, so the wheel never reaches the program.
+    pub fn restore_sequence(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // First, so what follows (the replayed output) lands on the screen
+        // the program draws on.
+        if self.alt_screen {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        let mouse: Option<&[u8]> = match self.mouse_mode {
+            MouseMode::None => None,
+            MouseMode::Press => Some(b"\x1b[?9h"),
+            MouseMode::PressRelease => Some(b"\x1b[?1000h"),
+            MouseMode::ButtonMotion => Some(b"\x1b[?1002h"),
+            MouseMode::AnyMotion => Some(b"\x1b[?1003h"),
+        };
+        if let Some(mouse) = mouse {
+            out.extend_from_slice(mouse);
+        }
+        match self.mouse_encoding {
+            MouseEncoding::Default => {}
+            MouseEncoding::Utf8 => out.extend_from_slice(b"\x1b[?1005h"),
+            MouseEncoding::Sgr => out.extend_from_slice(b"\x1b[?1006h"),
+        }
+        if self.bracketed_paste {
+            out.extend_from_slice(b"\x1b[?2004h");
+        }
+        if self.app_cursor {
+            out.extend_from_slice(b"\x1b[?1h");
+        }
+        if self.app_keypad {
+            out.extend_from_slice(b"\x1b=");
+        }
+        out
+    }
 }
 
 /// Which visible rows may have changed since a point in the grid's history

@@ -23,6 +23,8 @@ use crate::web::protocol::{AckOutcome, ImagePaste};
 struct RecordingHost {
     writes: Vec<(TerminalId, Vec<u8>)>,
     answers: HashMap<TerminalId, Written>,
+    /// What [`TerminalHost::terminal_modes`] answers, per terminal.
+    modes: HashMap<TerminalId, TerminalModes>,
 }
 
 impl RecordingHost {
@@ -52,6 +54,10 @@ impl TerminalHost for RecordingHost {
             self.writes.push((terminal_id.clone(), bytes.to_vec()));
         }
         answer
+    }
+
+    fn terminal_modes(&self, terminal_id: &TerminalId) -> Option<TerminalModes> {
+        self.modes.get(terminal_id).copied()
     }
 }
 
@@ -145,7 +151,9 @@ fn a_closed_terminal_keeps_its_replay_but_reports_the_exit() {
     assert!(!streams.alive(&id));
     assert_eq!(streams.exit_code(&id), Some(1));
     assert_eq!(streams.byte_len(&id), 7);
-    let frame = streams.resume_frame(&id, 0).expect("history survives");
+    let frame = streams
+        .resume_frame(&id, 0, None)
+        .expect("history survives");
     assert_eq!(frame.data, b"goodbye");
 }
 
@@ -178,7 +186,7 @@ fn a_current_cursor_earns_no_frame() {
     let mut streams = TerminalStreams::new(1024);
     let id = primary_terminal_id("tab");
     streams.pty_output(&id, b"abcdef");
-    assert!(streams.resume_frame(&id, 6).is_none());
+    assert!(streams.resume_frame(&id, 6, None).is_none());
 }
 
 /// The Tail case: an exact continuation, starting where the viewer said it was,
@@ -189,7 +197,7 @@ fn a_cursor_inside_the_ring_resumes_exactly_where_it_left_off() {
     let id = primary_terminal_id("tab");
     streams.pty_output(&id, b"abcdef");
 
-    let frame = streams.resume_frame(&id, 2).expect("a tail");
+    let frame = streams.resume_frame(&id, 2, None).expect("a tail");
     assert_eq!(frame.offset, 2);
     assert_eq!(frame.data, b"cdef");
     assert!(!frame.truncated, "nothing was lost, so nothing is claimed");
@@ -204,7 +212,9 @@ fn a_cursor_that_aged_out_is_answered_truncated_from_the_oldest_byte() {
     let id = primary_terminal_id("tab");
     streams.pty_output(&id, b"abcdefgh"); // ring now holds "efgh", offsets 4..8
 
-    let frame = streams.resume_frame(&id, 1).expect("a truncated replay");
+    let frame = streams
+        .resume_frame(&id, 1, None)
+        .expect("a truncated replay");
     assert!(frame.truncated, "the viewer must be told it missed output");
     assert_eq!(
         frame.offset, 4,
@@ -217,6 +227,86 @@ fn a_cursor_that_aged_out_is_answered_truncated_from_the_oldest_byte() {
     assert_eq!(frame.data, b"efgh");
 }
 
+/// A full-screen agent's modes, as its startup sets them.
+fn agent_modes() -> TerminalModes {
+    use crate::terminal::grid::{MouseEncoding, MouseMode};
+    TerminalModes {
+        alt_screen: true,
+        mouse_mode: MouseMode::AnyMotion,
+        mouse_encoding: MouseEncoding::Sgr,
+        bracketed_paste: true,
+        ..TerminalModes::default()
+    }
+}
+
+/// A truncated replay opens with the modes the host's emulator holds, placed
+/// in the lost range so the frame still ends at the stream's current offset
+/// (remote-control-ayjq): the agent set them once, long before the ring's
+/// oldest byte.
+#[test]
+fn a_truncated_replay_opens_with_the_programs_modes() {
+    let mut streams = TerminalStreams::new(4);
+    let id = primary_terminal_id("tab");
+    streams.pty_output(&id, &[b'x'; 200]);
+    streams.pty_output(&id, b"efgh");
+    let prelude = agent_modes().restore_sequence();
+
+    let frame = streams
+        .resume_frame(&id, 0, Some(agent_modes()))
+        .expect("a truncated replay");
+    assert!(frame.truncated);
+    assert!(frame.data.starts_with(&prelude), "{:?}", frame.data);
+    assert!(frame.data.ends_with(b"efgh"));
+    assert_eq!(frame.offset, 200 - prelude.len() as u64);
+    assert_eq!(frame.next_offset(), 204, "the viewer's cursor stays true");
+
+    // A late viewer's emulator ends up in the agent's modes.
+    let mut viewer = crate::terminal::grid::Emulator::Alacritty.build(4, 20);
+    viewer.process(&frame.data);
+    assert_eq!(viewer.modes(), agent_modes());
+}
+
+/// The prefix stands for lost bytes, so a viewer that lost fewer than its
+/// length gets none: trimming part of it off as a repeat would leave half an
+/// escape sequence on screen. A tail, and a program in its default modes, get
+/// none either.
+#[test]
+fn the_modes_prefix_needs_room_and_a_truncation() {
+    let mut streams = TerminalStreams::new(4);
+    let id = primary_terminal_id("tab");
+    streams.pty_output(&id, &[b'x'; 200]);
+    streams.pty_output(&id, b"efgh");
+    let modes = Some(agent_modes());
+
+    let short = streams.resume_frame(&id, 199, modes).expect("truncated");
+    assert_eq!((short.offset, short.data.as_slice()), (200, &b"efgh"[..]));
+    let future = streams.resume_frame(&id, 9_000, modes).expect("truncated");
+    assert_eq!(future.data, b"efgh");
+    let tail = streams.resume_frame(&id, 202, modes).expect("a tail");
+    assert_eq!(tail.data, b"gh");
+    let plain = streams
+        .resume_frame(&id, 0, Some(TerminalModes::default()))
+        .expect("truncated");
+    assert_eq!((plain.offset, plain.data.as_slice()), (200, &b"efgh"[..]));
+}
+
+/// An attach asks the host for each terminal's modes.
+#[test]
+fn an_attach_onto_a_wrapped_ring_carries_the_hosts_modes() {
+    let mut streams = TerminalStreams::new(4);
+    let id = primary_terminal_id("tab");
+    streams.pty_output(&id, &[b'x'; 200]);
+    let mut host = RecordingHost::default();
+    host.modes.insert(id.clone(), agent_modes());
+
+    let frames = streams.attach_frames(&[], &host);
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0]
+        .data
+        .starts_with(&agent_modes().restore_sequence()));
+    assert_eq!(frames[0].next_offset(), 200);
+}
+
 /// A cursor from the future (a client bug, or a host restart that zeroed the
 /// counters) is not skipped ahead to: it gets the same honest truncated answer.
 #[test]
@@ -226,7 +316,7 @@ fn a_cursor_from_the_future_is_answered_truncated_not_trusted() {
     streams.pty_output(&id, b"abc");
 
     let frame = streams
-        .resume_frame(&id, 9_000)
+        .resume_frame(&id, 9_000, None)
         .expect("a truncated replay");
     assert!(frame.truncated);
     assert_eq!(frame.data, b"abc");
@@ -242,14 +332,14 @@ fn a_first_attach_is_a_resume_from_zero_and_is_honest_about_a_wrapped_ring() {
     let mut fresh = TerminalStreams::new(1024);
     let id = primary_terminal_id("tab");
     fresh.pty_output(&id, b"abc");
-    let frames = fresh.attach_frames(&[]);
+    let frames = fresh.attach_frames(&[], &RecordingHost::default());
     assert_eq!(frames.len(), 1);
     assert!(!frames[0].truncated, "nothing was discarded");
     assert_eq!(frames[0].data, b"abc");
 
     let mut wrapped = TerminalStreams::new(4);
     wrapped.pty_output(&id, b"abcdefgh");
-    let frames = wrapped.attach_frames(&[]);
+    let frames = wrapped.attach_frames(&[], &RecordingHost::default());
     assert_eq!(frames.len(), 1);
     assert!(
         frames[0].truncated,
@@ -264,7 +354,9 @@ fn a_first_attach_is_a_resume_from_zero_and_is_honest_about_a_wrapped_ring() {
 fn a_silent_terminal_earns_no_attach_frame() {
     let mut streams = TerminalStreams::new(1024);
     streams.open(primary_terminal_id("tab"));
-    assert!(streams.attach_frames(&[]).is_empty());
+    assert!(streams
+        .attach_frames(&[], &RecordingHost::default())
+        .is_empty());
 }
 
 /// A cursor for a terminal this host does not have is not answered with an
@@ -277,9 +369,11 @@ fn a_cursor_for_an_unknown_terminal_earns_no_frame() {
         terminal_id: primary_terminal_id("vanished"),
         next_offset: 12,
     }];
-    assert!(streams.attach_frames(&cursors).is_empty());
     assert!(streams
-        .resume_frame(&primary_terminal_id("vanished"), 12)
+        .attach_frames(&cursors, &RecordingHost::default())
+        .is_empty());
+    assert!(streams
+        .resume_frame(&primary_terminal_id("vanished"), 12, None)
         .is_none());
 }
 
@@ -293,16 +387,19 @@ fn each_terminal_is_resumed_from_its_own_cursor() {
     streams.pty_output(&primary, b"PRIMARY");
     streams.pty_output(&child, b"CHILD");
 
-    let frames = streams.attach_frames(&[
-        TermCursor {
-            terminal_id: primary.clone(),
-            next_offset: 4,
-        },
-        TermCursor {
-            terminal_id: child.clone(),
-            next_offset: 0,
-        },
-    ]);
+    let frames = streams.attach_frames(
+        &[
+            TermCursor {
+                terminal_id: primary.clone(),
+                next_offset: 4,
+            },
+            TermCursor {
+                terminal_id: child.clone(),
+                next_offset: 0,
+            },
+        ],
+        &RecordingHost::default(),
+    );
 
     assert_eq!(frames.len(), 2);
     let by_id = |id: &TerminalId| {
@@ -329,7 +426,7 @@ fn a_zero_capacity_ring_answers_with_no_frame_at_all() {
         9,
         "the offset counter still advances"
     );
-    assert!(streams.resume_frame(&id, 0).is_none());
+    assert!(streams.resume_frame(&id, 0, None).is_none());
 }
 
 // ===========================================================================

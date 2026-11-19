@@ -1228,6 +1228,60 @@ fn the_worker_shell_round_trips_and_restarts_after_exit() {
     client.stop();
 }
 
+/// A window that attaches after a full-screen program set its modes, and
+/// after more output than the replay ring holds, still learns those modes
+/// (remote-control-ayjq). Without them its mirror drew the program on the main
+/// screen and kept the wheel to itself, so OpenCode 2's transcript never
+/// scrolled in a Desktop reopened onto a long-running worker session.
+#[test]
+fn a_late_window_learns_the_modes_a_program_set_before_the_replay_ring() {
+    use flightdeck::terminal::grid::{Emulator, MouseEncoding, MouseMode};
+    use flightdeck::terminal::session::{Terminal, TerminalKind, TerminalProfile};
+
+    let mut worker = Worker::prepare_with(|config| config.web.replay_bytes = 2048);
+    worker.run();
+    let (_token, mut laptop) = worker.window("laptop");
+    let shell = shell_id();
+    let mut pty = laptop.pty(&shell);
+    // The modes an agent TUI sets at startup, then three rings' worth of output.
+    shell_round_trip(
+        &worker,
+        &mut laptop,
+        &mut pty,
+        "printf '\\033[?1049h\\033[?1003h\\033[?1006h\\033[?2004h'; \
+         head -c 6000 /dev/zero | tr '\\0' x; echo; echo fd-flood-$((2*3))",
+        "fd-flood-6",
+    );
+    laptop.stop();
+
+    let (_token, mut studio) = worker.window("studio");
+    let profile = TerminalProfile {
+        emulator: Emulator::Alacritty,
+        default_colors: None,
+        env: &[],
+    };
+    let size = PtySize { rows: 24, cols: 80 };
+    let mut mirror = Terminal::mirror(
+        TerminalKind::Child,
+        "shell".to_string(),
+        Box::new(studio.pty(&shell)),
+        size,
+        profile,
+    );
+    worker.wait("the late mirror to take the program's modes", || {
+        studio.pump();
+        let out = mirror.session_mut().try_read_output().unwrap();
+        mirror.process_output(&out);
+        mirror.screen().modes().wants_mouse()
+    });
+    let modes = mirror.screen().modes();
+    assert!(modes.alt_screen, "{modes:?}");
+    assert_eq!(modes.mouse_mode, MouseMode::AnyMotion);
+    assert_eq!(modes.mouse_encoding, MouseEncoding::Sgr);
+    assert!(modes.bracketed_paste, "{modes:?}");
+    studio.stop();
+}
+
 // ---------------------------------------------------------------------------
 // 9. Revoke
 // ---------------------------------------------------------------------------
