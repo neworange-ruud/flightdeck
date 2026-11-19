@@ -8,6 +8,20 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [2.2.0] - 2026-11-19
+
+### New features
+
 - **Agents can use the session browser.** An agent started by FlightDeck Desktop or by a worker can now drive the session's browser in FlightDeck Desktop through MCP tools: list and open tabs, load an address, go back, reload, read the page as an outline whose links, buttons and fields can be clicked and typed into, press keys, take a screenshot, read the console, and run JavaScript. Requests are made by the machine the session runs on, so `localhost` is the agent's own dev server. The user allows it per session in the browser's toolbar (off by default) and can stop it at any time. Claude Code (`--mcp-config`) and Codex (`-c mcp_servers…`) get the tools at launch; OpenCode, Cursor and containerized agents do not yet. The new `flightdeck browser-mcp` command is the MCP server the agent runs; it reaches its host through a loopback bridge whose address and token are in `~/.flightdeck/browser/` (readable only by you). Web protocol v13: a worker sends the attached Desktop window `browser_tool_call` and takes its `browser_tool_result`; with no Desktop window attached, or one too old, the agent is told so at once. The TUI gives its agents no browser tools.
 
 ### Improvements
