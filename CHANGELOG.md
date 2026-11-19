@@ -16,6 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **OpenCode on the base branch showed idle while it worked.** Since 2.2.0, every base-branch tab keeps its status in its own `.flightdeck/runtime/tabs/<tab-id>/` folder. OpenCode 2's one background service can tell sessions apart only by folder, so it kept writing a base-branch session's status to the project root's `.flightdeck/agent-status`, and the tab stayed on idle while OpenCode worked. Its questions and permission requests didn't reach the phone or Mission control either. An OpenCode base-branch tab now reads the project root's status again. The limit: several OpenCode tabs on the base branch share one status.
 - **Linux: the update check no longer creates `~/Library`.** Without `XDG_CACHE_HOME` set, the update check's cache went to `~/Library/Application Support/flightdeck/` on every OS. On a Linux worker, that `~/Library` folder then showed up in the Open Project browser. Linux now uses `~/.cache/flightdeck/`, the XDG default. macOS is unchanged.
 
 ## [2.2.0] - 2026-11-19

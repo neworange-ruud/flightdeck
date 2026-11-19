@@ -89,6 +89,11 @@ these agents apart: they share one working tree. From the second base-branch tab
 onward the form warns about this, and your agent workflow must create its own
 worktrees, or the agents will overwrite each other's changes.
 
+OpenCode can't report its status per tab on the base branch: OpenCode 2 runs one
+background service and tells sessions apart only by folder. Several OpenCode
+tabs on the base branch therefore all show the same status, and a question one
+of them asks shows up on each of them.
+
 With [containers](/desktop/containers) enabled, only one base-branch tab is
 allowed.
 

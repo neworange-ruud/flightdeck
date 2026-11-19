@@ -26,6 +26,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **OpenCode on the base branch no longer shows idle while it works** (see the core changelog). Its questions and permission requests reach the phone and Mission control again. Several OpenCode tabs on the base branch share one status.
 - **Linux workers no longer get a `~/Library` folder** from the update check's cache (see the core changelog).
 
 ## [2.2.0] - 2026-11-19

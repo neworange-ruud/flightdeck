@@ -722,7 +722,11 @@ Each base-branch tab keeps its own status root at
 `.flightdeck/runtime/tabs/<tab-id>/` (covered by the `.flightdeck/runtime/`
 `.gitignore` entry, the tab id reduced to a portable directory name), so its
 `agent-status` file and question/prompt sidecars never mix with another
-agent's in the same folder. Closing the tab removes that directory. Auto-continue
+agent's in the same folder. Closing the tab removes that directory. OpenCode is
+the exception: OpenCode 2 runs one background service for every directory, and
+its plugin can tell sessions apart only by directory, so an OpenCode base-branch
+tab keeps its status root at the project root itself. Several OpenCode sessions
+on the base branch therefore share one status and one prompt sidecar. Auto-continue
 does not fall back to "the newest session in the project root" for a base-branch
 tab that shares the root with another one, since that session may be the other
 tab's; only the tab's own pinned session is resumed.
