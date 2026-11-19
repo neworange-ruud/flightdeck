@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agents::adapter::{build_launch, validate_agent};
 use crate::agents::registry::AgentRegistry;
-use crate::agents::setup::{prepare_status_launch, status_backend};
+use crate::agents::setup::{prepare_status_launch, status_backend, StatusBackend};
 use crate::agents::status::{combine_status, DisplayStatus};
 use crate::agents::status_log::StatusCursor;
 use crate::app::activity::{ActivityProbe, GitFingerprint};
@@ -1691,7 +1691,7 @@ impl AppState {
             return Err(e);
         }
 
-        let status_file = agent_status_file(&self.status_root(&tab_id, &worktree_abs));
+        let status_file = agent_status_file(&self.status_root(&tab_id, &agent, &worktree_abs));
         let (initial_status, status_cursor) =
             initial_status_snapshot(services.fs, &status_file, spawn.explicit_status);
         let tab = &mut self.tabs[idx];
@@ -2427,7 +2427,13 @@ impl AppState {
     /// A base-branch tab (`runs_on_base`) in a normal local run gets its own
     /// [`base_tab_status_root`], because several of them can share the
     /// project root.
-    fn status_root(&self, tab_id: &str, worktree: &Path) -> PathBuf {
+    ///
+    /// Except OpenCode: OpenCode 2 runs one background service for every
+    /// directory, and its plugin can tell sessions apart only by directory,
+    /// so it reports a base-branch session to the project root's own status
+    /// file, never to a per-tab one (remote-control-gkqk). Several OpenCode
+    /// sessions on the base branch therefore share one status.
+    fn status_root(&self, tab_id: &str, agent: &AgentDef, worktree: &Path) -> PathBuf {
         if self.config.containers.enabled {
             return worktree.to_path_buf();
         }
@@ -2438,7 +2444,7 @@ impl AppState {
             .tabs
             .iter()
             .any(|t| t.meta.id == tab_id && t.meta.runs_on_base);
-        if on_base {
+        if on_base && status_backend(agent) != Some(StatusBackend::OpenCode) {
             base_tab_status_root(&self.repo_root, tab_id)
         } else {
             worktree.to_path_buf()
@@ -2475,7 +2481,7 @@ impl AppState {
                 services.fs,
                 agent,
                 worktree_abs,
-                &self.status_root(tab_id, worktree_abs),
+                &self.status_root(tab_id, agent, worktree_abs),
                 false,
             )?;
             let mut launch_agent = agent.clone();
@@ -2488,7 +2494,7 @@ impl AppState {
                 if let Ok(extra) = crate::browser_tools::launch::agent_args(
                     services.fs,
                     agent,
-                    &self.status_root(tab_id, worktree_abs),
+                    &self.status_root(tab_id, agent, worktree_abs),
                     mcp,
                     tab_id,
                 ) {
@@ -2546,7 +2552,7 @@ impl AppState {
             services.fs,
             agent,
             worktree_abs,
-            &self.status_root(tab_id, worktree_abs),
+            &self.status_root(tab_id, agent, worktree_abs),
             true,
         )?;
         let mut launch_agent = agent.clone();
@@ -2763,7 +2769,7 @@ impl AppState {
         }
 
         let tab_id = self.tabs[idx].meta.id.clone();
-        let status_file = agent_status_file(&self.status_root(&tab_id, &cwd));
+        let status_file = agent_status_file(&self.status_root(&tab_id, &agent, &cwd));
         let spawn = self.build_primary_spawn(&tab_id, &agent, &cwd, services, allow_attach)?;
         // Fresh container: start it detached before attaching its PTY.
         if let Some(start_args) = &spawn.start_args {
@@ -3782,7 +3788,7 @@ mod tests {
     #[test]
     fn several_base_branch_tabs_each_keep_their_own_status_root() {
         let dir = TempDir::new().unwrap();
-        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let (agent, _cmd) = make_real_agent(&dir, "claude");
         let config = config_with_agent(agent);
 
         let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
@@ -3839,6 +3845,45 @@ mod tests {
         assert_eq!(app.tabs.len(), 1);
         assert!(!fs.exists(&root0), "the closed tab's status root is gone");
         assert!(fs.exists(app.tabs[0].status_file.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn an_opencode_base_branch_tab_reports_to_the_project_root() {
+        // OpenCode 2's one shared service tells sessions apart only by
+        // directory, so it writes a base-branch session's status to the
+        // root's own file; a per-tab file would stay on the seeded `idle`
+        // while the agent works (remote-control-gkqk).
+        let dir = TempDir::new().unwrap();
+        let (agent, _cmd) = make_real_agent(&dir, "opencode");
+        let config = config_with_agent(agent);
+
+        let git = FakeGit::new().with_root(REPO).with_branches(["main"]);
+        let fs = FakeFs::new();
+        let pty = FakePty::new();
+        pty.queue_session();
+        let clock = FakeClock::default();
+        let svc = services(&git, &fs, &pty, &clock);
+
+        let mut app = fresh_state(config);
+        let tab = app.begin_new_agent_tab_ex("", None, true, &svc).unwrap();
+        app.finalize_new_tab(&tab.tab_id, &svc).unwrap();
+        assert!(app.tabs[0].meta.runs_on_base);
+        assert_eq!(
+            app.tabs[0].status_file.clone().expect("a status file"),
+            agent_status_file(Path::new(REPO))
+        );
+        assert!(!fs.exists(&base_tab_status_root(Path::new(REPO), &tab.tab_id)));
+
+        // The plugin bakes the same file in for the root's own sessions.
+        let plugin = fs
+            .read_to_string(
+                &Path::new(REPO)
+                    .join(crate::agents::setup::STATUS_RUNTIME_DIR)
+                    .join("opencode/plugins/flightdeck.js"),
+            )
+            .expect("the OpenCode plugin");
+        assert!(plugin.contains("const FLIGHTDECK_STATUS_FILE = "));
+        assert!(!plugin.contains("runtime/tabs"));
     }
 
     #[test]
