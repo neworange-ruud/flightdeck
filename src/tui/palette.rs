@@ -278,7 +278,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
     },
     PaletteEntry {
         group: "Terminals",
-        label: "Close Agent",
+        label: "Close Child Agent",
         action: PaletteAction::Dispatch(Command::CloseAgentTerminal),
     },
     PaletteEntry {
@@ -355,7 +355,7 @@ const ALL_ENTRIES: &[PaletteEntry] = &[
 
 /// The number of required §22 command-palette actions, plus the "Toggle Split
 /// View", "Rebase Worktree", and "Pull Base" commands, the in-session agent
-/// actions ("New Agent" / "Close Agent"), and "Open Configuration". (The `.env`
+/// actions ("New Agent" / "Close Child Agent"), and "Open Configuration". (The `.env`
 /// files are now symlinked into new worktrees automatically, so the "Copy
 /// .env(.local)" entry is hidden from the palette; the [`Command::CopyEnvFile`]
 /// command remains.) The two FlightDeck Remote actions ("Pair Phone" / "Unpair
@@ -707,7 +707,7 @@ mod tests {
             "New Child Terminal",
             "Close Child Terminal",
             "New Agent",
-            "Close Agent",
+            "Close Child Agent",
             "Switch Agent Session Tab",
             "Switch Child Terminal",
             "Set Manual Status",

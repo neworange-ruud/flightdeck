@@ -170,6 +170,8 @@ pub enum LinkEvent {
     DownloadPlan(DownloadPlan),
     /// A worker's answer to `open_browser_tunnel` (v11).
     BrowserTunnel(crate::web::protocol::BrowserTunnel),
+    /// A session's agent wants its browser to do something (v13).
+    BrowserToolCall(crate::web::protocol::BrowserToolCall),
 }
 
 /// What the client asks the link task to send.
@@ -792,6 +794,9 @@ async fn session(
                     }
                     ServerMsg::BrowserTunnel(tunnel) => {
                         events.send(LinkEvent::BrowserTunnel(tunnel))
+                    }
+                    ServerMsg::BrowserToolCall(call) => {
+                        events.send(LinkEvent::BrowserToolCall(call))
                     }
                     ServerMsg::TakenOver { by } => {
                         return SessionEnd::Ended(LinkEnd::TakenOver { by });

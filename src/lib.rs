@@ -11,6 +11,7 @@ pub mod testing;
 
 pub mod agents;
 pub mod app;
+pub mod browser_tools;
 pub mod config;
 pub mod connect;
 pub mod defender;
@@ -162,6 +163,11 @@ pub fn run() -> Result<()> {
     // host, so nothing below (the worker lock, the workspace) applies.
     if argv.get(1).map(String::as_str) == Some("connect") {
         std::process::exit(crate::connect::main(&argv[2..]));
+    }
+    // `flightdeck browser-mcp …` is the MCP server an agent runs for the
+    // session browser (specs/SESSION_BROWSER_PRD.md §6): stdio only, no host.
+    if argv.get(1).map(String::as_str) == Some("browser-mcp") {
+        std::process::exit(crate::browser_tools::mcp::main(&argv[2..]));
     }
 
     if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
@@ -1104,6 +1110,10 @@ enum Prompt {
         run_on_base: bool,
         /// The base branch name, shown when `run_on_base` is on.
         base_branch: String,
+        /// Whether a base-branch tab already runs in the project root, so the
+        /// base target warns that agents there share one working tree
+        /// ([`AppState::base_tab_shared`]).
+        base_shared: bool,
     },
     /// Pick which agent backend to spawn as an additional agent in the current
     /// session's worktree (the "+ agent" flow). A number key selects one and
@@ -2126,6 +2136,27 @@ impl crate::web::stream::TerminalHost for WorkspaceTerminals<'_> {
             text.as_bytes(),
         )
         .unwrap_or(crate::web::stream::Written::NoSuchTerminal)
+    }
+
+    /// The state this host's own emulator holds for the terminal (a worker
+    /// shell, or a tab's primary or child terminal), for a late viewer's
+    /// truncated replay.
+    fn terminal_restore(
+        &mut self,
+        terminal_id: &crate::web::protocol::TerminalId,
+    ) -> Option<crate::web::stream::TerminalRestore> {
+        if let Some(shells) = self.worker_shells.as_deref_mut() {
+            if let Some(restore) = shells.restore(terminal_id) {
+                return Some(restore);
+            }
+        }
+        self.projects.iter_mut().find_map(|project| {
+            project.state.tabs.iter_mut().find_map(|tab| {
+                let tab_id = tab.meta.id.clone();
+                crate::web::stream::terminal_in_session(&mut tab.session, &tab_id, terminal_id)
+                    .map(crate::web::stream::terminal_restore)
+            })
+        })
     }
 }
 
@@ -6475,6 +6506,7 @@ fn start_new_tab_flow(state: &AppState, services: &Services, ui: &mut Ui) {
             use_existing_branch: false,
             run_on_base: false,
             base_branch: state.base_branch.clone(),
+            base_shared: state.base_tab_shared(),
         },
     );
 }
@@ -7006,6 +7038,14 @@ fn digit_accel(i: usize) -> DialogAccel {
     DialogAccel::Char(char::from_digit((i as u32 + 1) % 10, 10).unwrap_or('?'))
 }
 
+/// The New Agent form's warning on its base target once another base-branch
+/// tab runs in the project root (SPECS §32). Starts with `⚠` so a front-end
+/// can tell it from the other body lines and draw it as a warning.
+pub const BASE_SHARED_WARNING: &str =
+    "⚠ Another agent already runs here. Agents in the project root share \
+     one working tree: their workflow must create its own worktrees, or they will overwrite \
+     each other's changes.";
+
 /// Build the modal [`Dialog`] for a prompt: the question/notification text plus
 /// one button per available action. Each button's accelerator matches the key
 /// [`handle_prompt_key`] expects, so mouse and keyboard stay in lockstep.
@@ -7021,6 +7061,7 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
             use_existing_branch,
             run_on_base,
             base_branch,
+            base_shared,
         } => {
             let list: Vec<DialogListItem> = if *use_existing_branch {
                 let matches = matching_branches(existing_branches, branch);
@@ -7054,7 +7095,13 @@ fn prompt_dialog(prompt: &Prompt) -> Dialog {
                     })
                     .collect()
             };
-            let title = if *run_on_base {
+            let title = if *run_on_base && *base_shared {
+                format!(
+                    "New Agent Session Tab   (↑/↓ agent · Tab changes target)\n\
+                     Runs on base branch '{base_branch}' in the project root — no worktree.\n\
+                     {BASE_SHARED_WARNING}"
+                )
+            } else if *run_on_base {
                 format!(
                     "New Agent Session Tab   (↑/↓ agent · Tab changes target)\n\
                      Runs on base branch '{base_branch}' in the project root — no worktree."
@@ -10214,6 +10261,7 @@ mod tests {
             use_existing_branch: false,
             run_on_base: false,
             base_branch: "main".to_string(),
+            base_shared: false,
         };
         let dialog = prompt_dialog(&p);
         // Branch textbox visible with its buffer.
@@ -10245,6 +10293,7 @@ mod tests {
             use_existing_branch: false,
             run_on_base: true,
             base_branch: "main".to_string(),
+            base_shared: false,
         };
         let dialog = prompt_dialog(&p);
         // The branch textbox is disabled (hidden) when running on base.
@@ -10254,6 +10303,35 @@ mod tests {
             .buttons
             .iter()
             .any(|b| b.accel == DialogAccel::Tab && b.label.contains("main")));
+        assert!(
+            !dialog.title.contains(BASE_SHARED_WARNING),
+            "the first base tab gets no warning"
+        );
+    }
+
+    #[test]
+    fn new_agent_form_warns_on_base_once_another_base_tab_runs() {
+        let form = |run_on_base| Prompt::NewAgentForm {
+            agents: vec![("claude".to_string(), "Claude Code".to_string())],
+            selected: 0,
+            branch: String::new(),
+            existing_branches: vec![],
+            branch_selected: 0,
+            use_existing_branch: false,
+            run_on_base,
+            base_branch: "main".to_string(),
+            base_shared: true,
+        };
+        let on_base = prompt_dialog(&form(true)).title;
+        assert!(
+            on_base.ends_with(&format!("\n{BASE_SHARED_WARNING}")),
+            "{on_base}"
+        );
+        assert!(BASE_SHARED_WARNING.starts_with('⚠'));
+        // Only the base target shares the root; a worktree target does not warn.
+        assert!(!prompt_dialog(&form(false))
+            .title
+            .contains(BASE_SHARED_WARNING));
     }
 
     #[test]
@@ -10267,6 +10345,7 @@ mod tests {
             use_existing_branch: true,
             run_on_base: false,
             base_branch: "main".to_string(),
+            base_shared: false,
         };
 
         let dialog = prompt_dialog(&p);

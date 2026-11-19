@@ -411,3 +411,49 @@ fn emoji_presentation_selector_width() {
         assert_eq!(grid.cell(0, 1).unwrap().text, "x", "{emulator:?}");
     }
 }
+
+/// [`TerminalModes::restore_sequence`] puts a fresh grid of either emulator
+/// into the modes a program set: what a viewer joining after a full-screen
+/// agent started needs before it can forward the mouse (remote-control-ayjq).
+#[test]
+fn restore_sequence_reproduces_the_modes() {
+    let set = b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b=";
+    for emulator in [Emulator::Vt100, Emulator::Alacritty] {
+        let source = fed(emulator, 4, 20, set);
+        let modes = source.modes();
+        assert!(
+            modes.alt_screen && modes.wants_mouse(),
+            "{emulator:?}: {modes:?}"
+        );
+        for viewer in [Emulator::Vt100, Emulator::Alacritty] {
+            let restored = fed(viewer, 4, 20, &modes.restore_sequence());
+            assert_eq!(restored.modes(), modes, "{emulator:?} → {viewer:?}");
+        }
+    }
+    assert!(TerminalModes::default().restore_sequence().is_empty());
+}
+
+/// Each mouse mode and encoding on its own round-trips (X10 only on vt100,
+/// which is the only emulator that tracks it).
+#[test]
+fn restore_sequence_covers_each_mouse_mode() {
+    for (mode, set) in [
+        (MouseMode::PressRelease, &b"\x1b[?1000h"[..]),
+        (MouseMode::ButtonMotion, b"\x1b[?1002h"),
+        (MouseMode::AnyMotion, b"\x1b[?1003h"),
+    ] {
+        for encoding in [&b""[..], b"\x1b[?1005h", b"\x1b[?1006h"] {
+            let mut bytes = set.to_vec();
+            bytes.extend_from_slice(encoding);
+            for emulator in [Emulator::Vt100, Emulator::Alacritty] {
+                let modes = fed(emulator, 4, 20, &bytes).modes();
+                assert_eq!(modes.mouse_mode, mode, "{emulator:?}");
+                let restored = fed(emulator, 4, 20, &modes.restore_sequence()).modes();
+                assert_eq!(restored, modes, "{emulator:?} {bytes:?}");
+            }
+        }
+    }
+    let x10 = fed(Emulator::Vt100, 4, 20, b"\x1b[?9h").modes();
+    let restored = fed(Emulator::Vt100, 4, 20, &x10.restore_sequence()).modes();
+    assert_eq!(restored, x10);
+}

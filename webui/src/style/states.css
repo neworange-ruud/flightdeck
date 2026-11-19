@@ -1302,6 +1302,7 @@
 .fd-dialog__title {
   color: var(--fd-accent);
   font-weight: 700;
+  white-space: pre-line;
 }
 .fd-dialog__panel[data-toggled="true"] .fd-dialog__title {
   color: var(--fd-focus);

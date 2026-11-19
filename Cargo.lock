@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "flightdeck"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "alacritty_terminal",
  "axoupdater",
@@ -2481,9 +2481,10 @@ dependencies = [
 
 [[package]]
 name = "flightdeck-desktop"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2 0.6.2",
  "crossterm",
  "flightdeck",

@@ -847,7 +847,7 @@ export function fixtureCommands(): readonly HostCommand[] {
     },
     {
       id: "close_agent",
-      label: "Close Agent",
+      label: "Close Child Agent",
       group: "Terminals",
       run: { name: "close_agent" },
       hostOnly: false,

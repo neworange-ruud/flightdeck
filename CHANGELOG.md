@@ -8,12 +8,27 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Agents can use the session browser.** An agent started by FlightDeck Desktop or by a worker can now drive the session's browser in FlightDeck Desktop through MCP tools: list and open tabs, load an address, go back, reload, read the page as an outline whose links, buttons and fields can be clicked and typed into, press keys, take a screenshot, read the console, and run JavaScript. Requests are made by the machine the session runs on, so `localhost` is the agent's own dev server. The user allows it per session in the browser's toolbar (off by default) and can stop it at any time. Claude Code (`--mcp-config`) and Codex (`-c mcp_servers…`) get the tools at launch; OpenCode, Cursor and containerized agents do not yet. The new `flightdeck browser-mcp` command is the MCP server the agent runs; it reaches its host through a loopback bridge whose address and token are in `~/.flightdeck/browser/` (readable only by you). Web protocol v13: a worker sends the attached Desktop window `browser_tool_call` and takes its `browser_tool_result`; with no Desktop window attached, or one too old, the agent is told so at once. The TUI gives its agents no browser tools.
+
+### Improvements
+
+- **No second row of tabs in OpenCode.** OpenCode 2 started by FlightDeck no longer shows its own session tab strip: FlightDeck already gives every session its own tab. FlightDeck sets `OPENCODE_CLI_CONFIG_CONTENT` to `{"tabs":{"mode":"off"}}`, which OpenCode merges over your own `cli.json`, so your other OpenCode settings still apply.
+
+### Bug fixes
+
+- **OpenCode scrolls again in a window opened onto a running session.** A FlightDeck Desktop window, `flightdeck connect` or a browser that attached to a host (above all a worker) after an agent had written more than the replay buffer (`[web] replay_bytes`, 256 KiB) lost the modes the agent set when it started: its alternate screen, mouse reporting and bracketed paste. The window then kept the mouse wheel to itself, so OpenCode 2's transcript did not scroll (its scrollbar could still move) and clicks never reached it. The window also showed only the rows the agent had redrawn since, leaving the rest blank or stale (OpenCode's prompt area, for one). The host now starts such a truncated replay with the modes its own terminal holds for the program, and ends it with a repaint of that terminal's screen, so the window opens exactly as the host sees it.
+
+## [2.1.0] - 2026-11-18
+
+### New features
+
+- **Several agent sessions on the base branch.** You can now start more than one Agent Session Tab on the base branch in the project root. This suits a "workspace" repository whose agents create the worktrees they need themselves. From the second base-branch tab onward, the New Agent Session form warns that these agents share one working tree, so their workflow must create its own worktrees. Each base-branch tab keeps its agent status and question files in its own `.flightdeck/runtime/tabs/<tab>/` folder, so the tabs never show each other's status or questions. Containerized projects still allow one base-branch tab.
 - **Video tutorials on the website.** A new **Video Tutorials** page in the docs (under Start Here) has twelve short narrated videos of FlightDeck Desktop driving a worker with real agents: connecting a worker, a first agent from prompt to merge, starting a project, agents in parallel, Mission control, answering an agent, reviewing before you merge, rebasing onto a newer main, shells and SSH, files and pasted images, and FlightDeck Web. Every video has captions. The homepage now opens with a 100-second introduction video. The videos are recorded and narrated by scripts in `tutorials/`, so they can be made again for each release.
 - **A direct download link.** `/download` on the website goes straight to the newest FlightDeck Desktop release's downloads on GitHub. It's in the homepage's nav, hero and footer, and in the docs' header and Desktop quickstart.
 
 ### Improvements
 
-- None yet.
+- **Clearer palette name for closing an extra agent.** The command palette's **Close Agent**, which closes an additional agent inside a session, is now called **Close Child Agent**. That keeps it apart from **Close Agent Session Tab**, which closes the whole session.
 
 ### Bug fixes
 

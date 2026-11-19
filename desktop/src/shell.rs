@@ -176,6 +176,16 @@ impl FlightDeckWindow {
                 cx.observe(&view, |_, _, cx| cx.notify()).detach();
                 self.browser_views.insert(id, view);
             }
+            // The agents' calls on these browsers (§6). A tab an agent just
+            // opened gets its view on the next frame.
+            let views: Vec<(u64, Entity<crate::browser::view::BrowserView>)> = self
+                .browser_views
+                .iter()
+                .map(|(id, view)| (*id, view.clone()))
+                .collect();
+            if crate::browser::drive::drive(&self.host, &views, cx) {
+                cx.notify();
+            }
             let ports: Vec<(u64, Vec<u16>)> = self
                 .browser_views
                 .keys()

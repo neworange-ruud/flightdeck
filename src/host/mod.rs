@@ -64,6 +64,7 @@ use crate::{
 };
 use flightdeck_remote_protocol::ProjectId;
 
+mod browser;
 pub mod overlay;
 pub mod vscode;
 pub mod worker;
@@ -264,6 +265,9 @@ pub struct AppHost<'a> {
     /// The ports the sessions' processes listen on (B11), looked for only
     /// while a browser wants them ([`AppHost::want_listening_ports`]).
     ports: crate::ports::PortWatch,
+    /// The agent browser tools (`specs/SESSION_BROWSER_PRD.md` §6), once a
+    /// front-end with a browser enabled them; see [`browser`].
+    browser_tools: Option<browser::BrowserTools>,
 }
 
 impl<'a> AppHost<'a> {
@@ -395,6 +399,7 @@ impl<'a> AppHost<'a> {
             remote_has_persisted_pairing: false,
             web_surface,
             ports: crate::ports::PortWatch::new(std::sync::Arc::new(crate::ports::SystemProbe)),
+            browser_tools: None,
             interfaces: crate::web::interfaces::RealInterfaceEnumerator,
             #[cfg(debug_assertions)]
             web_test_code: None,
@@ -1074,7 +1079,9 @@ impl<'a> AppHost<'a> {
         // A worker's own turn: its shell, notifications, messages, clones and
         // health (see `worker`).
         let worker_changed = self.worker.is_some() && self.pump_worker(now_ms);
-        changed || moved || worker_changed
+        // Agents' browser tool calls, to whoever holds the browser.
+        let browser_calls = self.pump_browser_tools();
+        changed || moved || worker_changed || browser_calls
     }
 
     /// Second phase of a turn, after the front-end has synced the active
