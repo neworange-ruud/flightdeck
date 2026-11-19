@@ -349,14 +349,13 @@ impl WorkerShells {
         self.shells.is_empty()
     }
 
-    /// The modes shell `id`'s program has set, when it is open and running a
-    /// terminal (see [`crate::web::stream::TerminalHost::terminal_modes`]).
-    pub fn modes(&self, id: &TerminalId) -> Option<crate::terminal::grid::TerminalModes> {
-        self.shells
-            .iter()
-            .find(|(have, _)| have == id)
-            .and_then(|(_, shell)| shell.terminal.as_ref())
-            .map(|terminal| terminal.screen().modes())
+    /// Shell `id`'s state for a late viewer's truncated replay, when it is
+    /// open and running a terminal (see
+    /// [`crate::web::stream::TerminalHost::terminal_restore`]).
+    pub fn restore(&mut self, id: &TerminalId) -> Option<crate::web::stream::TerminalRestore> {
+        self.get_mut(id)
+            .and_then(|shell| shell.terminal.as_mut())
+            .map(crate::web::stream::terminal_restore)
     }
 
     /// Shell `id`, mutably.

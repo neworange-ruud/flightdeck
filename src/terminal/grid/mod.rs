@@ -29,6 +29,7 @@
 pub mod alacritty_grid;
 pub mod links;
 pub mod mouse;
+pub mod restore;
 pub mod vt100_grid;
 
 #[cfg(test)]

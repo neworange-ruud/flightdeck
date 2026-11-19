@@ -73,6 +73,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::terminal::grid::restore::incomplete_tail;
 use crate::terminal::grid::TerminalModes;
 use crate::web::protocol::{
     Ack, AckOutcome, ImagePaste, Input, TermBytes, TermCursor, TerminalId, ViewerId, Viewport,
@@ -139,16 +140,53 @@ pub trait TerminalHost {
         Written::Failed("this host does not take pasted images".to_string())
     }
 
-    /// The modes the program behind `terminal_id` has set, as this host's own
-    /// emulator parsed them: what a truncated replay is prefixed with so a
-    /// late viewer's emulator ends up in them too (see
-    /// [`TerminalStreams::resume_frame`]). Read-only, like the rest of the
-    /// seam's reach into a terminal. `None` (the default) for a host that
-    /// cannot say, which replays without a prefix.
-    fn terminal_modes(&self, terminal_id: &TerminalId) -> Option<TerminalModes> {
+    /// What a viewer joining `terminal_id` late needs to end up where this
+    /// host's own emulator is: the modes the program set and a repaint of its
+    /// screen (see [`TerminalStreams::resume_frame`] and [`terminal_restore`]).
+    /// `&mut` only so a host scrolled into its history can read the live
+    /// screen; nothing about the terminal changes. `None` (the default) for a
+    /// host that cannot say, which replays the retained bytes alone.
+    fn terminal_restore(&mut self, terminal_id: &TerminalId) -> Option<TerminalRestore> {
         let _ = terminal_id;
         None
     }
+}
+
+/// A terminal's state as a viewer's emulator can be brought to it
+/// ([`TerminalHost::terminal_restore`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalRestore {
+    /// The modes the program set.
+    pub modes: TerminalModes,
+    /// The live screen as escape sequences
+    /// ([`crate::terminal::grid::restore::repaint_sequence`]); empty when it
+    /// cannot be read faithfully right now.
+    pub screen: Vec<u8>,
+}
+
+/// `terminal`'s [`TerminalRestore`]: its modes, and its live screen even when
+/// the host's view is scrolled into history (put back as it was). The screen
+/// is left out while the emulator holds a synchronized update back: its grid
+/// then shows the frame before, which the held bytes, replayed after the
+/// repaint, would only half overwrite.
+pub fn terminal_restore(terminal: &mut crate::terminal::session::Terminal) -> TerminalRestore {
+    let grid = terminal.screen_mut();
+    let modes = grid.modes();
+    if grid.holds_output() {
+        return TerminalRestore {
+            modes,
+            screen: Vec::new(),
+        };
+    }
+    let scrolled = grid.scrollback();
+    if scrolled > 0 {
+        grid.set_scrollback(0);
+    }
+    let screen = crate::terminal::grid::restore::repaint_sequence(&*grid);
+    if scrolled > 0 {
+        grid.set_scrollback(scrolled);
+    }
+    TerminalRestore { modes, screen }
 }
 
 /// The outcome of one [`TerminalHost::write_terminal_input`].
@@ -287,16 +325,19 @@ pub fn write_into_session(
 /// The terminal `terminal_id` names in `session` (the tab `tab_id`), if it is
 /// one of this session's.
 pub fn terminal_in_session<'a>(
-    session: &'a crate::terminal::session::Session,
+    session: &'a mut crate::terminal::session::Session,
     tab_id: &str,
     terminal_id: &TerminalId,
-) -> Option<&'a crate::terminal::session::Terminal> {
+) -> Option<&'a mut crate::terminal::session::Terminal> {
     if terminal_id == &primary_terminal_id(tab_id) {
-        return session.primary();
+        return session.primary_mut();
     }
-    (0..session.child_count())
-        .filter_map(|c| session.child(c))
-        .find(|child| terminal_id == &child_terminal_id(tab_id, child.stream_id()))
+    let index = (0..session.child_count()).find(|&c| {
+        session
+            .child(c)
+            .is_some_and(|child| terminal_id == &child_terminal_id(tab_id, child.stream_id()))
+    })?;
+    session.child_mut(index)
 }
 
 pub fn session_has_terminal(
@@ -510,9 +551,13 @@ impl TerminalStreams {
     /// Frames are returned sorted by terminal id, so the order is stable for
     /// tests and for a reader watching two terminals repaint.
     ///
-    /// `host` is asked only for each terminal's current modes, which a
+    /// `host` is asked only for each terminal's [`TerminalRestore`], which a
     /// truncated replay carries (see [`TerminalStreams::resume_frame`]).
-    pub fn attach_frames(&self, cursors: &[TermCursor], host: &dyn TerminalHost) -> Vec<TermBytes> {
+    pub fn attach_frames(
+        &self,
+        cursors: &[TermCursor],
+        host: &mut dyn TerminalHost,
+    ) -> Vec<TermBytes> {
         let mut ids: Vec<&TerminalId> = self.streams.keys().collect();
         ids.sort();
         let mut out = Vec::new();
@@ -522,7 +567,13 @@ impl TerminalStreams {
                 .find(|c| &c.terminal_id == id)
                 .map(|c| c.next_offset)
                 .unwrap_or(0);
-            if let Some(frame) = self.resume_frame(id, from, host.terminal_modes(id)) {
+            // Asked only of a terminal whose answer is a truncated replay:
+            // the repaint reads every cell of its screen.
+            let restore = self
+                .needs_restore(id, from)
+                .then(|| host.terminal_restore(id))
+                .flatten();
+            if let Some(frame) = self.resume_frame(id, from, restore.as_ref()) {
                 out.push(frame);
             }
         }
@@ -534,27 +585,38 @@ impl TerminalStreams {
     /// Split out from [`TerminalStreams::attach_frames`] because this is the
     /// decision the unit tests are about.
     ///
-    /// **A truncated replay starts with `modes`.** A program sets its modes
-    /// (the alternate screen, mouse reporting, bracketed paste) once, when it
-    /// starts, so once the ring has wrapped they are gone from it: a viewer
-    /// replaying the tail would put a full-screen agent on its main screen and
-    /// keep the mouse to itself, and the wheel would never reach the agent
-    /// (remote-control-ayjq). So the frame opens with
-    /// [`TerminalModes::restore_sequence`] of the modes the host's emulator
-    /// holds now. Applying today's modes *before* the retained bytes is exact:
-    /// every mode the retained bytes change, they leave as they are now.
+    /// **A truncated replay is brought up to the host's state.** A program
+    /// sets its modes (the alternate screen, mouse reporting, bracketed paste)
+    /// once, when it starts, and a program that redraws only the cells that
+    /// change (OpenCode 2) painted most of its screen long ago. Once the ring
+    /// has wrapped, both are gone from it: replaying the tail put a full-screen
+    /// agent on the viewer's main screen, kept the wheel from it
+    /// (remote-control-ayjq), and left the rows it had not redrawn since
+    /// blank or stale (remote-control-bkv9). So, given the host's
+    /// [`TerminalRestore`], the frame is:
     ///
-    /// The prefix stands for bytes the viewer lost, so it is placed in the
-    /// lost range, just before the oldest retained byte: `offset + data.len()`
-    /// still ends at the stream's current offset, and a viewer's cursor stays
-    /// true. It is left out when the viewer did not lose that many bytes (a
-    /// cursor just short of the ring), so no viewer ever has part of it
-    /// trimmed off as a repeat and sees half an escape sequence.
+    /// 1. [`TerminalModes::restore_sequence`] of the modes the host holds now.
+    ///    Applying today's modes *before* the retained bytes is exact: every
+    ///    mode the retained bytes change, they leave as they are now.
+    /// 2. The retained bytes, up to any unfinished sequence at their end
+    ///    ([`incomplete_tail`]).
+    /// 3. The repaint of the host's live screen, which is the state those
+    ///    bytes left (an unfinished sequence changes nothing until it ends).
+    /// 4. The unfinished tail, which the next live frame completes on the
+    ///    viewer exactly as it does on the host.
+    ///
+    /// The added bytes stand for bytes the viewer lost, so they are placed in
+    /// the lost range: `offset + data.len()` still ends at the stream's
+    /// current offset and a viewer's cursor stays true. When the lost range
+    /// is shorter than they are, bytes from the front of the retained window
+    /// (the part that starts mid-sequence anyway) make room, so `offset` never
+    /// falls below what the viewer asked for and no viewer trims part of them
+    /// off as a repeat. A future cursor (`from` past the stream) gets neither.
     pub fn resume_frame(
         &self,
         terminal_id: &TerminalId,
         from: ByteOffset,
-        modes: Option<TerminalModes>,
+        restore: Option<&TerminalRestore>,
     ) -> Option<TermBytes> {
         let stream = self.streams.get(terminal_id)?;
         match stream.replay.resume(from) {
@@ -586,15 +648,11 @@ impl TerminalStreams {
                 // which is *ahead* of what the viewer asked for. That
                 // inequality is the gap, and `truncated` names it.
                 let oldest = stream.replay.oldest_offset();
-                let prelude = modes.map(|m| m.restore_sequence()).unwrap_or_default();
-                let room = oldest.saturating_sub(from);
-                let (offset, data) = if !prelude.is_empty() && room >= prelude.len() as u64 {
-                    let offset = oldest - prelude.len() as u64;
-                    let mut with = prelude;
-                    with.extend_from_slice(&data);
-                    (offset, with)
-                } else {
-                    (oldest, data)
+                let (offset, data) = match restore {
+                    Some(restore) if from <= oldest => {
+                        restored(&data, oldest, oldest - from, restore).unwrap_or((oldest, data))
+                    }
+                    _ => (oldest, data),
                 };
                 Some(TermBytes {
                     terminal_id: terminal_id.clone(),
@@ -604,6 +662,15 @@ impl TerminalStreams {
                 })
             }
         }
+    }
+
+    /// Whether a viewer resuming `terminal_id` from `from` lost bytes the
+    /// ring no longer holds: the only answer a [`TerminalRestore`] goes into
+    /// (a future cursor is truncated too, but gets nothing added).
+    fn needs_restore(&self, terminal_id: &TerminalId, from: ByteOffset) -> bool {
+        self.streams
+            .get(terminal_id)
+            .is_some_and(|stream| from < stream.replay.oldest_offset())
     }
 
     // -- input in (§5.1) ---------------------------------------------------
@@ -716,7 +783,7 @@ impl TerminalStreams {
                 if let Some(previous) = resume_viewer {
                     self.adopt_watermark(previous, viewer_id);
                 }
-                self.attach_frames(cursors, host)
+                self.attach_frames(cursors, &mut *host)
                     .into_iter()
                     .map(|frame| WebOutbound::Viewer {
                         viewer_id: viewer_id.clone(),
@@ -753,4 +820,40 @@ impl TerminalStreams {
             | WebInbound::UploadFinished(_) => Vec::new(),
         }
     }
+}
+
+/// A truncated replay's retained bytes `data` (the oldest at `oldest`, `lost`
+/// bytes after the viewer's cursor) with `restore` worked in, as
+/// `(offset, data)`; see [`TerminalStreams::resume_frame`]. The screen is
+/// dropped before giving up when the retained window cannot make room for
+/// it; `None` when not even the modes fit, or there is nothing to add.
+fn restored(
+    data: &[u8],
+    oldest: ByteOffset,
+    lost: u64,
+    restore: &TerminalRestore,
+) -> Option<(ByteOffset, Vec<u8>)> {
+    let prefix = restore.modes.restore_sequence();
+    let cut = data.len() - incomplete_tail(data);
+    [restore.screen.as_slice(), &[]]
+        .into_iter()
+        .find_map(|screen| {
+            let extra = (prefix.len() + screen.len()) as u64;
+            if extra == 0 {
+                return None;
+            }
+            // Retained bytes given up from the front so the frame starts no
+            // earlier than the viewer's cursor.
+            let skip = extra.saturating_sub(lost);
+            if skip > cut as u64 {
+                return None;
+            }
+            let skip = skip as usize;
+            let mut out = Vec::with_capacity(prefix.len() + data.len() - skip + screen.len());
+            out.extend_from_slice(&prefix);
+            out.extend_from_slice(&data[skip..cut]);
+            out.extend_from_slice(screen);
+            out.extend_from_slice(&data[cut..]);
+            Some((oldest + skip as u64 - extra, out))
+        })
 }
