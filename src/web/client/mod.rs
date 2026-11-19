@@ -630,6 +630,23 @@ impl RemoteClient {
         self.worker_command(worker_command::CREATE_PROJECT, Some(args))
     }
 
+    /// Whether the worker understands [`RemoteClient::update_worker`] (v14).
+    pub fn supports_worker_update(&self) -> bool {
+        self.is_worker()
+            && self.workspace().protocol_version >= crate::web::protocol::WORKER_UPDATE_MIN_VERSION
+    }
+
+    /// Ask the worker to update its FlightDeck and restart into it. Acked at
+    /// once; the outcome is a host message, or the link ending as
+    /// "restarting". `None` when the worker predates the command or the link
+    /// is down.
+    pub fn update_worker(&self) -> Option<u64> {
+        if !self.supports_worker_update() {
+            return None;
+        }
+        self.worker_command(worker_command::UPDATE_WORKER, None)
+    }
+
     /// Restart worker shell `terminal_id` after it exited. A pre-v10 worker
     /// ignores the argument and restarts its one shell.
     pub fn restart_worker_shell(&self, terminal_id: &TerminalId) -> Option<u64> {

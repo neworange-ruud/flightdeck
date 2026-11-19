@@ -15,12 +15,19 @@
 //!   and replaces it in the background (the banner shows progress and never
 //!   blocks), then offers "Restart";
 //! - anywhere else: a pointer at the release page.
+//!
+//! "Check for Updates…" (the app menu and the palette) reports through the
+//! same banner: "Checking…", then "up to date", a failure with "Check
+//! again", or the update found. Once dismissed, a newer release found later
+//! brings the banner back, and while one is known the status bar carries a
+//! pill ([`update_indicator`]) that does too.
 
 use std::rc::Rc;
 
 use flightdeck::host::HostNotices;
 use gpui::{
-    div, App, Div, FontWeight, InteractiveElement, ParentElement, Stateful, Styled, Window,
+    div, App, Div, FontWeight, InteractiveElement, ParentElement, Stateful,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::h_flex;
 
@@ -43,6 +50,8 @@ pub enum BannerAction {
     UpdateNow,
     /// Restart into the new version.
     Restart,
+    /// Ask GitHub again: after a failed check or a failed install.
+    CheckAgain,
     /// Nothing to press.
     None,
 }
@@ -54,16 +63,36 @@ pub struct BannerCopy {
     pub headline: String,
     pub detail: String,
     pub action: BannerAction,
+    /// Where "Release notes" goes, when there is a release to talk about.
+    pub notes_url: Option<String>,
+}
+
+/// The page of the desktop release `version`.
+pub fn release_notes_url(version: &str) -> String {
+    format!("{RELEASES_URL}/tag/desktop-v{version}")
 }
 
 /// What the banner says for `status`.
 pub fn banner_copy(status: &UpdateStatus) -> BannerCopy {
+    let notes_url = status.newer_version().map(release_notes_url);
     let copy = |headline: String, detail: &str, action| BannerCopy {
         headline,
         detail: detail.to_string(),
         action,
+        notes_url: notes_url.clone(),
     };
     match status {
+        UpdateStatus::Checking => copy("Checking for updates…".to_string(), "", BannerAction::None),
+        UpdateStatus::UpToDate { version } => copy(
+            "FlightDeck is up to date".to_string(),
+            &format!("v{version} is the newest release."),
+            BannerAction::None,
+        ),
+        UpdateStatus::CheckFailed { message } => copy(
+            "Could not check for updates".to_string(),
+            message,
+            BannerAction::CheckAgain,
+        ),
         UpdateStatus::Available { version, kind } => {
             let headline = format!("FlightDeck v{version} is available");
             match kind {
@@ -72,11 +101,11 @@ pub fn banner_copy(status: &UpdateStatus) -> BannerCopy {
                     "Update now downloads and checks it, then asks you to restart.",
                     BannerAction::UpdateNow,
                 ),
-                InstallKind::Managed(manager) => BannerCopy {
+                InstallKind::Managed(manager) => copy(
                     headline,
-                    detail: format!("Update with: {}", manager.update_hint()),
-                    action: BannerAction::None,
-                },
+                    &format!("Update with: {}", manager.update_hint()),
+                    BannerAction::None,
+                ),
                 InstallKind::Unsupported => copy(
                     headline,
                     "Download it from the releases page.",
@@ -109,7 +138,7 @@ pub fn banner_copy(status: &UpdateStatus) -> BannerCopy {
         UpdateStatus::Failed { version, message } => copy(
             format!("Could not update to v{version}"),
             message,
-            BannerAction::None,
+            BannerAction::CheckAgain,
         ),
     }
 }
@@ -133,6 +162,7 @@ pub fn update_banner(
                 headline: format!("FlightDeck v{} is available", update.latest_version),
                 detail: "Update when it suits you; nothing is interrupted.".to_string(),
                 action: BannerAction::None,
+                notes_url: Some(RELEASES_URL.to_string()),
             }
         }
     };
@@ -174,15 +204,26 @@ pub fn update_banner(
                 |_, _, cx| selfupdate::restart(cx),
             ));
         }
+        BannerAction::CheckAgain => {
+            row = row.child(button(
+                "update-check-again",
+                "Check again",
+                ButtonKind::Primary,
+                &p,
+                |_, _, cx| selfupdate::check_for_updates(cx),
+            ));
+        }
         BannerAction::None => {}
     }
-    row = row.child(button(
-        "update-notes",
-        "Release notes",
-        ButtonKind::Secondary,
-        &p,
-        |_, _, cx| cx.open_url(RELEASES_URL),
-    ));
+    if let Some(url) = copy.notes_url {
+        row = row.child(button(
+            "update-notes",
+            "Release notes",
+            ButtonKind::Secondary,
+            &p,
+            move |_, _, cx| cx.open_url(&url),
+        ));
+    }
     if let Some(dismiss) = on_dismiss {
         row = row.child(button(
             "update-dismiss",
@@ -211,15 +252,21 @@ pub struct SkewOffer {
 /// The skew banner's offer for the desktop's update state (`None`: no newer
 /// release known yet, so the releases page is the way to get one). Pure.
 pub fn skew_offer(status: Option<&UpdateStatus>) -> SkewOffer {
+    let nothing_known = SkewOffer {
+        note: None,
+        action: BannerAction::None,
+        releases_label: "Download",
+    };
     let Some(status) = status else {
-        return SkewOffer {
-            note: None,
-            action: BannerAction::None,
-            releases_label: "Download",
-        };
+        return nothing_known;
     };
     let copy = banner_copy(status);
     let note = match status {
+        // Nothing newer than this app is published yet (the worker may run
+        // a CLI release the desktop has not had): the releases page.
+        UpdateStatus::UpToDate { .. } => return nothing_known,
+        UpdateStatus::Checking => Some(copy.headline),
+        UpdateStatus::CheckFailed { .. } => Some(format!("{}: {}", copy.headline, copy.detail)),
         UpdateStatus::Available {
             kind: InstallKind::Direct(_),
             ..
@@ -234,8 +281,8 @@ pub fn skew_offer(status: Option<&UpdateStatus>) -> SkewOffer {
         UpdateStatus::Failed { .. } => Some(format!("{}: {}", copy.headline, copy.detail)),
     };
     let releases_label = match copy.action {
-        BannerAction::None => "Download",
-        _ => "Release notes",
+        BannerAction::None | BannerAction::CheckAgain => "Download",
+        BannerAction::UpdateNow | BannerAction::Restart => "Release notes",
     };
     SkewOffer {
         note,
@@ -273,6 +320,15 @@ pub fn skew_actions(cx: &App) -> Div {
                 |_, _, cx| selfupdate::restart(cx),
             ));
         }
+        BannerAction::CheckAgain => {
+            row = row.child(button(
+                "skew-check-again",
+                "Check again",
+                ButtonKind::Primary,
+                &p,
+                |_, _, cx| selfupdate::check_for_updates(cx),
+            ));
+        }
         BannerAction::None => {}
     }
     row.child(button(
@@ -282,6 +338,71 @@ pub fn skew_actions(cx: &App) -> Div {
         &p,
         |_, _, cx| cx.open_url(RELEASES_URL),
     ))
+}
+
+/// A worker window's "Update worker" (an older worker that can update
+/// itself, protocol v14), or while it updates, a note saying so.
+/// `on_update` sends the request.
+pub fn worker_update_actions(
+    updating: bool,
+    on_update: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Div {
+    let p = *Palette::global(cx);
+    let row = h_flex().flex_none().gap_2().items_center();
+    if updating {
+        return row.child(
+            div()
+                .debug_selector(|| "worker-updating".into())
+                .text_color(p.status_attention.hsla())
+                .child("Updating the worker… it restarts by itself"),
+        );
+    }
+    row.child(button(
+        "update-worker",
+        "Update worker",
+        ButtonKind::Primary,
+        &p,
+        move |_, w, cx| on_update(w, cx),
+    ))
+}
+
+/// The status bar's update pill, while a newer release is known or being
+/// installed: the way back to the banner after it was dismissed. Its words
+/// are [`indicator_label`]'s; a click brings the banner back
+/// ([`selfupdate::reshow`]), where the actions are.
+pub fn update_indicator(cx: &App) -> Option<Stateful<Div>> {
+    let label = indicator_label(selfupdate::status(cx).as_ref()?)?;
+    let p = Palette::global(cx);
+    Some(
+        div()
+            .id("update-indicator")
+            .debug_selector(|| "update-indicator".into())
+            .flex_none()
+            .px_1p5()
+            .rounded_sm()
+            .bg(p.status_attention_bg.hsla())
+            .text_color(p.status_attention.hsla())
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .child(label)
+            .on_click(|_, _, cx| selfupdate::reshow(cx)),
+    )
+}
+
+/// The pill's words for `status`, or `None` when there is nothing to update
+/// to. Pure.
+pub fn indicator_label(status: &UpdateStatus) -> Option<String> {
+    match status {
+        UpdateStatus::Available { version, .. } => Some(format!("Update to v{version}")),
+        UpdateStatus::Installing { .. } => Some("Updating…".to_string()),
+        UpdateStatus::Installed { .. } => Some("Restart to update".to_string()),
+        UpdateStatus::Failed { .. } => Some("Update failed".to_string()),
+        UpdateStatus::Checking
+        | UpdateStatus::UpToDate { .. }
+        | UpdateStatus::CheckFailed { .. } => None,
+    }
 }
 
 /// The permanent `ISOLATED` badge (SPECS §32), or `None` for an ordinary run.
@@ -432,7 +553,7 @@ mod tests {
             version: "2.1.0".into(),
             message: "checksum mismatch".into(),
         }));
-        assert_eq!(failed.action, BannerAction::None);
+        assert_eq!(failed.action, BannerAction::CheckAgain);
         assert_eq!(
             failed.note.as_deref(),
             Some("Could not update to v2.1.0: checksum mismatch")
@@ -467,8 +588,83 @@ mod tests {
             version: "2.0.0".into(),
             message: "the download does not match its checksum".into(),
         });
-        assert_eq!(failed.action, BannerAction::None);
+        assert_eq!(failed.action, BannerAction::CheckAgain);
         assert!(failed.detail.contains("checksum"));
+    }
+
+    /// "Check for Updates…" always answers: checking, up to date (no
+    /// release notes to read), or why it failed with a way to try again.
+    #[test]
+    fn an_asked_for_check_always_answers() {
+        let checking = banner_copy(&UpdateStatus::Checking);
+        assert_eq!(checking.headline, "Checking for updates…");
+        assert_eq!(checking.action, BannerAction::None);
+        assert_eq!(checking.notes_url, None);
+
+        let current = banner_copy(&UpdateStatus::UpToDate {
+            version: "2.2.0".into(),
+        });
+        assert_eq!(current.headline, "FlightDeck is up to date");
+        assert!(current.detail.contains("v2.2.0"), "{}", current.detail);
+        assert_eq!(current.notes_url, None);
+
+        let failed = banner_copy(&UpdateStatus::CheckFailed {
+            message: "could not download the update (timeout)".into(),
+        });
+        assert_eq!(failed.action, BannerAction::CheckAgain);
+        assert!(failed.detail.contains("timeout"));
+
+        // Release notes go to the release found, not the list of all.
+        let found = banner_copy(&available(InstallKind::Unsupported));
+        assert_eq!(
+            found.notes_url.as_deref(),
+            Some("https://github.com/neworange-ruud/flightdeck/releases/tag/desktop-v2.0.0")
+        );
+    }
+
+    /// The status bar pill shows only while there is something to update to.
+    #[test]
+    fn the_pill_shows_while_an_update_is_known() {
+        assert_eq!(
+            indicator_label(&available(InstallKind::Unsupported)).as_deref(),
+            Some("Update to v2.0.0")
+        );
+        let installed = UpdateStatus::Installed {
+            version: "2.0.0".into(),
+            outcome: Outcome::Replaced,
+        };
+        assert_eq!(
+            indicator_label(&installed).as_deref(),
+            Some("Restart to update")
+        );
+        for quiet in [
+            UpdateStatus::Checking,
+            UpdateStatus::UpToDate {
+                version: "2.0.0".into(),
+            },
+            UpdateStatus::CheckFailed {
+                message: "offline".into(),
+            },
+        ] {
+            assert_eq!(indicator_label(&quiet), None, "{quiet:?}");
+        }
+    }
+
+    /// The pill brings a dismissed banner back: it bumps the generation the
+    /// window compares its dismissal with.
+    #[gpui::test]
+    fn the_pill_brings_the_banner_back(cx: &mut TestAppContext) {
+        let cx = mount(cx, move |_, cx| {
+            update_indicator(cx)
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| div().into_any_element())
+        });
+        assert!(cx.debug_bounds("update-indicator").is_none());
+        cx.update(|_, cx| selfupdate::set_status(cx, available(InstallKind::Unsupported)));
+        cx.run_until_parked();
+        let before = cx.update(|_, cx| selfupdate::generation(cx));
+        click(cx, "update-indicator");
+        assert!(cx.update(|_, cx| selfupdate::generation(cx)) > before);
     }
 
     /// The desktop's own status draws the banner even when the host knows of

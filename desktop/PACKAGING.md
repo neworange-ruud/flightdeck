@@ -281,9 +281,15 @@ Files: `desktop/wix/main.wxs`, `[package.metadata.wix]` in `desktop/Cargo.toml`,
 Code: `desktop/src/selfupdate/`, the banner in `desktop/src/overlays/update.rs`.
 The CLI's `flightdeck update` (axoupdater) is unchanged.
 
-**Behaviour.** Once a day (own cache, `desktop-update-check.json` next to the TUI's,
-honouring `[update] check`) the app asks GitHub for the newest `desktop-v*` release and,
-if it is newer, shows the banner (never a modal). What the banner offers depends on how
+**Behaviour.** At launch and every 30 minutes while it runs, the app asks whether a check
+is due. Its own cache (`desktop-update-check.json`, next to the TUI's) keeps the network
+to at most one request every 6 hours, and the check honours `[update] check`. If GitHub's
+newest `desktop-v*` release is newer, the app shows the banner (never a modal).
+**Check for Updates…** (app menu, palette) skips the cache, ignores `[update] check`,
+and always answers in the banner: checking, up to date, the update found, or why the
+check failed, with **Check again**. Dismissing the banner hides it only for the state it
+showed. A newer finding, an asked-for check or the status bar's update pill brings it
+back. What the banner offers depends on how
 the app was installed, detected from where the executable runs:
 
 | Install | Detected by | Banner |

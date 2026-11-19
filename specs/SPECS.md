@@ -1529,6 +1529,16 @@ is governed by these rules:
 - **Notice ≠ update.** It never downloads or replaces anything; acting on it is
   the user's explicit choice (`flightdeck update`, or
   `brew update && brew upgrade flightdeck` for Homebrew installs).
+- **FlightDeck Desktop differs in three ways** (`desktop/PACKAGING.md`). It stays
+  open for days, so it re-evaluates every 30 minutes while it runs, and its cache
+  allows at most one network request every 6 hours. **Check for Updates…** is an
+  explicit request: it skips the cache, ignores `update.check`, and always
+  answers, including "up to date" and why a check failed. Its banner offers
+  **Update now**, which replaces a copy the user installed directly. A copy a
+  package manager owns is never replaced (§29).
+- **A worker is updated from the Desktop** (protocol v14, `specs/WORKER_PRD.md`
+  §9). It happens only when the user clicks **Update worker** in the worker's
+  window. The worker updates itself the way it was installed, then restarts.
 
 ## 31. Container Execution
 

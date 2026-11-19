@@ -179,6 +179,7 @@ pub fn worker_options(home: &str) -> crate::host::worker::WorkerOptions {
             lines: Vec::new(),
             outcome: Ok(()),
         }),
+        updater: Arc::new(crate::host::worker::self_update::NoUpdater),
         // No Tailscale, so no certificate: the browser app is plain HTTP.
         certs: None,
     }

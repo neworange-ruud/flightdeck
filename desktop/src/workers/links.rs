@@ -454,6 +454,9 @@ fn row(link: &Link) -> WorkerRow {
         address: link.saved.address.clone(),
         needs_you: if online { ws.needs_you_count() } else { 0 },
         skew: version.as_deref().is_some_and(|v| v != flightdeck::VERSION),
+        update_available: version.as_deref().is_some_and(|v| {
+            flightdeck::web::client::messages::worker_is_newer(flightdeck::VERSION, v)
+        }),
         version,
         health: health.filter(|_| online),
         unread: worker.map_or(0, |w| w.status.unread_messages),

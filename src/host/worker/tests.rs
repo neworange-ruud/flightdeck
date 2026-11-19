@@ -1865,3 +1865,135 @@ fn a_failed_first_commit_on_a_worker_removes_the_folder_and_says_why() {
     assert!(!fakes.fs.exists(Path::new("/home/me/code/fresh")));
     assert_eq!(host.project_count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Update from the Desktop (W20, v14)
+// ---------------------------------------------------------------------------
+
+/// An updater that answers as told and counts restarts.
+struct FakeUpdater {
+    outcome: std::result::Result<self_update::UpdateOutcome, String>,
+    restart: std::result::Result<(), String>,
+    restarts: std::sync::atomic::AtomicU32,
+}
+
+impl self_update::WorkerUpdater for FakeUpdater {
+    fn update(&self) -> std::result::Result<self_update::UpdateOutcome, String> {
+        self.outcome.clone()
+    }
+    fn restart(&self) -> std::result::Result<(), String> {
+        self.restarts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.restart.clone()
+    }
+}
+
+fn updating_worker<'a>(fakes: &'a Fakes, updater: Arc<FakeUpdater>) -> AppHost<'a> {
+    let mut opts = worker_options("/home/me");
+    opts.updater = updater;
+    testing::worker_host(fakes.env(), &fakes.notifier, Vec::new(), opts)
+}
+
+/// Pump until the update's outcome is in (it runs on a thread of its own).
+fn pump_until_updated(host: &mut AppHost<'_>) {
+    for _ in 0..500 {
+        host.pump_worker(0);
+        if !w(host).update_job.is_running() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the update never finished");
+}
+
+#[test]
+fn an_update_asked_for_is_acked_then_restarts_into_the_new_version() {
+    let fakes = Fakes::new();
+    let updater = Arc::new(FakeUpdater {
+        outcome: Ok(self_update::UpdateOutcome::Updated {
+            version: "9.9.9".into(),
+        }),
+        restart: Ok(()),
+        restarts: Default::default(),
+    });
+    let mut host = updating_worker(&fakes, Arc::clone(&updater));
+    let out = host.route_inbound(worker_op(1, worker_command::UPDATE_WORKER));
+    let ack = first_ack(&out);
+    assert_eq!(ack.outcome, AckOutcome::Applied);
+    assert!(ack.detail.as_deref().unwrap_or("").contains("Updating"));
+    // A second ask while the first runs is refused in words.
+    let again = host.route_inbound(worker_op(2, worker_command::UPDATE_WORKER));
+    if w(&host).update_job.is_running() {
+        assert_eq!(first_ack(&again).outcome, AckOutcome::Rejected);
+    }
+    pump_until_updated(&mut host);
+    assert_eq!(
+        updater.restarts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(w(&host).shutdown_restarting, "windows are told it restarts");
+    let unread = w(&host).messages.unread();
+    assert!(
+        unread.iter().any(|m| m.text.contains("9.9.9")),
+        "{unread:?}"
+    );
+}
+
+#[test]
+fn a_failed_or_needless_update_says_so_and_does_not_restart() {
+    for (outcome, says, level) in [
+        (
+            Err("no network".to_string()),
+            "no network",
+            MessageLevel::Error,
+        ),
+        (
+            Ok(self_update::UpdateOutcome::UpToDate),
+            "already runs the newest",
+            MessageLevel::Info,
+        ),
+    ] {
+        let fakes = Fakes::new();
+        let updater = Arc::new(FakeUpdater {
+            outcome,
+            restart: Ok(()),
+            restarts: Default::default(),
+        });
+        let mut host = updating_worker(&fakes, Arc::clone(&updater));
+        host.route_inbound(worker_op(1, worker_command::UPDATE_WORKER));
+        pump_until_updated(&mut host);
+        assert_eq!(
+            updater.restarts.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!w(&host).shutdown_restarting);
+        let unread = w(&host).messages.unread();
+        let message = unread.last().expect("a message");
+        assert!(message.text.contains(says), "{}", message.text);
+        assert_eq!(message.level, level);
+    }
+}
+
+#[test]
+fn an_update_that_cannot_restart_says_how_to_finish_it() {
+    let fakes = Fakes::new();
+    let updater = Arc::new(FakeUpdater {
+        outcome: Ok(self_update::UpdateOutcome::Updated {
+            version: "9.9.9".into(),
+        }),
+        restart: Err("no exe".to_string()),
+        restarts: Default::default(),
+    });
+    let mut host = updating_worker(&fakes, updater);
+    host.route_inbound(worker_op(1, worker_command::UPDATE_WORKER));
+    pump_until_updated(&mut host);
+    assert!(!w(&host).shutdown_restarting);
+    let unread = w(&host).messages.unread();
+    let last = unread.last().unwrap();
+    assert_eq!(last.level, MessageLevel::Error);
+    assert!(
+        last.text.contains("flightdeck worker restart"),
+        "{}",
+        last.text
+    );
+}

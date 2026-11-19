@@ -244,8 +244,24 @@ The restart makes the worker and its supervisor run the new binary. Until then,
 and the Desktop shows a **version differs** badge in the launcher and a banner in
 the worker window: "This worker runs FlightDeck `<worker>`; this app was built with
 `<app>`. Update it from the worker shell: `flightdeck update`, then
-`flightdeck worker restart`." Updating the worker from the Desktop is not
-available in this version.
+`flightdeck worker restart`."
+
+From FlightDeck Desktop 2.3 on, the worker window offers **Update worker**
+instead. It does the same two steps on the worker:
+
+1. It updates FlightDeck the way it was installed: `brew update` and `brew
+   upgrade flightdeck` for a Homebrew install, the installer's own update
+   otherwise.
+2. It restarts the worker, which resumes its agents. The window reconnects by
+   itself.
+
+A copy installed some other way (for example `cargo install`) is not updated.
+The worker says why in a message. Under systemd the restart runs as a transient
+unit of its own (`systemd-run --user`), so stopping the worker's unit doesn't
+cut it off.
+
+A worker older than 2.3 doesn't understand the request. Update that one by hand,
+once, with the two commands above. The window says so too.
 
 When the worker is the newer side, the banner says to update FlightDeck Desktop
 instead and offers it: **Update now** where the app can replace itself, the

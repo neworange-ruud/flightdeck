@@ -45,6 +45,9 @@ pub struct WorkerRow {
     pub version: Option<String>,
     /// The version differs from the core this app was built with.
     pub skew: bool,
+    /// The worker runs an older FlightDeck than this app: its window offers
+    /// "Update worker", so the badge says an update is available.
+    pub update_available: bool,
     /// The latest health sample, while online.
     pub health: Option<Health>,
     /// Host messages no window has seen yet.
@@ -171,7 +174,12 @@ fn worker_row(index: usize, row: &WorkerRow, p: &Palette, now: u64) -> impl Into
             .child(v)
     });
     let skew = row.skew.then(|| {
-        icons::pill("version differs", p.status_attention, p)
+        let word = if row.update_available {
+            "update available"
+        } else {
+            "version differs"
+        };
+        icons::pill(word, p.status_attention, p)
             .debug_selector(move || format!("worker-{index}-skew"))
     });
     let address = row.address.clone();
@@ -248,6 +256,7 @@ mod tests {
             needs_you: 0,
             version: None,
             skew: false,
+            update_available: false,
             health: Some(health()),
             unread: 0,
         }

@@ -10,19 +10,22 @@
 //!
 //! ## What is not in the table
 //!
-//! A handful of items are the desktop's own, not chords: About, Settings…,
+//! A handful of items are the desktop's own, not chords: About, Check for
+//! Updates…, Settings…,
 //! New window, Open project…, New project…, Connect to remote… and the
 //! GitHub link ([`AppCommand`]). Each is a small
 //! action whose handler asks the host for the same thing the palette row
 //! does (`PaletteAction::OpenConfig`, the native folder picker answering
 //! `HostEvent::OpenProject`, the native save dialog answering
 //! `HostEvent::CreateProject`), or acts on its own: About opens its own
-//! window (`crate::about_window`), with or without a project open.
+//! window (`crate::about_window`), with or without a project open, and Check
+//! for Updates… asks GitHub now and answers in the update banner
+//! (`flightdeck_desktop::selfupdate::check_for_updates`).
 //!
 //! ## Layout
 //!
 //! ```text
-//! FlightDeck  About · Settings… ⌘, · Services · Quit ⌘Q
+//! FlightDeck  About · Check for Updates… · Settings… ⌘, · Services · Quit ⌘Q
 //! File        New window ⌘N · New agent · New shell · Open project… ⌘O · New project… ⇧⌘N · Connect to remote… · Close session · Close shell · Open worktree
 //! View        Toggle split · Command palette · Projects / Agent sessions / Terminals ▸ · Focus
 //! Git         Push · Pull base · Finish
@@ -67,6 +70,7 @@ actions!(
     flightdeck,
     [
         About,
+        CheckForUpdates,
         OpenSettings,
         OpenProjectFolder,
         NewProjectFolder,
@@ -83,6 +87,8 @@ pub const GITHUB_URL: &str = "https://github.com/neworange-ruud/flightdeck";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppCommand {
     About,
+    /// Ask GitHub for a newer desktop release now, and say what it answered.
+    CheckForUpdates,
     Settings,
     OpenProject,
     /// A brand-new project: a new folder, `git init`, opened (SPECS §5.3).
@@ -99,6 +105,7 @@ impl AppCommand {
     fn label(self) -> &'static str {
         match self {
             AppCommand::About => "About FlightDeck",
+            AppCommand::CheckForUpdates => "Check for Updates…",
             AppCommand::Settings => "Settings…",
             AppCommand::OpenProject => "Open project…",
             AppCommand::NewProject => "New project…",
@@ -115,6 +122,7 @@ impl AppCommand {
             // A window of its own (`about_window`): it works with no project
             // open and from a worker window, where no local host is running.
             AppCommand::About
+            | AppCommand::CheckForUpdates
             | AppCommand::OpenProject
             | AppCommand::NewProject
             | AppCommand::NewWindow
@@ -126,6 +134,7 @@ impl AppCommand {
     fn action(self) -> Box<dyn Action> {
         match self {
             AppCommand::About => Box::new(About),
+            AppCommand::CheckForUpdates => Box::new(CheckForUpdates),
             AppCommand::Settings => Box::new(OpenSettings),
             AppCommand::OpenProject => Box::new(OpenProjectFolder),
             AppCommand::NewProject => Box::new(NewProjectFolder),
@@ -144,6 +153,7 @@ impl AppCommand {
         match action {
             FrontEndAction::ConnectToRemote => Some(AppCommand::ConnectRemote),
             FrontEndAction::NewWindow => Some(AppCommand::NewWindow),
+            FrontEndAction::CheckForUpdates => Some(AppCommand::CheckForUpdates),
             FrontEndAction::OpenInVsCode
             | FrontEndAction::RenameRemote
             | FrontEndAction::UploadFiles
@@ -181,6 +191,7 @@ impl AppCommand {
             AppCommand::ConnectRemote => crate::remote::connect::open_connect_window(None, cx),
             AppCommand::GitHub => cx.open_url(GITHUB_URL),
             AppCommand::About => crate::about_window::open(cx),
+            AppCommand::CheckForUpdates => flightdeck_desktop::selfupdate::check_for_updates(cx),
             other => {
                 if let Some(event) = other.host_event() {
                     crate::root::dispatch(event, cx);
@@ -252,6 +263,7 @@ const LAYOUT: &[(&str, &[Slot])] = &[
         "FlightDeck",
         &[
             AppSlot(AppCommand::About),
+            AppSlot(AppCommand::CheckForUpdates),
             Sep,
             AppSlot(AppCommand::Settings),
             Sep,
@@ -482,6 +494,7 @@ pub fn install(cx: &mut App, keymap: &'static Keymap, isolated: bool) {
 /// launcher up and no window focused on a project.
 pub fn register_actions(cx: &mut App) {
     cx.on_action(|_: &About, cx| AppCommand::About.perform(cx));
+    cx.on_action(|_: &CheckForUpdates, cx| AppCommand::CheckForUpdates.perform(cx));
     cx.on_action(|_: &OpenSettings, cx| AppCommand::Settings.perform(cx));
     cx.on_action(|_: &OpenProjectFolder, cx| AppCommand::OpenProject.perform(cx));
     cx.on_action(|_: &NewProjectFolder, cx| AppCommand::NewProject.perform(cx));
@@ -577,6 +590,7 @@ mod tests {
         );
         for target in [
             Target::App(AppCommand::About),
+            Target::App(AppCommand::CheckForUpdates),
             Target::App(AppCommand::Settings),
             Target::Entry("Quit"),
             Target::Entry("NewAgentTab"),
@@ -658,6 +672,10 @@ mod tests {
         assert_eq!(
             AppCommand::for_front_end(FrontEndAction::NewWindow),
             Some(AppCommand::NewWindow)
+        );
+        assert_eq!(
+            AppCommand::for_front_end(FrontEndAction::CheckForUpdates),
+            Some(AppCommand::CheckForUpdates)
         );
         assert_eq!(
             AppCommand::for_front_end(FrontEndAction::OpenInVsCode),

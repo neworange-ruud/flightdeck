@@ -4324,6 +4324,15 @@ async fn handle_worker_op(
                     "Creating a project needs a newer FlightDeck on this side: update it, then try again.",
                 ))
             }
+            // Only a v14 window offers "Update worker".
+            (Ok(WorkerOp::UpdateWorker), _)
+                if version < crate::web::protocol::WORKER_UPDATE_MIN_VERSION =>
+            {
+                Some(WireError::new(
+                    ErrorCode::NotSupported,
+                    "Updating a worker needs a newer FlightDeck on this side: update it, then try again.",
+                ))
+            }
             // A tool call reaches a v13 window only, so an older one has
             // nothing to answer.
             (Ok(WorkerOp::BrowserToolResult { .. }), _)

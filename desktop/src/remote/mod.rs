@@ -164,6 +164,11 @@ pub struct RemoteModel {
     pick_files: bool,
     /// The project picker is open to choose the upload panel's folder.
     choosing_upload_dir: bool,
+    /// "Update worker" was sent while the worker ran this version and its
+    /// newest message had this id: the update runs until a newer message
+    /// (its outcome) arrives, the link ends (the restart), or the worker
+    /// comes back on another version.
+    updating_worker_after: Option<(String, u64)>,
     /// The session browsers (`specs/SESSION_BROWSER_PRD.md`): which tabs
     /// exist and which is on screen. The web views are the window's.
     browsers: crate::browser::tabs::Browsers,
@@ -205,6 +210,7 @@ impl RemoteModel {
             rename_error: None,
             pick_files: false,
             choosing_upload_dir: false,
+            updating_worker_after: None,
             browsers: crate::browser::tabs::Browsers::default(),
             keyed_as: None,
             abandoned: Vec::new(),
@@ -456,6 +462,59 @@ impl RemoteModel {
     pub fn skew_wants_app_update(&self) -> bool {
         let ws = self.workspace();
         ws.is_worker() && messages::app_is_older(&ws.host_version, flightdeck::VERSION)
+    }
+
+    /// The banner's offer to update the worker, when it runs an older
+    /// FlightDeck than this app or its own check found a newer one.
+    pub fn worker_update_offer(&self) -> Option<messages::WorkerUpdateOffer> {
+        let ws = self.workspace();
+        if !ws.is_worker() {
+            return None;
+        }
+        messages::worker_update_offer(
+            &ws.host_version,
+            flightdeck::VERSION,
+            ws.update.as_ref().map(|u| u.latest_version.as_str()),
+            self.session.supports_worker_update(),
+        )
+    }
+
+    /// The newest host message's id, 0 when there is none.
+    fn last_message_id(&self) -> u64 {
+        self.workspace()
+            .worker
+            .as_ref()
+            .and_then(|w| w.messages.back())
+            .map_or(0, |m| m.id)
+    }
+
+    /// "Update worker": ask the worker to update and restart itself.
+    pub fn update_worker(&mut self) {
+        let after = (
+            self.workspace().host_version.clone(),
+            self.last_message_id(),
+        );
+        if self.session.update_worker() {
+            self.updating_worker_after = Some(after);
+        }
+    }
+
+    /// [`RemoteModel::update_worker`], then redraw (the button's handler).
+    pub fn update_worker_now(&mut self, cx: &mut Context<Self>) {
+        self.update_worker();
+        cx.notify();
+    }
+
+    /// Whether an update this window asked for is still running: no outcome
+    /// has arrived and the link is still up.
+    pub fn updating_worker(&self) -> bool {
+        self.updating_worker_after
+            .as_ref()
+            .is_some_and(|(version, after)| {
+                self.ended().is_none()
+                    && self.workspace().host_version == *version
+                    && self.last_message_id() <= *after
+            })
     }
 
     /// The project picker, while it is open.

@@ -99,8 +99,9 @@ pub struct FlightDeckWindow {
     mission: Entity<MissionControl>,
     /// Draws the host's overlay and answers it through `emit`.
     layer: Entity<OverlayLayer>,
-    /// The update banner was dismissed for this session.
-    update_dismissed: bool,
+    /// The update banner was dismissed while this update generation
+    /// (`selfupdate::generation`) was shown; a later one shows it again.
+    update_dismissed: Option<u64>,
     /// Split view's read-only panes (every terminal but the active one).
     panes: Panes,
     /// The window's activation and visibility, watched for the spinner
@@ -135,7 +136,7 @@ impl FlightDeckWindow {
             app_focus,
             mission,
             layer,
-            update_dismissed: false,
+            update_dismissed: None,
             panes: Panes::default(),
             window_watch: Vec::new(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -387,13 +388,16 @@ impl Render for FlightDeckWindow {
         let notices = host.notices();
         let view = host.workspace_ui().view;
         let split = SplitLayout::read(host);
-        let banner = if self.update_dismissed {
+        // Dismissed for the update state it showed: a newer finding, an
+        // asked-for check or the status bar's pill brings it back.
+        let generation = flightdeck_desktop::selfupdate::generation(cx);
+        let banner = if self.update_dismissed == Some(generation) {
             None
         } else {
             let this = cx.entity().downgrade();
             let dismiss: OnDismiss = Rc::new(move |_, cx| {
                 let _ = this.update(cx, |view, cx| {
-                    view.update_dismissed = true;
+                    view.update_dismissed = Some(generation);
                     cx.notify();
                 });
             });

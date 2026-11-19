@@ -14,15 +14,19 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
-- None yet.
+- **Check for Updates….** It is in the FlightDeck menu on macOS and in the command palette (**Check for Updates**) on every OS. It asks GitHub right away and always answers in the update banner: checking, up to date, the update it found (with **Update now**), or why it could not check (with **Check again**). It works even with `[update] check = false`.
+- **Update a worker with one click.** When a worker runs an older FlightDeck than the app (or its own check found a newer release), its window's banner says so and offers **Update worker**. The worker updates FlightDeck (Homebrew or the installer, however it was installed), restarts, resumes its agents, and the window reconnects. A worker that can't update says why. A worker older than this release is told how to update by hand, once. In the Workers list, an older worker's badge now says **update available**.
 
 ### Improvements
 
-- None yet.
+- **The app notices a new release without a restart.** Before, it checked only at launch, so an app left open for days never offered the update. It now re-evaluates every 30 minutes and asks GitHub at most every 6 hours.
+- **A dismissed update banner is no longer gone for good.** It comes back when a newer release appears. While an update is known, the status bar shows an **Update to v…** pill; click it to bring the banner back.
+- **Worker windows show the app's update banner**, so you see the update even if you only work in worker windows.
+- **Release notes** in the banner open the new version's release page instead of the list of all releases.
 
 ### Bug fixes
 
-- None yet.
+- **Linux workers no longer get a `~/Library` folder** from the update check's cache (see the core changelog).
 
 ## [2.2.0] - 2026-11-19
 

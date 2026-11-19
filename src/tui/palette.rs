@@ -110,6 +110,9 @@ pub enum FrontEndAction {
     /// Start another instance of the app, opened on its launcher, so one can
     /// run local projects while another controls a remote.
     NewWindow,
+    /// Ask for a newer release of the desktop app now and say what was found
+    /// (the update banner). The TUI has `flightdeck update` instead.
+    CheckForUpdates,
     /// Open the selected session's folder in VS Code on this machine — over
     /// SSH when the session is on a remote host ([`crate::host::vscode`]).
     OpenInVsCode,
@@ -383,6 +386,11 @@ const FRONT_END_ENTRIES: &[PaletteEntry] = &[
         group: "Global",
         label: "New Window",
         action: PaletteAction::FrontEnd(FrontEndAction::NewWindow),
+    },
+    PaletteEntry {
+        group: "Global",
+        label: "Check for Updates",
+        action: PaletteAction::FrontEnd(FrontEndAction::CheckForUpdates),
     },
     PaletteEntry {
         group: "Worktree",
@@ -810,7 +818,8 @@ mod tests {
                 "Open Worktree in VS Code",
                 "New Browser",
                 "Connect to Remote",
-                "New Window"
+                "New Window",
+                "Check for Updates"
             ]
         );
         assert_eq!(

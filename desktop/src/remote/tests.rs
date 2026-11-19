@@ -2052,6 +2052,45 @@ mod worker {
         assert_eq!(sent[0].2.as_ref().unwrap()["name"], "web");
     }
 
+    /// A worker older than this app gets "Update worker" in its banner;
+    /// one click sends `update_worker`, and the banner says it is underway.
+    #[gpui::test]
+    fn an_older_worker_is_updated_with_one_click(app: &mut TestAppContext) {
+        let mut snapshot = empty_worker();
+        snapshot.host_version = "0.0.1".to_string();
+        let (model, mut script, _window, cx) = open_on(app, snapshot);
+        script.sent();
+        assert!(cx.debug_bounds("update-worker").is_some());
+        click(cx, "update-worker");
+        let sent = sent_commands(&mut script);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, "update_worker");
+        assert!(model.read_with(cx, |m, _| m.updating_worker()));
+        assert!(cx.debug_bounds("worker-updating").is_some());
+        assert!(
+            cx.debug_bounds("update-worker").is_none(),
+            "no second click"
+        );
+    }
+
+    /// A worker that predates v14 cannot take the command: the banner says
+    /// how to update it by hand, with no button that would do nothing.
+    #[gpui::test]
+    fn a_worker_older_than_v14_is_told_how_to_update_by_hand(app: &mut TestAppContext) {
+        let mut snapshot = empty_worker();
+        snapshot.host_version = "0.0.1".to_string();
+        snapshot.protocol_version = 13;
+        let (model, _script, _window, cx) = open_on(app, snapshot);
+        assert!(cx.debug_bounds("update-worker").is_none());
+        let offer = model.read_with(cx, |m, _| m.worker_update_offer()).unwrap();
+        assert!(!offer.can_update);
+        assert!(
+            offer.text.contains("flightdeck worker restart"),
+            "{}",
+            offer.text
+        );
+    }
+
     #[gpui::test]
     fn a_worker_older_than_v12_has_no_new_project_section(app: &mut TestAppContext) {
         let mut snapshot = empty_worker();

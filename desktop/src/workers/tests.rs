@@ -306,6 +306,7 @@ fn rows_reflect_a_scripted_worker_snapshot(app: &mut TestAppContext) {
             needs_you: 2,
             version: Some(flightdeck::VERSION.to_string()),
             skew: false,
+            update_available: false,
             health: Some(health(flightdeck::VERSION)),
             unread: 2,
         }]
@@ -376,6 +377,10 @@ fn a_never_reached_worker_is_offline_since_its_saved_time(app: &mut TestAppConte
     );
     assert_eq!(row.version.as_deref(), Some("0.0.1"), "the saved version");
     assert!(row.skew);
+    assert!(
+        row.update_available,
+        "older than this app: its window offers the update"
+    );
 }
 
 #[gpui::test]
