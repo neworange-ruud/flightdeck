@@ -44,6 +44,6 @@ pub mod state;
 pub use apply::Outcome;
 pub use kind::{InstallKind, PackageManager};
 pub use state::{
-    begin_install, finish_staged_update_at_launch, restart, set_status, start_check, status,
-    UpdateStatus,
+    begin_install, check_now, finish_staged_update_at_launch, restart, set_status, start_check,
+    status, wants_check, UpdateStatus,
 };

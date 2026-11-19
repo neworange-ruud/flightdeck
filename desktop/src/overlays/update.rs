@@ -195,6 +195,95 @@ pub fn update_banner(
     Some(row)
 }
 
+/// What the version-skew banner of a worker window offers when the worker
+/// runs a newer FlightDeck than this app. The full update banner lives in
+/// the main window only, so the skew banner carries the same actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkewOffer {
+    /// A few words on where the update stands, when there is anything to say.
+    pub note: Option<String>,
+    /// "Update now", "Restart", or nothing.
+    pub action: BannerAction,
+    /// The label of the button that opens the releases page.
+    pub releases_label: &'static str,
+}
+
+/// The skew banner's offer for the desktop's update state (`None`: no newer
+/// release known yet, so the releases page is the way to get one). Pure.
+pub fn skew_offer(status: Option<&UpdateStatus>) -> SkewOffer {
+    let Some(status) = status else {
+        return SkewOffer {
+            note: None,
+            action: BannerAction::None,
+            releases_label: "Download",
+        };
+    };
+    let copy = banner_copy(status);
+    let note = match status {
+        UpdateStatus::Available {
+            kind: InstallKind::Direct(_),
+            ..
+        } => None,
+        UpdateStatus::Available {
+            kind: InstallKind::Managed(_),
+            ..
+        } => Some(copy.detail),
+        UpdateStatus::Available { .. }
+        | UpdateStatus::Installing { .. }
+        | UpdateStatus::Installed { .. } => Some(copy.headline),
+        UpdateStatus::Failed { .. } => Some(format!("{}: {}", copy.headline, copy.detail)),
+    };
+    let releases_label = match copy.action {
+        BannerAction::None => "Download",
+        _ => "Release notes",
+    };
+    SkewOffer {
+        note,
+        action: copy.action,
+        releases_label,
+    }
+}
+
+/// The version-skew banner's actions: [`skew_offer`] for the current update
+/// state, as a row of a note and buttons.
+pub fn skew_actions(cx: &App) -> Div {
+    let offer = skew_offer(selfupdate::status(cx).as_ref());
+    let p = *Palette::global(cx);
+    let mut row = h_flex().flex_none().gap_2().items_center().children(
+        offer
+            .note
+            .map(|note| div().text_color(p.status_attention.hsla()).child(note)),
+    );
+    match offer.action {
+        BannerAction::UpdateNow => {
+            row = row.child(button(
+                "skew-update-now",
+                "Update now",
+                ButtonKind::Primary,
+                &p,
+                |_, _, cx| selfupdate::begin_install(cx),
+            ));
+        }
+        BannerAction::Restart => {
+            row = row.child(button(
+                "skew-update-restart",
+                "Restart",
+                ButtonKind::Primary,
+                &p,
+                |_, _, cx| selfupdate::restart(cx),
+            ));
+        }
+        BannerAction::None => {}
+    }
+    row.child(button(
+        "skew-releases",
+        offer.releases_label,
+        ButtonKind::Secondary,
+        &p,
+        |_, _, cx| cx.open_url(RELEASES_URL),
+    ))
+}
+
 /// The permanent `ISOLATED` badge (SPECS §32), or `None` for an ordinary run.
 pub fn isolated_badge(notices: &HostNotices, cx: &App) -> Option<Div> {
     if !notices.isolated {
@@ -295,6 +384,60 @@ mod tests {
         let other = banner_copy(&available(InstallKind::Unsupported));
         assert_eq!(other.action, BannerAction::None);
         assert!(other.detail.contains("releases page"));
+    }
+
+    /// A worker newer than the app: its banner always offers a way to the
+    /// new release, "Update now" where the app may replace itself.
+    #[test]
+    fn the_skew_banner_always_offers_a_way_to_update() {
+        use crate::selfupdate::kind::{DirectKind, PackageManager};
+
+        let unknown = skew_offer(None);
+        assert_eq!(unknown.action, BannerAction::None);
+        assert_eq!(unknown.note, None);
+        assert_eq!(unknown.releases_label, "Download");
+
+        let direct = skew_offer(Some(&available(InstallKind::Direct(
+            DirectKind::MacBundle {
+                bundle: "/Applications/FlightDeck.app".into(),
+            },
+        ))));
+        assert_eq!(direct.action, BannerAction::UpdateNow);
+        assert_eq!(direct.note, None, "the button says it");
+        assert_eq!(direct.releases_label, "Release notes");
+
+        let managed = skew_offer(Some(&available(InstallKind::Managed(
+            PackageManager::Homebrew,
+        ))));
+        assert_eq!(managed.action, BannerAction::None);
+        assert!(managed.note.unwrap().contains("brew upgrade"));
+        assert_eq!(managed.releases_label, "Download");
+
+        let installing = skew_offer(Some(&UpdateStatus::Installing {
+            version: "2.1.0".into(),
+        }));
+        assert_eq!(installing.action, BannerAction::None);
+        assert_eq!(
+            installing.note.as_deref(),
+            Some("Updating FlightDeck to v2.1.0")
+        );
+
+        let installed = skew_offer(Some(&UpdateStatus::Installed {
+            version: "2.1.0".into(),
+            outcome: Outcome::Replaced,
+        }));
+        assert_eq!(installed.action, BannerAction::Restart);
+
+        let failed = skew_offer(Some(&UpdateStatus::Failed {
+            version: "2.1.0".into(),
+            message: "checksum mismatch".into(),
+        }));
+        assert_eq!(failed.action, BannerAction::None);
+        assert_eq!(
+            failed.note.as_deref(),
+            Some("Could not update to v2.1.0: checksum mismatch")
+        );
+        assert_eq!(failed.releases_label, "Download");
     }
 
     #[test]

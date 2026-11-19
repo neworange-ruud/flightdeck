@@ -451,6 +451,13 @@ impl RemoteModel {
         messages::skew_warning(&ws.host_version, flightdeck::VERSION)
     }
 
+    /// Whether the version-skew banner tells the user to update this app
+    /// (the worker runs a newer FlightDeck), so it offers the update.
+    pub fn skew_wants_app_update(&self) -> bool {
+        let ws = self.workspace();
+        ws.is_worker() && messages::app_is_older(&ws.host_version, flightdeck::VERSION)
+    }
+
     /// The project picker, while it is open.
     pub fn picker(&self) -> Option<&ProjectPicker> {
         self.session.picker()

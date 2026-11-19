@@ -244,8 +244,13 @@ The restart makes the worker and its supervisor run the new binary. Until then,
 and the Desktop shows a **version differs** badge in the launcher and a banner in
 the worker window: "This worker runs FlightDeck `<worker>`; this app was built with
 `<app>`. Update it from the worker shell: `flightdeck update`, then
-`flightdeck worker restart`." Updating from the Desktop is not available
-in this version. Start on boot doesn't need setting up again after an update:
+`flightdeck worker restart`." Updating the worker from the Desktop is not
+available in this version.
+
+When the worker is the newer side, the banner says to update FlightDeck Desktop
+instead and offers it: **Update now** where the app can replace itself, the
+`brew` command for a Homebrew install, or a **Download** link to the releases
+page. Start on boot doesn't need setting up again after an update:
 Homebrew and the installer both keep the binary's path.
 
 ### The terminal UI on a worker machine

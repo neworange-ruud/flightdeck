@@ -70,13 +70,24 @@ fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// Whether the worker's FlightDeck (`host`) is newer than the front-end's
+/// (`app`), so the front-end is the side to update. `false` when either
+/// version does not parse.
+pub fn worker_is_newer(host: &str, app: &str) -> bool {
+    matches!(
+        (parse_version(host), parse_version(app)),
+        (Some(host), Some(app)) if host > app
+    )
+}
+
 /// What to update, given the worker's version (`host`) and the front-end's
 /// (`app`): the front-end when the worker is newer, else the worker. A
 /// version that does not parse keeps the worker advice.
 fn which(host: &str, app: &str, advice: &Advice) -> &'static str {
-    match (parse_version(host), parse_version(app)) {
-        (Some(host), Some(app)) if host > app => advice.update_self,
-        _ => WORKER_UPDATE_ADVICE,
+    if worker_is_newer(host, app) {
+        advice.update_self
+    } else {
+        WORKER_UPDATE_ADVICE
     }
 }
 
