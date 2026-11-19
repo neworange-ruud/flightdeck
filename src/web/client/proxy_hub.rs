@@ -281,12 +281,13 @@ async fn serve(stream: TcpStream, hub: &HubInner) {
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
         }
         Err(refusal) => {
-            let _ = reply(&mut client, 502, "Bad Gateway", &refusal.message, "").await;
+            // The event first: whoever has seen the 502 can also see why.
             lock(&route.events).push(RelayEvent::Refused {
                 target,
                 reason: refusal.reason,
-                message: refusal.message,
+                message: refusal.message.clone(),
             });
+            let _ = reply(&mut client, 502, "Bad Gateway", &refusal.message, "").await;
         }
     }
 }
