@@ -77,7 +77,10 @@ to an existing tag) runs `check`, then `build-release` on macOS arm64 (`macos-la
 macOS x86_64 (`macos-15-intel`), Ubuntu x86_64 and Windows x86_64, then `publish`:
 
 1. `build-release` fails unless the tag equals `desktop-v` + the `desktop/Cargo.toml`
-   version. It runs the packaging scripts, then
+   version and the root `flightdeck` core version matches it. The Desktop's About
+   screen shows its package version, while its worker skew warning compares the
+   embedded core version. The release script and workflow both enforce alignment.
+   It runs the packaging scripts, then
    `scripts/desktop/check-asset-names.sh --os <os> --version <v>`, then uploads the files.
 2. `publish` (the only job with `contents: write`) downloads all artifacts, creates the
    GitHub Release for the tag if it does not exist and uploads everything with
