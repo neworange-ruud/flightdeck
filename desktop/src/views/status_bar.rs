@@ -2,7 +2,9 @@
 //! for that mode. Right: the isolated badge, the remote indicators (web
 //! viewers, phone, the input-lock holder — `overlays::remote`'s), and help.
 //! The update notice is the banner above the main area
-//! (`overlays::update::update_banner`), not a status-bar item.
+//! (`overlays::update::update_banner`); while a newer release is known the
+//! right side also carries the update pill (`update_indicator`), the way
+//! back to a dismissed banner.
 //!
 //! Pill and hints come from [`flightdeck::view::ModeBarView`] (the TUI's
 //! status bar model); each hint's keycap and click come from the keymap entry
@@ -12,7 +14,7 @@ use flightdeck::app::modes::InputMode;
 use flightdeck::host::{HostNotices, RemoteStatus};
 use flightdeck::view::{HintAction, HintView, ModeBarView};
 use flightdeck_desktop::overlays::remote::remote_indicator;
-use flightdeck_desktop::overlays::update::isolated_badge;
+use flightdeck_desktop::overlays::update::{isolated_badge, update_indicator};
 use gpui::{
     div, px, App, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
     StatefulInteractiveElement, Styled,
@@ -78,6 +80,7 @@ pub fn status_bar(
         .child(pill)
         .children(hints.into_iter().map(|h| hint(h, host, p)))
         .child(div().flex_1())
+        .children(update_indicator(cx))
         .children(isolated_badge(notices, cx))
         .child(remote_indicator(remote, cx))
         .children(help.into_iter().map(|h| hint(h, host, p)))

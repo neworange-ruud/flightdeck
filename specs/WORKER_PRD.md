@@ -236,7 +236,8 @@ Linux and macOS only; on Windows they exit with a clear "not supported" error.
 - **Version skew**: a protocol mismatch already fails with `version_mismatch`; the
   Desktop also shows a soft warning when the worker's FlightDeck version differs from
   the core version the Desktop was built with. The fix in v1 is `flightdeck update`
-  then `flightdeck worker restart` in the worker shell.
+  then `flightdeck worker restart` in the worker shell. From v14, an older worker's
+  banner offers **Update worker** instead (§9).
 
 ### 4.6 Observability (W29)
 
@@ -332,6 +333,10 @@ releases must both ship v7.
 ## 9. After v1
 
 - Update from the Desktop (W20): one click, self-update, supervisor restart, agents resume.
+  *Done as protocol v14's `update_worker` (remote-control-qlyd.22). The worker updates
+  itself the way it was installed (Homebrew or the installer's receipt), then hands
+  `worker restart` to a detached process (a transient systemd unit under systemd),
+  which resumes the agents. A pre-v14 worker is updated by hand once.*
 - Phone pushes from a worker through the push-only relay. *Done, with the
   whole phone link, as `[worker] phone` (remote-control-qlyd.28).*
 - Start on boot (`worker enable` writing a systemd user unit / launchd agent).

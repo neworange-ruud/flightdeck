@@ -35,6 +35,57 @@ pub fn app_is_older(host: &str, app: &str) -> bool {
     core::worker_is_newer(host, app)
 }
 
+/// "Update worker" in a worker window's banner: what it says, and whether
+/// the button is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerUpdateOffer {
+    /// The banner's sentence.
+    pub text: String,
+    /// The worker understands `update_worker` (protocol v14), so the banner
+    /// offers the one-click update; else `text` says how to do it by hand.
+    pub can_update: bool,
+}
+
+/// Whether to offer updating the worker, which runs FlightDeck `host`: when
+/// this app's core (`app`) is newer, or the worker's own check found a newer
+/// release (`found`). `supported`: the worker can update itself from here.
+/// `None` when the worker is current (or newer: the app is then the side to
+/// update, which the skew banner offers). Pure.
+pub fn worker_update_offer(
+    host: &str,
+    app: &str,
+    found: Option<&str>,
+    supported: bool,
+) -> Option<WorkerUpdateOffer> {
+    let newer = |v: &str| core::worker_is_newer(v, host);
+    let target = [Some(app), found]
+        .into_iter()
+        .flatten()
+        .filter(|v| newer(v))
+        .max_by(|a, b| {
+            if core::worker_is_newer(a, b) {
+                std::cmp::Ordering::Greater
+            } else if core::worker_is_newer(b, a) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })?;
+    let text = if supported {
+        format!("This worker runs FlightDeck {host}; {target} is available.")
+    } else {
+        format!(
+            "This worker runs FlightDeck {host}; {target} is available. Its version cannot \
+             be updated from here: in the worker shell run `flightdeck update`, then \
+             `flightdeck worker restart`. Later updates are one click."
+        )
+    };
+    Some(WorkerUpdateOffer {
+        text,
+        can_update: supported,
+    })
+}
+
 /// What a worker link that ended on a protocol mismatch says: the link's own
 /// reason, then the same advice as the banner.
 pub fn mismatch_advice(reason: &str, host: &str, app: &str) -> String {
@@ -44,6 +95,41 @@ pub fn mismatch_advice(reason: &str, host: &str, app: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_worker_is_offered_the_update() {
+        let offer = worker_update_offer("2.2.0", "2.3.0", None, true).unwrap();
+        assert!(offer.can_update);
+        assert_eq!(
+            offer.text,
+            "This worker runs FlightDeck 2.2.0; 2.3.0 is available."
+        );
+        // Too old to take the command: told how, once, by hand.
+        let manual = worker_update_offer("2.2.0", "2.3.0", None, false).unwrap();
+        assert!(!manual.can_update);
+        assert!(manual.text.contains("flightdeck worker restart"));
+        // The worker's own check found a release this app does not have yet.
+        let found = worker_update_offer("2.3.0", "2.3.0", Some("2.4.0"), true).unwrap();
+        assert!(
+            found.text.ends_with("2.4.0 is available."),
+            "{}",
+            found.text
+        );
+        // The newer of the two wins.
+        let both = worker_update_offer("2.2.0", "2.3.0", Some("2.10.0"), true).unwrap();
+        assert!(both.text.contains("2.10.0"), "{}", both.text);
+    }
+
+    #[test]
+    fn a_current_or_newer_worker_is_offered_nothing() {
+        assert_eq!(worker_update_offer("2.3.0", "2.3.0", None, true), None);
+        assert_eq!(worker_update_offer("2.4.0", "2.3.0", None, true), None);
+        assert_eq!(
+            worker_update_offer("2.3.0", "2.3.0", Some("2.3.0"), true),
+            None
+        );
+        assert_eq!(worker_update_offer("", "2.3.0", None, true), None);
+    }
 
     #[test]
     fn skew_is_only_warned_about_when_the_versions_differ() {

@@ -1776,6 +1776,7 @@ pub fn mission_status_bar(host: &Entity<HostModel>, p: &Palette, cx: &App) -> im
         .child(pill)
         .children(mission_hints(mode, &surface, p))
         .child(div().flex_1())
+        .children(flightdeck_desktop::overlays::update::update_indicator(cx))
         .children(flightdeck_desktop::overlays::update::isolated_badge(
             &notices, cx,
         ))

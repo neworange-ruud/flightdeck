@@ -69,6 +69,7 @@ pub mod messages;
 pub mod notify;
 pub mod phone;
 pub mod projects;
+pub mod self_update;
 pub mod shell;
 pub mod tls;
 pub mod upload;
@@ -129,6 +130,9 @@ pub struct WorkerOptions {
     pub listen: ListenPlan,
     pub health: Box<dyn health::HealthProbe + Send>,
     pub cloner: Arc<dyn clone::CloneRunner>,
+    /// Replaces this worker's FlightDeck and restarts it, when a Desktop asks
+    /// ([`self_update`]).
+    pub updater: Arc<dyn self_update::WorkerUpdater>,
     /// What the HTTPS certificate lifecycle needs ([`tls`]): `Some` when the
     /// worker listens on Tailscale, `None` otherwise (then the browser app is
     /// plain HTTP).
@@ -227,6 +231,9 @@ pub(crate) struct WorkerExt {
     update_check: bool,
     probe: Box<dyn HealthProbe + Send>,
     cloner: Arc<dyn CloneRunner>,
+    updater: Arc<dyn self_update::WorkerUpdater>,
+    /// The self-update a window asked for, while it runs.
+    update_job: self_update::UpdateJob,
     pub(super) shells: WorkerShells,
     messages: HostMessageLog,
     /// The [`WorkerNotifier`]'s queue: every agent notification the pump fired.
@@ -528,6 +535,8 @@ impl<'a> AppHost<'a> {
             config: opts.config,
             probe: opts.health,
             cloner: opts.cloner,
+            updater: opts.updater,
+            update_job: self_update::UpdateJob::default(),
             shells: WorkerShells::new(size),
             messages: HostMessageLog::new(),
             notifications: notifier.queue(),
@@ -759,6 +768,26 @@ impl<'a> AppHost<'a> {
             self.ui.overlay = crate::tui::render::UiOverlay::None;
             for text in captured {
                 w.post(handle, level_of(&text), text, at_ms);
+            }
+        }
+
+        // --- A self-update a window asked for: say how it went, and restart
+        //     into the new version (the link ends as "restarting"). ---
+        if let Some(outcome) = w.update_job.poll() {
+            changed = true;
+            let (restart, text) = self_update::report(&outcome);
+            w.post(handle, level_of(&text), text, at_ms);
+            if restart {
+                w.shutdown_restarting = true;
+                if let Err(reason) = w.updater.restart() {
+                    w.shutdown_restarting = false;
+                    let version = match &outcome {
+                        Ok(self_update::UpdateOutcome::Updated { version }) => version.as_str(),
+                        _ => "",
+                    };
+                    let text = self_update::restart_failed(version, &reason);
+                    w.post(handle, level_of(&text), text, at_ms);
+                }
             }
         }
 
@@ -1205,6 +1234,22 @@ impl<'a> AppHost<'a> {
                     }
                     Err(e) => Err(OpRefusal::new(e.to_string())),
                 }
+            }
+            WorkerOp::UpdateWorker => {
+                if !w.update_job.start(&w.updater) {
+                    return Err(OpRefusal::new(
+                        "An update of this worker is already running.",
+                    ));
+                }
+                w.log("updating FlightDeck at a window's request".to_string());
+                Ok((
+                    Some(
+                        "Updating FlightDeck on this worker… It restarts by itself when the \
+                         new version is in."
+                            .to_string(),
+                    ),
+                    None,
+                ))
             }
             WorkerOp::OpenWorkerShell => {
                 let home = w.home.clone();

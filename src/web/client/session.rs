@@ -136,6 +136,12 @@ pub type Dialer = Rc<dyn Fn() -> RemoteClient>;
 /// Why a worker command could not be sent.
 pub const WORKER_NOT_SENT: &str = "Not connected to the worker — nothing was sent.";
 
+/// A worker older than protocol v14 cannot update itself from here: its
+/// first update to a version that can is done in its shell.
+pub const WORKER_TOO_OLD_TO_UPDATE: &str = "This worker's FlightDeck is too old to update from \
+     here. Update it once from the worker shell: `flightdeck update`, then `flightdeck worker \
+     restart`. Later updates can be done from FlightDeck Desktop.";
+
 /// Why the upload panel does not open on a host that is not a worker.
 pub const UPLOAD_NOT_A_WORKER: &str = "Only a FlightDeck worker takes uploads.";
 
@@ -550,6 +556,27 @@ impl RemoteSession {
         if self.client.close_worker_shell(&id).is_none() {
             self.local = Local::Message(WORKER_NOT_SENT.to_string());
         }
+    }
+
+    /// Whether the worker can be updated from here (protocol v14).
+    pub fn supports_worker_update(&self) -> bool {
+        self.client.supports_worker_update()
+    }
+
+    /// Ask the worker to update its FlightDeck and restart into it; whether
+    /// the request was sent. A worker too old for it is told in words.
+    pub fn update_worker(&mut self) -> bool {
+        if self.client.update_worker().is_some() {
+            return true;
+        }
+        self.local = Local::Message(
+            if self.client.is_worker() && !self.supports_worker_update() {
+                WORKER_TOO_OLD_TO_UPDATE.to_string()
+            } else {
+                WORKER_NOT_SENT.to_string()
+            },
+        );
+        false
     }
 
     /// Start the shell on screen again after it exited (its Restart).

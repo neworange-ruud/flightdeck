@@ -188,6 +188,9 @@ fn run_unix(paths: &WorkerPaths) -> i32 {
         global_config: config,
         health: Box::new(RealHealthProbe),
         cloner: std::sync::Arc::new(RealGitCloner),
+        updater: std::sync::Arc::new(crate::worker::self_update::RealWorkerUpdater::new(
+            paths.clone(),
+        )),
         listen,
         certs,
     };

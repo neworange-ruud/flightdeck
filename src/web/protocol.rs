@@ -97,6 +97,7 @@
 //! | [`worker_command::BEGIN_DOWNLOAD`], [`DownloadPlan`], [`FileEntryView`], [`DOWNLOAD_MIN_VERSION`] | downloading files from a worker: a grant over the socket, the bytes over `GET /download/{ticket}` (v9) |
 //! | [`worker_command::CREATE_PROJECT`], [`CREATE_PROJECT_MIN_VERSION`] | creating a new project on a worker: folder, `git init`, empty root commit (SPECS §5.3, v12) |
 //! | [`ServerMsg::BrowserToolCall`], [`worker_command::BROWSER_TOOL_RESULT`], [`AGENT_BROWSER_MIN_VERSION`] | a session's agent drives the session browser in the attached Desktop window (`specs/SESSION_BROWSER_PRD.md` §6, v13) |
+//! | [`worker_command::UPDATE_WORKER`], [`WORKER_UPDATE_MIN_VERSION`] | updating a worker's FlightDeck from the Desktop and restarting into it (`specs/WORKER_PRD.md` §9, v14) |
 //!
 //! # Forward compatibility
 //!
@@ -274,10 +275,18 @@ mod tests;
 /// [`AGENT_BROWSER_MIN_VERSION`], and tells the agent the Desktop needs
 /// updating instead.
 ///
+/// **v14 is updating a worker from the Desktop** (`specs/WORKER_PRD.md` §9,
+/// W20). A window asks with [`worker_command::UPDATE_WORKER`]; the worker
+/// acks at once, updates its own FlightDeck in the background, and either
+/// restarts into the new version (the link ends with
+/// [`ShutdownReason::Restarting`]) or says why not in a host message. No new
+/// frame; the bump is how a window knows the worker understands the command
+/// ([`WORKER_UPDATE_MIN_VERSION`]).
+///
 /// Bump this when a change is **not** covered by the forward-compatibility
 /// policy in the module docs — i.e. when a field's meaning changes, a required
 /// field appears, or a closed vocabulary grows a member the peer must understand.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Oldest version this build can serve. The browser SPA co-ships with the
 /// server (D9), but a FlightDeck Desktop driving a TUI or Desktop host does
@@ -287,7 +296,7 @@ pub const PROTOCOL_VERSION: u16 = 13;
 pub const MIN_SUPPORTED_VERSION: u16 = 6;
 
 /// Newest version this build can serve. Equal to [`PROTOCOL_VERSION`].
-pub const MAX_SUPPORTED_VERSION: u16 = 13;
+pub const MAX_SUPPORTED_VERSION: u16 = 14;
 
 /// The oldest peer a worker sends an [`UploadPlan`] to, and so the oldest
 /// that may ask for one with [`worker_command::BEGIN_UPLOAD`] (v8).
@@ -322,6 +331,11 @@ pub const CREATE_PROJECT_MIN_VERSION: u16 = 12;
 /// ([`ServerMsg::BrowserToolCall`], v13), and so the oldest that may answer
 /// one with [`worker_command::BROWSER_TOOL_RESULT`].
 pub const AGENT_BROWSER_MIN_VERSION: u16 = 13;
+
+/// The oldest peer that may ask a worker to update itself
+/// ([`worker_command::UPDATE_WORKER`], v14). An older worker does not know
+/// the command, so a window offers "Update worker" only from this version on.
+pub const WORKER_UPDATE_MIN_VERSION: u16 = 14;
 
 /// The oldest client a **worker** host accepts (`specs/WORKER_PRD.md` §5).
 ///
@@ -3436,6 +3450,10 @@ pub mod worker_command {
     /// string, names: [string]}`. Answered with
     /// [`super::ServerMsg::DownloadPlan`].
     pub const BEGIN_DOWNLOAD: &str = "begin_download";
+    /// Update the worker's own FlightDeck to the newest release and restart
+    /// into it (v14). No args. Acked at once; the outcome is a host message,
+    /// or the restart itself.
+    pub const UPDATE_WORKER: &str = "update_worker";
     /// Every worker command name.
     pub const ALL: &[&str] = &[
         BROWSE_DIR,
@@ -3451,6 +3469,7 @@ pub mod worker_command {
         BROWSER_TOOL_RESULT,
         BEGIN_UPLOAD,
         BEGIN_DOWNLOAD,
+        UPDATE_WORKER,
     ];
 }
 
@@ -3522,6 +3541,8 @@ pub enum WorkerOp {
         /// What to do about names already taken.
         on_conflict: OnConflict,
     },
+    /// [`worker_command::UPDATE_WORKER`] (v14).
+    UpdateWorker,
     /// [`worker_command::BEGIN_DOWNLOAD`] (v9).
     BeginDownload {
         /// The source folder, as asked (`~`, `~/x`, relative or absolute).
@@ -3583,6 +3604,7 @@ impl WorkerOp {
                 })
             }
             worker_command::OPEN_WORKER_SHELL => Ok(WorkerOp::OpenWorkerShell),
+            worker_command::UPDATE_WORKER => Ok(WorkerOp::UpdateWorker),
             worker_command::OPEN_BROWSER_TUNNEL => Ok(WorkerOp::OpenBrowserTunnel),
             worker_command::CLOSE_BROWSER_TUNNEL => {
                 let args = WorkerArgs::new(name, args)?;

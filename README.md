@@ -50,8 +50,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/neworange-ruud/flightde
 irm https://github.com/neworange-ruud/flightdeck/releases/latest/download/flightdeck-installer.ps1 | iex
 ```
 
-Both update themselves: the Desktop shows an **Update now** banner, and
-`flightdeck update` updates the CLI (or tells you the `brew upgrade` command).
+Both update themselves: the Desktop shows an **Update now** banner (or ask with
+**Check for Updates…**), and `flightdeck update` updates the CLI (or tells you the
+`brew upgrade` command). A worker is updated from its window in the Desktop with
+**Update worker**.
 
 ## Quick start
 

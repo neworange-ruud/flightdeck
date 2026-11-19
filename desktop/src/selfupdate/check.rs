@@ -1,6 +1,12 @@
-//! The once-a-day check, with the TUI's rules (SPECS §30): at most one network
-//! request per day, the last answer remembered on disk so a restart shows
-//! yesterday's finding at once, and every failure silent.
+//! The background check, with the TUI's rules (SPECS §30) at a shorter
+//! interval: at most one network request every [`CHECK_INTERVAL_SECS`], the
+//! last answer remembered on disk so a restart shows the last finding at once,
+//! and every failure silent. The desktop app is left running for days, so it
+//! re-evaluates on a timer ([`RECHECK_TICK_SECS`]) rather than only at launch;
+//! the cache keeps that to the same few requests a day.
+//!
+//! "Check for Updates…" is the exception to "silent": it asks now, past the
+//! cache, and reports a failure ([`fetch_latest`]).
 //!
 //! The desktop keeps its own cache file, separate from the TUI's
 //! `update-check.json`, because the two products have separate release lines
@@ -13,10 +19,15 @@ use serde_json::{json, Value};
 
 use super::kind::Os;
 use super::release::Version;
-use super::source::ReleaseSource;
+use super::source::{ReleaseSource, UpdateError};
 
-/// Minimum gap between network checks.
-pub const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Minimum gap between background network checks. Four a day at most, far
+/// inside GitHub's unauthenticated limit of 60 an hour.
+pub const CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
+/// How often a running app re-evaluates whether a check is due. Most ticks
+/// are answered from the cache without touching the network.
+pub const RECHECK_TICK_SECS: u64 = 30 * 60;
 
 /// The last completed check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +116,25 @@ pub fn fetch_newer_version(
     now_unix: u64,
     current: Version,
 ) -> Option<Version> {
-    let latest = source.latest().ok()??.version;
+    fetch_latest(fs, source, cache_file, now_unix, current)
+        .ok()
+        .flatten()
+}
+
+/// [`fetch_newer_version`] that says why it failed, for "Check for
+/// Updates…", where the user asked and silence would read as "up to date".
+/// `Ok(None)`: nothing newer is published.
+pub fn fetch_latest(
+    fs: &dyn FileSystem,
+    source: &dyn ReleaseSource,
+    cache_file: &Path,
+    now_unix: u64,
+    current: Version,
+) -> Result<Option<Version>, UpdateError> {
+    let Some(latest) = source.latest()? else {
+        return Ok(None);
+    };
+    let latest = latest.version;
     if let Some(dir) = cache_file.parent() {
         let _ = fs.create_dir_all(dir);
     }
@@ -116,7 +145,7 @@ pub fn fetch_newer_version(
             latest_version: latest.to_string(),
         }),
     );
-    (latest > current).then_some(latest)
+    Ok((latest > current).then_some(latest))
 }
 
 #[cfg(test)]
@@ -126,7 +155,6 @@ mod tests {
     use flightdeck::testing::FakeFs;
 
     use super::super::release::ReleaseInfo;
-    use super::super::source::UpdateError;
     use super::*;
 
     fn v(text: &str) -> Version {
@@ -259,6 +287,30 @@ mod tests {
         assert_eq!(
             newer_version(&fs, &fixed(Ok(Some("1.4.0"))), path, 1, v("1.4.0")),
             None
+        );
+    }
+
+    /// "Check for Updates…" tells a failure from "nothing newer", which the
+    /// background check folds together.
+    #[test]
+    fn an_asked_for_check_reports_why_it_failed() {
+        let fs = FakeFs::new();
+        let path = Path::new(CACHE);
+        assert!(matches!(
+            fetch_latest(&fs, &fixed(Err(())), path, 1, v("1.4.0")),
+            Err(UpdateError::Network(_))
+        ));
+        assert_eq!(
+            fetch_latest(&fs, &fixed(Ok(Some("1.4.0"))), path, 1, v("1.4.0")),
+            Ok(None)
+        );
+        assert_eq!(
+            fetch_latest(&fs, &fixed(Ok(None)), path, 1, v("1.4.0")),
+            Ok(None)
+        );
+        assert_eq!(
+            fetch_latest(&fs, &fixed(Ok(Some("1.5.0"))), path, 1, v("1.4.0")),
+            Ok(Some(v("1.5.0")))
         );
     }
 

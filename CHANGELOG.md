@@ -8,7 +8,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
-- None yet.
+- **Update a worker from FlightDeck Desktop.** A worker now takes a request to update itself (web protocol v14, `update_worker`). It updates FlightDeck the way it was installed (`brew update` and `brew upgrade flightdeck` for a Homebrew install, the installer's own update otherwise), then restarts into the new version, and its agents resume. It reports the outcome as a message: already up to date, or why it could not update (for example, a copy installed with `cargo install`). Under systemd the restart runs as its own transient unit (`systemd-run --user`), so stopping the worker's unit doesn't cut it off. A worker older than this release doesn't understand the request; update it once with `flightdeck update` and `flightdeck worker restart`.
 
 ### Improvements
 
@@ -16,7 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
-- None yet.
+- **Linux: the update check no longer creates `~/Library`.** Without `XDG_CACHE_HOME` set, the update check's cache went to `~/Library/Application Support/flightdeck/` on every OS. On a Linux worker, that `~/Library` folder then showed up in the Open Project browser. Linux now uses `~/.cache/flightdeck/`, the XDG default. macOS is unchanged.
 
 ## [2.2.0] - 2026-11-19
 

@@ -6,8 +6,11 @@
 //! gets "Update now".
 //!
 //! ```text
-//! start_check ──► check::newer_version      once a day, cached, silent on failure
-//!                       │ newer
+//! start_check ─────────► check::newer_version   at launch and every 30 min;
+//!                              │                cached 6 h, silent on failure
+//! Check for Updates… ──► check::fetch_latest    past the cache; every answer
+//!                              │                shown (up to date, failed)
+//!                       ┌──────┘ newer
 //!                       ▼
 //!                 kind::detect              where do we run from?
 //!                       │
@@ -44,6 +47,7 @@ pub mod state;
 pub use apply::Outcome;
 pub use kind::{InstallKind, PackageManager};
 pub use state::{
-    begin_install, check_now, finish_staged_update_at_launch, restart, set_status, start_check,
-    status, wants_check, UpdateStatus,
+    after_check, begin_install, check_for_updates, check_now, finish_staged_update_at_launch,
+    generation, reshow, restart, set_status, start_check, status, wants_check, CheckKind,
+    UpdateStatus,
 };

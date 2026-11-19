@@ -18,7 +18,7 @@
 use crate::contracts::error::{FlightDeckError, Result};
 use axoupdater::Version;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 /// App name as recorded in the install receipt and GitHub Release artifacts.
@@ -83,6 +83,35 @@ pub fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// `flightdeck update` without the printing, for a worker updating itself
+/// at a Desktop's request (`specs/WORKER_PRD.md` W20): `Ok(Some(version))`
+/// when a newer release was installed over this binary, `Ok(None)` when this
+/// is already the newest, and `Err` (written for the user) when this install
+/// is not the installer's to update or the update failed. Blocks on the
+/// network: call it off the host's thread.
+pub fn update_installer_quietly() -> std::result::Result<Option<String>, String> {
+    let mut updater = axoupdater::AxoUpdater::new_for(APP_NAME);
+    let receipt_loaded = updater.load_receipt().is_ok();
+    let receipt_matches_executable = receipt_loaded
+        && updater
+            .check_receipt_is_for_this_executable()
+            .unwrap_or(false);
+    if must_defer(receipt_loaded, receipt_matches_executable) {
+        return Err(NOT_INSTALLER_INSTALL.to_string());
+    }
+    updater.disable_installer_output();
+    match updater.run_sync() {
+        Ok(Some(result)) => Ok(Some(result.new_version.to_string())),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("the update failed: {e}")),
+    }
+}
+
+/// Why [`update_installer_quietly`] would not touch this binary.
+pub const NOT_INSTALLER_INSTALL: &str = "this FlightDeck was not installed by the FlightDeck \
+     installer or Homebrew, so it cannot update itself. Update it the way it was installed, \
+     then run `flightdeck worker restart`";
 
 /// Whether `flightdeck update` must defer to the package manager instead of
 /// self-replacing the binary: either there is no install receipt, or the receipt
@@ -169,30 +198,29 @@ fn current_version() -> Option<Version> {
 /// to `USERPROFILE` on native Windows shells (cmd.exe/PowerShell), which don't
 /// set `HOME`, so the once-a-day cache still has a stable location there.
 fn cache_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("FLIGHTDECK_UPDATE_CACHE") {
-        return Some(PathBuf::from(explicit));
+    cache_path_for(cfg!(target_os = "macos"), &|name| {
+        std::env::var_os(name).map(PathBuf::from)
+    })
+}
+
+/// Where the check's cache lives, from an environment lookup: an explicit
+/// `FLIGHTDECK_UPDATE_CACHE`, then `$XDG_CACHE_HOME`, then each OS's own
+/// place (`~/Library/Application Support` on macOS, the XDG default
+/// `~/.cache` elsewhere: a Linux worker must not grow a `~/Library`). Pure.
+fn cache_path_for(macos: bool, env: &dyn Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(explicit) = env("FLIGHTDECK_UPDATE_CACHE") {
+        return Some(explicit);
     }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        return Some(
-            PathBuf::from(xdg)
-                .join("flightdeck")
-                .join("update-check.json"),
-        );
+    let file = Path::new("flightdeck").join("update-check.json");
+    if let Some(xdg) = env("XDG_CACHE_HOME") {
+        return Some(xdg.join(file));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Some(
-            PathBuf::from(home).join("Library/Application Support/flightdeck/update-check.json"),
-        );
-    }
-    #[cfg(windows)]
-    {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return Some(
-                PathBuf::from(profile).join("AppData\\Local\\flightdeck\\update-check.json"),
-            );
-        }
-    }
-    None
+    let home = env("HOME")?;
+    Some(if macos {
+        home.join("Library/Application Support").join(file)
+    } else {
+        home.join(".cache").join(file)
+    })
 }
 
 /// Pure: is a fresh check due, given the last check time and now?
@@ -377,6 +405,38 @@ mod tests {
         };
         let (due, _notice) = evaluate(Some(&cache), 5_000_000 + CHECK_INTERVAL_SECS, &v("1.0.2"));
         assert!(due, "a day later the check is due again");
+    }
+
+    #[test]
+    fn the_cache_is_in_each_oss_own_place() {
+        let env = |name: &str| (name == "HOME").then(|| PathBuf::from("/home/u"));
+        assert_eq!(
+            cache_path_for(false, &env),
+            Some(PathBuf::from("/home/u/.cache/flightdeck/update-check.json")),
+            "Linux: the XDG default, never ~/Library"
+        );
+        assert_eq!(
+            cache_path_for(true, &env),
+            Some(PathBuf::from(
+                "/home/u/Library/Application Support/flightdeck/update-check.json"
+            ))
+        );
+        let xdg = |name: &str| match name {
+            "XDG_CACHE_HOME" => Some(PathBuf::from("/x")),
+            "HOME" => Some(PathBuf::from("/home/u")),
+            _ => None,
+        };
+        assert_eq!(
+            cache_path_for(false, &xdg),
+            Some(PathBuf::from("/x/flightdeck/update-check.json"))
+        );
+        let explicit =
+            |name: &str| (name == "FLIGHTDECK_UPDATE_CACHE").then(|| PathBuf::from("/c/u.json"));
+        assert_eq!(
+            cache_path_for(true, &explicit),
+            Some(PathBuf::from("/c/u.json"))
+        );
+        assert_eq!(cache_path_for(false, &|_: &str| None), None);
     }
 
     #[test]

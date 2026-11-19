@@ -124,6 +124,9 @@ pub struct RemoteWindow {
         std::collections::HashMap<u64, (Entity<crate::browser::view::BrowserView>, String)>,
     /// The browser the main area shows this frame.
     shown_browser: Option<u64>,
+    /// The desktop app's update banner was dismissed while this update
+    /// generation was shown (as the main window's, `selfupdate::generation`).
+    update_dismissed: Option<u64>,
     /// The Worker tab's read-only panes, side by side (W35): every shell but
     /// the one on screen, which is [`RemoteWindow::terminal`].
     shell_panes: std::collections::HashMap<
@@ -155,6 +158,7 @@ impl RemoteWindow {
             layer,
             shell: None,
             shell_target: String::new(),
+            update_dismissed: None,
             shell_error: None,
             shell_pty: Rc::new(PortablePtyBackend),
             picker: None,
@@ -756,6 +760,7 @@ impl RemoteWindow {
                 |bar| bar.child(hint(p, "OpenPalette", "commands")),
             )
             .child(div().flex_1().min_w_0().truncate().children(notice))
+            .children(flightdeck_desktop::overlays::update::update_indicator(cx))
             .child(
                 div()
                     .debug_selector(|| "remote-seat".into())
@@ -1233,8 +1238,14 @@ impl Render for RemoteWindow {
         // Either shell's tab hides the project's sidebar and git strip.
         let off_project = model.tab() != Tab::Project;
         let link_down = model.ended().is_some() || !ws.ready;
-        let skew = model.skew_warning();
-        let app_update = skew.is_some() && model.skew_wants_app_update();
+        let app_update = model.skew_warning().is_some() && model.skew_wants_app_update();
+        // An older worker gets "Update worker" in place of the skew text.
+        let worker_update = (!app_update).then(|| model.worker_update_offer()).flatten();
+        let updating_worker = model.updating_worker();
+        let skew = match &worker_update {
+            Some(_) => None,
+            None => model.skew_warning(),
+        };
         // The worker is newer, so a release may be out that the daily check
         // has not seen yet: ask now, so the banner can offer it.
         let check_update = app_update && flightdeck_desktop::selfupdate::wants_check(cx);
@@ -1368,6 +1379,20 @@ impl Render for RemoteWindow {
                 let actions =
                     app_update.then(|| flightdeck_desktop::overlays::update::skew_actions(cx));
                 skew_banner(&p, text, actions)
+            }))
+            // This app's own update (the main window's banner): the skew
+            // banner already carries it when the worker is the newer side.
+            .children((!app_update).then(|| self.app_update_banner(cx)).flatten())
+            .children(worker_update.map(|offer| {
+                let remote = self.remote.clone();
+                let actions = offer.can_update.then(|| {
+                    flightdeck_desktop::overlays::update::worker_update_actions(
+                        updating_worker,
+                        move |_, cx| remote.update(cx, |m, cx| m.update_worker_now(cx)),
+                        cx,
+                    )
+                });
+                skew_banner(&p, offer.text, actions)
             }))
             .child(match picker {
                 Some(picker) => div()
@@ -1729,6 +1754,31 @@ fn open_project_button(p: &Palette, remote: &Entity<RemoteModel>) -> impl IntoEl
 
 /// The soft warning that the worker's FlightDeck is not this app's, with
 /// this app's update actions when it is the side to update.
+impl RemoteWindow {
+    /// The desktop app's update banner, as the main window draws it, unless
+    /// this window dismissed it for the update state it shows.
+    fn app_update_banner(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        use flightdeck_desktop::overlays::update::{update_banner, OnDismiss};
+        let generation = flightdeck_desktop::selfupdate::generation(cx);
+        if self.update_dismissed == Some(generation) {
+            return None;
+        }
+        let this = cx.entity().downgrade();
+        let dismiss: OnDismiss = Rc::new(move |_, cx| {
+            let _ = this.update(cx, |view, cx| {
+                view.update_dismissed = Some(generation);
+                cx.notify();
+            });
+        });
+        // A worker's own release notice is its banner's, not this one's.
+        let notices = flightdeck::host::HostNotices {
+            update: None,
+            isolated: false,
+        };
+        update_banner(&notices, Some(dismiss), cx)
+    }
+}
+
 fn skew_banner(p: &Palette, text: String, actions: Option<gpui::Div>) -> impl IntoElement {
     h_flex()
         .debug_selector(|| "remote-version-skew".into())

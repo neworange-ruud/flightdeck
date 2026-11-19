@@ -25,6 +25,7 @@ pub mod lock;
 pub mod log;
 pub mod paths;
 pub mod run;
+pub mod self_update;
 pub mod service;
 pub mod state;
 pub mod status;

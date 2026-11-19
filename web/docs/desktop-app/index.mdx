@@ -87,9 +87,29 @@ live screen.
 
 ## Updates
 
-The app checks for a new release once a day. When one is out, a banner offers
-**Update now**, which downloads it, checks it and asks you to restart. A copy
-installed by a package manager tells you which command to run instead.
+The app checks for a new release when it starts and again every few hours while
+it runs. When one is out, a banner offers **Update now**, which downloads it,
+checks it and asks you to restart. A copy installed by a package manager tells
+you which command to run instead.
+
+- **Check for Updates…** (the FlightDeck menu on macOS; **Check for Updates** in
+  the command palette everywhere) asks right away and always answers: up to date,
+  the update it found, or why it could not check. It works even with
+  `[update] check = false`.
+- A dismissed banner comes back when a newer release appears. While an update is
+  known, the status bar shows an **Update to v…** pill; click it to bring the
+  banner back.
+- Worker windows show the same banner.
+
+### Updating a worker
+
+When a worker runs an older FlightDeck than the app, its window shows "This
+worker runs FlightDeck `<worker>`; `<new>` is available." with **Update worker**.
+One click updates FlightDeck on the worker (with Homebrew for a Homebrew install,
+otherwise with FlightDeck's installer), then restarts the worker into the new
+version. Agents resume once it is back, and the window reconnects by itself. If
+the update cannot run, the worker says why in a message. See
+[Update](/worker/operations#update) in the worker docs.
 
 ## Other machines
 

@@ -715,10 +715,14 @@ fn protocol_version_is_seven_and_still_serves_six() {
     // **v13 is agent browser tools** (`specs/SESSION_BROWSER_PRD.md` §6): one
     // frame kind, `BrowserToolCall`, held back below v13, and one worker
     // command answering it.
-    assert_eq!(PROTOCOL_VERSION, 13);
+    //
+    // **v14 is updating a worker from the Desktop** (`specs/WORKER_PRD.md`
+    // §9): no frame, one worker command a window offers only from v14 on.
+    assert_eq!(PROTOCOL_VERSION, 14);
     assert_eq!(MIN_SUPPORTED_VERSION, 6);
-    assert_eq!(MAX_SUPPORTED_VERSION, 13);
+    assert_eq!(MAX_SUPPORTED_VERSION, 14);
     assert_eq!(AGENT_BROWSER_MIN_VERSION, 13);
+    assert_eq!(WORKER_UPDATE_MIN_VERSION, 14);
     assert_eq!(WORKER_MIN_CLIENT_VERSION, 7);
     assert_eq!(UPLOAD_MIN_VERSION, 8);
     assert_eq!(DOWNLOAD_MIN_VERSION, 9);
@@ -788,7 +792,8 @@ fn the_host_answers_each_peer_at_the_lower_of_the_two_versions() {
     assert_eq!(negotiated(11), 11);
     // A peer newer than this build never gets past `check_version`, but the
     // arithmetic still never claims a version this build does not speak.
-    assert_eq!(negotiated(13), PROTOCOL_VERSION);
+    assert_eq!(negotiated(13), 13);
+    assert_eq!(negotiated(15), PROTOCOL_VERSION);
 }
 
 #[test]
@@ -803,15 +808,15 @@ fn mismatched_version_is_representable_and_detectable() {
     // **v5 is the case at v6** (`remote-control-jija.1`): a v5 tab would send
     // its palette rows with no target and be served fine, but a v5 *native
     // client* would have its targets ignored by an older host, so the bump is
-    // refused both ways round. v13 keeps v6 in its range and still refuses v5.
-    let err = check_version(5).expect_err("v5 must not be accepted by a v13 host");
+    // refused both ways round. v14 keeps v6 in its range and still refuses v5.
+    let err = check_version(5).expect_err("v5 must not be accepted by a v14 host");
     assert_eq!(
         err,
         VersionMismatch {
-            local: 13,
+            local: 14,
             peer: 5,
             min_supported: 6,
-            max_supported: 13,
+            max_supported: 14,
         }
     );
     // v1 to v4 are equally refused, and for D14's original reason.
@@ -820,7 +825,7 @@ fn mismatched_version_is_representable_and_detectable() {
     }
     // Newer than our ceiling is equally a mismatch. A native client that
     // dialled too new may redial at `max_supported`; a browser reloads.
-    assert!(check_version(14).is_err());
+    assert!(check_version(15).is_err());
 
     // And it is representable on the wire, with the numbers the browser needs.
     let frame = ServerMsg::Error(WireError::version_mismatch(err));
@@ -828,7 +833,7 @@ fn mismatched_version_is_representable_and_detectable() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "version_mismatch");
     assert_eq!(value["version"]["peer"], 5);
-    assert_eq!(value["version"]["max_supported"], 13);
+    assert_eq!(value["version"]["max_supported"], 14);
     assert_eq!(round_trip(&frame), frame);
 }
 

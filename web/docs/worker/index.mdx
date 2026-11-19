@@ -251,7 +251,8 @@ one shows up in the other. `Ctrl-q` disconnects; the worker keeps running.
 | --- | --- |
 | **offline** in the WORKERS list | Check Tailscale is up on both machines (`tailscale status`). On the worker, `flightdeck worker status` says whether it runs. |
 | "The worker stopped." | Run `flightdeck worker start` on the worker, then **Reconnect**. |
-| **version differs** or **update needed** | Update the older side. On the worker: `flightdeck update`, then `flightdeck worker restart`. |
+| **update available** | The worker runs an older FlightDeck than the app. Open it and click **Update worker**. A worker older than 2.3: `flightdeck update`, then `flightdeck worker restart`, in its shell. |
+| **version differs** or **update needed** | Update the older side. On the worker: **Update worker** in its window, or `flightdeck update` then `flightdeck worker restart`. |
 | **Taken over by …** | Another window opened the worker. **Reconnect** takes it back. |
 | An agent says it isn't logged in | Log in again in a worker shell (step 3). |
 

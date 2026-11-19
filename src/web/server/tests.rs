@@ -1226,7 +1226,7 @@ fn the_advert_is_the_magic_dns_name_or_the_first_address_plus_the_port() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_tui_host_serves_v6_to_v13_and_a_worker_v7_to_v13() {
+fn a_tui_host_serves_v6_to_v14_and_a_worker_v7_to_v14() {
     assert_eq!(accept_version(HostKind::Tui, 6), Ok(6));
     assert_eq!(accept_version(HostKind::Tui, 7), Ok(7));
     assert_eq!(accept_version(HostKind::Tui, 8), Ok(8));
@@ -1240,8 +1240,9 @@ fn a_tui_host_serves_v6_to_v13_and_a_worker_v7_to_v13() {
     assert_eq!(accept_version(HostKind::Worker, 11), Ok(11));
     assert_eq!(accept_version(HostKind::Worker, 12), Ok(12));
     assert_eq!(accept_version(HostKind::Worker, 13), Ok(13));
+    assert_eq!(accept_version(HostKind::Worker, 14), Ok(14));
 
-    for peer in [5, 6, 14] {
+    for peer in [5, 6, 15] {
         let refused = accept_version(HostKind::Worker, peer).expect_err("refused");
         assert_eq!(refused.peer, peer);
         assert_eq!(refused.min_supported, 7, "the worker's own floor");

@@ -97,7 +97,7 @@
  * Desktop holds session browsers, so this app is never sent the frame; the
  * bump keeps it in step with the host it ships in (D9).
  */
-export const PROTOCOL_VERSION = 13;
+export const PROTOCOL_VERSION = 14;
 
 /** `GET /ws` — JSON over **text** frames, no subprotocol. */
 export const WS_PATH = "/ws";
