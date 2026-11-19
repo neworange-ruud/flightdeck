@@ -18,7 +18,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Improvements
 
-- None yet.
+- **No second row of tabs in OpenCode.** OpenCode 2 started by FlightDeck no longer shows its own session tab strip: FlightDeck already gives every session its own tab. FlightDeck sets `OPENCODE_CLI_CONFIG_CONTENT` to `{"tabs":{"mode":"off"}}`, which OpenCode merges over your own `cli.json`, so your other OpenCode settings still apply.
 
 ### Bug fixes
 

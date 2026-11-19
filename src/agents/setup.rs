@@ -233,6 +233,10 @@ pub fn prepare_status_launch(
                 "OPENCODE_CONFIG_DIR".to_string(),
                 format!("{agent_runtime}/opencode"),
             ));
+            env.push((
+                "OPENCODE_CLI_CONFIG_CONTENT".to_string(),
+                OPENCODE_CLI_CONFIG.to_string(),
+            ));
         }
         StatusBackend::Cursor => {
             explicit = install_cursor_hooks(fs, worktree, status_root, &agent_status_file)?;
@@ -500,6 +504,14 @@ fn opencode_runtime_plugin(status_file: &str, worktree: &str) -> String {
 /// The runtime plugin's choice of status file for an OpenCode 2 location (see
 /// [`opencode_runtime_plugin`]). Directories compare by their real path, so a
 /// symlinked worktree still counts as this plugin's own.
+/// OpenCode 2's terminal UI settings for a FlightDeck-launched OpenCode,
+/// through `OPENCODE_CLI_CONFIG_CONTENT`, which OpenCode deep-merges over the
+/// user's own `cli.json` (the user's other settings still apply). Its session
+/// tab strip is turned off: FlightDeck arranges sessions itself, one per tab,
+/// so OpenCode's own tabs only repeat that and take a row
+/// (remote-control-gxj1). OpenCode 1.x does not read the variable.
+const OPENCODE_CLI_CONFIG: &str = r#"{"tabs":{"mode":"off"}}"#;
+
 const OPENCODE_STATUS_FILE_FOR: &str = r#"// OpenCode 2's one background service runs this plugin for every directory's
 // sessions, whichever client started it: report each directory's sessions in
 // that directory's own status file, never in this launch's.
@@ -1799,10 +1811,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             launch.env,
-            vec![(
-                "OPENCODE_CONFIG_DIR".to_string(),
-                "/workspace/.flightdeck/runtime/status/opencode".to_string()
-            )]
+            vec![
+                (
+                    "OPENCODE_CONFIG_DIR".to_string(),
+                    "/workspace/.flightdeck/runtime/status/opencode".to_string()
+                ),
+                (
+                    "OPENCODE_CLI_CONFIG_CONTENT".to_string(),
+                    r#"{"tabs":{"mode":"off"}}"#.to_string()
+                ),
+            ]
         );
         let plugin = fs
             .file_contents(Path::new(
