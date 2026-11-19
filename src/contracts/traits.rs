@@ -61,6 +61,13 @@ pub trait GitExecutor {
     /// exist (`git worktree prune`). Used to reconcile after a worktree
     /// directory has been removed out-of-band (SPECS §5/§15).
     fn prune_worktrees(&self) -> Result<()>;
+    /// The user's global `core.longpaths` setting: `Some(value)` when the
+    /// global git config sets it, `None` when it does not.
+    fn global_long_paths(&self) -> Result<Option<bool>>;
+    /// Turn `core.longpaths` on in this repository's own config, so Git for
+    /// Windows may create its worktrees' files past the 260-character path
+    /// limit. Every worktree of the repository shares that config.
+    fn enable_repo_long_paths(&self) -> Result<()>;
     /// `(ahead, behind)` counts of `branch` relative to `base`.
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)>;
     /// Configured upstream of `branch`, if any (e.g. `origin/foo`).

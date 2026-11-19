@@ -111,33 +111,54 @@ pub struct WorktreeJob {
 /// Free function (no `&self`) so a background worker can call it with a cloned
 /// [`GitExecutor`]/[`CommandRunner`] without borrowing [`AppState`].
 ///
-/// Returns a [`crate::hooks::HookReport`] describing the hook run (`None` when no
-/// worktree was created or the repo defines no hook). Hook failures are
-/// **best-effort**: they are reported, never propagated — the worktree already
-/// exists, and failing here would remove the tab and strand it.
+/// Returns a [`Materialized`] carrying the hook run's report and any warning
+/// from creating the worktree. Hook failures are **best-effort**: they are
+/// reported, never propagated — the worktree already exists, and failing here
+/// would remove the tab and strand it.
 pub fn materialize_worktree(
     git: &dyn GitExecutor,
     runner: &dyn CommandRunner,
     job: &WorktreeJob,
-) -> Result<Option<crate::hooks::HookReport>> {
+) -> Result<Materialized> {
     if !job.needs_create {
-        return Ok(None);
+        return Ok(Materialized::default());
     }
-    create_worktree(
+    let create_warning = create_worktree(
         git,
         &job.branch,
         &job.base_branch,
         &job.worktree_abs,
         job.create_branch,
     )?;
-    if job.created_hooks.is_empty() {
-        return Ok(None);
+    let hook_report = (!job.created_hooks.is_empty())
+        .then(|| crate::hooks::run_commands(runner, &job.created_hooks, &job.worktree_abs));
+    Ok(Materialized {
+        hook_report,
+        create_warning,
+    })
+}
+
+/// What [`materialize_worktree`] has to tell the user once the worktree exists.
+#[derive(Debug, Default)]
+pub struct Materialized {
+    /// The `[worktree_created]` hook run (`None` when no worktree was created
+    /// or the repo defines no hook).
+    pub hook_report: Option<crate::hooks::HookReport>,
+    /// A warning from creating the worktree itself, such as `core.longpaths`
+    /// being off on Windows.
+    pub create_warning: Option<String>,
+}
+
+impl Materialized {
+    /// Every warning for the user, one per line; `None` when all went well.
+    pub fn warning(&self) -> Option<String> {
+        let hook = self
+            .hook_report
+            .as_ref()
+            .and_then(|r| r.warning_message("worktree_created"));
+        let lines: Vec<String> = self.create_warning.iter().cloned().chain(hook).collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
-    Ok(Some(crate::hooks::run_commands(
-        runner,
-        &job.created_hooks,
-        &job.worktree_abs,
-    )))
 }
 
 /// How to launch (or reattach) a tab's primary terminal (SPECS §31).
@@ -1229,11 +1250,10 @@ impl AppState {
         services: &Services,
     ) -> Result<Effect> {
         let job = self.begin_new_agent_tab(name, agent_key, services)?;
-        let (outcome, hook_report) =
-            match materialize_worktree(services.git, services.command, &job) {
-                Ok(report) => (self.finalize_new_tab(&job.tab_id, services), report),
-                Err(e) => (Err(e), None),
-            };
+        let (outcome, warning) = match materialize_worktree(services.git, services.command, &job) {
+            Ok(done) => (self.finalize_new_tab(&job.tab_id, services), done.warning()),
+            Err(e) => (Err(e), None),
+        };
         // Either step failing must leave no dead placeholder (the TabPhase
         // contract: creation failures remove the tab entirely). A spawn failure
         // in `finalize` (e.g. a missing container image) is no exception.
@@ -1242,8 +1262,9 @@ impl AppState {
             return outcome;
         }
         // The tab is created and the agent is running; a failing `worktree_created`
-        // hook is surfaced as a warning but never rolls back the tab (best-effort).
-        if let Some(warning) = hook_report.and_then(|r| r.warning_message("worktree_created")) {
+        // hook or a create warning is surfaced but never rolls back the tab
+        // (best-effort).
+        if let Some(warning) = warning {
             return Ok(Effect::Warning(warning));
         }
         outcome
@@ -3370,7 +3391,7 @@ mod tests {
         // The worker runs the hook in the freshly-created worktree.
         let runner = FakeCommandRunner::new();
         let report = materialize_worktree(&git, &runner, &job).unwrap();
-        assert!(report.expect("hook ran").failure.is_none());
+        assert!(report.hook_report.expect("hook ran").failure.is_none());
         assert_eq!(
             runner.invocations(),
             vec![(
@@ -3396,7 +3417,8 @@ mod tests {
             created_hooks: vec!["npm install".to_string()],
         };
         let report = materialize_worktree(&git, &runner, &job).unwrap();
-        assert!(report.is_none());
+        assert!(report.hook_report.is_none());
+        assert!(report.warning().is_none());
         assert!(runner.invocations().is_empty());
         assert!(git.added_worktrees().is_empty());
     }

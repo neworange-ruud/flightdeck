@@ -22,6 +22,7 @@ uses that version's section as the GitHub Release notes.
 
 ### Bug fixes
 
+- **New worktrees no longer fail with "Filename too long" on Windows.** A worktree sits under `.flightdeck/worktrees/<name>/`, which makes every path in it longer than in the main checkout, so a repository with deep folders could pass the 260-character Windows limit and fail halfway through the checkout. Before creating a worktree on Windows, FlightDeck now checks `core.longpaths` in your global git config. If it is not set there, FlightDeck turns it on for that repository. If you turned it off globally, FlightDeck leaves it alone and warns that long paths cannot be checked out.
 - A worker window whose worker runs a newer FlightDeck than the app no longer
   just says "Update FlightDeck Desktop" with nothing to click. Its banner now
   offers the update: **Update now** (then **Restart**) where the app can replace

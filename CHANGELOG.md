@@ -16,6 +16,7 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Bug fixes
 
+- **New worktrees no longer fail with "Filename too long" on Windows.** A worktree sits under `.flightdeck/worktrees/<name>/`, which makes every path in it longer than in the main checkout, so a repository with deep folders could pass the 260-character Windows limit and fail halfway through the checkout. Before creating a worktree on Windows, FlightDeck now checks `core.longpaths` in your global git config. If it is not set there, FlightDeck turns it on for that repository. If you turned it off globally, FlightDeck leaves it alone and warns that long paths cannot be checked out.
 - **OpenCode scrolls again in a window opened onto a running session.** A FlightDeck Desktop window, `flightdeck connect` or a browser that attached to a host (above all a worker) after an agent had written more than the replay buffer (`[web] replay_bytes`, 256 KiB) lost the modes the agent set when it started: its alternate screen, mouse reporting and bracketed paste. The window then kept the mouse wheel to itself, so OpenCode 2's transcript did not scroll (its scrollbar could still move) and clicks never reached it. The window also showed only the rows the agent had redrawn since, leaving the rest blank or stale (OpenCode's prompt area, for one). The host now starts such a truncated replay with the modes its own terminal holds for the program, and ends it with a repaint of that terminal's screen, so the window opens exactly as the host sees it.
 
 ## [2.1.0] - 2026-11-18

@@ -63,6 +63,20 @@ impl GitCli {
     }
 }
 
+/// Read a `git config --type=bool --get` result: exit 0 carries the
+/// normalized `true`/`false`, exit 1 means the key is not set, anything else
+/// is an error.
+fn parse_config_bool(out: &Output, what: &str) -> Result<Option<bool>> {
+    match out.status.code() {
+        Some(0) => Ok(Some(stdout_trimmed(out) == "true")),
+        Some(1) => Ok(None),
+        _ => Err(FlightDeckError::Git(format!(
+            "{what} failed: {}",
+            stderr_trimmed(out)
+        ))),
+    }
+}
+
 /// One open project's repository handle: its root plus the [`GitExecutor`]
 /// that runs git against it.
 ///
@@ -153,6 +167,14 @@ impl GitExecutor for ProjectGit {
 
     fn prune_worktrees(&self) -> Result<()> {
         self.exec.prune_worktrees()
+    }
+
+    fn global_long_paths(&self) -> Result<Option<bool>> {
+        self.exec.global_long_paths()
+    }
+
+    fn enable_repo_long_paths(&self) -> Result<()> {
+        self.exec.enable_repo_long_paths()
     }
 
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)> {
@@ -354,6 +376,23 @@ impl GitExecutor for GitCli {
         // just-orphaned entry behind.
         let out = self.run(&["worktree", "prune", "--expire", "now"])?;
         require_success(&out, "worktree prune --expire now")
+    }
+
+    fn global_long_paths(&self) -> Result<Option<bool>> {
+        // `--type=bool` normalizes yes/on/1 and friends to `true`/`false`.
+        let out = self.run(&[
+            "config",
+            "--global",
+            "--type=bool",
+            "--get",
+            "core.longpaths",
+        ])?;
+        parse_config_bool(&out, "config --global --get core.longpaths")
+    }
+
+    fn enable_repo_long_paths(&self) -> Result<()> {
+        let out = self.run(&["config", "--local", "core.longpaths", "true"])?;
+        require_success(&out, "config --local core.longpaths true")
     }
 
     fn ahead_behind(&self, base: &str, branch: &str) -> Result<(u32, u32)> {
