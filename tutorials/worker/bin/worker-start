@@ -1,4 +1,12 @@
 #!/bin/sh
 # The container's command: SSH on 2222 (as dev), then the worker.
+#
+# FD_NO_WORKER=1 (tutorials/worker/up.sh MODE=noworker) keeps SSH in the
+# foreground instead and starts no worker: a plain box with FlightDeck
+# installed, for scenes that run the terminal UI there (which refuses while a
+# worker serves the machine's projects).
+if [ "${FD_NO_WORKER:-}" = 1 ]; then
+  exec /usr/sbin/sshd -D -f /home/dev/.sshd/sshd_config -E /home/dev/.sshd/sshd.log
+fi
 /usr/sbin/sshd -f /home/dev/.sshd/sshd_config -E /home/dev/.sshd/sshd.log
 exec flightdeck worker run

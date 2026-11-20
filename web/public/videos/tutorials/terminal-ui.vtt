@@ -1,0 +1,58 @@
+WEBVTT
+
+00:00:00.661 --> 00:00:06.591
+FlightDeck also runs right in your terminal, on any machine you can reach.
+
+00:00:06.591 --> 00:00:08.834
+Here, it's devbox, over SSH.
+
+00:00:09.147 --> 00:00:11.887
+Go to a project, and start FlightDeck.
+
+00:00:14.633 --> 00:00:17.222
+Press Control N for a new agent.
+
+00:00:17.222 --> 00:00:20.135
+Pick the backend, and name the task.
+
+00:00:20.135 --> 00:00:25.314
+Like in FlightDeck Desktop, it gets its own branch and worktree.
+
+00:00:25.634 --> 00:00:28.195
+Enter puts you in the agent's terminal.
+
+00:00:28.195 --> 00:00:29.442
+Tell it what to do.
+
+00:00:30.035 --> 00:00:33.901
+To start another, switch back to FlightDeck's own keys:
+
+00:00:33.901 --> 00:00:37.837
+click the mode in the status bar, or press shift escape.
+
+00:00:38.125 --> 00:00:41.469
+Then Control N again, for a second task.
+
+00:00:49.400 --> 00:00:53.115
+The sidebar shows every agent, and what it's doing.
+
+00:00:54.068 --> 00:00:56.026
+Click an agent to look in.
+
+00:00:56.026 --> 00:01:00.245
+Plus shell opens a shell in its worktree, on its branch.
+
+00:01:05.314 --> 00:01:09.000
+Control G opens the palette, with every action.
+
+00:01:09.000 --> 00:01:12.373
+Finish merges the agent's branch into main.
+
+00:01:14.712 --> 00:01:17.591
+Merged, and the worktree is cleaned up.
+
+00:01:18.805 --> 00:01:21.719
+It's the same FlightDeck as the Desktop app.
+
+00:01:21.719 --> 00:01:26.421
+And flightdeck connect drives a worker from your terminal the same way.

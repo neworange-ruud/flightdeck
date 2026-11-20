@@ -11,8 +11,9 @@
 # lower case, spaces as dashes ("delete notes" -> delete-notes).
 #
 # It also marks Claude Code's launch announcements (e.g. "Fable 5.2 is here")
-# and notices as seen, and puts off its API-credit upsell, so they stay out
-# of the video.
+# and notices as seen, puts off its API-credit upsell, and turns off its
+# auto-updater (it cannot write the image's npm prefix, and says so in red),
+# so they stay out of the video.
 set -euo pipefail
 NAME="${WORKER_NAME:-fd-tutorial-worker}"
 project="$1"; shift
@@ -22,7 +23,7 @@ for task in "$@"; do
     /*) echo "$project/.flightdeck/worktrees/$slug" ;;
     *) echo "/home/dev/flightdeck/$project/.flightdeck/worktrees/$slug" ;;
   esac
-done | podman exec -i "$NAME" python3 -c '
+done | podman exec -i -u dev "$NAME" python3 -c '
 import json, os, sys
 p = os.path.expanduser("~/.claude/.claude.json")
 cfg = json.load(open(p))
@@ -37,4 +38,8 @@ for key in cfg.get("seenNotifications", {}):
 for org in cfg.get("apiCreditLinkStatusCache", {}).values():
     org["nextAskAt"] = 4102444800000  # 2100
 json.dump(cfg, open(p, "w"), indent=2)
+sp = os.path.expanduser("~/.claude/settings.json")
+settings = json.load(open(sp)) if os.path.exists(sp) else {}
+settings.setdefault("env", {})["DISABLE_AUTOUPDATER"] = "1"
+json.dump(settings, open(sp, "w"), indent=2)
 '

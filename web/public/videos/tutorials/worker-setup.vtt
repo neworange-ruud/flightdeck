@@ -1,0 +1,58 @@
+WEBVTT
+
+00:00:00.792 --> 00:00:05.726
+A worker is a machine that stays on and runs your agents:
+
+00:00:05.726 --> 00:00:09.621
+a Linux server, or a Mac mini under the desk.
+
+00:00:09.621 --> 00:00:14.036
+This is devbox, a fresh Linux server in my tailnet.
+
+00:00:14.036 --> 00:00:15.421
+Let's set it up.
+
+00:00:15.794 --> 00:00:17.981
+First, install FlightDeck.
+
+00:00:17.981 --> 00:00:21.934
+One command downloads it into your home folder.
+
+00:00:21.934 --> 00:00:23.364
+It needs no root.
+
+00:00:25.661 --> 00:00:29.098
+As it says, load the new path into this shell.
+
+00:00:29.517 --> 00:00:36.608
+Now one command starts the worker, and hands it to systemd, so it comes back by itself after a reboot.
+
+00:00:36.608 --> 00:00:41.684
+If your account needs lingering for that, it tells you how to turn it on.
+
+00:00:42.226 --> 00:00:45.740
+The worker offers every agent FlightDeck supports.
+
+00:00:45.740 --> 00:00:50.168
+This box has only Claude Code set up, so switch the others off.
+
+00:00:57.005 --> 00:01:00.442
+Let's check that. Reboot the server.
+
+00:01:02.158 --> 00:01:07.034
+Once it's back up, log in again, and ask the worker how it's doing.
+
+00:01:09.338 --> 00:01:11.960
+It's running, started at boot.
+
+00:01:11.960 --> 00:01:13.796
+Nobody had to log in.
+
+00:01:16.007 --> 00:01:18.947
+The worker is ready. Last step:
+
+00:01:18.947 --> 00:01:24.734
+pair FlightDeck Desktop with it, with flightdeck worker pair.
+
+00:01:24.734 --> 00:01:27.106
+The next video shows how.

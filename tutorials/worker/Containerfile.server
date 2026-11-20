@@ -1,0 +1,56 @@
+# A bare Linux server for the "set up a worker" tutorial: the tutorial
+# worker's box (fd-tutorial-worker, see Containerfile) with systemd as init and
+# FlightDeck not installed yet, so the scene installs it, starts the worker and
+# turns on start-on-boot (`flightdeck worker enable`) for real.
+#
+# Built and started by tutorials/worker/up.sh MODE=server.
+FROM localhost/fd-tutorial-worker
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# SSH as dev on 2222, now as a system service rather than worker-start's.
+RUN printf '%s\n' '[Unit]' 'Description=SSH for dev' 'After=network.target' \
+        '[Service]' 'User=dev' \
+        'ExecStart=/usr/sbin/sshd -D -f /home/dev/.sshd/sshd_config -E /home/dev/.sshd/sshd.log' \
+        '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/dev-sshd.service \
+    && systemctl enable dev-sshd.service
+
+# Lingering on for dev, as `sudo loginctl enable-linger dev` leaves it: dev's
+# systemd user manager runs from boot, so `worker enable` can start at boot.
+RUN mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/dev
+
+# Not installed: the scene runs the real installer, then (off camera) puts
+# this debug build where it installed the release one, which listens on
+# Tailscale only. In place of bin/flightdeck's wrapper, a shell function shows
+# devbox:7420 instead of the debug worker's 0.0.0.0:7420, so the installed
+# binary stays the one that runs (`worker enable` prints its path).
+RUN rm /usr/local/bin/flightdeck \
+    && printf '%s\n' 'flightdeck() {' \
+        '  case "$1 $2" in' \
+        '    "worker pair"|"worker status") command flightdeck "$@" | sed -e "s#0\.0\.0\.0:7420#devbox:7420#g" -e "s# (HTTPS unavailable[^)]*)##" ;;' \
+        '    *) command flightdeck "$@" ;;' \
+        '  esac' '}' >> /home/dev/.zshrc
+
+# `sudo reboot` on camera: the container's restart policy (up.sh) brings the
+# box back, and systemd with it.
+RUN apt-get update && apt-get install -y --no-install-recommends sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo 'dev ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/dev && chmod 440 /etc/sudoers.d/dev
+
+# The debug worker's listen address (FLIGHTDECK_WORKER_TEST_LISTEN) and the
+# container's ENV, for the user manager's units (a unit from `worker enable`)
+# and for SSH sessions (a worker `start`ed by hand). SSH runs without PAM, so
+# sessions also need the user manager's runtime folder for `systemctl --user`.
+RUN mkdir -p /home/dev/.config/environment.d \
+    && printf '%s\n' 'FLIGHTDECK_WORKER_TEST_LISTEN=0.0.0.0:7420' \
+        'CLAUDE_CONFIG_DIR=/home/dev/.claude' 'XDG_CACHE_HOME=/home/dev/.cache' \
+        > /home/dev/.config/environment.d/tutorial.conf \
+    && printf '%s\n' 'export FLIGHTDECK_WORKER_TEST_LISTEN=0.0.0.0:7420' \
+        'export XDG_RUNTIME_DIR=/run/user/$(id -u)' >> /home/dev/.zshenv \
+    && chown -R dev:dev /home/dev/.config /home/dev/.zshenv
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

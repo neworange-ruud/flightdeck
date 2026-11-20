@@ -6,6 +6,8 @@
 #   tutorials/prepare.sh                 everything from scratch
 #   SKIP_BUILD=0 tutorials/prepare.sh    also rebuild the worker binary
 #   STAGE=launcher tutorials/prepare.sh  stop at the launcher (for a pairing tutorial)
+#   MODE=noworker|server tutorials/prepare.sh   a devbox with no worker running
+#                                        (see tutorials/worker/up.sh); stops at the launcher
 #
 # Coordinates are screen points, 1440x810 (see tutorials/vm/vnc_drive.py). The launcher
 # and the Connect form open centred; the worker window is made full screen
@@ -26,12 +28,12 @@ SKIP_BUILD="${SKIP_BUILD:-1}" "$ROOT/tutorials/worker/up.sh" >/dev/null
 "$VMCTL" ssh 'test -f ~/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
 printf "Host devbox\n  Port 2222\n  User dev\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n" > ~/.ssh/config
 cat ~/.ssh/id_ed25519.pub' \
-  | podman exec -i "$WORKER" sh -c 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+  | podman exec -i -u dev "$WORKER" sh -c 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
 
 "$VMCTL" ssh 'open /Applications/FlightDeck.app'
 "$VMCTL" ssh 'for i in $(seq 1 50); do pgrep -q flightdeck-desktop && break; sleep 0.2; done'
 sleep 3
-[[ "${STAGE:-}" == "launcher" ]] && { echo "stage: launcher"; exit 0; }
+[[ "${STAGE:-}" == "launcher" || "${MODE:-worker}" != "worker" ]] && { echo "stage: launcher"; exit 0; }
 
 CODE="$(podman exec "$WORKER" flightdeck worker pair --json \
   | python3 -c 'import sys, json; print(json.load(sys.stdin)["code"])')"
