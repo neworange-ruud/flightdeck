@@ -12,7 +12,10 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### Improvements
 
-- None yet.
+- Add a `recording-flightdeck-tutorials` project skill under `.agents/skills/`:
+  how to record, re-cut and publish a narrated tutorial video with the
+  `tutorials/` pipeline, and the lessons from the first takes. Developer
+  tooling only, no change to the shipped app.
 
 ### Bug fixes
 
