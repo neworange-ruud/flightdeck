@@ -9,10 +9,20 @@
 set -euo pipefail
 VM="$(dirname "${BASH_SOURCE[0]}")/vm"
 
-"$VM" ssh 'killall Terminal 2>/dev/null; sleep 2
+# A blinking cursor (DECSCUSR 1, which ssh sessions keep): screencapture records
+# a frame only when the screen changes, and after a long still stretch it
+# stamps the first new frames too early, so a typed character would show up
+# seconds before it was typed. The blink keeps frames coming.
+"$VM" ssh 'grep -q "e\[1 q" ~/.zshrc 2>/dev/null || printf "%s\n" "printf '"'"'\\e[1 q'"'"'" >> ~/.zshrc
+killall Terminal 2>/dev/null; sleep 2
 rm -rf ~/Library/Saved\ Application\ State/com.apple.Terminal.savedState
 defaults write com.apple.Terminal NSQuitAlwaysKeepsWindows -bool false
-open -a Terminal'
+open -a Terminal
+# Now and then Terminal starts with no window (the scene would then type into
+# whatever is behind it): wait for a window shell (login, a child of
+# Terminal), and open a window on the home folder if none comes.
+for i in $(seq 1 20); do pgrep -P "$(pgrep -x Terminal)" login >/dev/null 2>&1 && break; sleep 0.25; done
+pgrep -P "$(pgrep -x Terminal)" login >/dev/null 2>&1 || open -a Terminal ~'
 sleep 3
 "$VM" run - <<'EOF'
 move 720 330

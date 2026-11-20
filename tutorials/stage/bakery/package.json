@@ -1,0 +1,12 @@
+{
+  "name": "bakery",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The menu site for a small bakery.",
+  "scripts": {
+    "dev": "node --env-file=.env server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

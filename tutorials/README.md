@@ -44,6 +44,10 @@ The scenes (all published on the docs site's Video Tutorials page):
 | `shells` | SSH into a worktree, the Worker tab's shells side by side, Open Worktree in VS Code |
 | `files-and-images` | Transfer files…, pasting a mockup into the agent, the result in the browser |
 | `web-client` | `worker pair`'s browser link, FlightDeck Web, taken over / Reconnect |
+| `worker-setup` | A bare Linux server: the installer, `worker enable`, `worker agents`, `sudo reboot`, back by itself |
+| `agent-browser` | Agent: on in the session browser; the agent loads the app, adds a note, checks the count |
+| `hooks` | A worktree without node_modules, a `worktree_created` hook in nano, the next worktree runs |
+| `terminal-ui` | The terminal UI over SSH: Ctrl-N, two agents, the mode switch, + shell, Ctrl-G Finish |
 
 A take uses real agents (your Claude subscription) and takes 3 to 8 minutes.
 
@@ -59,6 +63,9 @@ frame rate) and `NAME.timeline`.
 | `tutorials/prepare.sh` | Fresh stage, paired and full screen; fails loudly if the Desktop did not attach |
 | `tutorials/vm/up.sh` | Fresh VM clone with FlightDeck.app installed; starts the VNC daemon |
 | `tutorials/worker/up.sh` | Fresh worker container; prints a pairing code (`SKIP_BUILD=1` reuses the binary) |
+| `MODE=noworker\|server tutorials/prepare.sh` | A devbox with no worker: `noworker` for the terminal UI (it refuses next to a worker), `server` for a bare server (systemd as init, FlightDeck not installed, `Containerfile.server`); both stop at the launcher |
+| `tutorials/worker/stage-project.sh NAME` | Put `tutorials/stage/NAME` on the worker as a project (git, `origin`), off camera, without adding it to every scene's project list |
+| `tutorials/worker/tui-agent-state.sh "task" [state]` | `agent-state.sh` for a terminal-UI scene, where no worker can be asked |
 | `tutorials/worker/trust.sh PROJECT "task"...` | Pre-trust the worktrees a scene will create (no Claude Code trust prompt) |
 | `tutorials/worker/agent-state.sh "task" [state]` | An agent's state on the worker; scenes `waitfor` it |
 | `tutorials/vm/vm shot` | Full-size screenshot plus a 1280 px preview (preview px × 1.125 = screen points) |
@@ -139,6 +146,20 @@ from `agent-state.sh`.
 - Claude Code in the worker: `settings.json` in the volume also has
   `permissions.additionalDirectories: ["/tmp/flightdeck-paste"]`, so a pasted
   image is read without a permission prompt.
+- `screencapture` records a frame only when the screen changes, and after a
+  long still stretch it stamps the first new frames too early: a character
+  typed after ten quiet seconds showed up ten seconds early. `terminal.sh`
+  turns on a blinking cursor (`\e[1 q` in the guest's `.zshrc`) to keep frames
+  coming; check a Terminal take for gaps with
+  `ffprobe -show_entries frame=pts_time` if something appears before its time.
+- `type` text goes through shlex: inside double quotes a backslash stays, so
+  write `\$HOME` in an unquoted heredoc (bash makes it `$HOME`), not `\\\$HOME`.
+- In a worker window a new agent is not selected while another exists
+  (remote-control-bncp): select it with `key opt-N` before typing to it.
+- The terminal UI: Mac Terminal sends Shift-Esc as a plain Esc, which would
+  interrupt the agent; click the status bar's mode hint for app mode instead.
+  Clicking an agent leaves app mode on, so press Enter before typing in a new
+  shell. Its New Agent dialog starts on OpenCode (the default backend).
 - The Desktop shows a version banner unless the worker's FlightDeck version
   equals the core the app was built with, so build both from the same tree
   (`scripts/desktop/macos-bundle.sh`, `tutorials/worker/build-binary.sh`).

@@ -3,6 +3,12 @@
 #
 #   tutorials/worker/up.sh            build binary + image, start fresh
 #   SKIP_BUILD=1 tutorials/worker/up.sh   reuse the last binary
+#   MODE=noworker tutorials/worker/up.sh  the same box, but no worker running
+#                                         (for the terminal UI, which refuses
+#                                         to start next to a worker)
+#   MODE=server tutorials/worker/up.sh    a bare server: systemd as init,
+#                                         FlightDeck not installed, no worker
+#                                         (Containerfile.server)
 #
 # The container is recreated on every run so each recording starts from the
 # same state. Only ~/.claude survives (a named volume), so the agent login
@@ -30,11 +36,33 @@ cp -R "$ROOT/tutorials/worker/bin" "$ROOT/tutorials/worker/home" "$CONTEXT/"
 cp -R "$ROOT/webui/dist" "$CONTEXT/webui-dist"
 podman build -t fd-tutorial-worker -f "$ROOT/tutorials/worker/Containerfile" "$CONTEXT"
 
+MODE="${MODE:-worker}"
 podman rm -f "$NAME" >/dev/null 2>&1 || true
+case "$MODE" in
+  server)
+    podman build -t fd-tutorial-server -f "$ROOT/tutorials/worker/Containerfile.server" "$CONTEXT"
+    podman run -d --systemd=always --restart=always --name "$NAME" --hostname devbox \
+      -p "$BIND:$PORT:7420" -p "$BIND:$SSH_PORT:2222" \
+      -v fd-tutorial-claude:/home/dev/.claude \
+      fd-tutorial-server >/dev/null
+    for _ in $(seq 1 50); do
+      podman exec "$NAME" systemctl is-active -q dev-sshd 2>/dev/null && break
+      sleep 0.2
+    done
+    echo "Bare server devbox up (SSH on $BIND:$SSH_PORT); FlightDeck not installed"
+    exit 0 ;;
+  noworker|worker) ;;
+  *) echo "MODE: worker, noworker or server" >&2; exit 2 ;;
+esac
 podman run -d --init --name "$NAME" --hostname devbox \
   -p "$BIND:$PORT:7420" -p "$BIND:$SSH_PORT:2222" \
   -v fd-tutorial-claude:/home/dev/.claude \
+  $([[ "$MODE" == noworker ]] && echo "-e FD_NO_WORKER=1") \
   fd-tutorial-worker >/dev/null
+if [[ "$MODE" == noworker ]]; then
+  echo "devbox up (SSH on $BIND:$SSH_PORT), no worker running"
+  exit 0
+fi
 
 for _ in $(seq 1 50); do
   if podman exec "$NAME" flightdeck worker status >/dev/null 2>&1; then break; fi

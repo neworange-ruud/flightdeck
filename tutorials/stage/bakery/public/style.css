@@ -1,0 +1,6 @@
+body { margin: 0; font-family: Georgia, serif; background: #fbf6ee; color: #3b2a1a; }
+main { max-width: 34rem; margin: 4rem auto; padding: 0 1.5rem; }
+h1 { font-size: 2.6rem; margin: 0 0 0.3rem; }
+p { color: #8a6a4a; margin: 0 0 2rem; }
+ul { list-style: none; padding: 0; margin: 0; }
+li { display: flex; justify-content: space-between; padding: 0.8rem 0; border-bottom: 1px dashed #d9c6ad; font-size: 1.2rem; }

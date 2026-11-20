@@ -42,6 +42,8 @@ an agent or the timing places has no fixed coordinate. Use `clicktext` or
 | Sidebar: agent row (first) | 93,181 |
 | Sidebar: shell row (after the terminal button) | 93,208 |
 | Session browser address bar | 788,108 |
+| Session browser "Agent: off/on" switch | 1317,108 |
+| Sidebar: the session browser row (no shell open) | 93,208 |
 | Finish (agent header) | 1302,64 |
 | Merge (Finish dialog) | 922,447 |
 | Side by side (Worker tab) | 1389,61 |
@@ -60,6 +62,14 @@ area (around 840,400) before typing to an agent.
 | Pairing code field | 720,370 |
 | Connect | 505,457 |
 | Connect anyway (not-encrypted warning) | 536,565 |
+
+## The terminal UI (in the Mac's Terminal, terminal-ui scene)
+
+| Target | Point |
+| --- | --- |
+| Status bar mode hint (a button: to app mode) | 506,785 |
+| `+ shell` | 1371,137 |
+| `+ agent` (another agent in the same worktree, not a new task) | 1282,137 |
 
 ## The Mac's Terminal (tutorials/vm/terminal.sh)
 

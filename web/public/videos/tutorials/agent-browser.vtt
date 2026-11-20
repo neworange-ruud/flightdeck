@@ -1,0 +1,34 @@
+WEBVTT
+
+00:00:00.747 --> 00:00:05.324
+An agent can test its own work in the session's browser.
+
+00:00:05.324 --> 00:00:10.963
+It opens pages, clicks, types and reads the console, while you watch.
+
+00:00:11.324 --> 00:00:13.103
+Open the session's browser.
+
+00:00:13.103 --> 00:00:17.454
+The agent may only use it once you switch it on, for this session.
+
+00:00:23.588 --> 00:00:28.836
+Now give the agent its task, and ask it to check the result in the browser itself.
+
+00:00:35.381 --> 00:00:38.028
+Switch back to the browser, and watch.
+
+00:00:42.833 --> 00:00:49.729
+The agent wrote the code, loaded the app in this tab, added a note, and saw the count go up.
+
+00:00:49.729 --> 00:00:51.378
+It's all there to see.
+
+00:00:59.639 --> 00:01:03.540
+Its summary says what it checked, and it committed its work.
+
+00:01:04.565 --> 00:01:07.422
+When you're done, switch it off again.
+
+00:01:07.422 --> 00:01:14.039
+Using the browser yourself, or pressing Stop while the agent works, switches it off too.

@@ -7,9 +7,9 @@ icon: play
 
 # Video Tutorials
 
-Short narrated videos of FlightDeck in real use: FlightDeck Desktop on a Mac,
-driving a worker called `devbox`, with real Claude Code agents building a small
-notes app called Pinboard. Each video takes one task from start to finish, in
+Short narrated videos of FlightDeck in real use. Most show FlightDeck Desktop on
+a Mac, driving a worker called `devbox`, with real Claude Code agents building a
+small notes app called Pinboard. Each video takes one task from start to finish, in
 one to two minutes. Agent work is sped up (the corner says by how much), and
 every video has captions.
 
@@ -17,6 +17,7 @@ every video has captions.
 
 - [FlightDeck in 100 seconds](#flightdeck-in-100-seconds) · 1:39
 - **[Get started](#get-started)**
+  - [Set up a worker on your server](#set-up-a-worker-on-your-server) · 1:29
   - [Connect FlightDeck Desktop to a worker](#connect-flightdeck-desktop-to-a-worker) · 1:19
   - [Your first agent on a worker](#your-first-agent-on-a-worker) · 1:50
   - [Start a new project](#start-a-new-project) · 1:31
@@ -26,10 +27,14 @@ every video has captions.
   - [When an agent needs you](#when-an-agent-needs-you) · 0:51
   - [Review before you merge](#review-before-you-merge) · 0:48
   - [Keep an agent's branch up to date](#keep-an-agents-branch-up-to-date) · 0:56
+  - [Let the agent test its own work](#let-the-agent-test-its-own-work) · 1:16
 - **[The worker](#the-worker)**
   - [Shells on the worker and in an agent's worktree](#shells-on-the-worker-and-in-an-agents-worktree) · 1:04
   - [Files and images](#files-and-images) · 1:33
   - [FlightDeck Web: your worker in a browser](#flightdeck-web-your-worker-in-a-browser) · 1:11
+  - [Hooks: every new worktree ready to run](#hooks-every-new-worktree-ready-to-run) · 1:26
+- **[In your terminal](#in-your-terminal)**
+  - [FlightDeck in your terminal](#flightdeck-in-your-terminal) · 1:28
 
 ## FlightDeck in 100 seconds
 
@@ -38,6 +43,17 @@ every video has captions.
   caption="FlightDeck in 100 seconds: parallel agents, Mission control, the session browser and Finish." />
 
 ## Get started
+
+### Set up a worker on your server
+
+<Video src="/videos/tutorials/worker-setup.mp4" poster="/videos/tutorials/worker-setup.jpg"
+  captions="/videos/tutorials/worker-setup.vtt" title="Set up a worker on your server" />
+
+Turn a fresh Linux server into a worker: install FlightDeck with one command,
+start the worker with `flightdeck worker enable` so it comes back after every
+reboot, switch off the agent backends the box doesn't have, and reboot to see
+it start by itself. More in [Quickstart: Worker](/worker) and
+[Start on boot](/worker/operations#start-on-boot).
 
 ### Connect FlightDeck Desktop to a worker
 
@@ -113,6 +129,17 @@ A teammate pushed to main while the agent worked: pull main in a worker shell,
 spot **target +1** in the agent's header, and **Rebase Worktree** to put the
 agent's commits on top. More in [Git Workflow](/desktop/git#rebase-a-worktree).
 
+### Let the agent test its own work
+
+<Video src="/videos/tutorials/agent-browser.mp4" poster="/videos/tutorials/agent-browser.jpg"
+  captions="/videos/tutorials/agent-browser.vtt" title="Let the agent test its own work" />
+
+Switch **Agent** on in the session's browser, and the agent can use it: here it
+builds a note counter, loads the app, adds a note and checks that the count
+goes up, while you watch. It stays off until you switch it on, for each
+session, and switches off again when you take the browser over or press
+**Stop**. Claude Code and Codex agents get the browser tools.
+
 ## The worker
 
 ### Shells on the worker and in an agent's worktree
@@ -142,6 +169,28 @@ Pair a browser with the link `flightdeck worker pair` prints, then use the
 worker's projects, agents, terminals and command palette from any browser. A
 worker serves one window at a time; **Reconnect** in the Desktop takes it back.
 More in [FlightDeck Web](/web).
+
+### Hooks: every new worktree ready to run
+
+<Video src="/videos/tutorials/hooks.mp4" poster="/videos/tutorials/hooks.jpg"
+  captions="/videos/tutorials/hooks.vtt" title="Hooks: every new worktree ready to run" />
+
+A new worktree gets your `.env` linked in, but nothing else git doesn't track,
+so the app won't start. A `worktree_created` hook in `.flightdeck/hooks.toml`
+runs `npm install` in every new worktree, and the next agent's app starts right
+away. More in [Hooks](/desktop/hooks).
+
+## In your terminal
+
+### FlightDeck in your terminal
+
+<Video src="/videos/tutorials/terminal-ui.mp4" poster="/videos/tutorials/terminal-ui.jpg"
+  captions="/videos/tutorials/terminal-ui.vtt" title="FlightDeck in your terminal" />
+
+The terminal UI, over SSH on a Linux box: **Ctrl-N** for a new agent, two
+agents side by side in the sidebar, the mode switch between the agent's keys
+and FlightDeck's, a shell in an agent's worktree, and **Finish** from the
+**Ctrl-G** palette. More in [Terminal UI Tour](/interface).
 
 ## How these videos are made
 

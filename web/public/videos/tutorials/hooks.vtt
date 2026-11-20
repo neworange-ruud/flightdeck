@@ -1,0 +1,37 @@
+WEBVTT
+
+00:00:00.687 --> 00:00:03.906
+Every agent works in its own git worktree:
+
+00:00:03.906 --> 00:00:06.359
+a fresh checkout of the project.
+
+00:00:06.359 --> 00:00:14.944
+FlightDeck links your dot env file into it, but anything else git doesn't track stays behind, like node_modules.
+
+00:00:15.328 --> 00:00:18.578
+Open a terminal in the new worktree, and look.
+
+00:00:21.088 --> 00:00:26.150
+The dot env file is there, but no dependencies, so the app won't start.
+
+00:00:26.778 --> 00:00:32.180
+Hooks fix that. Each project has a hooks file in its dot flightdeck folder.
+
+00:00:32.180 --> 00:00:38.806
+Commands under worktree created run in every new worktree, as soon as FlightDeck creates it.
+
+00:00:39.120 --> 00:00:41.488
+Here, install the dependencies.
+
+00:00:43.101 --> 00:00:44.865
+Now start another agent.
+
+00:00:55.841 --> 00:01:00.020
+The hook installed its dependencies, so the app starts right away.
+
+00:01:15.364 --> 00:01:19.855
+The hooks file is gitignored, so your hooks only run on your machine.
+
+00:01:19.855 --> 00:01:24.606
+To share them with your team, take it out of the gitignore and commit it.

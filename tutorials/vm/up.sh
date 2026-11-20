@@ -27,7 +27,14 @@ if ! tart list | grep -E "^local +$VM +" | grep -q running; then
 fi
 for _ in $(seq 1 60); do grep -q 'vnc://' "$VM_RUN_LOG" 2>/dev/null && break; sleep 1; done
 vm_ip >/dev/null
-for _ in $(seq 1 60); do vm_ssh true 2>/dev/null && break; sleep 2; done
+for _ in $(seq 1 60); do nc -z -G 2 "$(vm_ip)" 22 2>/dev/null && break; sleep 2; done
+for _ in $(seq 1 5); do vm_ssh -o BatchMode=yes true 2>/dev/null && break; sleep 2; done
+# A key made after the base image was (target/ cleaned, another checkout) is
+# not in its authorized_keys yet: install it with the image's password.
+if ! vm_ssh -o BatchMode=yes true 2>/dev/null; then
+  vm_install_key
+  vm_ssh -o BatchMode=yes true
+fi
 # macOS keeps the mode it saved for the base image's display: switch it to
 # VM_DISPLAY (HiDPI) before the VNC daemon connects, as the VNC framebuffer
 # takes its size at connect time.

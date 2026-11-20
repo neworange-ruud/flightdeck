@@ -8,7 +8,7 @@
 set -euo pipefail
 NAME="${WORKER_NAME:-fd-tutorial-worker}"
 agent="$1"; want="${2:-}"
-state="$(podman exec "$NAME" flightdeck worker status --json | python3 -c '
+state="$(podman exec -u dev "$NAME" flightdeck worker status --json | python3 -c '
 import json, sys
 name = sys.argv[1]
 for project in json.load(sys.stdin).get("projects", []):

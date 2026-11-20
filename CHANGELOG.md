@@ -8,6 +8,14 @@ Future releases should group notes under `New features`, `Improvements`, and `Bu
 
 ### New features
 
+- **Four more video tutorials.** The docs' Video Tutorials page has four new narrated videos. **Set up a worker on your server** installs FlightDeck on a fresh Linux server, starts it with `flightdeck worker enable`, switches off the agent backends the box doesn't have, and reboots to show the worker starting by itself. **Let the agent test its own work** switches the session browser's Agent on, and the agent loads its app, adds a note and checks the result. **Hooks: every new worktree ready to run** adds a `worktree_created` hook that runs `npm install` in every new worktree. **FlightDeck in your terminal** tours the terminal UI over SSH: two agents, the mode switch, a shell in a worktree, and Finish from the palette.
+
+### Improvements
+
+- **Tutorial recordings.** `tutorials/prepare.sh` takes `MODE=noworker` (a devbox with no worker, for the terminal UI) and `MODE=server` (a bare server with systemd and FlightDeck not installed). `tutorials/worker/stage-project.sh` puts an extra mock project on the worker for one scene. The VM's SSH key is installed with the image's password when the base image doesn't know it yet, `terminal.sh` keeps the cursor blinking so a still screen can't shift typed text earlier in the video, and opens a Terminal window if Terminal starts without one. Claude Code's auto-updater is off on the tutorial worker.
+
+### New features
+
 - None yet.
 
 ### Improvements
