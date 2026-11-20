@@ -14,6 +14,20 @@ uses that version's section as the GitHub Release notes.
 
 ### New features
 
+- None yet.
+
+### Improvements
+
+- None yet.
+
+### Bug fixes
+
+- None yet.
+
+## [2.2.1] - 2026-11-20
+
+### New features
+
 - **Check for Updates….** It is in the FlightDeck menu on macOS and in the command palette (**Check for Updates**) on every OS. It asks GitHub right away and always answers in the update banner: checking, up to date, the update it found (with **Update now**), or why it could not check (with **Check again**). It works even with `[update] check = false`.
 - **Update a worker with one click.** When a worker runs an older FlightDeck than the app (or its own check found a newer release), its window's banner says so and offers **Update worker**. The worker updates FlightDeck (Homebrew or the installer, however it was installed), restarts, resumes its agents, and the window reconnects. A worker that can't update says why. A worker older than this release is told how to update by hand, once. In the Workers list, an older worker's badge now says **update available**.
 
