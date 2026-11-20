@@ -5,6 +5,10 @@ at the controls: an agent (or you) drives the real app in a macOS VM against a
 real worker, and the recording is cut into a 1080p video with captions,
 highlights and an ElevenLabs voiceover.
 
+To make or re-record one with an agent, the project skill
+`.claude/skills/recording-flightdeck-tutorials` has the workflow and the
+lessons from the first takes.
+
 ```
 host (Apple Silicon Mac)
 ├── Tart VM "fd-tutorial"        macOS 26, 1440x810 points (Retina, 2880x1620 px),
